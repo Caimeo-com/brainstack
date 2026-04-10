@@ -1,0 +1,32 @@
+profile: client-macos
+machine:
+  name: local-macos
+  user: swader
+  role: client
+  sshUser: swader
+  hostname: local-macos
+paths:
+  home: /Users/swader
+  productRepo: ~/brainstack
+  sharedBrainRoot: ~/shared-brain
+  privateBrainRoot: ~/private-brain
+  stateRoot: ~/.local/state/brainstack
+  configRoot: ~/.config/brainstack
+  systemdUserRoot: ~/.config/systemd/user
+brain:
+  bind: 127.0.0.1
+  port: 8080
+  publicBaseUrl: https://valkyrie.tailb647b6.ts.net
+  largeFileThresholdBytes: 10485760
+telemux:
+  enabled: false
+tailscale:
+  tailnetHost: ""
+  controlTag: tag:brain
+  workerTag: tag:brain-worker
+  advertiseTags: []
+  enableSsh: false
+client:
+  localPath: ~/shared-brain
+  envPath: ~/.config/shared-brain.env
+

@@ -1,0 +1,17 @@
+[Unit]
+Description=Clawdex control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/clawdex
+EnvironmentFile=%h/clawdex/.env
+ExecStart=%h/.bun/bin/bun run src/main.ts
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

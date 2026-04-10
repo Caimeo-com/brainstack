@@ -1,0 +1,19 @@
+.env
+.env.local
+.env.*.local
+workers.json
+
+# Local control-plane runtime state.
+data/
+.factory/
+
+# Build and dependency output.
+dist/
+node_modules/
+coverage/
+*.tsbuildinfo
+
+# Machine-local clutter.
+.DS_Store
+*.log
+*.pid

@@ -1,0 +1,16 @@
+[Unit]
+Description=brainstack braind shared-brain server
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{PRODUCT_REPO}}
+EnvironmentFile={{CONFIG_ROOT}}/braind.env
+ExecStartPre={{HOME}}/.bun/bin/bun run {{PRODUCT_REPO}}/apps/braind/src/reindex.ts --quiet
+ExecStart={{HOME}}/.bun/bin/bun run {{PRODUCT_REPO}}/apps/braind/src/server.ts
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+

@@ -1,0 +1,8 @@
+Host valkyrie
+  HostName valkyrie
+  User swader
+  IdentitiesOnly yes
+
+# Clone:
+# git clone swader@valkyrie:/home/swader/shared-brain/bare/shared-brain.git ~/shared-brain
+

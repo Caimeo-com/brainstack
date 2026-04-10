@@ -1,0 +1,17 @@
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+model = "gpt-5.4"
+model_reasoning_effort = "xhigh"
+
+[projects."/home/factory"]
+trust_level = "trusted"
+
+[projects."/home/factory/clawdex"]
+trust_level = "trusted"
+
+[notice]
+hide_full_access_warning = true
+
+[features]
+tui_app_server = true
+prevent_idle_sleep = true

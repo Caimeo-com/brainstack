@@ -1,0 +1,17 @@
+{
+  "name": "clawdex",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "dev": "bun --watch src/main.ts",
+    "build": "bun build src/main.ts --target bun --outdir dist",
+    "test": "bun test",
+    "doctor": "./scripts/doctor.sh",
+    "bootstrap:codex": "./scripts/bootstrap-codex.sh"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "@brainstack/braind",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "reindex": "bun run src/reindex.ts",
+    "test": "bun test"
+  }
+}
+

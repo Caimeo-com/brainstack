@@ -1,0 +1,14 @@
+{
+  "name": "@brainstack/brainctl",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "brainctl": "./src/main.ts"
+  },
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "test": "bun test"
+  }
+}
+

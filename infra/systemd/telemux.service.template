@@ -1,0 +1,15 @@
+[Unit]
+Description=brainstack telemux Telegram/Codex control plane
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{PRODUCT_REPO}}/apps/telemux
+EnvironmentFile={{CONFIG_ROOT}}/telemux.env
+ExecStart={{HOME}}/.bun/bin/bun run {{PRODUCT_REPO}}/apps/telemux/src/main.ts
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+

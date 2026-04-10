@@ -1,0 +1,37 @@
+# Quickstart: macOS Client
+
+The macOS client profile installs no services. It clones the shared-brain repo, writes a local env file if missing, and installs Codex/Claude/Cursor instruction snippets without silently overwriting existing files.
+
+## Render Bootstrap
+
+```bash
+cd ~/brainstack
+bun run packages/brainctl/src/main.ts bootstrap-client --profile client-macos --config examples/client-macos.yaml --out /tmp/brainstack-client
+```
+
+Copy or fetch that bootstrap directory on the Mac, then run:
+
+```bash
+cd /tmp/brainstack-client
+BRAIN_GIT_REMOTE=swader@valkyrie:/home/swader/shared-brain/bare/shared-brain.git ./install-client.sh
+```
+
+## Client Env
+
+`~/.config/shared-brain.env` should contain:
+
+```env
+BRAIN_BASE_URL=https://valkyrie.tailb647b6.ts.net
+BRAIN_IMPORT_TOKEN=
+SHARED_BRAIN_LOCAL_PATH=~/shared-brain
+```
+
+Do not put `BRAIN_ADMIN_TOKEN` on ordinary clients.
+
+## Read/Write Model
+
+- Read from `~/shared-brain` when possible.
+- Sync with `git -C ~/shared-brain pull --ff-only`.
+- Write imports/proposals with the HTTP API and import token.
+- Direct git push is trusted power-user mode only.
+

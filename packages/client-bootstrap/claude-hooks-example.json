@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "git -C ~/shared-brain pull --ff-only || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo Optional: summarize and propose via brainctl, do not auto-write canon."
+          }
+        ]
+      }
+    ]
+  }
+}
+
