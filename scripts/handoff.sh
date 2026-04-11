@@ -309,7 +309,7 @@ This is a REVIEW handoff bundle, not a release artifact.
 
 ## Scope Of This Pass
 
-- Documented the Tailscale control/worker caveats found while bringing up valkyrie and erbine.
+- Generated a review/audit bundle from a clean product HEAD.
 - Included generated proof for \`brainctl provision\`, \`brainctl destroy\`, client bootstrap, and worker join.
 - Generated this bundle with \`source/\` as the sole source representation.
 - Excluded compiled binaries, dist output, dependency trees, git metadata, env files, private keys, tokens, caches, and Finder/macOS junk.
@@ -334,36 +334,30 @@ See \`CLAIMS_AND_PROOF.md\` for the claim-to-evidence map.
 
 ## Valkyrie Production Touches
 
-- Tailscale prefs were adjusted outside the product repo: valkyrie now requests \`tag:brain\`; erbine now has \`tag:brain-worker\`; Tailscale SSH is disabled on erbine.
-- No brainstack service code was restarted by this script.
+- This handoff script collects service state only; it does not restart, stop, destroy, or cut over production services.
+- Pass-specific notes above are authoritative for whether the implementation pass touched production outside the product repo.
 
 ## Exact Validations Run
 
 - \`bun test\`
 - \`brainctl bootstrap-client\` with a custom \`client.localPath\`
 - \`brainctl join-worker\` with a custom \`paths.stateRoot\`
+- \`brainctl provision\` for a generated client-macos config
+- \`brainctl destroy --dry-run\` against the generated provision config
 - Optional local \`tailscale status/whois\` summary when Tailscale is installed
 - Optional local \`GET http://127.0.0.1:8080/health\` when braind is running
 
 ## Remaining Blockers
 
-- If valkyrie only shows \`RequestTags: [tag:brain]\` locally but \`tailscale whois <valkyrie-tailscale-ip>\` still shows a user owner, finish applying \`tag:brain\` in the Tailscale admin UI or re-enroll valkyrie with an auth key scoped to \`tag:brain\`.
-- Erbine bootstrap is still intentionally not performed by this handoff flow.
+- See pass-specific notes above. This generic handoff script does not infer rollout readiness beyond the generated command outputs.
 
 ## Single Biggest Remaining Risk
 
-Tailscale local prefs and server-applied tags are different states. A machine can request a tag locally without the server showing it in \`tailscale whois\`. Validate with \`tailscale whois <tailscale-ip>\`, using the IP shown by \`tailscale status\`, not just \`tailscale debug prefs\`.
+The bundle is a review artifact, not a release artifact. It proves the checked-in source and selected command outputs at HEAD; it does not prove a fresh external machine has been bootstrapped unless pass-specific notes say that happened.
 
 ## Next Recommended Operator Step
 
-Apply the tag-only Tailscale policy from \`source/infra/tailscale/policy-fragment.example.json\`, remove temporary host/IP fallback grants, then verify:
-
-\`\`\`bash
-tailscale status
-tailscale whois <valkyrie-tailscale-ip>
-tailscale whois <erbine-tailscale-ip>
-ssh -o BatchMode=yes -o ConnectTimeout=5 erbine true
-\`\`\`
+Start with \`HANDOFF.md\`, then use \`CHANGES.txt\` and \`CLAIMS_AND_PROOF.md\` to review only the claimed delta and its evidence.
 EOF
 } > "$bundle_dir/HANDOFF.md"
 
