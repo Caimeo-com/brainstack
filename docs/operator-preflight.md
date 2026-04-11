@@ -13,6 +13,15 @@ For control and single-node profiles, prepare the Unix user before installing se
 5. Confirm OpenSSH works over Tailscale for worker access.
 6. On Linux hosts using user services, enable lingering so services start without an interactive login: `loginctl enable-linger "$USER"`.
 
+For worker access, verify normal OpenSSH explicitly:
+
+```bash
+tailscale ping brain-worker
+ssh brain-worker true
+```
+
+If SSH reports `tailscale: tailnet policy does not permit you to SSH to this node`, you are hitting Tailscale SSH, not normal OpenSSH. Disable Tailscale SSH on that worker and ensure `sshd.service` is active.
+
 Example sudoers fragment:
 
 ```sudoers

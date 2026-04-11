@@ -13,6 +13,7 @@ Before sharing brainstack with another machine or person:
 - Product examples do not contain real tokens, chat ids, private keys, or personal repo data.
 - Tailscale docs clearly separate Serve from Funnel.
 - Worker docs use OpenSSH over Tailscale by default.
+- Tailscale docs explain the difference between local requested tags and server-applied tags, and document the Tailscale SSH port-22 interception failure mode.
 - Operator preflight docs explain passwordless sudo, Codex/Claude yolo mode, and the fact that telemux passes work into the configured harness rather than sandboxing it.
 - The shared-brain content repo remains markdown/manifests/raw/proposals, not a vector DB or hidden memory service.
 - Large binary policy is documented and tested.
@@ -34,3 +35,21 @@ The `brainctl` binary is compiled with `--no-compile-autoload-dotenv` and `--no-
 Generated source-run services use `bun --no-env-file run ...` for the same reason: service env must come from explicit runtime/secrets env files, not ambient repo `.env` loading.
 
 Cross-compilation can be added later with Bun compile targets after target support is verified on the release host.
+
+## Review Handoff Bundles
+
+Review bundles are not release artifacts:
+
+```bash
+cd ~/brainstack
+scripts/handoff.sh --mode review --out /tmp
+```
+
+For a larger local-audit bundle:
+
+```bash
+cd ~/brainstack
+scripts/handoff.sh --mode forensic --out /tmp
+```
+
+The handoff script uses exactly one source representation, `source/`, generated from `git archive` at `HEAD`. It excludes compiled binaries, `dist/`, `.git`, dependency trees, Bun cache, env files, private keys, tokens, empty directories, and Finder/macOS junk. It fails if secrets-looking patterns are found before zipping.

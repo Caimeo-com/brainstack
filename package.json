@@ -12,6 +12,8 @@
     "test": "bun test",
     "build:brainctl": "bun build packages/brainctl/src/main.ts --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --outfile dist/brainctl",
     "release": "scripts/release.sh",
+    "handoff": "scripts/handoff.sh",
+    "handoff:forensic": "scripts/handoff.sh --mode forensic",
     "smoke:single-node": "bun run packages/brainctl/src/main.ts smoke --profile single-node --config examples/single-node.yaml",
     "smoke:control": "bun run packages/brainctl/src/main.ts smoke --profile control --config examples/control.yaml"
   },

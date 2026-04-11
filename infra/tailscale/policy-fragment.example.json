@@ -1,4 +1,7 @@
 {
+  "groups": {
+    "group:brain-admins": ["operator@example.com"]
+  },
   "tagOwners": {
     "tag:brain": ["group:brain-admins"],
     "tag:brain-worker": ["group:brain-admins"]
@@ -23,4 +26,3 @@
   "ssh": [],
   "nodeAttrs": []
 }
-

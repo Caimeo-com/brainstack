@@ -4,6 +4,8 @@ The control profile runs `braind` and optional `telemux`. The worker profile doe
 
 Read [`operator-preflight.md`](./operator-preflight.md) before installing the control profile. Telemux passes Telegram-originated work into the configured harness process; it is not a sandbox.
 
+Read [`tailscale-control-worker.md`](./tailscale-control-worker.md) before pairing a control host with workers. The worker transport is normal OpenSSH over Tailscale, not Tailscale SSH.
+
 ## Control Dry Run
 
 ```bash
@@ -56,6 +58,8 @@ If that fails with a timeout while ping works, the likely blocker is Tailscale g
 - Worker hosts advertise `tag:brain-worker`.
 - Human laptops should normally stay untagged and access control through user/group grants.
 - Tailscale SSH is not the default; leave `"ssh": []` in policy unless intentionally enabling it later.
+- Validate server-applied tags with `tailscale whois <host>`, not only `tailscale debug prefs`.
+- If SSH says `tailscale: tailnet policy does not permit you to SSH to this node`, Tailscale SSH is still intercepting port 22 on the target. Disable Tailscale SSH on the target before using normal OpenSSH.
 
 ## Headless Control Enrollment
 

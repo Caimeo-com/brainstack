@@ -12,3 +12,10 @@ This repo contains the versioned product code for `brainstack`, not the canonica
 - Do not make Codex hooks part of correctness. Hooks may sync or summarize as convenience only.
 - Keep docs and examples aligned with generated behavior.
 
+## Handoff Bundles
+
+- When the operator asks for a handoff bundle, use `scripts/handoff.sh` unless explicitly told otherwise.
+- Default to `scripts/handoff.sh --mode review`; use `--mode forensic` only when a larger audit trail is requested.
+- Handoff bundles are review/audit artifacts, not releases. Do not include compiled binaries, `dist/`, `.git`, dependency trees, env files, private keys, tokens, caches, or Finder/macOS junk.
+- Use exactly one source representation in a handoff bundle. The checked-in script uses `source/` from `git archive HEAD`.
+- If Telegram delivery is requested on valkyrie, send the resulting zip through the existing telemux/Telegram path without printing secrets.
