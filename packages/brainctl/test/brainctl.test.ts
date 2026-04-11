@@ -194,6 +194,10 @@ describe("brainctl install safety", () => {
       const configRoot = join(root, "config");
       const headBefore = git(["rev-parse", "HEAD"], staging);
       const homeBefore = await readFile(join(staging, "wiki", "Home.md"), "utf8");
+      const seededClaude = await readFile(join(staging, "CLAUDE.md"), "utf8");
+      expect(seededClaude).toContain("@AGENTS.md");
+      expect(seededClaude).toContain("Claude-specific delta");
+      expect(seededClaude).not.toContain("Import and follow");
       expect(await Bun.file(join(configRoot, "braind.env")).exists()).toBe(false);
       expect(await Bun.file(join(configRoot, "braind.runtime.env")).exists()).toBe(true);
       expect(await Bun.file(join(configRoot, "braind.secrets.env")).exists()).toBe(true);
@@ -465,9 +469,10 @@ describe("public release hygiene", () => {
       expect(await readFile(join(out, "client.env.example"), "utf8")).toContain("SHARED_BRAIN_LOCAL_PATH=~/shared-brain");
       const installScript = await readFile(join(out, "install-client.sh"), "utf8");
       expect(installScript).toContain("operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git");
+      expect(installScript).toContain("TARGET_ABS=\"$(expand_path \"$TARGET\")\"");
       expect(installScript).toContain("ln -s \"$BOOTSTRAP_DIR/codex-shared-brain.include.md\" \"$CODEX_HOME/AGENTS.md\"");
       expect(installScript).not.toContain("Read the product-owned shared-brain snippet");
-      expect(installScript).toContain("@~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md");
+      expect(installScript).toContain("@$BOOTSTRAP_ABS/claude-user-CLAUDE.md");
       expect(installScript).toContain("cp \"$BOOTSTRAP_DIR/cursor-user-rule.md\" \"$CURSOR_RULE_DIR/shared-brain.md\"");
 
       const claude = await readFile(join(out, "claude-user-CLAUDE.md"), "utf8");
@@ -486,6 +491,53 @@ describe("public release hygiene", () => {
     }
   });
 
+  test("generated client bootstrap respects custom client.localPath", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-client-path-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      const out = join(dir, "bootstrap");
+      const customLocalPath = join(dir, "custom-client-brain");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: client-laptop",
+          "  user: operator",
+          "paths:",
+          "  home: /Users/operator",
+          "client:",
+          `  localPath: ${customLocalPath}`,
+          "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          "brain:",
+          "  publicBaseUrl: https://brain-control.example.ts.net",
+          ""
+        ].join("\n")
+      );
+
+      expectSuccess(runBrainctl(["bootstrap-client", "--profile", "client-macos", "--config", configPath, "--out", out]));
+      const files = await listFiles(out);
+      const hardcodedDefaults: string[] = [];
+      for (const file of files) {
+        const text = await readFile(file, "utf8");
+        if (text.includes("~/shared-brain")) {
+          hardcodedDefaults.push(file);
+        }
+      }
+      expect(hardcodedDefaults).toEqual([]);
+      expect(await readFile(join(out, "client.env.example"), "utf8")).toContain(`SHARED_BRAIN_LOCAL_PATH=${customLocalPath}`);
+      expect(await readFile(join(out, "codex-shared-brain.include.md"), "utf8")).toContain(`Consult \`${customLocalPath}\``);
+      expect(await readFile(join(out, "codex-global-AGENTS.md"), "utf8")).toContain(`git -C ${customLocalPath} pull --ff-only`);
+      expect(await readFile(join(out, "claude-user-CLAUDE.md"), "utf8")).toContain(`@${customLocalPath}/AGENTS.shared-client.md`);
+      expect(await readFile(join(out, "claude-hooks-example.json"), "utf8")).toContain(`git -C ${customLocalPath} pull --ff-only`);
+      expect(await readFile(join(out, "cursor-user-rule.md"), "utf8")).toContain(`consult \`${customLocalPath}\``);
+      expect(await readFile(join(out, "install-client.sh"), "utf8")).toContain(`DEFAULT_TARGET='${customLocalPath}'`);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("worker join flow is config-driven", () => {
     const result = runBrainctl(["join-worker", "--config", join(PRODUCT_ROOT, "examples", "control.yaml"), "--worker", "brain-worker"]);
     expectSuccess(result);
@@ -496,6 +548,38 @@ describe("public release hygiene", () => {
     expect(result.stdout).toContain("ssh operator@brain-worker true");
     expect(result.stdout).not.toContain("sshUser: factory");
     expect(result.stdout).not.toContain("Add to workers.json");
+  });
+
+  test("worker join paths respect custom stateRoot", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-worker-state-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      const stateRoot = join(dir, "custom-state");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: brain-control",
+          "  user: operator",
+          "paths:",
+          "  home: /home/operator",
+          `  stateRoot: ${stateRoot}`,
+          "telemux:",
+          "  enabled: false",
+          ""
+        ].join("\n")
+      );
+      const result = runBrainctl(["join-worker", "--config", configPath, "--worker", "brain-worker"]);
+      expectSuccess(result);
+      expect(result.stdout).toContain(`managedRepoRoot: ${stateRoot}/factory/repos`);
+      expect(result.stdout).toContain(`managedHostRoot: ${stateRoot}/factory/hostctx`);
+      expect(result.stdout).toContain(`managedScratchRoot: ${stateRoot}/factory/scratch`);
+      expect(result.stdout).not.toContain("~/.local/state/brainstack/factory");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   test("client env examples do not expose admin token slots", async () => {

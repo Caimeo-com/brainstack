@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "git -C ~/shared-brain pull --ff-only || true"
+            "command": "git -C __SHARED_BRAIN_LOCAL_PATH__ pull --ff-only || true"
           }
         ]
       }
@@ -24,4 +24,3 @@
     ]
   }
 }
-

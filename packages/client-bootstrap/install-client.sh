@@ -15,13 +15,38 @@ backup_file() {
   fi
 }
 
+expand_path() {
+  case "$1" in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\n' "$HOME" "${1#~/}" ;;
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$PWD" "$1" ;;
+  esac
+}
+
+escape_sed_replacement() {
+  printf '%s' "$1" | sed 's/[\/&]/\\&/g'
+}
+
+render_template() {
+  local source="$1"
+  local target="$2"
+  local replacement="$3"
+  local escaped
+  escaped="$(escape_sed_replacement "$replacement")"
+  sed "s#__SHARED_BRAIN_LOCAL_PATH__#$escaped#g" "$source" > "$target"
+}
+
+TARGET_ABS="$(expand_path "$TARGET")"
+BOOTSTRAP_ABS="$(expand_path "$BOOTSTRAP_DIR")"
+
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$BOOTSTRAP_DIR"
-cp "$(dirname "$0")/codex-global-AGENTS.md" "$BOOTSTRAP_DIR/codex-global-AGENTS.md"
-cp "$(dirname "$0")/codex-shared-brain.include.md" "$BOOTSTRAP_DIR/codex-shared-brain.include.md"
-cp "$(dirname "$0")/claude-user-CLAUDE.md" "$BOOTSTRAP_DIR/claude-user-CLAUDE.md"
-cp "$(dirname "$0")/cursor-user-rule.md" "$BOOTSTRAP_DIR/cursor-user-rule.md"
-cp "$(dirname "$0")/claude-hooks-example.json" "$BOOTSTRAP_DIR/claude-hooks-example.json"
+render_template "$(dirname "$0")/codex-global-AGENTS.md" "$BOOTSTRAP_DIR/codex-global-AGENTS.md" "$TARGET"
+render_template "$(dirname "$0")/codex-shared-brain.include.md" "$BOOTSTRAP_DIR/codex-shared-brain.include.md" "$TARGET"
+render_template "$(dirname "$0")/cursor-user-rule.md" "$BOOTSTRAP_DIR/cursor-user-rule.md" "$TARGET"
+render_template "$(dirname "$0")/claude-hooks-example.json" "$BOOTSTRAP_DIR/claude-hooks-example.json" "$TARGET"
+render_template "$(dirname "$0")/claude-user-CLAUDE.md" "$BOOTSTRAP_DIR/claude-user-CLAUDE.md" "$TARGET_ABS"
 if [ -d "$TARGET/.git" ]; then
   git -C "$TARGET" pull --ff-only
 else
@@ -45,12 +70,12 @@ fi
 CLAUDE_HOME="$HOME/.claude"
 mkdir -p "$CLAUDE_HOME"
 if [ ! -f "$CLAUDE_HOME/CLAUDE.md" ]; then
-  cat > "$CLAUDE_HOME/CLAUDE.md" <<'STUB'
-@~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md
+  cat > "$CLAUDE_HOME/CLAUDE.md" <<STUB
+@$BOOTSTRAP_ABS/claude-user-CLAUDE.md
 STUB
 else
   echo "Claude already has $CLAUDE_HOME/CLAUDE.md; append this exact import line manually:"
-  echo "@~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md"
+  echo "@$BOOTSTRAP_ABS/claude-user-CLAUDE.md"
 fi
 
 CURSOR_RULE_DIR="$HOME/.cursor/rules"

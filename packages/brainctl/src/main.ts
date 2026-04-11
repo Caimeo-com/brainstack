@@ -176,6 +176,10 @@ function absWithHome(input: string, home: string): string {
   return expanded.startsWith("/") ? expanded : resolve(expanded);
 }
 
+function shellSingleQuote(input: string): string {
+  return `'${input.replace(/'/g, "'\\''")}'`;
+}
+
 function splitKeyValue(text: string): [string, string] {
   const index = text.indexOf(":");
   if (index === -1) {
@@ -600,7 +604,9 @@ function sharedBrainSeedFiles(cfg: BrainstackConfig): Record<string, string> {
     "CLAUDE.md": [
       "# Claude",
       "",
-      "Import and follow `AGENTS.md`. Claude-specific delta: be conservative with direct wiki edits and prefer proposals unless acting as organizer/admin.",
+      "@AGENTS.md",
+      "",
+      "Claude-specific delta: be conservative with direct wiki edits and prefer proposals unless acting as organizer/admin.",
       ""
     ].join("\n"),
     "README.md": [
@@ -953,18 +959,21 @@ function tailscalePolicyFragment(cfg: BrainstackConfig): string {
 }
 
 function clientBootstrapFiles(cfg: BrainstackConfig): Record<string, string> {
+  const clientPath = cfg.client.localPath;
+  const defaultRemote = shellSingleQuote(cfg.client.remoteSsh);
+  const defaultTarget = shellSingleQuote(clientPath);
   return {
     "client.env.example": [
       `BRAIN_BASE_URL=${cfg.brain.publicBaseUrl || "https://brain-control.example.ts.net"}`,
       "BRAIN_IMPORT_TOKEN=",
-      `SHARED_BRAIN_LOCAL_PATH=${cfg.client.localPath}`,
+      `SHARED_BRAIN_LOCAL_PATH=${clientPath}`,
       ""
     ].join("\n"),
     "codex-shared-brain.include.md": [
       "# Shared Brain Client",
       "",
-      "- Consult `~/shared-brain` for prior decisions, machines, skills, runbooks, and source pages.",
-      "- Run `git -C ~/shared-brain pull --ff-only` before assuming the clone is current.",
+      `- Consult \`${clientPath}\` for prior decisions, machines, skills, runbooks, and source pages.`,
+      `- Run \`git -C ${clientPath} pull --ff-only\` before assuming the clone is current.`,
       "- Default writes are imports and proposals through the HTTP API using `BRAIN_IMPORT_TOKEN`.",
       "- Do not directly edit canonical wiki pages unless explicitly instructed.",
       "- Keep project-local state in the project, not in global memory.",
@@ -973,8 +982,8 @@ function clientBootstrapFiles(cfg: BrainstackConfig): Record<string, string> {
     "codex-global-AGENTS.md": [
       "# Shared Brain Client",
       "",
-      "- Consult `~/shared-brain` for prior decisions, machines, skills, runbooks, and source pages.",
-      "- Run `git -C ~/shared-brain pull --ff-only` before assuming the clone is current.",
+      `- Consult \`${clientPath}\` for prior decisions, machines, skills, runbooks, and source pages.`,
+      `- Run \`git -C ${clientPath} pull --ff-only\` before assuming the clone is current.`,
       "- Default writes are imports and proposals through the HTTP API using `BRAIN_IMPORT_TOKEN`.",
       "- Do not directly edit canonical wiki pages unless explicitly instructed.",
       "- Keep project-local state in the project, not in global memory.",
@@ -983,7 +992,7 @@ function clientBootstrapFiles(cfg: BrainstackConfig): Record<string, string> {
     "claude-user-CLAUDE.md": [
       "# Claude Shared Brain",
       "",
-      "@~/shared-brain/AGENTS.shared-client.md",
+      `@${clientPath}/AGENTS.shared-client.md`,
       "",
       "Claude-specific notes: sync first, read local markdown first, and use proposals for synthesized changes unless acting as organizer/admin.",
       ""
@@ -992,7 +1001,7 @@ function clientBootstrapFiles(cfg: BrainstackConfig): Record<string, string> {
       "{",
       '  "hooks": {',
       '    "SessionStart": [',
-      '      { "matcher": "*", "hooks": [{ "type": "command", "command": "git -C ~/shared-brain pull --ff-only || true" }] }',
+      `      { "matcher": "*", "hooks": [{ "type": "command", "command": "git -C ${clientPath} pull --ff-only || true" }] }`,
       "    ],",
       '    "Stop": [',
       '      { "matcher": "*", "hooks": [{ "type": "command", "command": "echo Optional: summarize and propose via brainctl, do not auto-write canon." }] }',
@@ -1004,7 +1013,7 @@ function clientBootstrapFiles(cfg: BrainstackConfig): Record<string, string> {
     "cursor-user-rule.md": [
       "# Shared Brain Rule",
       "",
-      "Before planning unfamiliar work, consult `~/shared-brain` for decisions, machines, harnesses, skills, and runbooks. Sync with `git pull --ff-only` when safe. For writes, use the shared-brain HTTP import/propose path or `brainctl`; do not directly mutate wiki pages unless explicitly instructed.",
+      `Before planning unfamiliar work, consult \`${clientPath}\` for decisions, machines, harnesses, skills, and runbooks. Sync with \`git -C ${clientPath} pull --ff-only\` when safe. For writes, use the shared-brain HTTP import/propose path or \`brainctl\`; do not directly mutate wiki pages unless explicitly instructed.`,
       ""
     ].join("\n"),
     "ssh_config_fragment.example": [
@@ -1014,14 +1023,16 @@ function clientBootstrapFiles(cfg: BrainstackConfig): Record<string, string> {
       "  IdentitiesOnly yes",
       "",
       "# Clone:",
-      `# git clone ${cfg.client.remoteSsh} ~/shared-brain`,
+      `# git clone ${cfg.client.remoteSsh} ${clientPath}`,
       ""
     ].join("\n"),
     "install-client.sh": `#!/usr/bin/env bash
 set -euo pipefail
 
-REMOTE="\${BRAIN_GIT_REMOTE:-${cfg.client.remoteSsh}}"
-TARGET="\${SHARED_BRAIN_LOCAL_PATH:-$HOME/shared-brain}"
+DEFAULT_REMOTE=${defaultRemote}
+DEFAULT_TARGET=${defaultTarget}
+REMOTE="\${BRAIN_GIT_REMOTE:-$DEFAULT_REMOTE}"
+TARGET="\${SHARED_BRAIN_LOCAL_PATH:-$DEFAULT_TARGET}"
 CONFIG_DIR="$HOME/.config"
 ENV_FILE="$CONFIG_DIR/shared-brain.env"
 BOOTSTRAP_DIR="$CONFIG_DIR/brainstack/client-bootstrap"
@@ -1034,13 +1045,32 @@ backup_file() {
   fi
 }
 
+expand_path() {
+  case "$1" in
+    "~") printf '%s\\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
+    /*) printf '%s\\n' "$1" ;;
+    *) printf '%s/%s\\n' "$PWD" "$1" ;;
+  esac
+}
+
+TARGET_ABS="$(expand_path "$TARGET")"
+BOOTSTRAP_ABS="$(expand_path "$BOOTSTRAP_DIR")"
+
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$BOOTSTRAP_DIR"
 cp "$(dirname "$0")/codex-global-AGENTS.md" "$BOOTSTRAP_DIR/codex-global-AGENTS.md"
 cp "$(dirname "$0")/codex-shared-brain.include.md" "$BOOTSTRAP_DIR/codex-shared-brain.include.md"
-cp "$(dirname "$0")/claude-user-CLAUDE.md" "$BOOTSTRAP_DIR/claude-user-CLAUDE.md"
 cp "$(dirname "$0")/cursor-user-rule.md" "$BOOTSTRAP_DIR/cursor-user-rule.md"
 cp "$(dirname "$0")/claude-hooks-example.json" "$BOOTSTRAP_DIR/claude-hooks-example.json"
+cat > "$BOOTSTRAP_DIR/claude-user-CLAUDE.md" <<CLAUDE
+# Claude Shared Brain
+
+@$TARGET_ABS/AGENTS.shared-client.md
+
+Claude-specific notes: sync first, read local markdown first, and use proposals for synthesized changes unless acting as organizer/admin.
+CLAUDE
+
 if [ -d "$TARGET/.git" ]; then
   git -C "$TARGET" pull --ff-only
 else
@@ -1064,12 +1094,12 @@ fi
 CLAUDE_HOME="$HOME/.claude"
 mkdir -p "$CLAUDE_HOME"
 if [ ! -f "$CLAUDE_HOME/CLAUDE.md" ]; then
-  cat > "$CLAUDE_HOME/CLAUDE.md" <<'STUB'
-@~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md
+  cat > "$CLAUDE_HOME/CLAUDE.md" <<STUB
+@$BOOTSTRAP_ABS/claude-user-CLAUDE.md
 STUB
 else
   echo "Claude already has $CLAUDE_HOME/CLAUDE.md; append this exact import line manually:"
-  echo "@~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md"
+  echo "@$BOOTSTRAP_ABS/claude-user-CLAUDE.md"
 fi
 
 CURSOR_RULE_DIR="$HOME/.cursor/rules"
@@ -1428,9 +1458,9 @@ async function commandJoinWorker(args: ParsedArgs): Promise<void> {
     transport: "ssh",
     sshTarget: worker,
     sshUser,
-    managedRepoRoot: "~/.local/state/brainstack/factory/repos",
-    managedHostRoot: "~/.local/state/brainstack/factory/hostctx",
-    managedScratchRoot: "~/.local/state/brainstack/factory/scratch"
+    managedRepoRoot: join(cfg.telemux.factoryRoot, "repos"),
+    managedHostRoot: join(cfg.telemux.factoryRoot, "hostctx"),
+    managedScratchRoot: join(cfg.telemux.factoryRoot, "scratch")
   };
   const workers = [...cfg.telemux.workers, snippet];
   const text = [
