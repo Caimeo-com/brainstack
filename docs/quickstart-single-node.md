@@ -19,6 +19,7 @@ Read [`operator-preflight.md`](./operator-preflight.md) first. A control/single-
 
 ```bash
 cd ~/brainstack
+bun install --frozen-lockfile
 bun run packages/brainctl/src/main.ts smoke --profile single-node --config examples/single-node.yaml
 ```
 
@@ -28,9 +29,11 @@ The smoke command creates a disposable install root under `/tmp`, initializes a 
 
 ```bash
 cd ~/brainstack
+bun install --frozen-lockfile
 bun run packages/brainctl/src/main.ts init --profile single-node --config examples/single-node.yaml
 systemctl --user daemon-reload
 systemctl --user enable --now braind.service
+loginctl enable-linger "$USER"
 ```
 
 Do not rerun `init` on an existing install. For product updates or service/hook/env re-rendering, use:
@@ -38,9 +41,20 @@ Do not rerun `init` on an existing install. For product updates or service/hook/
 ```bash
 cd ~/brainstack
 bun run packages/brainctl/src/main.ts upgrade --profile single-node --config examples/single-node.yaml
+systemctl --user daemon-reload
+systemctl --user restart braind.service
 ```
 
 To enable Telegram control explicitly, use `examples/control-telegram.yaml` and read `operator-preflight.md` first.
+
+## Runtime And Secrets Env
+
+`brainctl` splits generated runtime config from operator-owned secrets:
+
+- `~/.config/brainstack/braind.runtime.env`: generated and overwritten on upgrade.
+- `~/.config/brainstack/braind.secrets.env`: created if missing and never overwritten.
+
+The generated user service loads both files and runs Bun with `--no-env-file` so local repo `.env` files cannot silently change service behavior.
 
 ## Tailscale Serve
 

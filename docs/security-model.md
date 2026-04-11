@@ -44,13 +44,17 @@ Use grants:
 - `BRAIN_ADMIN_TOKEN`: organizer ingest/lint scope; do not copy to clients or workers.
 - `FACTORY_TELEGRAM_BOT_TOKEN`: local telemux env only.
 
-Examples must leave secret values blank. `brainctl rotate-token` writes generated shared-brain tokens to env files without printing token values.
+Examples must leave secret values blank. `brainctl rotate-token` writes generated shared-brain tokens to secrets env files without printing token values.
+
+Runtime env files are generated and may be overwritten by upgrade. Secrets env files are operator-managed and must not be overwritten by upgrade.
 
 ## Import Guardrails
 
 `braind` keeps originals but rejects risky imports before storing them:
 
 - `BRAIN_MAX_IMPORT_BYTES` limits text, uploads, and URL fetch bodies.
+- URL response bodies are capped while streaming; the service does not rely on `Content-Length`.
+- `BRAIN_URL_FETCH_TIMEOUT_MS` caps URL fetch/header/body read time.
 - URL imports only allow `http` and `https`.
 - URL imports block loopback, RFC1918, link-local, carrier-grade NAT/Tailscale, and unique-local/private IPv6 addresses by default.
 - `BRAIN_ALLOW_PRIVATE_URL_IMPORTS=true` exists only for trusted admin-controlled private fetches and should stay false for normal deployments.

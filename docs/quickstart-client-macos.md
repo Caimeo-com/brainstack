@@ -28,6 +28,14 @@ SHARED_BRAIN_LOCAL_PATH=~/shared-brain
 
 Do not put `BRAIN_ADMIN_TOKEN` on ordinary clients. The generated client env example intentionally omits it.
 
+## Harness Instructions
+
+The bootstrap installer installs real guidance, not prose pointers:
+
+- Codex: creates `~/.codex/AGENTS.md` as a symlink to the product-owned shared-brain guidance if no Codex global file exists. If it exists, the installer prints an exact append command.
+- Claude: writes real `@~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md` import syntax.
+- Cursor: writes the actual shared-brain rule content if no rule exists. If it exists, the installer prints the exact merge command.
+
 ## Read/Write Model
 
 - Read from `~/shared-brain` when possible.

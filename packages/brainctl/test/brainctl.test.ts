@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { syncWritableRepo } from "../../../apps/braind/src/brain-lib";
@@ -140,6 +141,44 @@ telemux:
     expect(cfg.paths.sharedBrainRoot).toBe("/home/operator/shared-brain");
     expect(cfg.repos.remoteSsh).toBe("operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git");
   });
+
+  test("rejects unsupported schema versions", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-schema-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      await writeFile(configPath, ["schema_version: 999", "profile: control", ""].join("\n"));
+      await expect(loadConfig(configPath, "control")).rejects.toThrow("Unsupported config schema version 999");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects unknown top-level config keys", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-unknown-key-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      await writeFile(configPath, ["schema_version: 1", "profile: control", "surprise: true", ""].join("\n"));
+      await expect(loadConfig(configPath, "control")).rejects.toThrow("Unsupported top-level config keys: surprise");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("resolves bun path dynamically from PATH", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-bun-path-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeBun = join(dir, "bun");
+      await writeFile(fakeBun, "#!/usr/bin/env sh\nprintf 'fake bun should not execute\\n'\n");
+      await chmod(fakeBun, 0o755);
+      process.env.PATH = `${dir}:${previousPath || ""}`;
+      const cfg = await loadConfig(join(PRODUCT_ROOT, "examples", "control.yaml"), "control");
+      expect(cfg.runtime.bunBin).toBe(fakeBun);
+    } finally {
+      process.env.PATH = previousPath;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("brainctl install safety", () => {
@@ -152,8 +191,14 @@ describe("brainctl install safety", () => {
 
       expectSuccess(runBrainctl(["init", "--profile", "single-node", "--config", configPath, "--root", root]));
       const staging = join(root, "shared-brain", "staging", "shared-brain");
+      const configRoot = join(root, "config");
       const headBefore = git(["rev-parse", "HEAD"], staging);
       const homeBefore = await readFile(join(staging, "wiki", "Home.md"), "utf8");
+      expect(await Bun.file(join(configRoot, "braind.env")).exists()).toBe(false);
+      expect(await Bun.file(join(configRoot, "braind.runtime.env")).exists()).toBe(true);
+      expect(await Bun.file(join(configRoot, "braind.secrets.env")).exists()).toBe(true);
+      await writeFile(join(configRoot, "braind.runtime.env"), "BRAIN_BIND=0.0.0.0\n");
+      await writeFile(join(configRoot, "braind.secrets.env"), "BRAIN_IMPORT_TOKEN=operator-owned\nBRAIN_ADMIN_TOKEN=operator-owned-admin\n");
 
       const rerun = runBrainctl(["init", "--profile", "single-node", "--config", configPath, "--root", root]);
       expect(rerun.code).not.toBe(0);
@@ -165,6 +210,8 @@ describe("brainctl install safety", () => {
       expect(git(["rev-parse", "HEAD"], staging)).toBe(headBefore);
       expect(await readFile(join(staging, "wiki", "Home.md"), "utf8")).toBe(homeBefore);
       expect(git(["status", "--porcelain"], staging)).toBe("");
+      expect(await readFile(join(configRoot, "braind.runtime.env"), "utf8")).toContain("BRAIN_BIND=127.0.0.1");
+      expect(await readFile(join(configRoot, "braind.secrets.env"), "utf8")).toContain("BRAIN_IMPORT_TOKEN=operator-owned");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -268,6 +315,89 @@ describe("braind write safety", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  test("URL import rejects oversize streamed bodies without content-length", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-stream-cap-"));
+    const braindPort = 29_000 + Math.floor(Math.random() * 5_000);
+    const sourcePort = 34_000 + Math.floor(Math.random() * 5_000);
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    let sourceServer: Server | null = null;
+    try {
+      sourceServer = createServer((socket) => {
+        socket.write("HTTP/1.1 200 OK\r\n");
+        socket.write("Content-Type: text/plain\r\n");
+        socket.write("Transfer-Encoding: chunked\r\n");
+        socket.write("\r\n");
+        socket.write(`40\r\n${"x".repeat(64)}\r\n`);
+        socket.write("0\r\n\r\n");
+        socket.end();
+      });
+      await new Promise<void>((resolveListen) => sourceServer?.listen(sourcePort, "127.0.0.1", resolveListen));
+
+      const configPath = join(dir, "config.yaml");
+      const root = join(dir, "install");
+      await writeFixtureConfig(configPath);
+      expectSuccess(runBrainctl(["init", "--profile", "single-node", "--config", configPath, "--root", root]));
+
+      proc = Bun.spawn(["bun", "run", SERVER], {
+        cwd: PRODUCT_ROOT,
+        env: {
+          ...process.env,
+          BRAIN_BIND: "127.0.0.1",
+          BRAIN_PORT: String(braindPort),
+          BRAIN_IMPORT_TOKEN: "import-test-token",
+          BRAIN_ADMIN_TOKEN: "admin-test-token",
+          BRAIN_ALLOW_PRIVATE_URL_IMPORTS: "true",
+          BRAIN_MAX_IMPORT_BYTES: "16",
+          SHARED_BRAIN_REPO_ROOT: join(root, "shared-brain", "serve", "shared-brain"),
+          SHARED_BRAIN_WRITE_REPO_ROOT: join(root, "shared-brain", "staging", "shared-brain"),
+          BRAIN_BLOB_STORE: join(root, "state", "blobs", "shared-brain")
+        },
+        stdout: "pipe",
+        stderr: "pipe"
+      });
+
+      let serverReady = false;
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        try {
+          const health = await fetch(`http://127.0.0.1:${braindPort}/health`);
+          if (health.ok) {
+            serverReady = true;
+            break;
+          }
+        } catch {
+          // wait for server startup
+        }
+        await Bun.sleep(100);
+      }
+      expect(serverReady).toBe(true);
+
+      const response = await fetch(`http://127.0.0.1:${braindPort}/api/import`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          title: "Oversize stream",
+          url: `http://127.0.0.1:${sourcePort}/stream`,
+          source_harness: "test-harness",
+          source_machine: "test-machine",
+          source_type: "url"
+        })
+      });
+      expect(response.status).toBe(413);
+      const payload = (await response.json()) as { error?: string };
+      expect(payload.error || "").toContain("streamed response exceeds");
+    } finally {
+      await new Promise<void>((resolveClose) => sourceServer?.close(() => resolveClose()) || resolveClose());
+      if (proc) {
+        proc.kill();
+        await proc.exited;
+      }
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("public release hygiene", () => {
@@ -333,12 +463,39 @@ describe("public release hygiene", () => {
       }
       expect(offenders).toEqual([]);
       expect(await readFile(join(out, "client.env.example"), "utf8")).toContain("SHARED_BRAIN_LOCAL_PATH=~/shared-brain");
-      expect(await readFile(join(out, "install-client.sh"), "utf8")).toContain(
-        "operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git"
-      );
+      const installScript = await readFile(join(out, "install-client.sh"), "utf8");
+      expect(installScript).toContain("operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git");
+      expect(installScript).toContain("ln -s \"$BOOTSTRAP_DIR/codex-shared-brain.include.md\" \"$CODEX_HOME/AGENTS.md\"");
+      expect(installScript).not.toContain("Read the product-owned shared-brain snippet");
+      expect(installScript).toContain("@~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md");
+      expect(installScript).toContain("cp \"$BOOTSTRAP_DIR/cursor-user-rule.md\" \"$CURSOR_RULE_DIR/shared-brain.md\"");
+
+      const claude = await readFile(join(out, "claude-user-CLAUDE.md"), "utf8");
+      expect(claude).toContain("@~/shared-brain/AGENTS.shared-client.md");
+      expect(claude).not.toContain("Import `");
+
+      const codex = await readFile(join(out, "codex-shared-brain.include.md"), "utf8");
+      expect(codex).toContain("Consult `~/shared-brain`");
+      expect(codex).toContain("Do not directly edit canonical wiki pages");
+
+      const cursor = await readFile(join(out, "cursor-user-rule.md"), "utf8");
+      expect(cursor).toContain("Before planning unfamiliar work");
+      expect(cursor).not.toContain("Read ~/.config");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  test("worker join flow is config-driven", () => {
+    const result = runBrainctl(["join-worker", "--config", join(PRODUCT_ROOT, "examples", "control.yaml"), "--worker", "brain-worker"]);
+    expectSuccess(result);
+    expect(result.stdout).toContain("Merge this YAML into brainstack.yaml");
+    expect(result.stdout).toContain("Do not edit `workers.json` directly");
+    expect(result.stdout).toContain("sshUser: operator");
+    expect(result.stdout).toContain("brainctl upgrade --config brainstack.yaml --profile control");
+    expect(result.stdout).toContain("ssh operator@brain-worker true");
+    expect(result.stdout).not.toContain("sshUser: factory");
+    expect(result.stdout).not.toContain("Add to workers.json");
   });
 
   test("client env examples do not expose admin token slots", async () => {
@@ -365,5 +522,10 @@ describe("public release hygiene", () => {
       expect(text).toContain("--no-compile-autoload-dotenv");
       expect(text).toContain("--no-compile-autoload-bunfig");
     }
+  });
+
+  test("nested telemux bun lockfile is gone", async () => {
+    expect(await Bun.file(join(PRODUCT_ROOT, "apps", "telemux", "bun.lock")).exists()).toBe(false);
+    expect(await Bun.file(join(PRODUCT_ROOT, "bun.lock")).exists()).toBe(true);
   });
 });

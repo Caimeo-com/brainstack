@@ -18,6 +18,7 @@ backup_file() {
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$BOOTSTRAP_DIR"
 cp "$(dirname "$0")/codex-global-AGENTS.md" "$BOOTSTRAP_DIR/codex-global-AGENTS.md"
+cp "$(dirname "$0")/codex-shared-brain.include.md" "$BOOTSTRAP_DIR/codex-shared-brain.include.md"
 cp "$(dirname "$0")/claude-user-CLAUDE.md" "$BOOTSTRAP_DIR/claude-user-CLAUDE.md"
 cp "$(dirname "$0")/cursor-user-rule.md" "$BOOTSTRAP_DIR/cursor-user-rule.md"
 cp "$(dirname "$0")/claude-hooks-example.json" "$BOOTSTRAP_DIR/claude-hooks-example.json"
@@ -35,39 +36,30 @@ fi
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 mkdir -p "$CODEX_HOME"
 if [ ! -f "$CODEX_HOME/AGENTS.md" ]; then
-  cat > "$CODEX_HOME/AGENTS.md" <<'STUB'
-# Codex Local Instructions
-
-Read the product-owned shared-brain snippet at ~/.config/brainstack/client-bootstrap/codex-global-AGENTS.md.
-STUB
+  ln -s "$BOOTSTRAP_DIR/codex-shared-brain.include.md" "$CODEX_HOME/AGENTS.md"
 else
-  echo "Codex already has $CODEX_HOME/AGENTS.md; add this line manually if desired:"
-  echo "Read ~/.config/brainstack/client-bootstrap/codex-global-AGENTS.md for shared-brain client guidance."
+  echo "Codex already has $CODEX_HOME/AGENTS.md; append the real shared-brain guidance with:"
+  echo "cat $BOOTSTRAP_DIR/codex-shared-brain.include.md >> $CODEX_HOME/AGENTS.md"
 fi
 
 CLAUDE_HOME="$HOME/.claude"
 mkdir -p "$CLAUDE_HOME"
 if [ ! -f "$CLAUDE_HOME/CLAUDE.md" ]; then
   cat > "$CLAUDE_HOME/CLAUDE.md" <<'STUB'
-# Claude Local Instructions
-
-Import ~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md.
+@~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md
 STUB
 else
-  echo "Claude already has $CLAUDE_HOME/CLAUDE.md; add this line manually if desired:"
-  echo "Import ~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md."
+  echo "Claude already has $CLAUDE_HOME/CLAUDE.md; append this exact import line manually:"
+  echo "@~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md"
 fi
 
 CURSOR_RULE_DIR="$HOME/.cursor/rules"
 mkdir -p "$CURSOR_RULE_DIR"
 if [ ! -f "$CURSOR_RULE_DIR/shared-brain.md" ]; then
-  cat > "$CURSOR_RULE_DIR/shared-brain.md" <<'STUB'
-# Shared Brain
-
-Read ~/.config/brainstack/client-bootstrap/cursor-user-rule.md for the shared-brain client workflow.
-STUB
+  cp "$BOOTSTRAP_DIR/cursor-user-rule.md" "$CURSOR_RULE_DIR/shared-brain.md"
 else
-  echo "Cursor shared-brain rule already exists at $CURSOR_RULE_DIR/shared-brain.md; compare it with $BOOTSTRAP_DIR/cursor-user-rule.md manually."
+  echo "Cursor shared-brain rule already exists at $CURSOR_RULE_DIR/shared-brain.md; append or merge the actual rule content with:"
+  echo "cat $BOOTSTRAP_DIR/cursor-user-rule.md >> $CURSOR_RULE_DIR/shared-brain.md"
 fi
 
 echo "shared brain client installed or updated at $TARGET"

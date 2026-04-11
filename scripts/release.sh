@@ -11,6 +11,7 @@ fi
 
 mkdir -p dist
 
+bun install --frozen-lockfile
 bun test
 bun build packages/brainctl/src/main.ts \
   --compile \
@@ -24,4 +25,3 @@ git archive --format=tar.gz --prefix="brainstack-${version}/" HEAD > "$archive"
 
 echo "brainctl: dist/brainctl"
 echo "source archive: $archive"
-

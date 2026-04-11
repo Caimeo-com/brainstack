@@ -30,6 +30,13 @@ Search uses local SQLite under `derived/` in the serve clone and is never shared
 
 Use `brainctl upgrade` or `brainctl apply-runtime` for existing installs. Those commands render and apply runtime artifacts such as service files, hooks, env examples, Tailscale Serve config, and bootstrap files, but they do not silently rewrite canonical wiki pages, manifests, raw artifacts, proposals, or logs.
 
+Runtime env and secrets env are split:
+
+- `braind.runtime.env` and `telemux.runtime.env` are generated and overwritten by upgrade.
+- `braind.secrets.env` and `telemux.secrets.env` are operator-managed, created only if missing, and never overwritten.
+
+`workers.json` is rendered from `brainstack.yaml`. Treat `brainstack.yaml` as the source of truth for workers; do not edit `workers.json` directly.
+
 ## Large Files
 
 Text and normalized extracts stay in git. Small binaries may stay in git. Large binary originals above the configured threshold are stored in a content-addressed blob store outside git with pointer manifests and normalized extracts committed to git.

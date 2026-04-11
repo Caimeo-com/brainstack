@@ -8,6 +8,7 @@ Read [`operator-preflight.md`](./operator-preflight.md) before installing the co
 
 ```bash
 cd ~/brainstack
+bun install --frozen-lockfile
 bun run packages/brainctl/src/main.ts smoke --profile control --config examples/control.yaml
 ```
 
@@ -16,7 +17,11 @@ For a fresh control host install, run `brainctl init`. For later product updates
 ```bash
 cd ~/brainstack
 bun run packages/brainctl/src/main.ts init --profile control --config examples/control.yaml
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
 bun run packages/brainctl/src/main.ts upgrade --profile control --config examples/control.yaml
+systemctl --user daemon-reload
+systemctl --user restart braind.service
 ```
 
 ## Worker Plan
@@ -31,6 +36,7 @@ bun run packages/brainctl/src/main.ts join-worker --config examples/control.yaml
 The worker transport default is normal OpenSSH over Tailscale:
 
 ```bash
+loginctl enable-linger "$USER"
 ssh operator@brain-worker true
 ```
 
@@ -66,3 +72,17 @@ sudo tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname=brain-worker --a
 ```
 
 Use reusable/preapproved auth keys with restricted tags from the Tailscale dashboard. Do not store auth keys in git.
+
+## Runtime And Secrets Env
+
+Generated runtime env files are overwritten on upgrade:
+
+- `~/.config/brainstack/braind.runtime.env`
+- `~/.config/brainstack/telemux.runtime.env` when telemux is explicitly enabled
+
+Operator-managed secrets env files are created only if missing and are never overwritten:
+
+- `~/.config/brainstack/braind.secrets.env`
+- `~/.config/brainstack/telemux.secrets.env` when telemux is explicitly enabled
+
+Generated user services load both runtime and secrets env files and invoke Bun with `--no-env-file` so local repo `.env` files cannot silently alter service behavior.

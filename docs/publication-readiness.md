@@ -3,6 +3,8 @@
 Before sharing brainstack with another machine or person:
 
 - `~/brainstack` is a git repo with no real secrets.
+- `bun install --frozen-lockfile` succeeds from the root lockfile.
+- `find . -name bun.lock` returns only `./bun.lock`.
 - `bun test` passes.
 - `brainctl smoke --profile single-node` passes.
 - `brainctl smoke --profile control` passes.
@@ -25,8 +27,10 @@ cd ~/brainstack
 scripts/release.sh
 ```
 
-The release script refuses dirty trees, runs `bun test`, builds `dist/brainctl`, and emits a source archive from `git archive`.
+The release script refuses dirty trees, runs `bun install --frozen-lockfile`, runs `bun test`, builds `dist/brainctl`, and emits a source archive from `git archive`.
 
 The `brainctl` binary is compiled with `--no-compile-autoload-dotenv` and `--no-compile-autoload-bunfig`. Those flags keep release artifacts from inheriting local release-machine `.env` or `bunfig.toml` behavior. `braind` and `telemux` are intentionally not compiled by default; they run from source under Bun so service behavior stays inspectable.
+
+Generated source-run services use `bun --no-env-file run ...` for the same reason: service env must come from explicit runtime/secrets env files, not ambient repo `.env` loading.
 
 Cross-compilation can be added later with Bun compile targets after target support is verified on the release host.

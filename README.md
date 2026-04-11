@@ -16,6 +16,7 @@ The canonical shared brain remains a separate git repo of markdown, manifests, r
 
 ```bash
 cd ~/brainstack
+bun install --frozen-lockfile
 bun test
 bun run packages/brainctl/src/main.ts render --profile single-node --config examples/single-node.yaml --out /tmp/brainstack-render
 bun run packages/brainctl/src/main.ts smoke --profile single-node --config examples/single-node.yaml
@@ -33,6 +34,8 @@ bun build packages/brainctl/src/main.ts --compile --no-compile-autoload-dotenv -
 ```
 
 The deterministic flags prevent the compiled binary from implicitly loading local `.env` or `bunfig.toml` files from the release machine.
+
+Generated source-run services also invoke Bun with `--no-env-file` and load explicit `*.runtime.env` plus operator-owned `*.secrets.env` files. This keeps service behavior deterministic instead of depending on whichever `.env` happens to exist near the product repo.
 
 ## Profiles
 

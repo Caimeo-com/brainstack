@@ -11,6 +11,7 @@ For control and single-node profiles, prepare the Unix user before installing se
 3. Configure the harness for unattended execution only if you accept the risk.
 4. Configure passwordless sudo for the current user if telemux/Codex/Claude should perform machine administration.
 5. Confirm OpenSSH works over Tailscale for worker access.
+6. On Linux hosts using user services, enable lingering so services start without an interactive login: `loginctl enable-linger "$USER"`.
 
 Example sudoers fragment:
 
@@ -59,6 +60,7 @@ ssh -V
 tailscale status
 sudo -n true
 codex --version
+loginctl show-user "$USER" --property=Linger --value
 ```
 
 If `sudo -n true` fails, either fix passwordless sudo or accept that unattended machine-admin tasks will stall.

@@ -77,6 +77,11 @@ const maxImportBytes =
   Number.isFinite(configuredMaxImportBytes) && configuredMaxImportBytes > 0
     ? configuredMaxImportBytes
     : 25 * 1024 * 1024;
+const configuredUrlFetchTimeoutMs = Number(process.env.BRAIN_URL_FETCH_TIMEOUT_MS || "");
+const urlFetchTimeoutMs =
+  Number.isFinite(configuredUrlFetchTimeoutMs) && configuredUrlFetchTimeoutMs > 0
+    ? configuredUrlFetchTimeoutMs
+    : 15_000;
 const organizerLabel = process.env.BRAIN_ORGANIZER_LABEL || "organizer";
 const allowPrivateUrlImports = ["1", "true", "yes", "on"].includes(
   (process.env.BRAIN_ALLOW_PRIVATE_URL_IMPORTS || "").toLowerCase()
@@ -424,11 +429,15 @@ async function assertSafeImportUrl(input: string): Promise<URL> {
 
 async function safeFetchImportUrl(input: string, redirectsLeft = 5): Promise<Response> {
   const url = await assertSafeImportUrl(input);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), urlFetchTimeoutMs);
   let response: Response;
   try {
-    response = await fetch(url, { redirect: "manual" });
+    response = await fetch(url, { redirect: "manual", signal: controller.signal });
   } catch (error) {
     reject(400, `URL import fetch failed: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    clearTimeout(timeout);
   }
   if (response.status >= 300 && response.status < 400 && response.headers.get("location")) {
     if (redirectsLeft <= 0) {
@@ -442,6 +451,53 @@ async function safeFetchImportUrl(input: string, redirectsLeft = 5): Promise<Res
     assertImportSize(length, "URL import response");
   }
   return response;
+}
+
+async function readResponseBytesCapped(response: Response, label: string): Promise<Uint8Array> {
+  if (!response.body) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    assertImportSize(bytes.byteLength, label);
+    return bytes;
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    reader.cancel().catch(() => undefined);
+  }, urlFetchTimeoutMs);
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (timedOut) {
+        reject(400, `URL import fetch timed out after ${urlFetchTimeoutMs}ms`);
+      }
+      if (done) {
+        break;
+      }
+      if (!value) {
+        continue;
+      }
+      total += value.byteLength;
+      if (total > maxImportBytes) {
+        await reader.cancel().catch(() => undefined);
+        reject(413, `${label} is too large: streamed response exceeds BRAIN_MAX_IMPORT_BYTES=${maxImportBytes}`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged;
 }
 
 type AuthScope = "import" | "admin";
@@ -595,12 +651,11 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
     const sourceUrl = body.url;
     const upstream = await safeFetchImportUrl(sourceUrl);
     if (!upstream.ok) {
-      throw new Error(`URL fetch failed: ${upstream.status} ${upstream.statusText}`);
+      reject(400, `URL fetch failed: ${upstream.status} ${upstream.statusText}`);
     }
     const upstreamType = upstream.headers.get("content-type")?.split(";")[0];
     const title = typeof body.title === "string" ? body.title : sourceUrl;
-    const bytes = new Uint8Array(await upstream.arrayBuffer());
-    assertImportSize(bytes.byteLength, "URL import response");
+    const bytes = await readResponseBytesCapped(upstream, "URL import response");
     const input = {
       title,
       url: sourceUrl,

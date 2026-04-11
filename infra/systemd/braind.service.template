@@ -5,12 +5,12 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory={{PRODUCT_REPO}}
-EnvironmentFile={{CONFIG_ROOT}}/braind.env
-ExecStartPre={{HOME}}/.bun/bin/bun run {{PRODUCT_REPO}}/apps/braind/src/reindex.ts --quiet
-ExecStart={{HOME}}/.bun/bin/bun run {{PRODUCT_REPO}}/apps/braind/src/server.ts
+EnvironmentFile={{CONFIG_ROOT}}/braind.runtime.env
+EnvironmentFile={{CONFIG_ROOT}}/braind.secrets.env
+ExecStartPre={{BUN_BIN}} --no-env-file run {{PRODUCT_REPO}}/apps/braind/src/reindex.ts --quiet
+ExecStart={{BUN_BIN}} --no-env-file run {{PRODUCT_REPO}}/apps/braind/src/server.ts
 Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=default.target
-
