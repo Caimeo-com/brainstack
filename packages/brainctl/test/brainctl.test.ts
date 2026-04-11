@@ -183,6 +183,160 @@ telemux:
 });
 
 describe("brainctl install safety", () => {
+  test("provision checks prerequisites, tests selected harness, and writes config", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-provision-"));
+    try {
+      const binDir = join(dir, "bin");
+      const configPath = join(dir, "brainstack.yaml");
+      await mkdir(binDir, { recursive: true });
+      const fakeSudo = join(binDir, "sudo");
+      const fakeCodex = join(binDir, "codex");
+      await writeFile(fakeSudo, "#!/usr/bin/env sh\nexit 0\n");
+      await writeFile(
+        fakeCodex,
+        "#!/usr/bin/env sh\ncat >/dev/null\nprintf 'BRAINSTACK_HARNESS_SUDO_OK\\n'\n"
+      );
+      await chmod(fakeSudo, 0o755);
+      await chmod(fakeCodex, 0o755);
+
+      const result = runBrainctl(
+        [
+          "provision",
+          "--profile",
+          "control",
+          "--out",
+          configPath,
+          "--harness",
+          "codex",
+          "--enable-telemux",
+          "--brain-base-url",
+          "https://brain-control.example.ts.net"
+        ],
+        {
+          PATH: `${binDir}:${process.env.PATH || ""}`,
+          BRAINSTACK_HARNESS_TEST_TIMEOUT_MS: "5000"
+        }
+      );
+      expectSuccess(result);
+      const rendered = await readFile(configPath, "utf8");
+      expect(rendered).toContain("harness:");
+      expect(rendered).toContain("name: codex");
+      expect(rendered).toContain(`bin: ${fakeCodex}`);
+      expect(rendered).toContain("enabled: true");
+      expect(rendered).toContain('publicBaseUrl: "https://brain-control.example.ts.net"');
+      expect(result.stdout).toContain("selected harness: codex");
+      expect(result.stdout).toContain("brainctl init --profile control");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("provision requires explicit harness when codex and claude are both present non-interactively", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-provision-choice-"));
+    try {
+      const binDir = join(dir, "bin");
+      await mkdir(binDir, { recursive: true });
+      for (const name of ["codex", "claude"]) {
+        const path = join(binDir, name);
+        await writeFile(path, "#!/usr/bin/env sh\nexit 0\n");
+        await chmod(path, 0o755);
+      }
+      const result = runBrainctl(["provision", "--profile", "client-macos", "--out", join(dir, "brainstack.yaml")], {
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      });
+      expect(result.code).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("pass --harness codex or --harness claude");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("destroy removes rendered runtime paths but keeps canonical repos unless requested", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-destroy-"));
+    try {
+      const home = join(dir, "home");
+      const configRoot = join(home, ".config", "brainstack");
+      const stateRoot = join(home, ".local", "state", "brainstack");
+      const systemdRoot = join(home, ".config", "systemd", "user");
+      const sharedBrainRoot = join(home, "shared-brain");
+      const privateBrainRoot = join(home, "private-brain");
+      const configPath = join(dir, "brainstack.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: brain-control",
+          "  user: operator",
+          "paths:",
+          `  home: ${home}`,
+          `  configRoot: ${configRoot}`,
+          `  stateRoot: ${stateRoot}`,
+          `  systemdUserRoot: ${systemdRoot}`,
+          `  sharedBrainRoot: ${sharedBrainRoot}`,
+          `  privateBrainRoot: ${privateBrainRoot}`,
+          "telemux:",
+          "  enabled: false",
+          ""
+        ].join("\n")
+      );
+      await mkdir(configRoot, { recursive: true });
+      await mkdir(stateRoot, { recursive: true });
+      await mkdir(systemdRoot, { recursive: true });
+      await mkdir(sharedBrainRoot, { recursive: true });
+      await mkdir(privateBrainRoot, { recursive: true });
+      await writeFile(join(systemdRoot, "braind.service"), "owned\n");
+
+      const dryRun = runBrainctl(["destroy", "--config", configPath, "--dry-run"]);
+      expectSuccess(dryRun);
+      expect(existsSync(configRoot)).toBe(true);
+      expect(dryRun.stdout).toContain("dry-run destroy plan");
+
+      const destroy = runBrainctl(["destroy", "--config", configPath]);
+      expectSuccess(destroy);
+      expect(existsSync(configRoot)).toBe(false);
+      expect(existsSync(stateRoot)).toBe(false);
+      expect(existsSync(join(systemdRoot, "braind.service"))).toBe(false);
+      expect(existsSync(sharedBrainRoot)).toBe(true);
+      expect(existsSync(privateBrainRoot)).toBe(true);
+      expect(destroy.stdout).toContain("pass --remove-shared-brain to delete");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("destroy only targets services owned by the selected profile", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-destroy-profile-"));
+    try {
+      const home = join(dir, "home");
+      const systemdRoot = join(home, ".config", "systemd", "user");
+      const configPath = join(dir, "client.yaml");
+      await mkdir(systemdRoot, { recursive: true });
+      await writeFile(join(systemdRoot, "telemux.service"), "unrelated\n");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: client",
+          "  user: operator",
+          "paths:",
+          `  home: ${home}`,
+          `  systemdUserRoot: ${systemdRoot}`,
+          ""
+        ].join("\n")
+      );
+
+      const result = runBrainctl(["destroy", "--config", configPath, "--profile", "client-macos", "--dry-run"]);
+      expectSuccess(result);
+      expect(result.stdout).not.toContain("telemux.service");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("init is fresh-install only and upgrade does not rewrite canonical content", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-init-safety-"));
     try {

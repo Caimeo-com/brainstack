@@ -49,9 +49,11 @@ Put durable Codex configuration under the target user's Codex config, not inside
 
 If using Claude Code as a harness, configure its equivalent bypass/permission mode only on machines where you accept full command execution as the current user. Keep Claude-specific config outside the brain content repo.
 
+`brainctl provision --harness claude` tests Claude with `--dangerously-skip-permissions --permission-mode bypassPermissions`. `brainctl provision --harness codex` tests Codex with `--dangerously-bypass-approvals-and-sandbox`. Both tests ask the harness to run `sudo -n true`; failures mean the machine is not ready for unattended telemux control.
+
 ## Telemux Trust Boundary
 
-Telemux is not a security sandbox. It receives Telegram messages from an allowed Telegram user, maps the topic to a workspace, and passes prompts/files to the configured local harness process such as Codex CLI, and later optionally Claude Code.
+Telemux is not a security sandbox. It receives Telegram messages from an allowed Telegram user, maps the topic to a workspace, and passes prompts/files to the configured local harness process, either Codex CLI or Claude Code.
 
 Consequences:
 
@@ -69,6 +71,7 @@ ssh -V
 tailscale status
 sudo -n true
 codex --version
+claude --version
 loginctl show-user "$USER" --property=Linger --value
 ```
 

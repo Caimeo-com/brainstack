@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 export type WorkerTransport = "local" | "ssh" | "tailscale-ssh";
+export type HarnessName = "codex" | "claude";
 
 export interface FactoryWorkerConfig {
   name: string;
@@ -36,6 +37,8 @@ export interface FactoryConfig {
   localMachine: string;
   workers: FactoryWorkerConfig[];
   usageAdapter: string;
+  harness: HarnessName;
+  harnessBin: string;
   codexBin: string;
   brainBaseUrl: string;
   brainImportToken: string;
@@ -102,6 +105,10 @@ function normalizeTransport(value: string | undefined, fallback: WorkerTransport
   }
 
   return fallback;
+}
+
+function normalizeHarness(value: string | undefined): HarnessName {
+  return value === "claude" ? "claude" : "codex";
 }
 
 function normalizeWorkerConfig(
@@ -191,6 +198,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
       })
     )
   );
+  const harness = normalizeHarness(env.FACTORY_HARNESS?.trim());
+  const harnessBin = env.FACTORY_HARNESS_BIN?.trim() || (harness === "codex" ? env.FACTORY_CODEX_BIN?.trim() || "codex" : "claude");
 
   return {
     projectRoot,
@@ -214,7 +223,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
     localMachine,
     workers,
     usageAdapter: env.FACTORY_USAGE_ADAPTER?.trim() || "manual",
-    codexBin: env.FACTORY_CODEX_BIN?.trim() || "codex",
+    harness,
+    harnessBin,
+    codexBin: env.FACTORY_CODEX_BIN?.trim() || (harness === "codex" ? harnessBin : "codex"),
     brainBaseUrl: env.BRAIN_BASE_URL?.trim() || "",
     brainImportToken: env.BRAIN_IMPORT_TOKEN?.trim() || "",
     allowAbsoluteArtifactPaths: ["1", "true", "yes", "on"].includes((env.FACTORY_ALLOW_ABSOLUTE_ARTIFACT_PATHS || "").toLowerCase())

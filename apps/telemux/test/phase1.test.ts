@@ -231,6 +231,7 @@ async function createFixture(envOverrides: Record<string, string> = {}) {
   const factoryRoot = join(root, "factory");
   const workersFile = join(root, "workers.json");
   const fakeCodex = join(binDir, "codex");
+  const fakeClaude = join(binDir, "claude");
   const fakeSsh = join(binDir, "ssh");
 
   await mkdir(binDir, { recursive: true });
@@ -373,6 +374,36 @@ exit 255
 `
   );
 
+  await makeExecutable(
+    fakeClaude,
+    `#!/usr/bin/env bash
+set -euo pipefail
+while (($#)); do
+  shift
+done
+prompt="$(cat)"
+mkdir -p .factory
+turn_file=".factory/fake-claude-turn-count"
+turns=0
+if [[ -f "$turn_file" ]]; then
+  turns="$(cat "$turn_file")"
+fi
+turns=$((turns + 1))
+printf '%s' "$turns" > "$turn_file"
+printf '# Summary\\n\\nClaude turn %s for %s.\\n\\nPrompt: %s\\n' "$turns" "$(basename "$PWD")" "$prompt" > .factory/SUMMARY.md
+printf '# Artifacts\\n\\n- claude-artifact-turn-%s\\n' "$turns" > .factory/ARTIFACTS.md
+printf '# TODO\\n\\n- Continue with Claude from turn %s.\\n' "$turns" > .factory/TODO.md
+cat > .factory/STATE.json <<EOF
+{
+  "sessionId": "claude-session-$turns",
+  "turns": $turns
+}
+EOF
+rm -f .factory/CRON_REQUESTS.json
+printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
+`
+  );
+
   await writeFile(
     workersFile,
     `${JSON.stringify(
@@ -402,6 +433,7 @@ exit 255
   const previousPath = process.env.PATH || "";
   process.env.PATH = `${binDir}:${previousPath}`;
 
+  const selectedHarness = envOverrides.FACTORY_HARNESS || "codex";
   const config = loadConfig({
     ...process.env,
     FACTORY_CONTROL_ROOT: controlRoot,
@@ -409,6 +441,8 @@ exit 255
     FACTORY_LOCAL_MACHINE: "control",
     FACTORY_WORKERS_FILE: workersFile,
     FACTORY_CODEX_BIN: fakeCodex,
+    FACTORY_HARNESS: selectedHarness,
+    FACTORY_HARNESS_BIN: envOverrides.FACTORY_HARNESS_BIN || (selectedHarness === "claude" ? fakeClaude : fakeCodex),
     FACTORY_TELEGRAM_BOT_TOKEN: "test-token",
     FACTORY_ALLOWED_TELEGRAM_USER_ID: String(TEST_ALLOWED_TELEGRAM_USER_ID),
     ...envOverrides
@@ -430,6 +464,7 @@ exit 255
     controlRoot,
     factoryRoot,
     fakeCodex,
+    fakeClaude,
     previousPath,
     db,
     cronManager,
@@ -762,6 +797,28 @@ test("successful runs can opt into shared brain raw imports", async () => {
   }
 }, 15_000);
 
+test("telemux can run Claude as the selected harness", async () => {
+  const fixture = await createFixture({
+    FACTORY_HARNESS: "claude"
+  });
+
+  try {
+    expect(fixture.workers["config"].harness).toBe("claude");
+    await fixture.commands.handleMessage(telegramMessage("/newctx claudeharness control scratch", 68));
+    await fixture.commands.handleMessage(telegramMessage("Use the selected harness.", 68));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Claude reply turn 1 for claudeharness.")));
+
+    const context = fixture.db.getContextBySlug("claudeharness");
+    expect(context?.state).toBe("active");
+    expect(await readFile(join(fixture.factoryRoot, "scratch", "claudeharness", ".factory", "SUMMARY.md"), "utf8")).toContain(
+      "Claude turn 1"
+    );
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
 test("phase 1 inbound Telegram media stages files and only forwards images to Codex", async () => {
   const fixture = await createFixture();
 
@@ -838,7 +895,7 @@ sleep 30
 
     expect(result.ok).toBe(false);
     expect(result.exitCode).toBe(88);
-    expect(result.stderr).toContain("worktree disappeared during Codex run");
+    expect(result.stderr).toContain("worktree disappeared during harness run");
     expect(Date.now() - startedAt).toBeLessThan(10_000);
   } finally {
     process.env.PATH = fixture.previousPath;

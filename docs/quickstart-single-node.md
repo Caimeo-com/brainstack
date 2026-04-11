@@ -20,10 +20,13 @@ Read [`operator-preflight.md`](./operator-preflight.md) first. A control/single-
 ```bash
 cd ~/brainstack
 bun install --frozen-lockfile
+bun run packages/brainctl/src/main.ts provision --profile single-node --out ~/.config/brainstack/brainstack.yaml --harness codex
 bun run packages/brainctl/src/main.ts smoke --profile single-node --config examples/single-node.yaml
 ```
 
 The smoke command creates a disposable install root under `/tmp`, initializes a bare/staging/serve shared-brain repo, renders service files, runs doctor, and rebuilds the local search index.
+
+`provision` checks that Bun, Git, OpenSSH, Tailscale, sudo, and the selected harness are usable. It does not install system tools; fix any missing prerequisite with the printed command, then rerun it. Use `--harness claude` to select Claude Code instead of Codex.
 
 ## Install
 
@@ -44,6 +47,14 @@ bun run packages/brainctl/src/main.ts upgrade --profile single-node --config exa
 systemctl --user daemon-reload
 systemctl --user restart braind.service
 ```
+
+To rehearse teardown without deleting data:
+
+```bash
+bun run packages/brainctl/src/main.ts destroy --config ~/.config/brainstack/brainstack.yaml --dry-run
+```
+
+Without `--dry-run`, `destroy` disables/stops rendered user services, removes `~/.config/brainstack` and `~/.local/state/brainstack`, and keeps `~/shared-brain`/`~/private-brain` unless explicit removal flags are passed.
 
 To enable Telegram control explicitly, use `examples/control-telegram.yaml` and read `operator-preflight.md` first.
 

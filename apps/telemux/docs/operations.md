@@ -129,9 +129,9 @@ If the remote worker is unavailable, the context is still created and stored as 
 /loop keep going until you hit a real blocker or a clean checkpoint
 ```
 
-Inside a bound topic, plain text starts or resumes the stored Codex session automatically.
+Inside a bound topic, plain text starts or resumes the configured harness automatically.
 
-You can change the Codex runtime for the current topic without rebinding it:
+You can change the harness runtime for the current topic without rebinding it:
 
 ```text
 /mode fast
@@ -150,7 +150,7 @@ Preset meanings:
 - `normal` -> `gpt-5.4` with `medium`
 - `max` -> `gpt-5.4` with `xhigh`
 
-These overrides are stored with the bound context and applied to both `codex exec` and `codex exec resume`, so the session continues instead of starting over.
+These overrides are stored with the bound context and applied to the configured harness runner. Codex receives `codex exec` flags; Claude receives `claude -p` flags where supported.
 
 Scheduled jobs are available too:
 
@@ -262,7 +262,7 @@ The internal scheduler lives in the same service. There is no separate OS cron o
 - Confirm the worker shows `status=unreachable` instead of crashing the daemon
 - Confirm the SSH target and user in `workers.json`
 - Confirm Tailscale networking between the control host and the remote worker
-- Confirm `sshd`, `git`, `bash`, and `codex` exist on the worker
+- Confirm `sshd`, `git`, `bash`, and the configured harness binary exist on the worker
 
 If the worker is unavailable, context creation should land in `pending`.
 

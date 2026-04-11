@@ -1,5 +1,8 @@
 schema_version: 1
 profile: worker
+harness:
+  name: codex
+  bin: codex
 machine:
   name: brain-worker
   user: operator

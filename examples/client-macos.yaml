@@ -1,5 +1,8 @@
 schema_version: 1
 profile: client-macos
+harness:
+  name: codex
+  bin: codex
 machine:
   name: mac-client
   user: operator

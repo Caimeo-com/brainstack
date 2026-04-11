@@ -11,10 +11,13 @@ Read [`tailscale-control-worker.md`](./tailscale-control-worker.md) before pairi
 ```bash
 cd ~/brainstack
 bun install --frozen-lockfile
+bun run packages/brainctl/src/main.ts provision --profile control --out ~/.config/brainstack/brainstack.yaml --harness codex
 bun run packages/brainctl/src/main.ts smoke --profile control --config examples/control.yaml
 ```
 
 For a fresh control host install, run `brainctl init`. For later product updates, use `brainctl upgrade`; it backs up first and applies runtime files without rewriting canonical shared-brain content.
+
+`provision` only checks prerequisites and writes config. It does not install Bun, Git, OpenSSH, Tailscale, Codex, or Claude. If both Codex and Claude are installed in a non-interactive run, pass `--harness codex` or `--harness claude`.
 
 ```bash
 cd ~/brainstack
@@ -103,3 +106,5 @@ Operator-managed secrets env files are created only if missing and are never ove
 Generated user services load both runtime and secrets env files and invoke Bun with `--no-env-file` so local repo `.env` files cannot silently alter service behavior.
 
 When telemux is enabled, `telemux.runtime.env` includes `BRAIN_BASE_URL` and `telemux.secrets.env` includes a blank `BRAIN_IMPORT_TOKEN`. Filling both opts successful runs into shared-brain raw imports of `SUMMARY.md` and `ARTIFACTS.md`; leaving either blank disables the bridge.
+
+`telemux.runtime.env` also includes `FACTORY_HARNESS` and `FACTORY_HARNESS_BIN`. Use `harness.name: claude` and `harness.bin: claude` in `brainstack.yaml` to route jobs through Claude Code instead of Codex.

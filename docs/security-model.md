@@ -67,7 +67,7 @@ These checks reduce server-side request forgery risk. They do not make arbitrary
 
 ## Harness Execution Risk
 
-Telemux passes authorized Telegram-topic prompts and staged files to the configured harness process, normally Codex CLI and optionally a future Claude Code adapter. It does not sandbox the harness. If the harness is configured with bypass-all-permissions/yolo settings and the Unix user has passwordless sudo, telemux can indirectly execute privileged commands as that user.
+Telemux passes authorized Telegram-topic prompts and staged files to the configured harness process, either Codex CLI or Claude Code. It does not sandbox the harness. If the harness is configured with bypass-all-permissions/yolo settings and the Unix user has passwordless sudo, telemux can indirectly execute privileged commands as that user.
 
 Before enabling telemux on a control host, read [`operator-preflight.md`](./operator-preflight.md).
 

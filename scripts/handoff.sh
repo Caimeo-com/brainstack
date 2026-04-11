@@ -181,6 +181,22 @@ bun run packages/brainctl/src/main.ts join-worker \
   --worker brain-worker \
   > "$bundle_dir/generated/join-worker-custom-state.md" 2>&1
 
+provision_config="$bundle_dir/generated/provision-client-macos.yaml"
+bun run packages/brainctl/src/main.ts provision \
+  --profile client-macos \
+  --out "$provision_config" \
+  --harness codex \
+  --brain-base-url https://brain-control.example.ts.net \
+  --brain-remote operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git \
+  --skip-harness-sudo-test \
+  > "$bundle_dir/command-outputs/provision-client-macos.txt" 2>&1
+
+bun run packages/brainctl/src/main.ts destroy \
+  --config "$provision_config" \
+  --profile client-macos \
+  --dry-run \
+  > "$bundle_dir/command-outputs/destroy-client-macos-dry-run.txt" 2>&1
+
 {
   echo "product_head=$product_head"
   echo "base_commit=${base_commit:-none}"
@@ -276,6 +292,8 @@ cat > "$bundle_dir/CLAIMS_AND_PROOF.md" <<'EOF'
 | The bundle uses exactly one source representation. | `source/` plus `MANIFEST.txt` |
 | Client bootstrap respects a custom `client.localPath`. | `generated/client-bootstrap-custom-path/` and `command-outputs/bootstrap-client-custom-path.txt` |
 | Worker join paths are derived from config state roots. | `generated/join-worker-custom-state.md` |
+| `brainctl provision` generates a discovered first-stage config without installing system packages. | `generated/provision-client-macos.yaml` and `command-outputs/provision-client-macos.txt` |
+| `brainctl destroy` has a dry-run teardown plan and does not delete brain repos by default. | `command-outputs/destroy-client-macos-dry-run.txt` |
 | Bun tests passed for the product tree at HEAD. | `command-outputs/bun-test.txt` |
 | Local braind health was checked when available. | `service-state/braind-health.json` or `service-state/braind-health.txt` |
 | Tailscale whois evidence uses Tailscale IPs, not bare hostnames. | `command-outputs/tailscale-whois-valkyrie.txt` and `command-outputs/tailscale-whois-erbine.txt` |
@@ -292,7 +310,7 @@ This is a REVIEW handoff bundle, not a release artifact.
 ## Scope Of This Pass
 
 - Documented the Tailscale control/worker caveats found while bringing up valkyrie and erbine.
-- Added \`scripts/handoff.sh\` so future handoff bundles use one source representation only.
+- Included generated proof for \`brainctl provision\`, \`brainctl destroy\`, client bootstrap, and worker join.
 - Generated this bundle with \`source/\` as the sole source representation.
 - Excluded compiled binaries, dist output, dependency trees, git metadata, env files, private keys, tokens, caches, and Finder/macOS junk.
 

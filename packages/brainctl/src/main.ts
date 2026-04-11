@@ -1,11 +1,12 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { chmod, cp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 type Profile = "single-node" | "control" | "worker" | "client-macos" | "private-journal";
 type SeedMode = "empty-only" | "missing" | "force";
+type HarnessName = "codex" | "claude";
 
 const CONFIG_SCHEMA_VERSION = 1;
 const MIN_BUN_VERSION = "1.3.11";
@@ -21,6 +22,10 @@ interface BrainstackConfig {
   profile: Profile;
   runtime: {
     bunBin: string;
+  };
+  harness: {
+    name: HarnessName;
+    bin: string;
   };
   machine: {
     name: string;
@@ -81,6 +86,7 @@ const ALLOWED_TOP_LEVEL_CONFIG_KEYS = new Set([
   "config_version",
   "profile",
   "runtime",
+  "harness",
   "machine",
   "paths",
   "brain",
@@ -93,6 +99,7 @@ const ALLOWED_TOP_LEVEL_CONFIG_KEYS = new Set([
 function usage(): string {
   return `Usage:
   brainctl init --profile single-node|control|worker|client-macos --config brainstack.yaml [--dry-run] [--root /tmp/install-root] [--seed-missing|--force-seed]
+  brainctl provision --profile single-node|control|worker|client-macos [--out brainstack.yaml] [--harness codex|claude] [--enable-telemux] [--enroll-tailscale] [--tailscale-tag tag:brain] [--brain-base-url URL] [--brain-remote SSH_OR_PATH] [--test-bot]
   brainctl upgrade --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
   brainctl apply-runtime --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
   brainctl doctor --config brainstack.yaml [--profile ...]
@@ -102,6 +109,7 @@ function usage(): string {
   brainctl bootstrap-client --profile client-macos --config brainstack.yaml --out DIR
   brainctl join-worker --config brainstack.yaml --worker WORKER_HOST [--ssh-user USER] [--out DIR]
   brainctl rotate-token --kind import|admin|telegram-placeholder --config brainstack.yaml [--env FILE]
+  brainctl destroy --config brainstack.yaml [--profile ...] [--dry-run] [--remove-shared-brain] [--remove-private-brain] [--remove-tailscale-serve]
   brainctl migrate-current-install [--out FILE]
   brainctl smoke --profile single-node|control|worker|client-macos --config brainstack.yaml`;
 }
@@ -144,6 +152,17 @@ function flag(args: ParsedArgs, key: string): string | undefined {
 
 function hasFlag(args: ParsedArgs, key: string): boolean {
   return args.flags[key] === true;
+}
+
+function boolFlag(args: ParsedArgs, key: string, fallback = false): boolean {
+  if (args.flags[key] === true) {
+    return true;
+  }
+  const value = flag(args, key);
+  if (value === undefined) {
+    return fallback;
+  }
+  return ["1", "true", "yes", "on"].includes(value.toLowerCase());
 }
 
 function expandHome(input: string): string {
@@ -190,6 +209,14 @@ function renderTemplate(text: string, replacements: Record<string, string>): str
 
 function readClientBootstrapTemplate(path: string): string {
   return readFileSync(join(PRODUCT_ROOT, "packages", "client-bootstrap", path), "utf8");
+}
+
+function normalizeHarness(value: string | undefined, fallback: HarnessName = "codex"): HarnessName {
+  const normalized = (value || fallback).trim().toLowerCase();
+  if (normalized === "codex" || normalized === "claude") {
+    return normalized;
+  }
+  throw new Error(`Unsupported harness: ${value}. Expected codex or claude.`);
 }
 
 function splitKeyValue(text: string): [string, string] {
@@ -404,6 +431,7 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
   const schemaVersion = numberAt(raw, "schema_version", numberAt(raw, "config_version", CONFIG_SCHEMA_VERSION));
   const profile = (profileOverride || stringAt(raw, "profile", "single-node")) as Profile;
   const runtime = objectAt(raw, "runtime");
+  const harness = objectAt(raw, "harness");
   const machine = objectAt(raw, "machine");
   const paths = objectAt(raw, "paths");
   const brain = objectAt(raw, "brain");
@@ -436,11 +464,17 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
   const publicBaseUrl = stringAt(brain, "publicBaseUrl", "");
   const workers = arrayAt(telemux, "workers") as Array<Record<string, unknown>>;
   const remoteSsh = `${machineUser}@${machineName}:${join(sharedBrainRoot, "bare", "shared-brain.git")}`;
+  const harnessName = normalizeHarness(stringAt(harness, "name", stringAt(telemux, "harness", "codex")));
+  const harnessBin = stringAt(harness, "bin", harnessName);
 
   return {
     schemaVersion,
     runtime: {
       bunBin: stringAt(runtime, "bunBin", "") || resolveBunBin()
+    },
+    harness: {
+      name: harnessName,
+      bin: harnessBin
     },
     profile,
     machine: {
@@ -777,7 +811,9 @@ function telemuxRuntimeEnv(cfg: BrainstackConfig): string {
     `FACTORY_FACTORY_ROOT=${cfg.telemux.factoryRoot}`,
     `FACTORY_WORKERS_FILE=${join(cfg.paths.configRoot, "workers.json")}`,
     "FACTORY_USAGE_ADAPTER=manual",
-    "FACTORY_CODEX_BIN=codex",
+    `FACTORY_HARNESS=${cfg.harness.name}`,
+    `FACTORY_HARNESS_BIN=${cfg.harness.bin}`,
+    `FACTORY_CODEX_BIN=${cfg.harness.name === "codex" ? cfg.harness.bin : "codex"}`,
     `BRAIN_BASE_URL=${cfg.brain.publicBaseUrl}`,
     ""
   ].join("\n");
@@ -844,7 +880,7 @@ function braindService(cfg: BrainstackConfig): string {
 function telemuxService(cfg: BrainstackConfig): string {
   return [
     "[Unit]",
-    "Description=brainstack telemux Telegram/Codex control plane",
+    "Description=brainstack telemux Telegram harness control plane",
     "After=network-online.target",
     "",
     "[Service]",
@@ -1001,6 +1037,7 @@ function renderFiles(cfg: BrainstackConfig): Record<string, string> {
       schema_version: cfg.schemaVersion,
       profile: cfg.profile,
       runtime: cfg.runtime,
+      harness: cfg.harness,
       machine: cfg.machine,
       paths: cfg.paths,
       brain: cfg.brain,
@@ -1114,6 +1151,353 @@ async function installLocalClientBootstrap(cfg: BrainstackConfig): Promise<strin
   }
 
   return touched;
+}
+
+function commandPath(name: string): string | null {
+  const proc = run(["bash", "-lc", `command -v ${shellSingleQuote(name)}`], { check: false });
+  return proc.code === 0 && proc.stdout.trim() ? proc.stdout.trim().split(/\r?\n/)[0] : null;
+}
+
+function whereisPath(name: string): string | null {
+  const direct = commandPath(name);
+  if (direct) {
+    return direct;
+  }
+  const proc = run(["whereis", name], { check: false });
+  if (proc.code !== 0) {
+    return null;
+  }
+  const [, rest = ""] = proc.stdout.split(":");
+  return rest.trim().split(/\s+/).find((entry) => entry.startsWith("/")) || null;
+}
+
+function installHint(name: string): string {
+  const osRelease = existsSync("/etc/os-release") ? readFileSync("/etc/os-release", "utf8").toLowerCase() : "";
+  if (process.platform === "darwin") {
+    if (name === "bun") return "Install Bun: curl -fsSL https://bun.sh/install | bash";
+    if (name === "tailscale") return "Install Tailscale: brew install --cask tailscale";
+    if (name === "git") return "Install Git: xcode-select --install or brew install git";
+    if (name === "ssh") return "OpenSSH client is normally built in; install Xcode Command Line Tools if missing.";
+    if (name === "sshd") return "Enable Remote Login in macOS Sharing settings if this machine must accept SSH.";
+    if (name === "codex") return "Install and authenticate Codex CLI, then ensure `codex --version` works.";
+    if (name === "claude") return "Install and authenticate Claude Code, then ensure `claude --version` works.";
+  }
+  if (osRelease.includes("arch") || osRelease.includes("omarchy")) {
+    if (name === "bun") return "Install Bun: curl -fsSL https://bun.sh/install | bash";
+    if (name === "git") return "Install Git: sudo pacman -S git";
+    if (name === "ssh") return "Install OpenSSH client/server: sudo pacman -S openssh";
+    if (name === "sshd") return "Enable OpenSSH server: sudo pacman -S openssh && sudo systemctl enable --now sshd.service";
+    if (name === "tailscale") return "Install Tailscale: sudo pacman -S tailscale && sudo systemctl enable --now tailscaled.service";
+  }
+  if (osRelease.includes("debian") || osRelease.includes("ubuntu")) {
+    if (name === "bun") return "Install Bun: curl -fsSL https://bun.sh/install | bash";
+    if (name === "git") return "Install Git: sudo apt-get update && sudo apt-get install -y git";
+    if (name === "ssh") return "Install OpenSSH client/server: sudo apt-get update && sudo apt-get install -y openssh-client openssh-server";
+    if (name === "sshd") return "Enable OpenSSH server: sudo systemctl enable --now ssh.service";
+    if (name === "tailscale") return "Install Tailscale: curl -fsSL https://tailscale.com/install.sh | sh && sudo systemctl enable --now tailscaled.service";
+  }
+  if (name === "bun") return "Install Bun from https://bun.sh and ensure `command -v bun` works.";
+  if (name === "tailscale") return "Install Tailscale and ensure `command -v tailscale` works.";
+  if (name === "codex") return "Install and authenticate Codex CLI, then ensure `codex --version` works.";
+  if (name === "claude") return "Install and authenticate Claude Code, then ensure `claude --version` works.";
+  return `Install ${name} and ensure it is available in PATH.`;
+}
+
+function requiredProvisionCommands(profile: Profile): string[] {
+  const commands = ["bun", "git", "ssh", "tailscale"];
+  if (profile === "single-node" || profile === "control" || profile === "worker") {
+    commands.push("sshd");
+  }
+  return commands;
+}
+
+function ensureProvisionPrereqs(profile: Profile): Record<string, string> {
+  const found: Record<string, string> = {};
+  const missing: string[] = [];
+  for (const name of requiredProvisionCommands(profile)) {
+    const path = whereisPath(name);
+    if (path) {
+      found[name] = path;
+    } else {
+      missing.push(name);
+    }
+  }
+  if (missing.length) {
+    throw new Error(
+      [
+        `provision blocked: missing required tools: ${missing.join(", ")}`,
+        "",
+        ...missing.map((name) => `- ${name}: ${installHint(name)}`)
+      ].join("\n")
+    );
+  }
+  return found;
+}
+
+async function promptHarnessChoice(codexPath: string, claudePath: string): Promise<HarnessName> {
+  process.stdout.write(`Both Codex and Claude are installed.\n1. codex (${codexPath})\n2. claude (${claudePath})\nSelect default harness [1/2]: `);
+  const input = await new Response(Bun.stdin.stream()).text();
+  const choice = input.trim().toLowerCase();
+  if (choice === "2" || choice === "claude") {
+    return "claude";
+  }
+  if (!choice || choice === "1" || choice === "codex") {
+    return "codex";
+  }
+  throw new Error("provision blocked: invalid harness choice");
+}
+
+async function selectProvisionHarness(args: ParsedArgs): Promise<{ name: HarnessName; bin: string; discovered: Record<string, string | null> }> {
+  const requested = flag(args, "harness");
+  const codexPath = whereisPath("codex");
+  const claudePath = whereisPath("claude");
+  const discovered = { codex: codexPath, claude: claudePath };
+  if (requested) {
+    const name = normalizeHarness(requested);
+    const bin = name === "codex" ? codexPath : claudePath;
+    if (!bin) {
+      throw new Error(`provision blocked: requested harness ${name} is missing.\n${installHint(name)}`);
+    }
+    return { name, bin, discovered };
+  }
+  if (codexPath && !claudePath) {
+    return { name: "codex", bin: codexPath, discovered };
+  }
+  if (claudePath && !codexPath) {
+    return { name: "claude", bin: claudePath, discovered };
+  }
+  if (codexPath && claudePath) {
+    if (process.stdin.isTTY && !hasFlag(args, "yes")) {
+      const name = await promptHarnessChoice(codexPath, claudePath);
+      return { name, bin: name === "codex" ? codexPath : claudePath, discovered };
+    }
+    throw new Error("provision blocked: both Codex and Claude were found; pass --harness codex or --harness claude for non-interactive provisioning.");
+  }
+  throw new Error(`provision blocked: neither Codex nor Claude was found.\n- codex: ${installHint("codex")}\n- claude: ${installHint("claude")}`);
+}
+
+async function runWithInputTimeout(
+  args: string[],
+  input: string,
+  options: { cwd?: string; timeoutMs?: number; env?: Record<string, string> } = {}
+): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
+  const proc = Bun.spawn(args, {
+    cwd: options.cwd || process.cwd(),
+    env: { ...process.env, ...(options.env || {}) },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe"
+  });
+  proc.stdin.write(input);
+  proc.stdin.end();
+  let timedOut = false;
+  const timeoutMs = options.timeoutMs || Number(process.env.BRAINSTACK_HARNESS_TEST_TIMEOUT_MS || "120000");
+  const timer = setTimeout(() => {
+    timedOut = true;
+    proc.kill();
+  }, timeoutMs);
+  try {
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited
+    ]);
+    return { code, stdout, stderr, timedOut };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function ensurePasswordlessSudo(): void {
+  const sudo = run(["sudo", "-n", "true"], { check: false });
+  if (sudo.code !== 0) {
+    throw new Error(`provision blocked: current user does not have passwordless sudo.\n${sudo.stderr || sudo.stdout}`);
+  }
+}
+
+async function testHarnessSudo(harness: { name: HarnessName; bin: string }): Promise<void> {
+  const marker = "BRAINSTACK_HARNESS_SUDO_OK";
+  const prompt = [
+    "Run exactly this shell command and then stop:",
+    "",
+    "sudo -n true && printf BRAINSTACK_HARNESS_SUDO_OK",
+    "",
+    "Do not summarize. The output must contain BRAINSTACK_HARNESS_SUDO_OK."
+  ].join("\n");
+  const temp = await mkdtemp(join(tmpdir(), "brainstack-harness-test-"));
+  try {
+    const args =
+      harness.name === "codex"
+        ? [harness.bin, "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-"]
+        : [harness.bin, "-p", "--dangerously-skip-permissions", "--permission-mode", "bypassPermissions", "--output-format", "text"];
+    const result = await runWithInputTimeout(args, prompt, { cwd: temp });
+    if (result.timedOut) {
+      throw new Error(`provision blocked: ${harness.name} harness sudo test timed out`);
+    }
+    const combined = `${result.stdout}\n${result.stderr}`;
+    if (result.code !== 0 || !combined.includes(marker)) {
+      throw new Error(
+        [
+          `provision blocked: ${harness.name} did not prove it can run sudo in bypass/yolo mode.`,
+          `exit=${result.code}`,
+          combined.trim()
+        ].join("\n")
+      );
+    }
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+}
+
+async function testTelegramBotConfig(args: ParsedArgs): Promise<void> {
+  const envFile = flag(args, "telegram-env");
+  let tokenValue = process.env.FACTORY_TELEGRAM_BOT_TOKEN || "";
+  if (envFile && existsSync(abs(envFile))) {
+    const text = await readFile(abs(envFile), "utf8");
+    const match = text.match(/^FACTORY_TELEGRAM_BOT_TOKEN=(.*)$/m);
+    tokenValue = match?.[1]?.replace(/^['"]|['"]$/g, "") || tokenValue;
+  }
+  if (!tokenValue.trim()) {
+    throw new Error("provision blocked: --test-bot requires FACTORY_TELEGRAM_BOT_TOKEN in env or --telegram-env FILE");
+  }
+  let response: Response;
+  try {
+    response = await fetch(`https://api.telegram.org/bot${tokenValue.trim()}/getMe`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message.replaceAll(tokenValue.trim(), "[REDACTED_TELEGRAM_TOKEN]") : String(error);
+    throw new Error(`provision blocked: Telegram getMe request failed: ${message}`);
+  }
+  if (!response.ok) {
+    throw new Error(`provision blocked: Telegram getMe failed with HTTP ${response.status}`);
+  }
+  const payload = (await response.json()) as { ok?: boolean };
+  if (!payload.ok) {
+    throw new Error("provision blocked: Telegram getMe returned ok=false");
+  }
+}
+
+function discoveredMachineName(): string {
+  return run(["hostname", "-s"], { check: false }).stdout.trim() || run(["hostname"], { check: false }).stdout.trim() || "brain-control";
+}
+
+function buildProvisionConfig(profile: Profile, harness: { name: HarnessName; bin: string }, args: ParsedArgs): Record<string, unknown> {
+  const user = process.env.USER || "operator";
+  const home = process.env.HOME || `/home/${user}`;
+  const machineName = flag(args, "machine") || discoveredMachineName();
+  const role = flag(args, "role") || profile;
+  const publicBaseUrl = flag(args, "brain-base-url") || flag(args, "public-base-url") || "";
+  const tailnetHost = flag(args, "tailnet-host") || publicBaseUrl.replace(/^https?:\/\//, "");
+  const telemuxEnabled = hasFlag(args, "enable-telemux");
+  const sharedBrainRemote =
+    flag(args, "brain-remote") || flag(args, "shared-brain-remote") || `${user}@${machineName}:${join(home, "shared-brain", "bare", "shared-brain.git")}`;
+  const localPath = flag(args, "client-local-path") || "~/shared-brain";
+  const tailscaleTag =
+    flag(args, "tailscale-tag") || (profile === "worker" ? "tag:brain-worker" : profile === "client-macos" ? "" : "tag:brain");
+  const advertiseTags = tailscaleTag ? [tailscaleTag] : [];
+  const controlTag = flag(args, "control-tag") || "tag:brain";
+  const workerTag = flag(args, "worker-tag") || "tag:brain-worker";
+  return {
+    schema_version: CONFIG_SCHEMA_VERSION,
+    profile,
+    runtime: {
+      bunBin: whereisPath("bun") || "bun"
+    },
+    harness,
+    machine: {
+      name: machineName,
+      user,
+      role,
+      sshUser: flag(args, "ssh-user") || user,
+      hostname: flag(args, "hostname") || machineName
+    },
+    paths: {
+      home,
+      productRepo: "~/brainstack",
+      sharedBrainRoot: "~/shared-brain",
+      privateBrainRoot: "~/private-brain",
+      stateRoot: "~/.local/state/brainstack",
+      configRoot: "~/.config/brainstack",
+      systemdUserRoot: "~/.config/systemd/user"
+    },
+    brain: {
+      bind: "127.0.0.1",
+      port: Number(flag(args, "brain-port") || "8080"),
+      publicBaseUrl,
+      largeFileThresholdBytes: 10 * 1024 * 1024,
+      enableTelemux: telemuxEnabled
+    },
+    telemux: {
+      enabled: telemuxEnabled,
+      dashboardHost: "127.0.0.1",
+      dashboardPort: Number(flag(args, "telemux-port") || "8787"),
+      localMachine: machineName,
+      workers: []
+    },
+    tailscale: {
+      tailnetHost,
+      controlTag,
+      workerTag,
+      advertiseTags,
+      enableSsh: false
+    },
+    client: {
+      localPath,
+      envPath: "~/.config/shared-brain.env",
+      remoteSsh: sharedBrainRemote
+    }
+  };
+}
+
+function tailscaleUpShellCommand(machineName: string, user: string, tags: string[], authKeyEnv: string): string {
+  const tagFlag = tags.length ? ` --advertise-tags=${shellSingleQuote(tags.join(","))}` : "";
+  return [
+    `: "\${${authKeyEnv}:?set ${authKeyEnv} first}"`,
+    `sudo tailscale up --auth-key="\${${authKeyEnv}}" --hostname=${shellSingleQuote(machineName)} --operator=${shellSingleQuote(user)} --ssh=false${tagFlag}`
+  ].join("\n");
+}
+
+async function commandProvision(args: ParsedArgs): Promise<void> {
+  const profile = (flag(args, "profile") || "single-node") as Profile;
+  if (!["single-node", "control", "worker", "client-macos"].includes(profile)) {
+    throw new Error("provision supports --profile single-node|control|worker|client-macos");
+  }
+  const found = ensureProvisionPrereqs(profile);
+  const selectedHarness = await selectProvisionHarness(args);
+  ensurePasswordlessSudo();
+  if (!hasFlag(args, "skip-harness-sudo-test")) {
+    await testHarnessSudo(selectedHarness);
+  }
+  if (hasFlag(args, "test-bot")) {
+    await testTelegramBotConfig(args);
+  }
+  const config = buildProvisionConfig(profile, { name: selectedHarness.name, bin: selectedHarness.bin }, args);
+  const out = abs(flag(args, "out") || "~/.config/brainstack/brainstack.yaml");
+  await writeText(out, stringifySimpleYaml(config));
+  if (hasFlag(args, "enroll-tailscale")) {
+    const authKeyEnv = flag(args, "tailscale-auth-key-env") || "TAILSCALE_AUTH_KEY";
+    if (!process.env[authKeyEnv]) {
+      throw new Error(`provision blocked: --enroll-tailscale requires ${authKeyEnv} in env`);
+    }
+    const tailscale = objectAt(config, "tailscale");
+    const machine = objectAt(config, "machine");
+    const paths = objectAt(config, "paths");
+    run(["bash", "-lc", tailscaleUpShellCommand(String(machine.name), String(machine.user), arrayAt(tailscale, "advertiseTags").map(String), authKeyEnv)]);
+    console.log(`tailscale enrolled for ${String(machine.name)}; config still written to ${out}`);
+    console.log(`home path: ${String(paths.home)}`);
+  }
+  console.log(`provision config written: ${out}`);
+  console.log(`detected tools: ${Object.entries(found).map(([name, path]) => `${name}=${path}`).join(" ")}`);
+  console.log(`selected harness: ${selectedHarness.name} (${selectedHarness.bin})`);
+  console.log("next:");
+  console.log(`  brainctl init --profile ${profile} --config ${out}`);
+  if (profile === "single-node" || profile === "control") {
+    console.log("  systemctl --user daemon-reload");
+    console.log("  systemctl --user enable --now braind.service");
+    if (boolFlag(args, "enable-telemux")) {
+      console.log("  edit ~/.config/brainstack/telemux.secrets.env before starting telemux.service");
+      console.log("  systemctl --user enable --now telemux.service");
+    }
+  }
 }
 
 async function commandRender(args: ParsedArgs): Promise<void> {
@@ -1303,6 +1687,7 @@ async function commandDoctor(args: ParsedArgs): Promise<void> {
   checks.push({ name: "git", ok: commandOk("git"), detail: "Git CLI" });
   checks.push({ name: "ssh", ok: commandOk("ssh"), detail: "OpenSSH client" });
   checks.push({ name: "tailscale", ok: commandOk("tailscale"), detail: "Tailscale CLI optional for clients" });
+  checks.push({ name: "harness", ok: commandOk(cfg.harness.bin), detail: `${cfg.harness.name} via ${cfg.harness.bin}` });
   if (usesUserServices(cfg) && commandOk("loginctl")) {
     const linger = run(["loginctl", "show-user", cfg.machine.user, "--property=Linger", "--value"], { check: false });
     const enabled = linger.stdout.trim() === "yes";
@@ -1434,6 +1819,125 @@ async function commandRestore(args: ParsedArgs): Promise<void> {
   console.log(`restore copied into ${dest}`);
 }
 
+async function removePath(path: string, dryRun: boolean, removed: string[]): Promise<void> {
+  if (!existsSync(path)) {
+    return;
+  }
+  removed.push(path);
+  if (!dryRun) {
+    await rm(path, { recursive: true, force: true });
+  }
+}
+
+async function removeSymlinkIfTarget(path: string, expectedTarget: string, dryRun: boolean, removed: string[], skipped: string[]): Promise<void> {
+  if (!existsSync(path)) {
+    return;
+  }
+  const info = await lstat(path);
+  if (!info.isSymbolicLink()) {
+    skipped.push(`${path} (not a symlink)`);
+    return;
+  }
+  const target = await readlink(path);
+  if (target !== expectedTarget) {
+    skipped.push(`${path} (symlink target differs)`);
+    return;
+  }
+  removed.push(path);
+  if (!dryRun) {
+    await rm(path, { force: true });
+  }
+}
+
+async function removeFileIfExact(path: string, expectedContent: string, dryRun: boolean, removed: string[], skipped: string[]): Promise<void> {
+  if (!existsSync(path)) {
+    return;
+  }
+  const actual = await readFile(path, "utf8").catch(() => null);
+  if (actual !== expectedContent) {
+    skipped.push(`${path} (content differs)`);
+    return;
+  }
+  removed.push(path);
+  if (!dryRun) {
+    await rm(path, { force: true });
+  }
+}
+
+async function commandDestroy(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const dryRun = hasFlag(args, "dry-run");
+  const removed: string[] = [];
+  const skipped: string[] = [];
+  const bootstrapRoot = join(cfg.paths.configRoot, "client-bootstrap");
+  const bootstrapFiles = clientBootstrapFiles(cfg);
+
+  if (!dryRun && commandPath("systemctl")) {
+    if (runsBraind(cfg)) {
+      run(["systemctl", "--user", "disable", "--now", "braind.service"], { check: false });
+    }
+    if (cfg.telemux.enabled) {
+      run(["systemctl", "--user", "disable", "--now", "telemux.service"], { check: false });
+    }
+  }
+  if (runsBraind(cfg)) {
+    await removePath(join(cfg.paths.systemdUserRoot, "braind.service"), dryRun, removed);
+  }
+  if (cfg.telemux.enabled) {
+    await removePath(join(cfg.paths.systemdUserRoot, "telemux.service"), dryRun, removed);
+  }
+  await removeSymlinkIfTarget(
+    join(cfg.paths.home, ".codex", "AGENTS.md"),
+    join(bootstrapRoot, "codex-shared-brain.include.md"),
+    dryRun,
+    removed,
+    skipped
+  );
+  await removeFileIfExact(
+    join(cfg.paths.home, ".claude", "CLAUDE.md"),
+    `@${join(bootstrapRoot, "claude-user-CLAUDE.md")}\n`,
+    dryRun,
+    removed,
+    skipped
+  );
+  await removeFileIfExact(
+    join(cfg.paths.home, ".cursor", "rules", "shared-brain.md"),
+    bootstrapFiles["cursor-user-rule.md"],
+    dryRun,
+    removed,
+    skipped
+  );
+  await removeFileIfExact(clientEnvPathAbs(cfg), bootstrapFiles["client.env.example"], dryRun, removed, skipped);
+  await removePath(cfg.paths.configRoot, dryRun, removed);
+  await removePath(cfg.paths.stateRoot, dryRun, removed);
+  if (hasFlag(args, "remove-shared-brain")) {
+    await removePath(cfg.paths.sharedBrainRoot, dryRun, removed);
+  } else if (existsSync(cfg.paths.sharedBrainRoot)) {
+    skipped.push(`${cfg.paths.sharedBrainRoot} (pass --remove-shared-brain to delete)`);
+  }
+  if (hasFlag(args, "remove-private-brain")) {
+    await removePath(cfg.paths.privateBrainRoot, dryRun, removed);
+  } else if (existsSync(cfg.paths.privateBrainRoot)) {
+    skipped.push(`${cfg.paths.privateBrainRoot} (pass --remove-private-brain to delete)`);
+  }
+  if (hasFlag(args, "remove-tailscale-serve")) {
+    removed.push("tailscale serve config");
+    if (!dryRun) {
+      run(["tailscale", "serve", "reset", "--yes"], { check: false });
+    }
+  }
+  console.log(`${dryRun ? "dry-run destroy plan" : "destroy complete"} for ${cfg.profile}`);
+  console.log("removed:");
+  console.log(removed.length ? removed.map((item) => `  ${item}`).join("\n") : "  (none)");
+  console.log("skipped:");
+  console.log(skipped.length ? skipped.map((item) => `  ${item}`).join("\n") : "  (none)");
+  if (!dryRun) {
+    console.log("activation commands:");
+    console.log("  systemctl --user daemon-reload");
+    console.log("  systemctl --user reset-failed braind.service telemux.service || true");
+  }
+}
+
 async function commandBootstrapClient(args: ParsedArgs): Promise<void> {
   const out = flag(args, "out") || join(tmpdir(), `brainstack-client-bootstrap-${Date.now()}`);
   const cfg = await loadConfig(flag(args, "config"), "client-macos", flag(args, "root"));
@@ -1553,6 +2057,10 @@ async function commandMigrateCurrentInstall(args: ParsedArgs): Promise<void> {
   const current = {
     schema_version: CONFIG_SCHEMA_VERSION,
     profile: "control",
+    harness: {
+      name: "codex",
+      bin: "codex"
+    },
     machine: {
       name: hostname,
       user,
@@ -1625,6 +2133,8 @@ async function main(): Promise<void> {
       return;
     case "init":
       return await commandInit(args);
+    case "provision":
+      return await commandProvision(args);
     case "upgrade":
       return await commandApplyRuntime(args, true);
     case "apply-runtime":
@@ -1635,6 +2145,8 @@ async function main(): Promise<void> {
       return await commandBackup(args);
     case "restore":
       return await commandRestore(args);
+    case "destroy":
+      return await commandDestroy(args);
     case "render":
       return await commandRender(args);
     case "bootstrap-client":

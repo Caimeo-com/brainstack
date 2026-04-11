@@ -1,10 +1,10 @@
 # Clawdex
 
-Telegram-driven Codex control plane for one control host, with optional remote workers.
+Telegram-driven harness control plane for one control host, with optional remote workers.
 
 Brainstack product note: this app is vendored under `apps/telemux`. Fresh brainstack installs default mutable state to `~/.local/state/brainstack/telemux` and factory workspaces to `~/.local/state/brainstack/factory`. Older `/srv/telemux` and `/srv/factory` paths below describe the original valkyrie deployment and remain relevant only for compatibility migration.
 
-Security note: telemux is not a sandbox. It accepts Telegram messages from the configured allowed user and passes work into the configured harness process, currently Codex CLI. If that harness is configured for bypass/yolo mode and the Unix user has passwordless sudo, telemux is effectively a remote command path into that authority.
+Security note: telemux is not a sandbox. It accepts Telegram messages from the configured allowed user and passes work into the configured harness process, Codex CLI or Claude Code. If that harness is configured for bypass/yolo mode and the Unix user has passwordless sudo, telemux is effectively a remote command path into that authority.
 
 Phase 1 is intentionally usable without a remote worker. `host` and `scratch` topics can run locally on the control machine today, while remote contexts can exist in `pending` state until SSH is ready.
 
@@ -28,16 +28,16 @@ For a fresh-machine bootstrap, including passwordless sudo for the control user,
 - Context kinds: `repo`, `host`, `scratch`.
 - Context states: `active`, `pending`, `archived`, `error`.
 - `/newctx` is usually run once per reusable Telegram topic.
-- Plain text in a bound topic starts a Codex session if none exists, otherwise resumes the stored session.
-- Telegram captions are treated as user text too, so captioned media messages can drive Codex runs.
+- Plain text in a bound topic starts the configured harness if no session exists, otherwise resumes the stored topic session where supported.
+- Telegram captions are treated as user text too, so captioned media messages can drive harness runs.
 - Inbound Telegram media is staged into `.factory/inbox/telegram/<message_id>/` inside the bound workspace before the run.
-- Images are also forwarded to Codex with `--image` for faster visual response; non-image files are staged on disk and referenced by path in the prompt.
-- Audio/voice-only Telegram messages are intentionally not forwarded to Codex yet; they are reserved for the later transcription phase.
+- Images are also forwarded to Codex with `--image` for faster visual response; Claude runs currently receive staged file paths as text context.
+- Audio/voice-only Telegram messages are intentionally not forwarded to the harness yet; they are reserved for the later transcription phase.
 - While a job is active, the bot sends a lightweight `typing` heartbeat into the same Telegram topic so long runs do not look stalled.
 - Scheduled jobs live inside `telemux.service`, not OS cron. The scheduler checks the SQLite job registry on an interval and can proactively post into a Telegram topic even when no one is actively chatting there.
-- Scheduled jobs can either send a direct reminder into Telegram or run Codex against a stored context/session and post the result back into the bound topic.
+- Scheduled jobs can either send a direct reminder into Telegram or run the configured harness against a stored context/session and post the result back into the bound topic.
 - Scheduled jobs have their own optional model/effort overrides. Effective runtime is `cron override -> context override -> global default`.
-- `host` and `scratch` contexts auto-create lightweight local git repos so Codex always has a safe working directory.
+- `host` and `scratch` contexts auto-create lightweight local git repos so the harness always has a safe working directory.
 - Managed `host` and `scratch` workspaces get an initial commit so `git status` and future diffs start clean.
 - `repo` contexts can bind an existing repo path or clone a git URL into a managed repo root.
 - Worker transport is configurable per worker: `local`, `ssh`, or optional `tailscale-ssh`.

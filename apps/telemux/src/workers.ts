@@ -177,7 +177,9 @@ export class WorkerService {
         "printf 'hostname=%s\\n' \"$(hostname)\"",
         "printf 'cwd=%s\\n' \"$PWD\"",
         "if command -v git >/dev/null 2>&1; then printf 'git=1\\n'; else printf 'git=0\\n'; fi",
-        "if command -v codex >/dev/null 2>&1; then printf 'codex=1\\n'; else printf 'codex=0\\n'; fi",
+        `harness_bin=${quoteSh(this.config.harnessBin)}`,
+        `printf 'harness=%s\\n' ${quoteSh(this.config.harness)}`,
+        "if command -v \"$harness_bin\" >/dev/null 2>&1; then printf 'harness_bin=1\\n'; else printf 'harness_bin=0\\n'; fi",
         "printf 'home=%s\\n' \"$HOME\""
       ].join("\n"),
       undefined,
@@ -254,7 +256,7 @@ export class WorkerService {
     options: CodexRunOptions = {}
   ): Promise<CodexRunResult> {
     await mkdir(dirname(logPath), { recursive: true });
-    await appendFile(logPath, `== ${new Date().toISOString()} ${mode} ${context.slug} on ${context.machine} ==\n`);
+    await appendFile(logPath, `== ${new Date().toISOString()} ${mode} ${context.slug} on ${context.machine} via ${this.config.harness} ==\n`);
 
     const worker = this.requireWorker(context.machine);
     const promptBase64 = Buffer.from(prompt, "utf8").toString("base64");
@@ -265,13 +267,21 @@ export class WorkerService {
     const modelOverride = options.modelOverride?.trim() || "";
     const reasoningEffortOverride = options.reasoningEffortOverride?.trim() || "";
     const workspaceSeedScript = buildWorkspaceSeedScript(workspaceFiles);
-    const imageArgScript = imagePaths.map((imagePath) => `image_args+=(--image ${quoteSh(imagePath)})`).join("\n");
-    const modelArgScript = [
+    const codexImageArgScript = imagePaths.map((imagePath) => `image_args+=(--image ${quoteSh(imagePath)})`).join("\n");
+    const codexModelArgScript = [
       "model_args=()",
       modelOverride ? `model_args+=(-m ${quoteSh(modelOverride)})` : "",
       reasoningEffortOverride
         ? `model_args+=(-c ${quoteSh(`model_reasoning_effort="${reasoningEffortOverride}"`)})`
         : ""
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const claudeArgScript = [
+      "claude_args=(-p --dangerously-skip-permissions --permission-mode bypassPermissions --output-format text)",
+      modelOverride ? `claude_args+=(--model ${quoteSh(modelOverride)})` : "",
+      reasoningEffortOverride ? `claude_args+=(--effort ${quoteSh(reasoningEffortOverride)})` : "",
+      shouldResume && resumeSessionId ? `claude_args+=(-r ${quoteSh(resumeSessionId)})` : mode !== "run" ? "claude_args+=(-c)" : ""
     ]
       .filter(Boolean)
       .join("\n");
@@ -289,86 +299,92 @@ expand_home_path() {
 worktree_raw=${quoteSh(context.worktreePath)}
 prompt_b64=${quoteSh(promptBase64)}
 resume_session=${quoteSh(resumeSessionId)}
-codex_bin=${quoteSh(this.config.codexBin)}
+harness=${quoteSh(this.config.harness)}
+harness_bin=${quoteSh(this.config.harnessBin)}
 worktree="$(expand_home_path "$worktree_raw")"
 launcher_dir="$(mktemp -d "\${TMPDIR:-/tmp}/clawdex-run.XXXXXX")"
 prompt_file="$launcher_dir/control-plane.prompt.md"
-runner_file="$launcher_dir/run-codex.sh"
+runner_file="$launcher_dir/run-harness.sh"
 
 cleanup() {
   rm -rf "$launcher_dir"
 }
 
-terminate_codex_run() {
-  if [ -n "\${codex_pgid:-}" ]; then
-    kill -TERM -- "-$codex_pgid" 2>/dev/null || true
+terminate_harness_run() {
+  if [ -n "\${harness_pgid:-}" ]; then
+    kill -TERM -- "-$harness_pgid" 2>/dev/null || true
   fi
-  kill "$codex_pid" 2>/dev/null || true
+  kill "$harness_pid" 2>/dev/null || true
   if command -v pkill >/dev/null 2>&1; then
-    pkill -TERM -P "$codex_pid" 2>/dev/null || true
+    pkill -TERM -P "$harness_pid" 2>/dev/null || true
   fi
   sleep 1
-  if [ -n "\${codex_pgid:-}" ] && kill -0 -- "-$codex_pgid" 2>/dev/null; then
-    kill -KILL -- "-$codex_pgid" 2>/dev/null || true
+  if [ -n "\${harness_pgid:-}" ] && kill -0 -- "-$harness_pgid" 2>/dev/null; then
+    kill -KILL -- "-$harness_pgid" 2>/dev/null || true
   fi
-  if kill -0 "$codex_pid" 2>/dev/null; then
-    kill -9 "$codex_pid" 2>/dev/null || true
+  if kill -0 "$harness_pid" 2>/dev/null; then
+    kill -9 "$harness_pid" 2>/dev/null || true
   fi
   if command -v pkill >/dev/null 2>&1; then
-    pkill -KILL -P "$codex_pid" 2>/dev/null || true
+    pkill -KILL -P "$harness_pid" 2>/dev/null || true
   fi
 }
 
 trap cleanup EXIT
 
-if ! command -v "$codex_bin" >/dev/null 2>&1; then
-  echo "codex binary not found on worker: $codex_bin" >&2
+if ! command -v "$harness_bin" >/dev/null 2>&1; then
+  echo "$harness binary not found on worker: $harness_bin" >&2
   exit 30
 fi
 
 printf '%s' "$prompt_b64" | base64 -d > "$prompt_file"
 cat > "$runner_file" <<'__CLAWDEX_RUNNER__'
 set -euo pipefail
-${modelArgScript}
+${codexModelArgScript}
+${claudeArgScript}
 image_args=()
 cd "$worktree"
 mkdir -p .factory
 rm -f ${quoteSh(TELEGRAM_ATTACHMENTS_WORKSPACE_PATH)}
 cp "$prompt_file" .factory/control-plane.prompt.md
 ${workspaceSeedScript}
-${imageArgScript}
+${codexImageArgScript}
 
-if ${shouldResume ? "true" : "false"}; then
-  exec "$codex_bin" exec resume --json --output-last-message .factory/last-message.txt --dangerously-bypass-approvals-and-sandbox "\${model_args[@]}" "\${image_args[@]}" "$resume_session" - < "$prompt_file"
+if [ "$harness" = "claude" ]; then
+  exec "$harness_bin" "\${claude_args[@]}" < "$prompt_file" | tee .factory/last-message.txt
 else
-  exec "$codex_bin" exec --json --output-last-message .factory/last-message.txt --dangerously-bypass-approvals-and-sandbox "\${model_args[@]}" "\${image_args[@]}" - < "$prompt_file"
+  if ${shouldResume ? "true" : "false"}; then
+    exec "$harness_bin" exec resume --json --output-last-message .factory/last-message.txt --dangerously-bypass-approvals-and-sandbox "\${model_args[@]}" "\${image_args[@]}" "$resume_session" - < "$prompt_file"
+  else
+    exec "$harness_bin" exec --json --output-last-message .factory/last-message.txt --dangerously-bypass-approvals-and-sandbox "\${model_args[@]}" "\${image_args[@]}" - < "$prompt_file"
+  fi
 fi
 __CLAWDEX_RUNNER__
 chmod +x "$runner_file"
-export worktree prompt_file resume_session codex_bin
+export worktree prompt_file resume_session harness harness_bin
 
 if command -v setsid >/dev/null 2>&1; then
   setsid bash "$runner_file" &
-  codex_pid=$!
-  codex_pgid=$codex_pid
+  harness_pid=$!
+  harness_pgid=$harness_pid
 else
   bash "$runner_file" &
-  codex_pid=$!
-  codex_pgid=""
+  harness_pid=$!
+  harness_pgid=""
 fi
 
-while kill -0 "$codex_pid" 2>/dev/null; do
+while kill -0 "$harness_pid" 2>/dev/null; do
   if [ ! -d "$worktree" ]; then
-    echo "worktree disappeared during Codex run: $worktree" >&2
-    terminate_codex_run
-    wait "$codex_pid" || true
+    echo "worktree disappeared during harness run: $worktree" >&2
+    terminate_harness_run
+    wait "$harness_pid" || true
     exit 88
   fi
 
   sleep 1
 done
 
-wait "$codex_pid"
+wait "$harness_pid"
 `;
 
     let stdoutBuffer = "";

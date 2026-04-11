@@ -5,7 +5,7 @@
 ## Product Code
 
 - `apps/braind`: web/API/search/import service.
-- `apps/telemux`: optional Telegram/Codex control plane.
+- `apps/telemux`: optional Telegram control plane for Codex or Claude.
 - `packages/brainctl`: deterministic installer/operator CLI.
 - `packages/client-bootstrap`: harness client bootstrap artifacts.
 - `packages/skills`: portable skills, outside brain content.

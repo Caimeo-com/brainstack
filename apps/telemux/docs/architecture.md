@@ -124,7 +124,7 @@ If a remote worker is unavailable, context creation does not hard-fail. The cont
 
 1. Ensure the context workspace exists, or keep it `pending` if the worker is unreachable.
 2. If the triggering Telegram message included supported media, download it and stage it into `.factory/inbox/telegram/<message_id>/` in the workspace.
-3. Run `codex exec` or `codex exec resume <session_id>` in the workspace, adding `--image` for staged image inputs and any topic-local `-m` / `-c model_reasoning_effort=...` overrides.
+3. Run the configured harness in the workspace. Codex uses `codex exec` or `codex exec resume <session_id>` with image/model/effort flags; Claude uses `claude -p` with bypass-permissions flags and text/model/effort overrides.
 4. The worker launcher monitors the bound worktree during the run and aborts cleanly if that worktree disappears, so a self-deleting task cannot wedge the topic forever.
 5. Capture the current session id.
 6. Read `.factory/SUMMARY.md`, `.factory/ARTIFACTS.md`, and `.factory/last-message.txt`.
