@@ -24,12 +24,6 @@ telemux:
   dashboardHost: 127.0.0.1
   dashboardPort: 8787
   localMachine: brain-control
-  workers:
-    - name: brain-control
-      transport: local
-      managedRepoRoot: ~/.local/state/brainstack/factory/repos
-      managedHostRoot: ~/.local/state/brainstack/factory/hostctx
-      managedScratchRoot: ~/.local/state/brainstack/factory/scratch
 tailscale:
   tailnetHost: brain-control.example.ts.net
   controlTag: tag:brain
@@ -37,4 +31,3 @@ tailscale:
   advertiseTags:
     - tag:brain
   enableSsh: false
-
