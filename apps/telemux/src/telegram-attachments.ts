@@ -22,7 +22,7 @@ export interface ParsedAttachmentManifest {
 export const TELEGRAM_ATTACHMENTS_FILE_NAME = "TELEGRAM_ATTACHMENTS.json";
 export const TELEGRAM_ATTACHMENTS_WORKSPACE_PATH = `.factory/${TELEGRAM_ATTACHMENTS_FILE_NAME}`;
 
-const ABSOLUTE_PATH_PATTERN = /`((?:\/|~\/)[^`]+)`|((?:\/|~\/)\S+)/g;
+const ARTIFACT_PATH_PATTERN = /`((?:\/|~\/|\.?[\w.-][^`\s]*\/)[^`]+)`|((?:\/|~\/|\.?[\w.-][^\s]*\/)\S+)/g;
 const PHOTO_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
 
 function normalizePathCandidate(value: string): string {
@@ -55,9 +55,9 @@ export function parseArtifactEntries(markdown: string | null): ArtifactEntry[] {
   const seen = new Set<string>();
 
   for (const line of markdown.split("\n")) {
-    ABSOLUTE_PATH_PATTERN.lastIndex = 0;
+    ARTIFACT_PATH_PATTERN.lastIndex = 0;
 
-    for (const match of line.matchAll(ABSOLUTE_PATH_PATTERN)) {
+    for (const match of line.matchAll(ARTIFACT_PATH_PATTERN)) {
       const raw = match[1] || match[2];
       if (!raw) {
         continue;

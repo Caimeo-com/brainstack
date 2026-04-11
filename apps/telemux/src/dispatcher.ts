@@ -92,7 +92,7 @@ function buildPrompt(context: ContextRecord, mode: DispatchMode, instruction: st
     "Start by reading those files and the current git status.",
     "Before finishing, update all relevant .factory files so the next run can resume cleanly.",
     "Record artifact paths in .factory/ARTIFACTS.md.",
-    `These messages are coming through Telegram. If the user explicitly asks you to send or attach a file into the Telegram thread, keep your normal answer and also write ${TELEGRAM_ATTACHMENTS_WORKSPACE_PATH} as JSON like {"attachments":[{"path":"/absolute/path/to/file","caption":"optional short caption","type":"document"}]}.`,
+    `These messages are coming through Telegram. If the user explicitly asks you to send or attach a file into the Telegram thread, keep your normal answer and also write ${TELEGRAM_ATTACHMENTS_WORKSPACE_PATH} as JSON like {"attachments":[{"path":"relative/path/inside/workspace","caption":"optional short caption","type":"document"}]}.`,
     `Only list regular files that already exist and are already recorded in .factory/ARTIFACTS.md. Use type "photo" for images only when you want Telegram to render them inline. Do not create ${TELEGRAM_ATTACHMENTS_FILE_NAME} unless the user explicitly asked for a Telegram attachment.`,
     `If the user explicitly asks to create, change, move, pause, resume, or delete a scheduled job, keep your normal answer and also write ${CRON_REQUESTS_WORKSPACE_PATH} as JSON like {"actions":[{"type":"create","job":{"label":"example","kind":"reminder","schedule":{"type":"once","at":"2026-04-08T09:00:00+02:00"},"reminderText":"Example reminder"}}]}.`,
     `Use exact cron ids from ${CONTEXT_CRONS_FILE_NAME} when updating existing jobs if they are available. Do not create ${CRON_REQUESTS_FILE_NAME} unless the user explicitly asked about scheduled jobs.`,
@@ -319,6 +319,7 @@ export class Dispatcher {
 
         await this.sendTelegramAttachments(saved, replyTarget, artifacts, attachmentManifest);
         await this.applyCronManifest(saved, replyTarget, cronManifest);
+        await this.importRunNotesToBrain(saved, summary, artifacts);
         return;
       }
 
@@ -371,6 +372,59 @@ export class Dispatcher {
     const notes = formatAttachmentDeliveryIssues(delivery);
     if (notes) {
       await this.telegram.sendText(replyTarget, notes);
+    }
+  }
+
+  private async importRunNotesToBrain(context: ContextRecord, summary: string | null, artifacts: string | null): Promise<void> {
+    if (!this.config.brainBaseUrl || !this.config.brainImportToken) {
+      return;
+    }
+
+    const body = [
+      `# Telemux run notes: ${context.slug}`,
+      "",
+      `- context: ${context.slug}`,
+      `- machine: ${context.machine}`,
+      `- session: ${context.codexSessionId || "n/a"}`,
+      `- run_at: ${context.lastRunAt || new Date().toISOString()}`,
+      "",
+      "## SUMMARY.md",
+      "",
+      summary?.trim() || "(empty)",
+      "",
+      "## ARTIFACTS.md",
+      "",
+      artifacts?.trim() || "(empty)",
+      ""
+    ].join("\n");
+
+    try {
+      const response = await fetch(new URL("/api/import", this.config.brainBaseUrl).toString(), {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.config.brainImportToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          title: `telemux run notes: ${context.slug}`,
+          text: body,
+          source_harness: "telemux",
+          source_machine: context.machine,
+          source_type: "telemux-run",
+          conversation_id: context.slug,
+          tags: ["telemux", "factory-run"]
+        })
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        console.error(`shared brain import failed for ${context.slug}: ${response.status} ${text.slice(0, 500)}`);
+        return;
+      }
+
+      console.log(`shared brain import succeeded for ${context.slug}`);
+    } catch (error) {
+      console.error(`shared brain import failed for ${context.slug}`, error);
     }
   }
 

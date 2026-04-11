@@ -17,8 +17,11 @@ paths:
 brain:
   bind: 127.0.0.1
   port: 8080
-  publicBaseUrl: ""
+  publicBaseUrl: https://brain-control.example.ts.net
   largeFileThresholdBytes: 10485760
+client:
+  localPath: ~/shared-brain
+  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git
 telemux:
   enabled: false
 tailscale:
@@ -28,4 +31,3 @@ tailscale:
   advertiseTags:
     - tag:brain-worker
   enableSsh: false
-

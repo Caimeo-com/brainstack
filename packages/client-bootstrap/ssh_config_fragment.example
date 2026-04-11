@@ -1,7 +1,7 @@
 Host brain-control
   HostName brain-control
-  User operator
+  User __MACHINE_USER__
   IdentitiesOnly yes
 
 # Clone:
-# git clone operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git ~/shared-brain
+# git clone __BRAIN_GIT_REMOTE__ __SHARED_BRAIN_LOCAL_PATH__

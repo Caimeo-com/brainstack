@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REMOTE="${BRAIN_GIT_REMOTE:-operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git}"
-TARGET="${SHARED_BRAIN_LOCAL_PATH:-$HOME/shared-brain}"
+REMOTE="${BRAIN_GIT_REMOTE:-__BRAIN_GIT_REMOTE__}"
+TARGET="${SHARED_BRAIN_LOCAL_PATH:-__SHARED_BRAIN_LOCAL_PATH__}"
 CONFIG_DIR="$HOME/.config"
 ENV_FILE="$CONFIG_DIR/shared-brain.env"
 BOOTSTRAP_DIR="$CONFIG_DIR/brainstack/client-bootstrap"
@@ -18,7 +18,7 @@ backup_file() {
 expand_path() {
   case "$1" in
     "~") printf '%s\n' "$HOME" ;;
-    "~/"*) printf '%s/%s\n' "$HOME" "${1#~/}" ;;
+    "~/"*) printf '%s/%s\n' "$HOME" "${1#\~/}" ;;
     /*) printf '%s\n' "$1" ;;
     *) printf '%s/%s\n' "$PWD" "$1" ;;
   esac
@@ -28,13 +28,20 @@ escape_sed_replacement() {
   printf '%s' "$1" | sed 's/[\/&]/\\&/g'
 }
 
+escape_sed_pattern() {
+  printf '%s' "$1" | sed 's/[#\/&.^$*[]/\\&/g'
+}
+
 render_template() {
   local source="$1"
   local target="$2"
-  local replacement="$3"
+  local search="$3"
+  local replacement="$4"
+  local escaped_search
   local escaped
+  escaped_search="$(escape_sed_pattern "$search")"
   escaped="$(escape_sed_replacement "$replacement")"
-  sed "s#__SHARED_BRAIN_LOCAL_PATH__#$escaped#g" "$source" > "$target"
+  sed "s#$escaped_search#$escaped#g" "$source" > "$target"
 }
 
 TARGET_ABS="$(expand_path "$TARGET")"
@@ -42,15 +49,15 @@ BOOTSTRAP_ABS="$(expand_path "$BOOTSTRAP_DIR")"
 
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$BOOTSTRAP_DIR"
-render_template "$(dirname "$0")/codex-global-AGENTS.md" "$BOOTSTRAP_DIR/codex-global-AGENTS.md" "$TARGET"
-render_template "$(dirname "$0")/codex-shared-brain.include.md" "$BOOTSTRAP_DIR/codex-shared-brain.include.md" "$TARGET"
-render_template "$(dirname "$0")/cursor-user-rule.md" "$BOOTSTRAP_DIR/cursor-user-rule.md" "$TARGET"
-render_template "$(dirname "$0")/claude-hooks-example.json" "$BOOTSTRAP_DIR/claude-hooks-example.json" "$TARGET"
-render_template "$(dirname "$0")/claude-user-CLAUDE.md" "$BOOTSTRAP_DIR/claude-user-CLAUDE.md" "$TARGET_ABS"
-if [ -d "$TARGET/.git" ]; then
-  git -C "$TARGET" pull --ff-only
+render_template "$(dirname "$0")/codex-global-AGENTS.md" "$BOOTSTRAP_DIR/codex-global-AGENTS.md" "__SHARED_BRAIN_LOCAL_PATH__" "$TARGET"
+render_template "$(dirname "$0")/codex-shared-brain.include.md" "$BOOTSTRAP_DIR/codex-shared-brain.include.md" "__SHARED_BRAIN_LOCAL_PATH__" "$TARGET"
+render_template "$(dirname "$0")/cursor-user-rule.md" "$BOOTSTRAP_DIR/cursor-user-rule.md" "__SHARED_BRAIN_LOCAL_PATH__" "$TARGET"
+render_template "$(dirname "$0")/claude-hooks-example.json" "$BOOTSTRAP_DIR/claude-hooks-example.json" "__SHARED_BRAIN_LOCAL_PATH__" "$TARGET"
+render_template "$(dirname "$0")/claude-user-CLAUDE.md" "$BOOTSTRAP_DIR/claude-user-CLAUDE.md" "__SHARED_BRAIN_LOCAL_PATH__" "$TARGET_ABS"
+if [ -d "$TARGET_ABS/.git" ]; then
+  git -C "$TARGET_ABS" pull --ff-only
 else
-  git clone "$REMOTE" "$TARGET"
+  git clone "$REMOTE" "$TARGET_ABS"
 fi
 
 if [ ! -f "$ENV_FILE" ]; then
@@ -87,5 +94,5 @@ else
   echo "cat $BOOTSTRAP_DIR/cursor-user-rule.md >> $CURSOR_RULE_DIR/shared-brain.md"
 fi
 
-echo "shared brain client installed or updated at $TARGET"
+echo "shared brain client installed or updated at $TARGET_ABS"
 echo "product-owned bootstrap snippets are in $BOOTSTRAP_DIR"

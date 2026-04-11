@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
-import { existsSync, statSync } from "node:fs";
-import { chmod, cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { chmod, cp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -96,7 +96,7 @@ function usage(): string {
   brainctl upgrade --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
   brainctl apply-runtime --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
   brainctl doctor --config brainstack.yaml [--profile ...]
-  brainctl backup --config brainstack.yaml [--out DIR]
+  brainctl backup --config brainstack.yaml [--out DIR] [--pause-telemux]
   brainctl restore --backup DIR_OR_TGZ --target DIR [--apply]
   brainctl render --config brainstack.yaml --profile ... --out DIR
   brainctl bootstrap-client --profile client-macos --config brainstack.yaml --out DIR
@@ -178,6 +178,18 @@ function absWithHome(input: string, home: string): string {
 
 function shellSingleQuote(input: string): string {
   return `'${input.replace(/'/g, "'\\''")}'`;
+}
+
+function renderTemplate(text: string, replacements: Record<string, string>): string {
+  let rendered = text;
+  for (const [key, value] of Object.entries(replacements)) {
+    rendered = rendered.replaceAll(`__${key}__`, value);
+  }
+  return rendered;
+}
+
+function readClientBootstrapTemplate(path: string): string {
+  return readFileSync(join(PRODUCT_ROOT, "packages", "client-bootstrap", path), "utf8");
 }
 
 function splitKeyValue(text: string): [string, string] {
@@ -766,6 +778,7 @@ function telemuxRuntimeEnv(cfg: BrainstackConfig): string {
     `FACTORY_WORKERS_FILE=${join(cfg.paths.configRoot, "workers.json")}`,
     "FACTORY_USAGE_ADAPTER=manual",
     "FACTORY_CODEX_BIN=codex",
+    `BRAIN_BASE_URL=${cfg.brain.publicBaseUrl}`,
     ""
   ].join("\n");
 }
@@ -775,6 +788,7 @@ function telemuxSecretsEnv(): string {
     "FACTORY_TELEGRAM_BOT_TOKEN=",
     "# FACTORY_TELEGRAM_CONTROL_CHAT_ID=-1001234567890",
     "FACTORY_ALLOWED_TELEGRAM_USER_ID=0",
+    "BRAIN_IMPORT_TOKEN=",
     ""
   ].join("\n");
 }
@@ -960,161 +974,25 @@ function tailscalePolicyFragment(cfg: BrainstackConfig): string {
 
 function clientBootstrapFiles(cfg: BrainstackConfig): Record<string, string> {
   const clientPath = cfg.client.localPath;
-  const defaultRemote = shellSingleQuote(cfg.client.remoteSsh);
-  const defaultTarget = shellSingleQuote(clientPath);
-  return {
-    "client.env.example": [
-      `BRAIN_BASE_URL=${cfg.brain.publicBaseUrl || "https://brain-control.example.ts.net"}`,
-      "BRAIN_IMPORT_TOKEN=",
-      `SHARED_BRAIN_LOCAL_PATH=${clientPath}`,
-      ""
-    ].join("\n"),
-    "codex-shared-brain.include.md": [
-      "# Shared Brain Client",
-      "",
-      `- Consult \`${clientPath}\` for prior decisions, machines, skills, runbooks, and source pages.`,
-      `- Run \`git -C ${clientPath} pull --ff-only\` before assuming the clone is current.`,
-      "- Default writes are imports and proposals through the HTTP API using `BRAIN_IMPORT_TOKEN`.",
-      "- Do not directly edit canonical wiki pages unless explicitly instructed.",
-      "- Keep project-local state in the project, not in global memory.",
-      ""
-    ].join("\n"),
-    "codex-global-AGENTS.md": [
-      "# Shared Brain Client",
-      "",
-      `- Consult \`${clientPath}\` for prior decisions, machines, skills, runbooks, and source pages.`,
-      `- Run \`git -C ${clientPath} pull --ff-only\` before assuming the clone is current.`,
-      "- Default writes are imports and proposals through the HTTP API using `BRAIN_IMPORT_TOKEN`.",
-      "- Do not directly edit canonical wiki pages unless explicitly instructed.",
-      "- Keep project-local state in the project, not in global memory.",
-      ""
-    ].join("\n"),
-    "claude-user-CLAUDE.md": [
-      "# Claude Shared Brain",
-      "",
-      `@${clientPath}/AGENTS.shared-client.md`,
-      "",
-      "Claude-specific notes: sync first, read local markdown first, and use proposals for synthesized changes unless acting as organizer/admin.",
-      ""
-    ].join("\n"),
-    "claude-hooks-example.json": [
-      "{",
-      '  "hooks": {',
-      '    "SessionStart": [',
-      `      { "matcher": "*", "hooks": [{ "type": "command", "command": "git -C ${clientPath} pull --ff-only || true" }] }`,
-      "    ],",
-      '    "Stop": [',
-      '      { "matcher": "*", "hooks": [{ "type": "command", "command": "echo Optional: summarize and propose via brainctl, do not auto-write canon." }] }',
-      "    ]",
-      "  }",
-      "}",
-      ""
-    ].join("\n"),
-    "cursor-user-rule.md": [
-      "# Shared Brain Rule",
-      "",
-      `Before planning unfamiliar work, consult \`${clientPath}\` for decisions, machines, harnesses, skills, and runbooks. Sync with \`git -C ${clientPath} pull --ff-only\` when safe. For writes, use the shared-brain HTTP import/propose path or \`brainctl\`; do not directly mutate wiki pages unless explicitly instructed.`,
-      ""
-    ].join("\n"),
-    "ssh_config_fragment.example": [
-      "Host brain-control",
-      "  HostName brain-control",
-      `  User ${cfg.machine.user}`,
-      "  IdentitiesOnly yes",
-      "",
-      "# Clone:",
-      `# git clone ${cfg.client.remoteSsh} ${clientPath}`,
-      ""
-    ].join("\n"),
-    "install-client.sh": `#!/usr/bin/env bash
-set -euo pipefail
-
-DEFAULT_REMOTE=${defaultRemote}
-DEFAULT_TARGET=${defaultTarget}
-REMOTE="\${BRAIN_GIT_REMOTE:-$DEFAULT_REMOTE}"
-TARGET="\${SHARED_BRAIN_LOCAL_PATH:-$DEFAULT_TARGET}"
-CONFIG_DIR="$HOME/.config"
-ENV_FILE="$CONFIG_DIR/shared-brain.env"
-BOOTSTRAP_DIR="$CONFIG_DIR/brainstack/client-bootstrap"
-STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-
-backup_file() {
-  local path="$1"
-  if [ -e "$path" ] || [ -L "$path" ]; then
-    cp -a "$path" "$path.brainstack-backup-$STAMP"
-  fi
-}
-
-expand_path() {
-  case "$1" in
-    "~") printf '%s\\n' "$HOME" ;;
-    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
-    /*) printf '%s\\n' "$1" ;;
-    *) printf '%s/%s\\n' "$PWD" "$1" ;;
-  esac
-}
-
-TARGET_ABS="$(expand_path "$TARGET")"
-BOOTSTRAP_ABS="$(expand_path "$BOOTSTRAP_DIR")"
-
-mkdir -p "$CONFIG_DIR"
-mkdir -p "$BOOTSTRAP_DIR"
-cp "$(dirname "$0")/codex-global-AGENTS.md" "$BOOTSTRAP_DIR/codex-global-AGENTS.md"
-cp "$(dirname "$0")/codex-shared-brain.include.md" "$BOOTSTRAP_DIR/codex-shared-brain.include.md"
-cp "$(dirname "$0")/cursor-user-rule.md" "$BOOTSTRAP_DIR/cursor-user-rule.md"
-cp "$(dirname "$0")/claude-hooks-example.json" "$BOOTSTRAP_DIR/claude-hooks-example.json"
-cat > "$BOOTSTRAP_DIR/claude-user-CLAUDE.md" <<CLAUDE
-# Claude Shared Brain
-
-@$TARGET_ABS/AGENTS.shared-client.md
-
-Claude-specific notes: sync first, read local markdown first, and use proposals for synthesized changes unless acting as organizer/admin.
-CLAUDE
-
-if [ -d "$TARGET/.git" ]; then
-  git -C "$TARGET" pull --ff-only
-else
-  git clone "$REMOTE" "$TARGET"
-fi
-
-if [ ! -f "$ENV_FILE" ]; then
-  cp "$(dirname "$0")/client.env.example" "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-fi
-
-CODEX_HOME="\${CODEX_HOME:-$HOME/.codex}"
-mkdir -p "$CODEX_HOME"
-if [ ! -f "$CODEX_HOME/AGENTS.md" ]; then
-  ln -s "$BOOTSTRAP_DIR/codex-shared-brain.include.md" "$CODEX_HOME/AGENTS.md"
-else
-  echo "Codex already has $CODEX_HOME/AGENTS.md; append the real shared-brain guidance with:"
-  echo "cat $BOOTSTRAP_DIR/codex-shared-brain.include.md >> $CODEX_HOME/AGENTS.md"
-fi
-
-CLAUDE_HOME="$HOME/.claude"
-mkdir -p "$CLAUDE_HOME"
-if [ ! -f "$CLAUDE_HOME/CLAUDE.md" ]; then
-  cat > "$CLAUDE_HOME/CLAUDE.md" <<STUB
-@$BOOTSTRAP_ABS/claude-user-CLAUDE.md
-STUB
-else
-  echo "Claude already has $CLAUDE_HOME/CLAUDE.md; append this exact import line manually:"
-  echo "@$BOOTSTRAP_ABS/claude-user-CLAUDE.md"
-fi
-
-CURSOR_RULE_DIR="$HOME/.cursor/rules"
-mkdir -p "$CURSOR_RULE_DIR"
-if [ ! -f "$CURSOR_RULE_DIR/shared-brain.md" ]; then
-  cp "$BOOTSTRAP_DIR/cursor-user-rule.md" "$CURSOR_RULE_DIR/shared-brain.md"
-else
-  echo "Cursor shared-brain rule already exists at $CURSOR_RULE_DIR/shared-brain.md; append or merge the actual rule content with:"
-  echo "cat $BOOTSTRAP_DIR/cursor-user-rule.md >> $CURSOR_RULE_DIR/shared-brain.md"
-fi
-
-echo "shared brain client installed or updated at $TARGET"
-echo "product-owned bootstrap snippets are in $BOOTSTRAP_DIR"
-`
+  const replacements = {
+    BRAIN_BASE_URL: cfg.brain.publicBaseUrl || "https://brain-control.example.ts.net",
+    BRAIN_GIT_REMOTE: cfg.client.remoteSsh,
+    MACHINE_USER: cfg.machine.user,
+    SHARED_BRAIN_LOCAL_PATH: clientPath
   };
+  const templateNames = [
+    "client.env.example",
+    "codex-shared-brain.include.md",
+    "codex-global-AGENTS.md",
+    "claude-user-CLAUDE.md",
+    "claude-hooks-example.json",
+    "cursor-user-rule.md",
+    "ssh_config_fragment.example",
+    "install-client.sh"
+  ];
+  return Object.fromEntries(
+    templateNames.map((name) => [name, renderTemplate(readClientBootstrapTemplate(name), replacements)])
+  );
 }
 
 function renderFiles(cfg: BrainstackConfig): Record<string, string> {
@@ -1126,6 +1004,8 @@ function renderFiles(cfg: BrainstackConfig): Record<string, string> {
       machine: cfg.machine,
       paths: cfg.paths,
       brain: cfg.brain,
+      repos: cfg.repos,
+      telemux: { ...cfg.telemux, workers: defaultWorkers(cfg) },
       tailscale: cfg.tailscale,
       client: cfg.client
     }),
@@ -1171,6 +1051,69 @@ async function writeFileMap(root: string, files: Record<string, string>): Promis
     const fullPath = join(root, path);
     await writeText(fullPath, content, path.endsWith(".sh") || path.includes("git-hooks/") ? 0o755 : undefined);
   }
+}
+
+function clientLocalPathAbs(cfg: BrainstackConfig): string {
+  return absWithHome(cfg.client.localPath, cfg.paths.home);
+}
+
+function clientEnvPathAbs(cfg: BrainstackConfig): string {
+  return absWithHome(cfg.client.envPath, cfg.paths.home);
+}
+
+async function installLocalClientBootstrap(cfg: BrainstackConfig): Promise<string[]> {
+  const touched: string[] = [];
+  const bootstrapRoot = join(cfg.paths.configRoot, "client-bootstrap");
+  const bootstrapFiles = clientBootstrapFiles(cfg);
+  await writeFileMap(bootstrapRoot, bootstrapFiles);
+  await writeText(
+    join(bootstrapRoot, "claude-user-CLAUDE.md"),
+    renderTemplate(readClientBootstrapTemplate("claude-user-CLAUDE.md"), {
+      BRAIN_BASE_URL: cfg.brain.publicBaseUrl || "https://brain-control.example.ts.net",
+      BRAIN_GIT_REMOTE: cfg.client.remoteSsh,
+      MACHINE_USER: cfg.machine.user,
+      SHARED_BRAIN_LOCAL_PATH: clientLocalPathAbs(cfg)
+    })
+  );
+  touched.push(bootstrapRoot);
+
+  const target = clientLocalPathAbs(cfg);
+  if (gitExists(target)) {
+    run(["git", "-C", target, "pull", "--ff-only"]);
+  } else {
+    await ensureDir(dirname(target));
+    run(["git", "clone", cfg.client.remoteSsh, target]);
+  }
+  touched.push(target);
+
+  const envPath = clientEnvPathAbs(cfg);
+  if (await writeIfMissing(envPath, bootstrapFiles["client.env.example"], 0o600)) {
+    touched.push(envPath);
+  }
+
+  const codexHome = join(cfg.paths.home, ".codex");
+  await ensureDir(codexHome);
+  const codexAgents = join(codexHome, "AGENTS.md");
+  if (!existsSync(codexAgents)) {
+    await symlink(join(bootstrapRoot, "codex-shared-brain.include.md"), codexAgents);
+    touched.push(codexAgents);
+  }
+
+  const claudeHome = join(cfg.paths.home, ".claude");
+  await ensureDir(claudeHome);
+  const claudeFile = join(claudeHome, "CLAUDE.md");
+  if (await writeIfMissing(claudeFile, `@${join(bootstrapRoot, "claude-user-CLAUDE.md")}\n`)) {
+    touched.push(claudeFile);
+  }
+
+  const cursorRules = join(cfg.paths.home, ".cursor", "rules");
+  await ensureDir(cursorRules);
+  const cursorRule = join(cursorRules, "shared-brain.md");
+  if (await writeIfMissing(cursorRule, bootstrapFiles["cursor-user-rule.md"])) {
+    touched.push(cursorRule);
+  }
+
+  return touched;
 }
 
 async function commandRender(args: ParsedArgs): Promise<void> {
@@ -1277,6 +1220,10 @@ async function commandInit(args: ParsedArgs): Promise<void> {
     await writeIfMissing(join(cfg.paths.configRoot, "telemux.secrets.env"), telemuxSecretsEnv(), 0o600);
     await writeText(join(cfg.paths.configRoot, "workers.json"), `${JSON.stringify(defaultWorkers(cfg), null, 2)}\n`);
     await writeText(join(cfg.paths.systemdUserRoot, "telemux.service"), telemuxService(cfg));
+  }
+  if (cfg.profile === "worker" || cfg.profile === "client-macos") {
+    const touched = await installLocalClientBootstrap(cfg);
+    console.log(`client bootstrap touched: ${touched.length ? touched.join(", ") : "(none)"}`);
   }
   await writeFileMap(join(cfg.paths.stateRoot, "rendered"), renderFiles(cfg));
   console.log(`initialized ${cfg.profile} at ${cfg.paths.sharedBrainRoot}`);
@@ -1388,32 +1335,81 @@ async function copyIfExists(source: string, target: string): Promise<void> {
   await cp(source, target, { recursive: true, force: true, errorOnExist: false });
 }
 
+function userServiceActive(serviceName: string): boolean {
+  return run(["systemctl", "--user", "is-active", "--quiet", serviceName], { check: false }).code === 0;
+}
+
+function stopUserService(serviceName: string): boolean {
+  if (!userServiceActive(serviceName)) {
+    return false;
+  }
+  run(["systemctl", "--user", "stop", serviceName], { check: false });
+  return true;
+}
+
+function startUserService(serviceName: string): void {
+  run(["systemctl", "--user", "start", serviceName], { check: false });
+}
+
+async function backupSqliteIfPossible(sourceDb: string, targetDb: string): Promise<string> {
+  if (!existsSync(sourceDb)) {
+    return "not-present";
+  }
+  await ensureDir(dirname(targetDb));
+  await rm(targetDb, { force: true });
+  const escapedTarget = targetDb.replaceAll("'", "''");
+  const sqlite = run(["sqlite3", sourceDb, `.backup '${escapedTarget}'`], { check: false });
+  if (sqlite.code === 0) {
+    return "sqlite-backup";
+  }
+  await copyIfExists(sourceDb, targetDb);
+  return "plain-copy-fallback";
+}
+
 async function commandBackup(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
   const outRoot = abs(flag(args, "out") || join(cfg.paths.stateRoot, "backups"));
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
   const backupDir = join(outRoot, `brainstack-backup-${stamp}`);
-  await ensureDir(backupDir);
-  await copyIfExists(cfg.paths.configRoot, join(backupDir, "config"));
-  await copyIfExists(cfg.paths.sharedBrainRoot, join(backupDir, "shared-brain"));
-  await copyIfExists(cfg.repos.blobs, join(backupDir, "blobs"));
-  await copyIfExists(cfg.telemux.controlRoot, join(backupDir, "telemux"));
-  await copyIfExists(cfg.telemux.factoryRoot, join(backupDir, "factory"));
-  await writeText(
-    join(backupDir, "MANIFEST.txt"),
-    [
-      `created_at=${stamp}`,
-      `profile=${cfg.profile}`,
-      `machine=${cfg.machine.name}`,
-      `shared_brain=${cfg.paths.sharedBrainRoot}`,
-      `config=${cfg.paths.configRoot}`,
-      `state=${cfg.paths.stateRoot}`,
-      "notes=Contains local env/config if present; keep permissions restricted.",
-      ""
-    ].join("\n")
-  );
-  await chmod(backupDir, 0o700);
-  console.log(`backup created: ${backupDir}`);
+  const pauseTelemux = hasFlag(args, "pause-telemux");
+  const telemuxWasStopped = pauseTelemux && cfg.telemux.enabled ? stopUserService("telemux.service") : false;
+  let sqliteMode = "not-run";
+  try {
+    await ensureDir(backupDir);
+    await copyIfExists(cfg.paths.configRoot, join(backupDir, "config"));
+    await copyIfExists(cfg.paths.sharedBrainRoot, join(backupDir, "shared-brain"));
+    await copyIfExists(cfg.repos.blobs, join(backupDir, "blobs"));
+    await copyIfExists(cfg.telemux.controlRoot, join(backupDir, "telemux"));
+    sqliteMode = await backupSqliteIfPossible(join(cfg.telemux.controlRoot, "db.sqlite"), join(backupDir, "telemux", "db.sqlite"));
+    await copyIfExists(cfg.telemux.factoryRoot, join(backupDir, "factory"));
+    await writeText(
+      join(backupDir, "MANIFEST.txt"),
+      [
+        `created_at=${stamp}`,
+        `profile=${cfg.profile}`,
+        `machine=${cfg.machine.name}`,
+        `shared_brain=${cfg.paths.sharedBrainRoot}`,
+        `config=${cfg.paths.configRoot}`,
+        `state=${cfg.paths.stateRoot}`,
+        `pause_telemux_requested=${pauseTelemux}`,
+        `telemux_was_stopped=${telemuxWasStopped}`,
+        `telemux_sqlite_backup=${sqliteMode}`,
+        "notes=Contains local env/config if present; keep permissions restricted.",
+        "crash_consistency=Git repos are copied as filesystem trees; SQLite uses .backup when sqlite3 is available; factory workspaces may still change unless telemux was paused.",
+        ""
+      ].join("\n")
+    );
+    await chmod(backupDir, 0o700);
+    console.log(`backup created: ${backupDir}`);
+    console.log(`telemux sqlite backup: ${sqliteMode}`);
+    if (pauseTelemux) {
+      console.log(`telemux pause: ${telemuxWasStopped ? "stopped and restarted" : "service was not active or not enabled"}`);
+    }
+  } finally {
+    if (telemuxWasStopped) {
+      startUserService("telemux.service");
+    }
+  }
 }
 
 async function commandRestore(args: ParsedArgs): Promise<void> {

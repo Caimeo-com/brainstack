@@ -1,6 +1,6 @@
 # Quickstart: macOS Client
 
-The macOS client profile installs no services. It clones the shared-brain repo, writes a local env file if missing, and installs Codex/Claude/Cursor instruction snippets without silently overwriting existing files.
+The macOS client profile installs no services. It clones the shared-brain repo, writes a local env file if missing, and installs Codex/Claude/Cursor instruction snippets without silently overwriting existing files. The installer normalizes `~/shared-brain` to an absolute path before clone/pull operations, so the default path works on macOS and Linux.
 
 ## Render Bootstrap
 
@@ -35,6 +35,7 @@ The bootstrap installer installs real guidance, not prose pointers:
 - Codex: creates `~/.codex/AGENTS.md` as a symlink to the product-owned shared-brain guidance if no Codex global file exists. If it exists, the installer prints an exact append command.
 - Claude: writes real `@~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md` import syntax.
 - Cursor: writes the actual shared-brain rule content if no rule exists. If it exists, the installer prints the exact merge command.
+- The generated files come from checked-in templates under `packages/client-bootstrap/`; `brainctl` only renders config placeholders.
 
 ## Read/Write Model
 

@@ -37,6 +37,8 @@ Runtime env and secrets env are split:
 
 `workers.json` is rendered from `brainstack.yaml`. Treat `brainstack.yaml` as the source of truth for workers; do not edit `workers.json` directly.
 
+When telemux is enabled and both `BRAIN_BASE_URL` and `BRAIN_IMPORT_TOKEN` are present in its control-host env, successful runs import `.factory/SUMMARY.md` and `.factory/ARTIFACTS.md` back into `braind` as raw artifacts. This is import-only; telemux does not directly edit canonical wiki pages.
+
 ## Large Files
 
 Text and normalized extracts stay in git. Small binaries may stay in git. Large binary originals above the configured threshold are stored in a content-addressed blob store outside git with pointer manifests and normalized extracts committed to git.

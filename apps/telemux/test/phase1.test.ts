@@ -224,7 +224,7 @@ function gitHasCommit(repoPath: string): boolean {
   return result.exitCode === 0;
 }
 
-async function createFixture() {
+async function createFixture(envOverrides: Record<string, string> = {}) {
   const root = await mkdtemp(join(tmpdir(), "factory-phase1-"));
   const binDir = join(root, "bin");
   const controlRoot = join(root, "telemux");
@@ -327,7 +327,7 @@ EOF
 
 if printf '%s' "$prompt" | grep -q 'send-file'; then
   mkdir -p output
-  artifact_file="$PWD/output/attachment-turn-$turns.txt"
+  artifact_file="output/attachment-turn-$turns.txt"
   printf 'attachment turn %s for %s' "$turns" "$(basename "$PWD")" > "$artifact_file"
   printf '# Artifacts\\n\\n- %s - generated attachment for turn %s\\n' "$artifact_file" "$turns" > .factory/ARTIFACTS.md
   cat > .factory/TELEGRAM_ATTACHMENTS.json <<EOF
@@ -410,7 +410,8 @@ exit 255
     FACTORY_WORKERS_FILE: workersFile,
     FACTORY_CODEX_BIN: fakeCodex,
     FACTORY_TELEGRAM_BOT_TOKEN: "test-token",
-    FACTORY_ALLOWED_TELEGRAM_USER_ID: String(TEST_ALLOWED_TELEGRAM_USER_ID)
+    FACTORY_ALLOWED_TELEGRAM_USER_ID: String(TEST_ALLOWED_TELEGRAM_USER_ID),
+    ...envOverrides
   });
 
   ensureProjectPaths(config);
@@ -703,6 +704,59 @@ test("per-topic Codex mode, model, and effort overrides persist across resume wi
     expect(await readFile(join(tuningRoot, ".factory", "fake-model.txt"), "utf8")).toBe("");
     expect(await readFile(join(tuningRoot, ".factory", "fake-reasoning.txt"), "utf8")).toBe("");
   } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("artifact delivery rejects absolute paths recorded in ARTIFACTS by default", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx exfil control host", 66));
+    const context = fixture.db.getContextBySlug("exfil");
+    expect(context?.worktreePath).toBeTruthy();
+    await writeFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), "# Artifacts\n\n- /etc/passwd - should not leave host\n");
+
+    await fixture.commands.handleMessage(telegramMessage("/artifacts send passwd", 66));
+
+    expect(fixture.telegram.attachments).toHaveLength(0);
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("absolute artifact paths are disabled");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("successful runs can opt into shared brain raw imports", async () => {
+  const received: Array<Record<string, unknown>> = [];
+  const port = 35_000 + Math.floor(Math.random() * 5_000);
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port,
+    async fetch(req) {
+      expect(new URL(req.url).pathname).toBe("/api/import");
+      expect(req.headers.get("authorization")).toBe("Bearer brain-import-token");
+      received.push((await req.json()) as Record<string, unknown>);
+      return Response.json({ ok: true, artifact_id: "test-artifact" });
+    }
+  });
+  const fixture = await createFixture({
+    BRAIN_BASE_URL: `http://127.0.0.1:${port}`,
+    BRAIN_IMPORT_TOKEN: "brain-import-token"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx brainbridge control scratch", 67));
+    await fixture.commands.handleMessage(telegramMessage("Summarize bridge state.", 67));
+    await waitFor(() => received.length === 1);
+
+    expect(received[0].source_harness).toBe("telemux");
+    expect(received[0].source_type).toBe("telemux-run");
+    expect(String(received[0].text)).toContain("## SUMMARY.md");
+    expect(String(received[0].text)).toContain("## ARTIFACTS.md");
+  } finally {
+    server.stop(true);
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }

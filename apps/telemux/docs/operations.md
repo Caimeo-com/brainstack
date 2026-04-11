@@ -212,7 +212,7 @@ Legacy `/bind <slug>` is still accepted to attach the topic to an existing store
 /usage
 ```
 
-If a Codex reply says a file was created and recorded in `.factory/ARTIFACTS.md`, you can either ask for it in plain language in the same topic or explicitly run `/artifacts send [filter]` to have the control plane upload the matching file back into Telegram.
+If a Codex reply says a file was created and recorded in `.factory/ARTIFACTS.md`, you can either ask for it in plain language in the same topic or explicitly run `/artifacts send [filter]` to have the control plane upload the matching file back into Telegram. Artifact paths must be relative paths inside the active workspace by default; absolute paths are rejected unless `FACTORY_ALLOW_ABSOLUTE_ARTIFACT_PATHS=true` is explicitly set.
 
 While a job is running, the bot should show a `typing...` indicator in the same topic. That is expected while `/topicinfo` reports `Busy: yes`.
 

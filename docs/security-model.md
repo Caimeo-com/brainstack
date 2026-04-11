@@ -77,6 +77,10 @@ A leaked Telegram bot token should be treated as compromised even after local lo
 
 Rotate via BotFather after any log leak because logs, backups, terminal scrollback, journal files, and model transcripts can have copies that local cleanup cannot prove were never read.
 
+## Artifact Delivery Guardrail
+
+Telemux only delivers requested artifacts from the active workspace by default. `.factory/TELEGRAM_ATTACHMENTS.json` and `.factory/ARTIFACTS.md` should record relative paths inside the workspace. Absolute paths such as `/etc/passwd` are rejected unless `FACTORY_ALLOW_ABSOLUTE_ARTIFACT_PATHS=true` is explicitly set, which should be treated as an exfiltration-risk override for trusted local debugging only.
+
 ## Private Journal Boundary
 
 Personal/private journaling is a separate profile/repo/service/token boundary:

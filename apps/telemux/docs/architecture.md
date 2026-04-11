@@ -135,6 +135,7 @@ If a remote worker is unavailable, context creation does not hard-fail. The cont
 11. While the job is active, emit a `sendChatAction(typing)` heartbeat into the same Telegram topic.
 12. Post the concise result back into the same Telegram topic.
 13. If the manifest requested attachments, fetch the recorded files from the worker workspace and upload them into the same Telegram topic.
+14. If shared-brain import env is configured, import `SUMMARY.md` and `ARTIFACTS.md` to `braind` as raw artifacts.
 
 ### Internal scheduler
 

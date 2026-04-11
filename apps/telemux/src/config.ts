@@ -37,6 +37,9 @@ export interface FactoryConfig {
   workers: FactoryWorkerConfig[];
   usageAdapter: string;
   codexBin: string;
+  brainBaseUrl: string;
+  brainImportToken: string;
+  allowAbsoluteArtifactPaths: boolean;
 }
 
 interface WorkerConfigInput {
@@ -211,7 +214,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
     localMachine,
     workers,
     usageAdapter: env.FACTORY_USAGE_ADAPTER?.trim() || "manual",
-    codexBin: env.FACTORY_CODEX_BIN?.trim() || "codex"
+    codexBin: env.FACTORY_CODEX_BIN?.trim() || "codex",
+    brainBaseUrl: env.BRAIN_BASE_URL?.trim() || "",
+    brainImportToken: env.BRAIN_IMPORT_TOKEN?.trim() || "",
+    allowAbsoluteArtifactPaths: ["1", "true", "yes", "on"].includes((env.FACTORY_ALLOW_ABSOLUTE_ARTIFACT_PATHS || "").toLowerCase())
   };
 }
 

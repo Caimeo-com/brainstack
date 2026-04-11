@@ -448,6 +448,10 @@ ${marker}
   }
 
   async readArtifactFile(context: ContextRecord, filePath: string, maxBytes = 45 * 1024 * 1024): Promise<WorkspaceArtifactFile> {
+    if (!this.config.allowAbsoluteArtifactPaths && (filePath.startsWith("/") || filePath === "~" || filePath.startsWith("~/"))) {
+      throw new Error("absolute artifact paths are disabled; record a relative path inside the workspace");
+    }
+
     const worker = this.requireWorker(context.machine);
     const script = `
 set -euo pipefail
@@ -462,19 +466,47 @@ expand_home_path() {
 worktree_raw=${quoteSh(context.worktreePath)}
 requested_raw=${quoteSh(filePath)}
 max_bytes=${quoteSh(String(maxBytes))}
+allow_absolute=${quoteSh(this.config.allowAbsoluteArtifactPaths ? "1" : "0")}
 worktree="$(expand_home_path "$worktree_raw")"
 
 case "$requested_raw" in
   "~"|~/*)
+    if [ "$allow_absolute" != "1" ]; then
+      echo "absolute artifact paths are disabled" >&2
+      exit 44
+    fi
     resolved="$(expand_home_path "$requested_raw")"
     ;;
   /*)
+    if [ "$allow_absolute" != "1" ]; then
+      echo "absolute artifact paths are disabled" >&2
+      exit 44
+    fi
     resolved="$requested_raw"
     ;;
   *)
     resolved="$worktree/$requested_raw"
     ;;
 esac
+
+worktree_real="$(realpath "$worktree")"
+resolved_real="$(realpath "$resolved" 2>/dev/null || true)"
+if [ -z "$resolved_real" ]; then
+  echo "missing file: $resolved" >&2
+  exit 41
+fi
+
+if [ "$allow_absolute" != "1" ]; then
+  case "$resolved_real" in
+    "$worktree_real"|"$worktree_real"/*) ;;
+    *)
+      echo "artifact path escapes workspace: $requested_raw" >&2
+      exit 45
+      ;;
+  esac
+fi
+
+resolved="$resolved_real"
 
 if [ ! -e "$resolved" ]; then
   echo "missing file: $resolved" >&2

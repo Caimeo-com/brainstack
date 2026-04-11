@@ -42,6 +42,17 @@ loginctl enable-linger "$USER"
 ssh operator@brain-worker true
 ```
 
+## Worker Bootstrap
+
+On a worker host, `brainctl init --profile worker` performs a real client bootstrap:
+
+```bash
+cd ~/brainstack
+bun run packages/brainctl/src/main.ts init --profile worker --config examples/worker.yaml
+```
+
+That clones the shared-brain repo to the configured client path, writes `~/.config/shared-brain.env` if missing, and installs Codex/Claude/Cursor shared-brain guidance. It does not run local `braind`, does not run Telegram polling, and does not write an admin ingest token.
+
 If that fails with a timeout while ping works, the likely blocker is Tailscale grants. The required grant shape is:
 
 ```json
@@ -90,3 +101,5 @@ Operator-managed secrets env files are created only if missing and are never ove
 - `~/.config/brainstack/telemux.secrets.env` when telemux is explicitly enabled
 
 Generated user services load both runtime and secrets env files and invoke Bun with `--no-env-file` so local repo `.env` files cannot silently alter service behavior.
+
+When telemux is enabled, `telemux.runtime.env` includes `BRAIN_BASE_URL` and `telemux.secrets.env` includes a blank `BRAIN_IMPORT_TOKEN`. Filling both opts successful runs into shared-brain raw imports of `SUMMARY.md` and `ARTIFACTS.md`; leaving either blank disables the bridge.

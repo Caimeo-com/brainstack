@@ -62,6 +62,8 @@ When Telegram file delivery is requested, the control plane also checks for the 
 
 When a user asks in plain language to create, change, move, pause, resume, or delete a scheduled job, Codex can emit the ephemeral control-plane manifest `.factory/CRON_REQUESTS.json` after the turn. The control plane validates and applies those requested cron changes after the normal reply is sent.
 
+If `BRAIN_BASE_URL` and `BRAIN_IMPORT_TOKEN` are set, successful runs import `.factory/SUMMARY.md` and `.factory/ARTIFACTS.md` into the shared brain as raw artifacts. This is opt-in and import-only.
+
 ## Commands
 
 - `/help`

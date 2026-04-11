@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { basename, extname, join, resolve } from "node:path";
@@ -698,6 +699,7 @@ async function renderHome(): Promise<Response> {
   const health = await getHealth(repoRoot);
   const logEntries = await getRecentLogEntries(repoRoot, 8);
   const imports = await getRecentImports(repoRoot, 8);
+  const sections = await discoverHomeSections();
   return layout(
     "Shared Brain",
     `<section class="masthead">
@@ -745,27 +747,63 @@ async function renderHome(): Promise<Response> {
         <h2>Recent imports</h2>
         <ul>
           ${imports
-            .map(
-              (manifest) =>
-                `<li><a href="${pageHref(`wiki/Sources/${manifest.id}.md`)}">${htmlEscape(manifest.title)}</a> <span class="pill">${htmlEscape(manifest.source_type)}</span></li>`
-            )
+            .map((manifest) => {
+              const sourcePage = `wiki/Sources/${manifest.id}.md`;
+              const href = existsSync(join(repoRoot, sourcePage))
+                ? pageHref(sourcePage)
+                : rawHref(manifest.normalized_path || manifest.raw_path);
+              return `<li><a href="${href}">${htmlEscape(manifest.title)}</a> <span class="pill">${htmlEscape(manifest.source_type)}</span></li>`;
+            })
             .join("")}
         </ul>
       </section>
       <aside class="card">
         <h2>Top-level sections</h2>
         <ul>
-          <li><a href="${pageHref("wiki/Home.md")}">Home</a></li>
-          <li><a href="${pageHref("wiki/Index.md")}">Index</a></li>
-          <li><a href="${pageHref("wiki/Machines/Valkyrie.md")}">Machines</a></li>
-          <li><a href="${pageHref("wiki/Harnesses/Local-Codex.md")}">Harnesses</a></li>
-          <li><a href="${pageHref("wiki/Projects/Shared-Brain-v1.md")}">Projects</a></li>
-          <li><a href="${pageHref("wiki/Runbooks/Operate-Shared-Brain.md")}">Runbooks</a></li>
-          <li><a href="${pageHref("wiki/Sources/src-20260409-operator-brief.md")}">Sources</a></li>
+          ${sections.map((section) => `<li><a href="${pageHref(section.path)}">${htmlEscape(section.label)}</a></li>`).join("")}
         </ul>
       </aside>
     </div>`
   );
+}
+
+async function discoverHomeSections(): Promise<Array<{ label: string; path: string }>> {
+  const sections: Array<{ label: string; path: string }> = [];
+  const seen = new Set<string>();
+  const add = (label: string, path: string) => {
+    if (!seen.has(path) && existsSync(join(repoRoot, path))) {
+      seen.add(path);
+      sections.push({ label, path });
+    }
+  };
+
+  add("Home", "wiki/Home.md");
+  add("Index", "wiki/Index.md");
+
+  const wikiRoot = join(repoRoot, "wiki");
+  const entries = await readdir(wikiRoot, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) {
+      continue;
+    }
+
+    const indexPath = `wiki/${entry.name}/Index.md`;
+    if (existsSync(join(repoRoot, indexPath))) {
+      add(entry.name, indexPath);
+      continue;
+    }
+
+    const childEntries = await readdir(join(wikiRoot, entry.name), { withFileTypes: true }).catch(() => []);
+    const firstPage = childEntries
+      .filter((child) => child.isFile() && child.name.endsWith(".md"))
+      .map((child) => child.name)
+      .sort()[0];
+    if (firstPage) {
+      add(entry.name, `wiki/${entry.name}/${firstPage}`);
+    }
+  }
+
+  return sections;
 }
 
 async function renderPage(repoPath: string): Promise<Response> {

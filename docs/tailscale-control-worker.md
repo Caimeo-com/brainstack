@@ -56,8 +56,9 @@ sudo ss -tulpen | grep ':22'
 Validate server-applied tags, not only local prefs:
 
 ```bash
-tailscale whois brain-control
-tailscale whois brain-worker
+tailscale status
+tailscale whois <brain-control-tailscale-ip>
+tailscale whois <brain-worker-tailscale-ip>
 tailscale ping brain-worker
 ssh brain-worker true
 ```

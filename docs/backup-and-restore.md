@@ -21,7 +21,15 @@ cd ~/brainstack
 bun run packages/brainctl/src/main.ts backup --profile control --config examples/control.yaml
 ```
 
-The backup command copies configured repo/state/config paths into a timestamped directory and writes a manifest. Keep backup permissions restricted because env files may be included.
+For a quieter telemux backup:
+
+```bash
+bun run packages/brainctl/src/main.ts backup --profile control --config examples/control.yaml --pause-telemux
+```
+
+The backup command copies configured repo/state/config paths into a timestamped directory and writes a manifest. When `sqlite3` is available, telemux `db.sqlite` is copied with SQLite `.backup`; otherwise it falls back to a plain file copy and records that in the manifest. `--pause-telemux` stops the user `telemux.service` before backup and restarts it afterward if it was active.
+
+Keep backup permissions restricted because env files may be included. Backups are not fully crash-consistent for all git working trees or factory workspaces; pausing telemux reduces concurrent writes, but external editors or harnesses can still modify files during backup.
 
 ## Restore Dry Run
 
