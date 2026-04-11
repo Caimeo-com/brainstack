@@ -2,6 +2,8 @@
 
 Single-node is the reference profile for valkyrie-style installs: one machine runs `braind`, optional `telemux`, the shared-brain bare repo, the staging clone, and the serve clone.
 
+Read [`operator-preflight.md`](./operator-preflight.md) first. A control/single-node install assumes the chosen harness can run unattended as the current user. If you enable Codex or Claude yolo mode and passwordless sudo, telemux becomes a remote command path into that authority.
+
 ## Paths
 
 - Product repo: `~/brainstack`
@@ -60,4 +62,3 @@ curl -fsS https://valkyrie.tailb647b6.ts.net/health
 systemctl --user status braind.service --no-pager
 journalctl --user -u braind.service -n 100 --no-pager
 ```
-

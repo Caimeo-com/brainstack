@@ -2,6 +2,8 @@
 
 The control profile runs `braind` and optional `telemux`. The worker profile does not run Telegram polling and does not receive the admin ingest token.
 
+Read [`operator-preflight.md`](./operator-preflight.md) before installing the control profile. Telemux passes Telegram-originated work into the configured harness process; it is not a sandbox.
+
 ## Control Dry Run
 
 ```bash
@@ -56,4 +58,3 @@ sudo tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname=erbine --adverti
 ```
 
 Use reusable/preapproved auth keys with restricted tags from the Tailscale dashboard. Do not store auth keys in git.
-

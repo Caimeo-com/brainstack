@@ -23,6 +23,8 @@ Fresh installs use:
 
 The web server reads from the serve clone. Write APIs use the staging clone and push to the bare repo. The bare repo post-receive hook updates the serve clone and reindexes. This removes the dangerous old behavior where a hook could hard-reset a checkout humans were editing.
 
+As of the valkyrie remodel, production `shared-brain.service` uses `/home/swader/brainstack/apps/braind/src/server.ts`, reads from `/home/swader/shared-brain/serve/shared-brain`, and writes through `/home/swader/shared-brain/staging/shared-brain`.
+
 ## Compatibility Plan
 
 On valkyrie, preserve the current service until a deliberate cutover:
@@ -56,4 +58,3 @@ It does not stop services, move repos, rewrite hooks, or delete `/srv`.
 - Historical journald logs contain leaked Telegram bot-token material. Rotate the Telegram bot token manually in BotFather and vacuum/sanitize logs according to local retention policy.
 - `valkyrie -> erbine tcp:22` may still need a Tailscale grant from `tag:brain` to `tag:brain-worker`.
 - Current production telemux still uses `/srv/telemux` and `/srv/factory`; brainstack defaults are home-directory based for future installs.
-

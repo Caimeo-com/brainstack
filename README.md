@@ -39,3 +39,4 @@ bun build packages/brainctl/src/main.ts --compile --outfile dist/brainctl
 
 Start with the quickstart docs in `docs/`.
 
+Read [`docs/operator-preflight.md`](./docs/operator-preflight.md) before enabling `telemux`. The control-plane profile assumes a trusted private machine; telemux passes authorized Telegram work into the configured harness process and is not a sandbox.

@@ -738,7 +738,6 @@ while read -r oldrev newrev refname; do
   git --git-dir="$SERVE_REPO/.git" --work-tree="$SERVE_REPO" checkout -f main
   git --git-dir="$SERVE_REPO/.git" --work-tree="$SERVE_REPO" reset --hard origin/main
   SHARED_BRAIN_REPO_ROOT="$SERVE_REPO" "$BUN_BIN" run "$PRODUCT_REPO/apps/braind/src/reindex.ts" --quiet || true
-  systemctl --user try-restart braind.service >/dev/null 2>&1 || true
 done
 `;
 }

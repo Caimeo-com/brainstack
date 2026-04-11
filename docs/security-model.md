@@ -50,6 +50,18 @@ Examples must leave secret values blank. `brainctl rotate-token` writes generate
 
 `apps/telemux/src/telegram.ts` redacts Telegram bot-token-shaped strings from fetch/network error messages before logging. Historical logs may still contain old token material and require manual token rotation.
 
+## Harness Execution Risk
+
+Telemux passes authorized Telegram-topic prompts and staged files to the configured harness process, normally Codex CLI and optionally a future Claude Code adapter. It does not sandbox the harness. If the harness is configured with bypass-all-permissions/yolo settings and the Unix user has passwordless sudo, telemux can indirectly execute privileged commands as that user.
+
+Before enabling telemux on a control host, read [`operator-preflight.md`](./operator-preflight.md).
+
+## Token Compromise Impact
+
+A leaked Telegram bot token should be treated as compromised even after local log cleanup. Anyone with the token can call Telegram Bot API methods for that bot. They cannot forge Telegram's `from.id` for a real user message, so the app-level `FACTORY_ALLOWED_TELEGRAM_USER_ID` still blocks direct command injection through normal updates. The token still allows meaningful abuse: reading or racing future updates, sending messages as the bot, changing bot commands, disrupting polling, fetching bot-accessible files when file ids are known, and social-engineering users inside the bot's chats.
+
+Rotate via BotFather after any log leak because logs, backups, terminal scrollback, journal files, and model transcripts can have copies that local cleanup cannot prove were never read.
+
 ## Private Journal Boundary
 
 Personal/private journaling is a separate profile/repo/service/token boundary:
@@ -58,4 +70,3 @@ Personal/private journaling is a separate profile/repo/service/token boundary:
 - Private brain: personal journal/private memory.
 
 Do not co-mingle private journaling secrets or content into the shared dev brain.
-
