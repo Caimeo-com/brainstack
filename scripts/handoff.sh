@@ -192,7 +192,7 @@ bun test > "$bundle_dir/command-outputs/bun-test.txt" 2>&1
 
 tailscale_ip_for_name() {
   local target="$1"
-  TAILSCALE_TARGET="$target" tailscale status --json | bun --eval '
+  tailscale status --json | TAILSCALE_TARGET="$target" bun --eval '
 const target = (Bun.env.TAILSCALE_TARGET || "").replace(/\.$/, "");
 const data = await new Response(Bun.stdin.stream()).json();
 const nodes = [data.Self, ...Object.values(data.Peer || {})].filter(Boolean);
