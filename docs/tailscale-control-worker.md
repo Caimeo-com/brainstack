@@ -62,7 +62,7 @@ tailscale ping brain-worker
 ssh brain-worker true
 ```
 
-`tailscale debug prefs` shows local requested tags under `AdvertiseTags`. That is not the same as the control plane applying those tags. `tailscale whois <host>` should show `Tags: tag:...` when the server-side tag is actually active.
+`tailscale debug prefs` shows local requested tags under `AdvertiseTags`. That is not the same as the control plane applying those tags. Use `tailscale status` to get the device's Tailscale IP, then run `tailscale whois <tailscale-ip>`. The `whois` output should show `Tags: tag:...` when the server-side tag is actually active.
 
 ## Caveats Found On Valkyrie/Erbine
 

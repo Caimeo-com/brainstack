@@ -4,11 +4,12 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/handoff.sh [--mode review|forensic] [--out DIR]
+  scripts/handoff.sh [--mode review|forensic] [--out DIR] [--base COMMIT] [--notes FILE]
 
 Defaults:
   --mode review
   --out  ${TMPDIR:-/tmp}
+  --base HEAD^ when available
 
 Environment:
   BRAINSTACK_HANDOFF_UTC=YYYYMMDDTHHMMSSZ  Override bundle timestamp.
@@ -19,6 +20,8 @@ USAGE
 
 mode="review"
 out_dir="${TMPDIR:-/tmp}"
+base_ref=""
+notes_file=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -28,6 +31,14 @@ while [ "$#" -gt 0 ]; do
       ;;
     --out)
       out_dir="${2:-}"
+      shift 2
+      ;;
+    --base)
+      base_ref="${2:-}"
+      shift 2
+      ;;
+    --notes)
+      notes_file="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -45,6 +56,11 @@ done
 if [ "$mode" != "review" ] && [ "$mode" != "forensic" ]; then
   echo "invalid mode: $mode" >&2
   exit 2
+fi
+
+if [ -n "$notes_file" ] && [ ! -f "$notes_file" ]; then
+  echo "handoff refused: notes file not found: $notes_file" >&2
+  exit 1
 fi
 
 repo_root="$(git rev-parse --show-toplevel)"
@@ -79,6 +95,16 @@ rm -rf "$bundle_dir" "$zip_path" "${zip_path}.sha256"
 mkdir -p "$bundle_dir"/{source,generated,command-outputs,service-state,shared-brain}
 
 product_head="$(git rev-parse HEAD)"
+if [ -n "$base_ref" ]; then
+  if ! base_commit="$(git rev-parse --verify "${base_ref}^{commit}" 2>/dev/null)"; then
+    echo "handoff refused: invalid --base commit: $base_ref" >&2
+    exit 1
+  fi
+elif base_commit="$(git rev-parse --verify HEAD^ 2>/dev/null)"; then
+  :
+else
+  base_commit=""
+fi
 shared_brain_root="${SHARED_BRAIN_ROOT:-$HOME/shared-brain/staging/shared-brain}"
 private_factory_root="${PRIVATE_DEV_FACTORY_ROOT:-$HOME/private-dev-factory}"
 
@@ -94,6 +120,23 @@ fi
 
 # Exactly one source representation: source/ as a git archive at HEAD.
 git archive --format=tar HEAD | tar -C "$bundle_dir/source" -xf -
+
+{
+  echo "# brainstack handoff changes"
+  echo
+  echo "Base commit: ${base_commit:-none}"
+  echo "Head commit: $product_head"
+  echo
+  if [ -n "$base_commit" ]; then
+    echo "## Name Status"
+    git diff --name-status "${base_commit}..${product_head}"
+    echo
+    echo "## Diff Stat"
+    git diff --stat "${base_commit}..${product_head}"
+  else
+    echo "No base commit is available. This appears to be an initial commit handoff."
+  fi
+} > "$bundle_dir/CHANGES.txt"
 
 custom_config="$bundle_dir/generated/custom-client.yaml"
 cat > "$custom_config" <<'YAML'
@@ -140,22 +183,61 @@ bun run packages/brainctl/src/main.ts join-worker \
 
 {
   echo "product_head=$product_head"
+  echo "base_commit=${base_commit:-none}"
   echo "mode=$mode"
   git status --short
 } > "$bundle_dir/command-outputs/git-status.txt"
 
 bun test > "$bundle_dir/command-outputs/bun-test.txt" 2>&1
 
+tailscale_ip_for_name() {
+  local target="$1"
+  TAILSCALE_TARGET="$target" tailscale status --json | bun --eval '
+const target = (Bun.env.TAILSCALE_TARGET || "").replace(/\.$/, "");
+const data = await new Response(Bun.stdin.stream()).json();
+const nodes = [data.Self, ...Object.values(data.Peer || {})].filter(Boolean);
+function names(node) {
+  return [node.HostName, node.DNSName?.replace(/\.$/, "")].filter(Boolean);
+}
+function matches(node) {
+  return names(node).some((name) => name === target || name.startsWith(`${target}.`) || name.split(".")[0] === target);
+}
+const node = nodes.find(matches);
+if (node?.TailscaleIPs?.length) {
+  console.log(node.TailscaleIPs[0]);
+}
+'
+}
+
 if command -v tailscale >/dev/null 2>&1; then
   {
     tailscale status 2>&1 || true
-    echo
-    echo "--- whois valkyrie ---"
-    tailscale whois valkyrie 2>&1 || true
-    echo
-    echo "--- whois erbine ---"
-    tailscale whois erbine 2>&1 || true
   } > "$bundle_dir/command-outputs/tailscale-summary.txt"
+
+  for host in valkyrie erbine; do
+    output="$bundle_dir/command-outputs/tailscale-whois-${host}.txt"
+    {
+      ip="$(tailscale_ip_for_name "$host" 2>/dev/null || true)"
+      if [ -n "$ip" ]; then
+        echo "$ tailscale whois $ip"
+        tailscale whois "$ip" 2>&1 || true
+      else
+        echo "No Tailscale IP found for $host in tailscale status --json."
+      fi
+    } > "$output"
+  done
+fi
+
+if command -v ssh >/dev/null 2>&1; then
+  {
+    echo '$ ssh -o BatchMode=yes -o ConnectTimeout=5 erbine true'
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 erbine true 2>&1; then
+      echo "exit=0"
+    else
+      status=$?
+      echo "exit=$status"
+    fi
+  } > "$bundle_dir/command-outputs/ssh-erbine-true.txt"
 fi
 
 if curl -fsS --max-time 2 http://127.0.0.1:8080/health > "$bundle_dir/service-state/braind-health.json" 2>/dev/null; then
@@ -185,7 +267,24 @@ if [ -d "$shared_brain_root" ]; then
   done
 fi
 
-cat > "$bundle_dir/HANDOFF.md" <<EOF
+cat > "$bundle_dir/CLAIMS_AND_PROOF.md" <<'EOF'
+# Claims And Proof
+
+| Claim | Proof |
+| --- | --- |
+| This bundle includes a real product delta, not just current HEAD. | `CHANGES.txt` |
+| The bundle uses exactly one source representation. | `source/` plus `MANIFEST.txt` |
+| Client bootstrap respects a custom `client.localPath`. | `generated/client-bootstrap-custom-path/` and `command-outputs/bootstrap-client-custom-path.txt` |
+| Worker join paths are derived from config state roots. | `generated/join-worker-custom-state.md` |
+| Bun tests passed for the product tree at HEAD. | `command-outputs/bun-test.txt` |
+| Local braind health was checked when available. | `service-state/braind-health.json` or `service-state/braind-health.txt` |
+| Tailscale whois evidence uses Tailscale IPs, not bare hostnames. | `command-outputs/tailscale-whois-valkyrie.txt` and `command-outputs/tailscale-whois-erbine.txt` |
+| Valkyrie-to-erbine SSH was smoke-tested without an interactive prompt. | `command-outputs/ssh-erbine-true.txt` |
+| Secret-looking tokens and private keys were scanned before zipping. | `command-outputs/secret-scan.txt` |
+EOF
+
+{
+cat <<EOF
 # brainstack ${mode} handoff
 
 This is a REVIEW handoff bundle, not a release artifact.
@@ -197,9 +296,23 @@ This is a REVIEW handoff bundle, not a release artifact.
 - Generated this bundle with \`source/\` as the sole source representation.
 - Excluded compiled binaries, dist output, dependency trees, git metadata, env files, private keys, tokens, caches, and Finder/macOS junk.
 
+## Pass-Specific Notes
+
+EOF
+if [ -n "$notes_file" ]; then
+  cat "$notes_file"
+else
+  echo "No pass-specific notes file was provided."
+fi
+cat <<EOF
+
 ## Exact Changed Files
 
-See \`command-outputs/git-status.txt\` for the source tree state used to build this bundle.
+See \`CHANGES.txt\` for the base commit, head commit, changed files, and diff stat.
+
+## Claims And Proof
+
+See \`CLAIMS_AND_PROOF.md\` for the claim-to-evidence map.
 
 ## Valkyrie Production Touches
 
@@ -216,30 +329,34 @@ See \`command-outputs/git-status.txt\` for the source tree state used to build t
 
 ## Remaining Blockers
 
-- If valkyrie only shows \`RequestTags: [tag:brain]\` locally but \`tailscale whois valkyrie\` still shows a user owner, finish applying \`tag:brain\` in the Tailscale admin UI or re-enroll valkyrie with an auth key scoped to \`tag:brain\`.
+- If valkyrie only shows \`RequestTags: [tag:brain]\` locally but \`tailscale whois <valkyrie-tailscale-ip>\` still shows a user owner, finish applying \`tag:brain\` in the Tailscale admin UI or re-enroll valkyrie with an auth key scoped to \`tag:brain\`.
 - Erbine bootstrap is still intentionally not performed by this handoff flow.
 
 ## Single Biggest Remaining Risk
 
-Tailscale local prefs and server-applied tags are different states. A machine can request a tag locally without the server showing it in \`tailscale whois\`. Validate with \`tailscale whois <host>\`, not just \`tailscale debug prefs\`.
+Tailscale local prefs and server-applied tags are different states. A machine can request a tag locally without the server showing it in \`tailscale whois\`. Validate with \`tailscale whois <tailscale-ip>\`, using the IP shown by \`tailscale status\`, not just \`tailscale debug prefs\`.
 
 ## Next Recommended Operator Step
 
 Apply the tag-only Tailscale policy from \`source/infra/tailscale/policy-fragment.example.json\`, remove temporary host/IP fallback grants, then verify:
 
 \`\`\`bash
-tailscale whois valkyrie
-tailscale whois erbine
-ssh erbine true
+tailscale status
+tailscale whois <valkyrie-tailscale-ip>
+tailscale whois <erbine-tailscale-ip>
+ssh -o BatchMode=yes -o ConnectTimeout=5 erbine true
 \`\`\`
 EOF
+} > "$bundle_dir/HANDOFF.md"
 
 cat > "$bundle_dir/MANIFEST.txt" <<EOF
 UTC creation time: $utc
 Mode: $mode
+Base commit: ${base_commit:-none}
 Product HEAD: $product_head
 Shared brain HEAD: $shared_head
 Private dev factory HEAD: $factory_head
+Pass notes included: $([ -n "$notes_file" ] && echo yes || echo no)
 Source representation: source/
 Secrets included: no
 Binaries included: no
@@ -285,6 +402,10 @@ if [ -n "$secret_hits" ]; then
   echo "$secret_hits" >&2
   exit 1
 fi
+{
+  echo "No secret-looking patterns detected in bundle directory before zipping."
+  echo "Patterns checked: private key headers, GitHub tokens, Telegram bot-token shape, OpenAI sk-* shape, Tailscale tskey-* shape."
+} > "$bundle_dir/command-outputs/secret-scan.txt"
 
 (cd "$out_dir" && zip -X -qr "$zip_path" "$top" \
   -x '*/.git/*' '*/dist/*' '*/node_modules/*' '*/.bun/*' '*/.DS_Store' '*/__MACOSX/*' \

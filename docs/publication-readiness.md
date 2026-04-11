@@ -42,7 +42,7 @@ Review bundles are not release artifacts:
 
 ```bash
 cd ~/brainstack
-scripts/handoff.sh --mode review --out /tmp
+scripts/handoff.sh --mode review --base <last-reviewed-commit> --notes /tmp/handoff-notes.md --out /tmp
 ```
 
 For a larger local-audit bundle:
@@ -53,3 +53,5 @@ scripts/handoff.sh --mode forensic --out /tmp
 ```
 
 The handoff script uses exactly one source representation, `source/`, generated from `git archive` at `HEAD`. It excludes compiled binaries, `dist/`, `.git`, dependency trees, Bun cache, env files, private keys, tokens, empty directories, and Finder/macOS junk. It fails if secrets-looking patterns are found before zipping.
+
+Every review handoff should include `CHANGES.txt` for the exact base-to-head delta and `CLAIMS_AND_PROOF.md` for a short claim-to-evidence map. Use `--notes` for pass-specific context so a fresh-context reviewer does not have to infer what the bundle is proving.

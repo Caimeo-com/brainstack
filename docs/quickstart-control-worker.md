@@ -58,7 +58,7 @@ If that fails with a timeout while ping works, the likely blocker is Tailscale g
 - Worker hosts advertise `tag:brain-worker`.
 - Human laptops should normally stay untagged and access control through user/group grants.
 - Tailscale SSH is not the default; leave `"ssh": []` in policy unless intentionally enabling it later.
-- Validate server-applied tags with `tailscale whois <host>`, not only `tailscale debug prefs`.
+- Validate server-applied tags with `tailscale status` plus `tailscale whois <tailscale-ip>`, not only `tailscale debug prefs`.
 - If SSH says `tailscale: tailnet policy does not permit you to SSH to this node`, Tailscale SSH is still intercepting port 22 on the target. Disable Tailscale SSH on the target before using normal OpenSSH.
 
 ## Headless Control Enrollment

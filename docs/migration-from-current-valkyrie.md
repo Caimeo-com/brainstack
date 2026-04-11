@@ -57,5 +57,5 @@ It does not stop services, move repos, rewrite hooks, or delete `/srv`.
 
 - Historical journald logs contained leaked Telegram bot-token material. The customer-zero token was rotated and telemux was restarted successfully; future operators should still rotate any leaked bot token in BotFather and sanitize logs according to local retention policy.
 - `valkyrie -> erbine tcp:22` was unblocked during customer-zero setup by disabling Tailscale SSH on erbine, enabling normal `sshd.service`, installing a dedicated `valkyrie_to_erbine_ed25519` key for `swader@erbine`, and changing current telemux worker config to `sshUser: swader`.
-- Erbine now advertises `tag:brain-worker`. Valkyrie locally requests `tag:brain`; validate server-side application with `tailscale whois valkyrie` before removing any temporary host/IP fallback grants from the live tailnet policy.
+- Erbine now advertises `tag:brain-worker`. Valkyrie locally requests `tag:brain`; validate server-side application with `tailscale status` plus `tailscale whois <valkyrie-tailscale-ip>` before removing any temporary host/IP fallback grants from the live tailnet policy.
 - Current production telemux still uses `/srv/telemux` and `/srv/factory`; brainstack defaults are home-directory based for future installs.
