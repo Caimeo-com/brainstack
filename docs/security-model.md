@@ -46,6 +46,17 @@ Use grants:
 
 Examples must leave secret values blank. `brainctl rotate-token` writes generated shared-brain tokens to env files without printing token values.
 
+## Import Guardrails
+
+`braind` keeps originals but rejects risky imports before storing them:
+
+- `BRAIN_MAX_IMPORT_BYTES` limits text, uploads, and URL fetch bodies.
+- URL imports only allow `http` and `https`.
+- URL imports block loopback, RFC1918, link-local, carrier-grade NAT/Tailscale, and unique-local/private IPv6 addresses by default.
+- `BRAIN_ALLOW_PRIVATE_URL_IMPORTS=true` exists only for trusted admin-controlled private fetches and should stay false for normal deployments.
+
+These checks reduce server-side request forgery risk. They do not make arbitrary URL fetching safe enough for public internet exposure.
+
 ## Telegram Logging
 
 `apps/telemux/src/telegram.ts` redacts Telegram bot-token-shaped strings from fetch/network error messages before logging. Historical logs may still contain old token material and require manual token rotation.

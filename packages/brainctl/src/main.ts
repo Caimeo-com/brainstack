@@ -5,6 +5,10 @@ import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 type Profile = "single-node" | "control" | "worker" | "client-macos" | "private-journal";
+type SeedMode = "empty-only" | "missing" | "force";
+
+const CONFIG_SCHEMA_VERSION = 1;
+const MIN_BUN_VERSION = "1.3.11";
 
 interface ParsedArgs {
   command: string;
@@ -13,6 +17,7 @@ interface ParsedArgs {
 }
 
 interface BrainstackConfig {
+  schemaVersion: number;
   profile: Profile;
   machine: {
     name: string;
@@ -63,6 +68,7 @@ interface BrainstackConfig {
   client: {
     localPath: string;
     envPath: string;
+    remoteSsh: string;
   };
 }
 
@@ -70,13 +76,15 @@ const PRODUCT_ROOT = resolve(import.meta.dir, "..", "..", "..");
 
 function usage(): string {
   return `Usage:
-  brainctl init --profile single-node|control|worker|client-macos --config brainstack.yaml [--dry-run] [--root /tmp/install-root]
+  brainctl init --profile single-node|control|worker|client-macos --config brainstack.yaml [--dry-run] [--root /tmp/install-root] [--seed-missing|--force-seed]
+  brainctl upgrade --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
+  brainctl apply-runtime --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
   brainctl doctor --config brainstack.yaml [--profile ...]
   brainctl backup --config brainstack.yaml [--out DIR]
   brainctl restore --backup DIR_OR_TGZ --target DIR [--apply]
   brainctl render --config brainstack.yaml --profile ... --out DIR
   brainctl bootstrap-client --profile client-macos --config brainstack.yaml --out DIR
-  brainctl join-worker --config brainstack.yaml --worker erbine [--out DIR]
+  brainctl join-worker --config brainstack.yaml --worker WORKER_HOST [--out DIR]
   brainctl rotate-token --kind import|admin|telegram-placeholder --config brainstack.yaml [--env FILE]
   brainctl migrate-current-install [--out FILE]
   brainctl smoke --profile single-node|control|worker|client-macos --config brainstack.yaml`;
@@ -134,6 +142,21 @@ function expandHome(input: string): string {
 
 function abs(input: string): string {
   const expanded = expandHome(input);
+  return expanded.startsWith("/") ? expanded : resolve(expanded);
+}
+
+function expandWithHome(input: string, home: string): string {
+  if (input === "~") {
+    return home;
+  }
+  if (input.startsWith("~/")) {
+    return resolve(home, input.slice(2));
+  }
+  return input;
+}
+
+function absWithHome(input: string, home: string): string {
+  const expanded = expandWithHome(input, home);
   return expanded.startsWith("/") ? expanded : resolve(expanded);
 }
 
@@ -322,6 +345,7 @@ function arrayAt(input: Record<string, unknown>, key: string): unknown[] {
 
 export async function loadConfig(configPath?: string, profileOverride?: string, rootOverride?: string): Promise<BrainstackConfig> {
   const raw = await loadRawConfig(configPath);
+  const schemaVersion = numberAt(raw, "schema_version", numberAt(raw, "config_version", CONFIG_SCHEMA_VERSION));
   const profile = (profileOverride || stringAt(raw, "profile", "single-node")) as Profile;
   const machine = objectAt(raw, "machine");
   const paths = objectAt(raw, "paths");
@@ -331,16 +355,16 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
   const client = objectAt(raw, "client");
   const home = abs(stringAt(paths, "home", process.env.HOME || "."));
   const root = rootOverride ? abs(rootOverride) : "";
-  const stateRoot = root ? join(root, "state") : abs(stringAt(paths, "stateRoot", "~/.local/state/brainstack"));
-  const configRoot = root ? join(root, "config") : abs(stringAt(paths, "configRoot", "~/.config/brainstack"));
-  const sharedBrainRoot = root ? join(root, "shared-brain") : abs(stringAt(paths, "sharedBrainRoot", "~/shared-brain"));
-  const productRepo = root ? PRODUCT_ROOT : abs(stringAt(paths, "productRepo", "~/brainstack"));
-  const systemdUserRoot = root ? join(root, "systemd-user") : abs(stringAt(paths, "systemdUserRoot", "~/.config/systemd/user"));
-  const machineName = stringAt(machine, "name", profile === "worker" ? "worker" : "valkyrie");
-  const machineUser = stringAt(machine, "user", process.env.USER || "swader");
+  const stateRoot = root ? join(root, "state") : absWithHome(stringAt(paths, "stateRoot", "~/.local/state/brainstack"), home);
+  const configRoot = root ? join(root, "config") : absWithHome(stringAt(paths, "configRoot", "~/.config/brainstack"), home);
+  const sharedBrainRoot = root ? join(root, "shared-brain") : absWithHome(stringAt(paths, "sharedBrainRoot", "~/shared-brain"), home);
+  const productRepo = root ? PRODUCT_ROOT : absWithHome(stringAt(paths, "productRepo", "~/brainstack"), home);
+  const systemdUserRoot = root ? join(root, "systemd-user") : absWithHome(stringAt(paths, "systemdUserRoot", "~/.config/systemd/user"), home);
+  const machineName = stringAt(machine, "name", profile === "worker" ? "worker-host" : "brain-control");
+  const machineUser = stringAt(machine, "user", process.env.USER || "operator");
   const enableTelemux =
     profile === "single-node" || profile === "control"
-      ? booleanAt(telemux, "enabled", true)
+      ? booleanAt(telemux, "enabled", false)
       : booleanAt(telemux, "enabled", false);
   const controlTag = stringAt(tailscale, "controlTag", "tag:brain");
   const workerTag = stringAt(tailscale, "workerTag", "tag:brain-worker");
@@ -352,14 +376,12 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
         : profile === "client-macos"
           ? []
           : [controlTag];
-  const publicBaseUrl = stringAt(
-    brain,
-    "publicBaseUrl",
-    profile === "worker" ? "" : `https://${machineName}.tailb647b6.ts.net`
-  );
+  const publicBaseUrl = stringAt(brain, "publicBaseUrl", "");
   const workers = arrayAt(telemux, "workers") as Array<Record<string, unknown>>;
+  const remoteSsh = `${machineUser}@${machineName}:${join(sharedBrainRoot, "bare", "shared-brain.git")}`;
 
   return {
+    schemaVersion,
     profile,
     machine: {
       name: machineName,
@@ -372,7 +394,7 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
       home,
       productRepo,
       sharedBrainRoot,
-      privateBrainRoot: root ? join(root, "private-brain") : abs(stringAt(paths, "privateBrainRoot", "~/private-brain")),
+      privateBrainRoot: root ? join(root, "private-brain") : absWithHome(stringAt(paths, "privateBrainRoot", "~/private-brain"), home),
       stateRoot,
       configRoot,
       systemdUserRoot
@@ -389,7 +411,7 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
       staging: join(sharedBrainRoot, "staging", "shared-brain"),
       serve: join(sharedBrainRoot, "serve", "shared-brain"),
       blobs: join(stateRoot, "blobs", "shared-brain"),
-      remoteSsh: `${machineUser}@${machineName}:${join(sharedBrainRoot, "bare", "shared-brain.git")}`
+      remoteSsh
     },
     telemux: {
       enabled: enableTelemux,
@@ -408,8 +430,9 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
       enableSsh: booleanAt(tailscale, "enableSsh", false)
     },
     client: {
-      localPath: abs(stringAt(client, "localPath", "~/shared-brain")),
-      envPath: abs(stringAt(client, "envPath", "~/.config/shared-brain.env"))
+      localPath: stringAt(client, "localPath", "~/shared-brain"),
+      envPath: stringAt(client, "envPath", "~/.config/shared-brain.env"),
+      remoteSsh: stringAt(client, "remoteSsh", remoteSsh)
     }
   };
 }
@@ -452,6 +475,41 @@ async function writeIfMissing(path: string, text: string, mode?: number): Promis
 function token(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   return `bs_${Buffer.from(bytes).toString("base64url")}`;
+}
+
+function compareVersions(a: string, b: string): number {
+  const aa = a.split(".").map((part) => Number(part.replace(/[^0-9].*$/, "")) || 0);
+  const bb = b.split(".").map((part) => Number(part.replace(/[^0-9].*$/, "")) || 0);
+  for (let index = 0; index < Math.max(aa.length, bb.length); index += 1) {
+    const delta = (aa[index] || 0) - (bb[index] || 0);
+    if (delta !== 0) {
+      return delta > 0 ? 1 : -1;
+    }
+  }
+  return 0;
+}
+
+function installedBunVersion(): string | null {
+  const proc = run(["bun", "--version"], { check: false });
+  return proc.code === 0 ? proc.stdout.trim() : null;
+}
+
+function refExists(repo: string, ref: string): boolean {
+  return run(["git", "--git-dir", repo, "rev-parse", "--verify", ref], { check: false }).code === 0;
+}
+
+function isBareRepoInitialized(repo: string): boolean {
+  return existsSync(repo) && refExists(repo, "refs/heads/main");
+}
+
+function syncCloneToMain(path: string): void {
+  const dirty = run(["git", "status", "--porcelain"], { cwd: path }).stdout.trim();
+  if (dirty) {
+    throw new Error(`Cannot sync dirty clone: ${path}`);
+  }
+  run(["git", "fetch", "origin", "main"], { cwd: path });
+  run(["git", "checkout", "-f", "main"], { cwd: path });
+  run(["git", "merge", "--ff-only", "origin/main"], { cwd: path });
 }
 
 function sharedBrainSeedFiles(cfg: BrainstackConfig): Record<string, string> {
@@ -629,6 +687,9 @@ function braindEnv(cfg: BrainstackConfig, includeSecrets: boolean): string {
     `SHARED_BRAIN_WRITE_REPO_ROOT=${cfg.repos.staging}`,
     `BRAIN_BLOB_STORE=${cfg.repos.blobs}`,
     `BRAIN_LARGE_FILE_THRESHOLD_BYTES=${cfg.brain.largeFileThresholdBytes}`,
+    "BRAIN_MAX_IMPORT_BYTES=26214400",
+    "BRAIN_ALLOW_PRIVATE_URL_IMPORTS=false",
+    `BRAIN_ORGANIZER_LABEL=${cfg.machine.name}`,
     `BRAIN_IMPORT_TOKEN=${includeSecrets ? token() : ""}`,
     `BRAIN_ADMIN_TOKEN=${includeSecrets ? token() : ""}`,
     ""
@@ -759,9 +820,34 @@ done
 function tailscaleServeScript(cfg: BrainstackConfig): string {
   return `#!/usr/bin/env bash
 set -euo pipefail
-tailscale serve --bg ${cfg.brain.port}
+CONFIG_FILE="\${1:-$(dirname "$0")/serve-config.json}"
+tailscale serve set-config --all "$CONFIG_FILE"
 tailscale serve status
 `;
+}
+
+function tailscaleServeConfig(cfg: BrainstackConfig): string {
+  const host = cfg.tailscale.tailnetHost || "brain-control.example.ts.net";
+  return `${JSON.stringify(
+    {
+      TCP: {
+        "443": {
+          HTTPS: true
+        }
+      },
+      Web: {
+        [`${host}:443`]: {
+          Handlers: {
+            "/": {
+              Proxy: `http://127.0.0.1:${cfg.brain.port}`
+            }
+          }
+        }
+      }
+    },
+    null,
+    2
+  )}\n`;
 }
 
 function tailscaleUpScript(cfg: BrainstackConfig): string {
@@ -806,9 +892,8 @@ function tailscalePolicyFragment(cfg: BrainstackConfig): string {
 function clientBootstrapFiles(cfg: BrainstackConfig): Record<string, string> {
   return {
     "client.env.example": [
-      `BRAIN_BASE_URL=${cfg.brain.publicBaseUrl || "https://valkyrie.tailb647b6.ts.net"}`,
+      `BRAIN_BASE_URL=${cfg.brain.publicBaseUrl || "https://brain-control.example.ts.net"}`,
       "BRAIN_IMPORT_TOKEN=",
-      "BRAIN_ADMIN_TOKEN=",
       `SHARED_BRAIN_LOCAL_PATH=${cfg.client.localPath}`,
       ""
     ].join("\n"),
@@ -850,22 +935,23 @@ function clientBootstrapFiles(cfg: BrainstackConfig): Record<string, string> {
       ""
     ].join("\n"),
     "ssh_config_fragment.example": [
-      "Host valkyrie",
-      "  HostName valkyrie",
+      "Host brain-control",
+      "  HostName brain-control",
       `  User ${cfg.machine.user}`,
       "  IdentitiesOnly yes",
       "",
       "# Clone:",
-      `# git clone ${cfg.repos.remoteSsh} ~/shared-brain`,
+      `# git clone ${cfg.client.remoteSsh} ~/shared-brain`,
       ""
     ].join("\n"),
     "install-client.sh": `#!/usr/bin/env bash
 set -euo pipefail
 
-REMOTE="\${BRAIN_GIT_REMOTE:-${cfg.repos.remoteSsh}}"
+REMOTE="\${BRAIN_GIT_REMOTE:-${cfg.client.remoteSsh}}"
 TARGET="\${SHARED_BRAIN_LOCAL_PATH:-$HOME/shared-brain}"
 CONFIG_DIR="$HOME/.config"
 ENV_FILE="$CONFIG_DIR/shared-brain.env"
+BOOTSTRAP_DIR="$CONFIG_DIR/brainstack/client-bootstrap"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 backup_file() {
@@ -876,6 +962,11 @@ backup_file() {
 }
 
 mkdir -p "$CONFIG_DIR"
+mkdir -p "$BOOTSTRAP_DIR"
+cp "$(dirname "$0")/codex-global-AGENTS.md" "$BOOTSTRAP_DIR/codex-global-AGENTS.md"
+cp "$(dirname "$0")/claude-user-CLAUDE.md" "$BOOTSTRAP_DIR/claude-user-CLAUDE.md"
+cp "$(dirname "$0")/cursor-user-rule.md" "$BOOTSTRAP_DIR/cursor-user-rule.md"
+cp "$(dirname "$0")/claude-hooks-example.json" "$BOOTSTRAP_DIR/claude-hooks-example.json"
 if [ -d "$TARGET/.git" ]; then
   git -C "$TARGET" pull --ff-only
 else
@@ -890,22 +981,43 @@ fi
 CODEX_HOME="\${CODEX_HOME:-$HOME/.codex}"
 mkdir -p "$CODEX_HOME"
 if [ ! -f "$CODEX_HOME/AGENTS.md" ]; then
-  cp "$(dirname "$0")/codex-global-AGENTS.md" "$CODEX_HOME/AGENTS.md"
+  cat > "$CODEX_HOME/AGENTS.md" <<'STUB'
+# Codex Local Instructions
+
+Read the product-owned shared-brain snippet at ~/.config/brainstack/client-bootstrap/codex-global-AGENTS.md.
+STUB
+else
+  echo "Codex already has $CODEX_HOME/AGENTS.md; add this line manually if desired:"
+  echo "Read ~/.config/brainstack/client-bootstrap/codex-global-AGENTS.md for shared-brain client guidance."
 fi
 
 CLAUDE_HOME="$HOME/.claude"
 mkdir -p "$CLAUDE_HOME"
 if [ ! -f "$CLAUDE_HOME/CLAUDE.md" ]; then
-  cp "$(dirname "$0")/claude-user-CLAUDE.md" "$CLAUDE_HOME/CLAUDE.md"
+  cat > "$CLAUDE_HOME/CLAUDE.md" <<'STUB'
+# Claude Local Instructions
+
+Import ~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md.
+STUB
+else
+  echo "Claude already has $CLAUDE_HOME/CLAUDE.md; add this line manually if desired:"
+  echo "Import ~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md."
 fi
 
 CURSOR_RULE_DIR="$HOME/.cursor/rules"
 mkdir -p "$CURSOR_RULE_DIR"
 if [ ! -f "$CURSOR_RULE_DIR/shared-brain.md" ]; then
-  cp "$(dirname "$0")/cursor-user-rule.md" "$CURSOR_RULE_DIR/shared-brain.md"
+  cat > "$CURSOR_RULE_DIR/shared-brain.md" <<'STUB'
+# Shared Brain
+
+Read ~/.config/brainstack/client-bootstrap/cursor-user-rule.md for the shared-brain client workflow.
+STUB
+else
+  echo "Cursor shared-brain rule already exists at $CURSOR_RULE_DIR/shared-brain.md; compare it with $BOOTSTRAP_DIR/cursor-user-rule.md manually."
 fi
 
 echo "shared brain client installed or updated at $TARGET"
+echo "product-owned bootstrap snippets are in $BOOTSTRAP_DIR"
 `
   };
 }
@@ -913,16 +1025,19 @@ echo "shared brain client installed or updated at $TARGET"
 function renderFiles(cfg: BrainstackConfig): Record<string, string> {
   const files: Record<string, string> = {
     "brainstack.yaml": stringifySimpleYaml({
+      schema_version: cfg.schemaVersion,
       profile: cfg.profile,
       machine: cfg.machine,
       paths: cfg.paths,
       brain: cfg.brain,
-      tailscale: cfg.tailscale
+      tailscale: cfg.tailscale,
+      client: cfg.client
     }),
     "git-hooks/post-receive": postReceiveHook(cfg),
     "git-hooks/pre-receive": preReceiveHook(),
     "tailscale/tailscale-up.sh": tailscaleUpScript(cfg),
     "tailscale/tailscale-serve.sh": tailscaleServeScript(cfg),
+    "tailscale/serve-config.json": tailscaleServeConfig(cfg),
     "tailscale/policy-fragment.json": tailscalePolicyFragment(cfg),
     "telemux/workers.json": `${JSON.stringify(defaultWorkers(cfg), null, 2)}\n`,
     "README.generated.md": [
@@ -971,45 +1086,71 @@ async function commandRender(args: ParsedArgs): Promise<void> {
   console.log(`rendered ${Object.keys(renderFiles(cfg)).length} files to ${abs(out)}`);
 }
 
-async function writeSharedBrainSeed(target: string, cfg: BrainstackConfig): Promise<void> {
-  await writeFileMap(target, sharedBrainSeedFiles(cfg));
+async function writeSharedBrainSeed(target: string, cfg: BrainstackConfig, mode: SeedMode): Promise<string[]> {
+  const touched: string[] = [];
+  const seedFiles = sharedBrainSeedFiles(cfg);
+  for (const [path, content] of Object.entries(seedFiles)) {
+    const fullPath = join(target, path);
+    if (mode !== "force" && existsSync(fullPath)) {
+      continue;
+    }
+    await writeText(fullPath, content, path.endsWith(".sh") || path.includes("git-hooks/") ? 0o755 : undefined);
+    touched.push(path);
+  }
+  return touched;
 }
 
 function gitExists(path: string): boolean {
   return existsSync(join(path, ".git"));
 }
 
-async function ensureGitRepoLayout(cfg: BrainstackConfig): Promise<void> {
+async function ensureGitRepoLayout(cfg: BrainstackConfig, mode: "fresh" | "runtime", seedMode: SeedMode = "empty-only"): Promise<void> {
   await ensureDir(dirname(cfg.repos.bare));
   await ensureDir(dirname(cfg.repos.staging));
   await ensureDir(dirname(cfg.repos.serve));
   await ensureDir(cfg.repos.blobs);
+  const existingCanon = isBareRepoInitialized(cfg.repos.bare);
+  if (mode === "runtime" && !existingCanon) {
+    throw new Error(`No initialized shared-brain repo at ${cfg.repos.bare}; run brainctl init for a fresh install first.`);
+  }
+  if (mode === "fresh" && existingCanon && seedMode === "empty-only") {
+    throw new Error(
+      `Existing canonical shared-brain repo detected at ${cfg.repos.bare}. init is fresh-install only; use brainctl upgrade/apply-runtime for reruns.`
+    );
+  }
   if (!existsSync(cfg.repos.bare)) {
     run(["git", "init", "--bare", "--initial-branch=main", cfg.repos.bare]);
   }
   if (!gitExists(cfg.repos.staging)) {
     run(["git", "clone", cfg.repos.bare, cfg.repos.staging]);
+  } else if (existingCanon) {
+    syncCloneToMain(cfg.repos.staging);
   }
-  await writeSharedBrainSeed(cfg.repos.staging, cfg);
-  run(["git", "add", "."], { cwd: cfg.repos.staging });
-  const status = run(["git", "status", "--porcelain"], { cwd: cfg.repos.staging }).stdout.trim();
-  if (status) {
-    run([
-      "git",
-      "-c",
-      "user.name=brainstack",
-      "-c",
-      "user.email=brainstack@local",
-      "commit",
-      "-m",
-      `brainstack: initialize ${cfg.profile} shared brain`
-    ], { cwd: cfg.repos.staging });
+  const shouldSeed = mode === "fresh" && (!existingCanon || seedMode === "missing" || seedMode === "force");
+  if (shouldSeed) {
+    const touched = await writeSharedBrainSeed(cfg.repos.staging, cfg, seedMode === "empty-only" ? "force" : seedMode);
+    if (touched.length) {
+      run(["git", "add", "--", ...touched], { cwd: cfg.repos.staging });
+      const status = run(["git", "status", "--porcelain", "--", ...touched], { cwd: cfg.repos.staging }).stdout.trim();
+      if (status) {
+        run([
+          "git",
+          "-c",
+          "user.name=brainstack",
+          "-c",
+          "user.email=brainstack@local",
+          "commit",
+          "-m",
+          `brainstack: initialize ${cfg.profile} shared brain`
+        ], { cwd: cfg.repos.staging });
+      }
+    }
   }
   run(["git", "push", "-u", "origin", "main"], { cwd: cfg.repos.staging, check: false });
   if (!gitExists(cfg.repos.serve)) {
     run(["git", "clone", cfg.repos.bare, cfg.repos.serve]);
   } else {
-    run(["git", "pull", "--ff-only"], { cwd: cfg.repos.serve, check: false });
+    syncCloneToMain(cfg.repos.serve);
   }
   await writeText(join(cfg.repos.bare, "hooks", "post-receive"), postReceiveHook(cfg), 0o755);
   await writeText(join(cfg.repos.bare, "hooks", "pre-receive"), preReceiveHook(), 0o755);
@@ -1027,7 +1168,8 @@ async function commandInit(args: ParsedArgs): Promise<void> {
   await ensureDir(cfg.paths.stateRoot);
   await ensureDir(cfg.paths.systemdUserRoot);
   if (runsBraind(cfg)) {
-    await ensureGitRepoLayout(cfg);
+    const seedMode: SeedMode = hasFlag(args, "force-seed") ? "force" : hasFlag(args, "seed-missing") ? "missing" : "empty-only";
+    await ensureGitRepoLayout(cfg, "fresh", seedMode);
     await writeIfMissing(join(cfg.paths.configRoot, "braind.env"), braindEnv(cfg, true), 0o600);
     await writeText(join(cfg.paths.systemdUserRoot, "braind.service"), braindService(cfg));
   }
@@ -1042,11 +1184,58 @@ async function commandInit(args: ParsedArgs): Promise<void> {
   console.log(`user units: ${cfg.paths.systemdUserRoot}`);
 }
 
+async function applyRuntime(cfg: BrainstackConfig): Promise<string[]> {
+  const touched: string[] = [];
+  await ensureDir(cfg.paths.configRoot);
+  await ensureDir(cfg.paths.stateRoot);
+  await ensureDir(cfg.paths.systemdUserRoot);
+  if (runsBraind(cfg)) {
+    await ensureGitRepoLayout(cfg, "runtime", "empty-only");
+    await writeIfMissing(join(cfg.paths.configRoot, "braind.env"), braindEnv(cfg, true), 0o600);
+    await writeText(join(cfg.paths.systemdUserRoot, "braind.service"), braindService(cfg));
+    touched.push(join(cfg.paths.systemdUserRoot, "braind.service"));
+    touched.push(join(cfg.repos.bare, "hooks", "post-receive"));
+    touched.push(join(cfg.repos.bare, "hooks", "pre-receive"));
+  }
+  if (cfg.telemux.enabled) {
+    await writeIfMissing(join(cfg.paths.configRoot, "telemux.env"), telemuxEnv(cfg), 0o600);
+    await writeText(join(cfg.paths.configRoot, "workers.json"), `${JSON.stringify(defaultWorkers(cfg), null, 2)}\n`);
+    await writeText(join(cfg.paths.systemdUserRoot, "telemux.service"), telemuxService(cfg));
+    touched.push(join(cfg.paths.systemdUserRoot, "telemux.service"));
+    touched.push(join(cfg.paths.configRoot, "workers.json"));
+  }
+  await writeFileMap(join(cfg.paths.stateRoot, "rendered"), renderFiles(cfg));
+  touched.push(join(cfg.paths.stateRoot, "rendered"));
+  return touched;
+}
+
+async function commandApplyRuntime(args: ParsedArgs, withBackup: boolean): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  if (hasFlag(args, "dry-run")) {
+    const out = flag(args, "out") || join(tmpdir(), `brainstack-upgrade-render-${cfg.profile}-${Date.now()}`);
+    await writeFileMap(out, renderFiles(cfg));
+    console.log(`dry-run runtime render complete: ${out}`);
+    return;
+  }
+  if (withBackup) {
+    await commandBackup({ ...args, flags: { ...args.flags, profile: cfg.profile } });
+  }
+  const touched = await applyRuntime(cfg);
+  console.log(`${withBackup ? "upgrade" : "apply-runtime"} complete for ${cfg.profile}`);
+  console.log(`runtime artifacts touched: ${touched.length ? touched.join(", ") : "(none)"}`);
+  console.log("canonical shared-brain content was not seeded or rewritten");
+}
+
 async function commandDoctor(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
   const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
   const commandOk = (name: string) => run(["bash", "-lc", `command -v ${name}`], { check: false }).code === 0;
-  checks.push({ name: "bun", ok: commandOk("bun"), detail: "Bun runtime" });
+  const bunVersion = installedBunVersion();
+  checks.push({
+    name: "bun",
+    ok: Boolean(bunVersion) && compareVersions(bunVersion || "0.0.0", MIN_BUN_VERSION) >= 0,
+    detail: bunVersion ? `Bun ${bunVersion}; required >= ${MIN_BUN_VERSION}` : "Bun runtime missing"
+  });
   checks.push({ name: "git", ok: commandOk("git"), detail: "Git CLI" });
   checks.push({ name: "ssh", ok: commandOk("ssh"), detail: "OpenSSH client" });
   checks.push({ name: "tailscale", ok: commandOk("tailscale"), detail: "Tailscale CLI optional for clients" });
@@ -1218,19 +1407,23 @@ async function commandRotateToken(args: ParsedArgs): Promise<void> {
 }
 
 async function commandMigrateCurrentInstall(args: ParsedArgs): Promise<void> {
-  const out = abs(flag(args, "out") || "~/.config/brainstack/valkyrie-current.brainstack.yaml");
+  const out = abs(flag(args, "out") || "~/.config/brainstack/current-install.brainstack.yaml");
   const cfg = await loadConfig(undefined, "control");
+  const hostname = run(["hostname"], { check: false }).stdout.trim() || "brain-control";
+  const user = process.env.USER || "operator";
+  const home = process.env.HOME || `/home/${user}`;
   const current = {
+    schema_version: CONFIG_SCHEMA_VERSION,
     profile: "control",
     machine: {
-      name: "valkyrie",
-      user: process.env.USER || "swader",
+      name: hostname,
+      user,
       role: "control",
-      sshUser: process.env.USER || "swader",
-      hostname: "valkyrie"
+      sshUser: user,
+      hostname
     },
     paths: {
-      home: process.env.HOME || "/home/swader",
+      home,
       productRepo: "~/brainstack",
       sharedBrainRoot: "~/shared-brain",
       privateBrainRoot: "~/private-brain",
@@ -1241,35 +1434,18 @@ async function commandMigrateCurrentInstall(args: ParsedArgs): Promise<void> {
     brain: {
       bind: "127.0.0.1",
       port: 8080,
-      publicBaseUrl: "https://valkyrie.tailb647b6.ts.net",
+      publicBaseUrl: "",
       largeFileThresholdBytes: 10485760
     },
     telemux: {
-      enabled: true,
+      enabled: false,
       dashboardHost: "127.0.0.1",
       dashboardPort: 8787,
-      localMachine: "valkyrie",
-      workers: [
-        {
-          name: "valkyrie",
-          transport: "local",
-          managedRepoRoot: "/srv/factory/repos",
-          managedHostRoot: "/srv/factory/hostctx",
-          managedScratchRoot: "/srv/factory/scratch"
-        },
-        {
-          name: "erbine",
-          transport: "ssh",
-          sshTarget: "erbine",
-          sshUser: "factory",
-          managedRepoRoot: "/srv/factory/repos",
-          managedHostRoot: "/srv/factory/hostctx",
-          managedScratchRoot: "/srv/factory/scratch"
-        }
-      ]
+      localMachine: hostname,
+      workers: []
     },
     tailscale: {
-      tailnetHost: "valkyrie.tailb647b6.ts.net",
+      tailnetHost: "",
       controlTag: "tag:brain",
       workerTag: "tag:brain-worker",
       advertiseTags: ["tag:brain"],
@@ -1277,7 +1453,7 @@ async function commandMigrateCurrentInstall(args: ParsedArgs): Promise<void> {
     }
   };
   await writeText(out, stringifySimpleYaml(current));
-  console.log(`wrote current valkyrie compatibility config: ${out}`);
+  console.log(`wrote current-install compatibility config: ${out}`);
   console.log(`existing live clone remains untouched: ${cfg.paths.sharedBrainRoot}/live/shared-brain`);
 }
 
@@ -1311,6 +1487,10 @@ async function main(): Promise<void> {
       return;
     case "init":
       return await commandInit(args);
+    case "upgrade":
+      return await commandApplyRuntime(args, true);
+    case "apply-runtime":
+      return await commandApplyRuntime(args, false);
     case "doctor":
       return await commandDoctor(args);
     case "backup":

@@ -15,13 +15,13 @@ For control and single-node profiles, prepare the Unix user before installing se
 Example sudoers fragment:
 
 ```sudoers
-swader ALL=(ALL) NOPASSWD:ALL
+operator ALL=(ALL) NOPASSWD:ALL
 ```
 
 Install with `visudo`, not by writing directly to `/etc/sudoers`:
 
 ```bash
-sudo visudo -f /etc/sudoers.d/brainstack-swader
+sudo visudo -f /etc/sudoers.d/brainstack-operator
 ```
 
 ## Codex Yolo Mode
@@ -62,4 +62,3 @@ codex --version
 ```
 
 If `sudo -n true` fails, either fix passwordless sudo or accept that unattended machine-admin tasks will stall.
-

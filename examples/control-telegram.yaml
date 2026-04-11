@@ -1,9 +1,9 @@
 schema_version: 1
-profile: single-node
+profile: control
 machine:
   name: brain-control
   user: operator
-  role: single-node
+  role: control
   sshUser: operator
   hostname: brain-control
 paths:
@@ -20,7 +20,16 @@ brain:
   publicBaseUrl: https://brain-control.example.ts.net
   largeFileThresholdBytes: 10485760
 telemux:
-  enabled: false
+  enabled: true
+  dashboardHost: 127.0.0.1
+  dashboardPort: 8787
+  localMachine: brain-control
+  workers:
+    - name: brain-control
+      transport: local
+      managedRepoRoot: ~/.local/state/brainstack/factory/repos
+      managedHostRoot: ~/.local/state/brainstack/factory/hostctx
+      managedScratchRoot: ~/.local/state/brainstack/factory/scratch
 tailscale:
   tailnetHost: brain-control.example.ts.net
   controlTag: tag:brain

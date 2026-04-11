@@ -198,7 +198,7 @@ export function expandHome(input: string): string {
   if (!input.startsWith("~")) {
     return input;
   }
-  const home = process.env.HOME || "/home/swader";
+  const home = process.env.HOME || "/home/brainstack";
   return resolve(home, input.slice(2));
 }
 
@@ -471,6 +471,35 @@ function runCommand(args: string[], cwd: string, check = true): string {
     throw new Error(`${args.join(" ")} failed: ${stderr || stdout}`);
   }
   return stdout;
+}
+
+export function syncWritableRepo(repoRoot: string): void {
+  if (!existsSync(join(repoRoot, ".git"))) {
+    throw new Error(`Writable repo is not a git checkout: ${repoRoot}`);
+  }
+  const branch = runCommand(["git", "rev-parse", "--abbrev-ref", "HEAD"], repoRoot);
+  if (branch !== "main") {
+    throw new Error(`Writable repo must be on main before writes; found ${branch} in ${repoRoot}`);
+  }
+  const dirty = runCommand(["git", "status", "--porcelain"], repoRoot);
+  if (dirty.trim()) {
+    throw new Error(`Writable repo is dirty; refusing API write until cleaned: ${repoRoot}`);
+  }
+  runCommand(["git", "fetch", "origin", "main"], repoRoot);
+  const local = runCommand(["git", "rev-parse", "HEAD"], repoRoot);
+  const remote = runCommand(["git", "rev-parse", "origin/main"], repoRoot);
+  if (local === remote) {
+    return;
+  }
+  const base = runCommand(["git", "merge-base", "HEAD", "origin/main"], repoRoot);
+  if (base === local) {
+    runCommand(["git", "merge", "--ff-only", "origin/main"], repoRoot);
+    return;
+  }
+  if (base === remote) {
+    throw new Error(`Writable repo has unpushed commits; refusing API write until pushed or reset: ${repoRoot}`);
+  }
+  throw new Error(`Writable repo diverged from origin/main; reconcile manually before API writes: ${repoRoot}`);
 }
 
 async function hashBytes(bytes: Uint8Array): Promise<string> {
@@ -1702,7 +1731,7 @@ export async function ensureGitIdentity(repoRoot: string): Promise<void> {
     runCommand(["git", "config", "user.name", "Shared Brain Organizer"], repoRoot);
   }
   if (!email) {
-    runCommand(["git", "config", "user.email", "shared-brain@valkyrie.local"], repoRoot);
+    runCommand(["git", "config", "user.email", "shared-brain@brainstack.local"], repoRoot);
   }
 }
 

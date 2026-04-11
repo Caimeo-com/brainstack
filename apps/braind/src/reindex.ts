@@ -14,7 +14,7 @@ function expandHome(input: string): string {
 }
 
 function defaultRepoRoot(): string {
-  const home = process.env.HOME || "/home/swader";
+  const home = process.env.HOME || "/home/brainstack";
   const serveClone = resolve(home, "shared-brain", "serve", "shared-brain");
   const legacyLiveClone = resolve(home, "shared-brain", "live", "shared-brain");
   return existsSync(serveClone) ? serveClone : legacyLiveClone;
@@ -33,4 +33,3 @@ const result = await rebuildIndex(repoRoot);
 if (!quiet) {
   console.log(JSON.stringify({ ok: true, repo_root: repoRoot, ...result }, null, 2));
 }
-

@@ -20,9 +20,16 @@ Fresh installs use three repo views:
 - Staging clone: writable clone for import, propose, ingest, lint, and admin changes.
 - Serve clone: read-serving clone updated by post-receive hook.
 
+`braind` synchronizes the staging clone under the repo lock before every write. If staging is clean and behind `origin/main`, it fast-forwards. If staging is dirty, ahead, or diverged, the write fails with a precise error instead of risking a stale-clone push or silent overwrite.
+
 Search uses local SQLite under `derived/` in the serve clone and is never shared over a network filesystem.
+
+## Install And Upgrade Boundary
+
+`brainctl init` is a fresh-install command. It seeds canonical shared-brain content only when the canonical repo is empty, unless the operator explicitly passes `--seed-missing` or `--force-seed`.
+
+Use `brainctl upgrade` or `brainctl apply-runtime` for existing installs. Those commands render and apply runtime artifacts such as service files, hooks, env examples, Tailscale Serve config, and bootstrap files, but they do not silently rewrite canonical wiki pages, manifests, raw artifacts, proposals, or logs.
 
 ## Large Files
 
 Text and normalized extracts stay in git. Small binaries may stay in git. Large binary originals above the configured threshold are stored in a content-addressed blob store outside git with pointer manifests and normalized extracts committed to git.
-

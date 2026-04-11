@@ -1,12 +1,13 @@
+schema_version: 1
 profile: worker
 machine:
-  name: erbine
-  user: factory
+  name: brain-worker
+  user: operator
   role: worker
-  sshUser: factory
-  hostname: erbine
+  sshUser: operator
+  hostname: brain-worker
 paths:
-  home: /home/factory
+  home: /home/operator
   productRepo: ~/brainstack
   sharedBrainRoot: ~/shared-brain
   privateBrainRoot: ~/private-brain
@@ -21,7 +22,7 @@ brain:
 telemux:
   enabled: false
 tailscale:
-  tailnetHost: erbine.tailb647b6.ts.net
+  tailnetHost: brain-worker.example.ts.net
   controlTag: tag:brain
   workerTag: tag:brain-worker
   advertiseTags:

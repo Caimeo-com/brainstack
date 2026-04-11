@@ -11,19 +11,27 @@ cd ~/brainstack
 bun run packages/brainctl/src/main.ts smoke --profile control --config examples/control.yaml
 ```
 
-## Worker Plan
-
-Generate a worker join plan without touching erbine:
+For a fresh control host install, run `brainctl init`. For later product updates, use `brainctl upgrade`; it backs up first and applies runtime files without rewriting canonical shared-brain content.
 
 ```bash
 cd ~/brainstack
-bun run packages/brainctl/src/main.ts join-worker --config examples/control.yaml --worker erbine
+bun run packages/brainctl/src/main.ts init --profile control --config examples/control.yaml
+bun run packages/brainctl/src/main.ts upgrade --profile control --config examples/control.yaml
+```
+
+## Worker Plan
+
+Generate a worker join plan without touching the worker:
+
+```bash
+cd ~/brainstack
+bun run packages/brainctl/src/main.ts join-worker --config examples/control.yaml --worker brain-worker
 ```
 
 The worker transport default is normal OpenSSH over Tailscale:
 
 ```bash
-ssh factory@erbine true
+ssh operator@brain-worker true
 ```
 
 If that fails with a timeout while ping works, the likely blocker is Tailscale grants. The required grant shape is:
@@ -47,14 +55,14 @@ If that fails with a timeout while ping works, the likely blocker is Tailscale g
 
 ```bash
 export TAILSCALE_AUTH_KEY=tskey-auth-...
-sudo tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname=valkyrie --advertise-tags=tag:brain --operator=swader
+sudo tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname=brain-control --advertise-tags=tag:brain --operator=operator
 ```
 
 ## Headless Worker Enrollment
 
 ```bash
 export TAILSCALE_AUTH_KEY=tskey-auth-...
-sudo tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname=erbine --advertise-tags=tag:brain-worker --operator=factory
+sudo tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname=brain-worker --advertise-tags=tag:brain-worker --operator=operator
 ```
 
 Use reusable/preapproved auth keys with restricted tags from the Tailscale dashboard. Do not store auth keys in git.

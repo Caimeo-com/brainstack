@@ -6,6 +6,8 @@
 *.token
 node_modules/
 .bun/
+.DS_Store
+__MACOSX/
 dist/
 build/
 coverage/
@@ -15,4 +17,3 @@ tmp/
 *.sqlite-shm
 *.sqlite-wal
 *.tgz
-

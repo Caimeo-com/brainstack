@@ -1,8 +1,7 @@
-Host valkyrie
-  HostName valkyrie
-  User swader
+Host brain-control
+  HostName brain-control
+  User operator
   IdentitiesOnly yes
 
 # Clone:
-# git clone swader@valkyrie:/home/swader/shared-brain/bare/shared-brain.git ~/shared-brain
-
+# git clone operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git ~/shared-brain

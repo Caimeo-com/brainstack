@@ -6,6 +6,7 @@ Before sharing brainstack with another machine or person:
 - `bun test` passes.
 - `brainctl smoke --profile single-node` passes.
 - `brainctl smoke --profile control` passes.
+- `brainctl init` has been tested only on fresh install roots; use `brainctl upgrade` or `brainctl apply-runtime` for existing installs.
 - `brainctl bootstrap-client` renders Codex, Claude, Cursor, SSH, env, and install artifacts.
 - Product examples do not contain real tokens, chat ids, private keys, or personal repo data.
 - Tailscale docs clearly separate Serve from Funnel.
@@ -21,7 +22,11 @@ Current-platform binary:
 
 ```bash
 cd ~/brainstack
-bun build packages/brainctl/src/main.ts --compile --outfile dist/brainctl
+scripts/release.sh
 ```
+
+The release script refuses dirty trees, runs `bun test`, builds `dist/brainctl`, and emits a source archive from `git archive`.
+
+The `brainctl` binary is compiled with `--no-compile-autoload-dotenv` and `--no-compile-autoload-bunfig`. Those flags keep release artifacts from inheriting local release-machine `.env` or `bunfig.toml` behavior. `braind` and `telemux` are intentionally not compiled by default; they run from source under Bun so service behavior stays inspectable.
 
 Cross-compilation can be added later with Bun compile targets after target support is verified on the release host.

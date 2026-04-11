@@ -12,7 +12,7 @@
 - Factory workspaces: `~/.local/state/brainstack/factory`
 - Optional private brain repo: `~/private-brain`
 
-Current valkyrie compatibility also needs `/srv/telemux`, `/srv/factory`, `/etc/shared-brain.env`, and current service units until cutover.
+Legacy compatibility deployments may also need historical service env files, service units, and any pre-brainstack telemux/factory state paths. Keep those details in host-specific migration notes, not public examples.
 
 ## Backup Command
 
@@ -47,4 +47,3 @@ git -C /tmp/restore-check/shared-brain/staging/shared-brain status --short
 ```
 
 Then point a temporary config at the restored paths and run `brainctl doctor`.
-

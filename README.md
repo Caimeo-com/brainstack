@@ -1,11 +1,11 @@
 # brainstack
 
-`brainstack` is a Bun-first productization of the current valkyrie shared-brain and clawdex/telemux stack.
+`brainstack` is a Bun-first shared-brain and optional telemux/clawdex control-plane product.
 
 It packages:
 
 - `apps/braind`: shared-brain web/API/search/import service.
-- `apps/telemux`: optional Telegram/Codex control plane vendored from `~/private-dev-factory`.
+- `apps/telemux`: optional Telegram/Codex control plane vendored from the current clawdex/private-dev-factory codebase.
 - `packages/brainctl`: installer, renderer, doctor, backup, restore, token, migration, and smoke-test CLI.
 - `packages/client-bootstrap`: generated Codex, Claude, Cursor, SSH, and env bootstrap artifacts.
 - `packages/skills`: portable skill seeds that are intentionally outside the brain content repo.
@@ -20,14 +20,19 @@ bun test
 bun run packages/brainctl/src/main.ts render --profile single-node --config examples/single-node.yaml --out /tmp/brainstack-render
 bun run packages/brainctl/src/main.ts smoke --profile single-node --config examples/single-node.yaml
 bun run packages/brainctl/src/main.ts doctor --config examples/control.yaml
+bun run packages/brainctl/src/main.ts upgrade --profile control --config examples/control.yaml
 ```
+
+`init` is fresh-install only. Use `upgrade` or `apply-runtime` for existing installs; those commands do not silently seed or rewrite canonical shared-brain content.
 
 Build a current-platform standalone CLI:
 
 ```bash
 cd ~/brainstack
-bun build packages/brainctl/src/main.ts --compile --outfile dist/brainctl
+bun build packages/brainctl/src/main.ts --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --outfile dist/brainctl
 ```
+
+The deterministic flags prevent the compiled binary from implicitly loading local `.env` or `bunfig.toml` files from the release machine.
 
 ## Profiles
 

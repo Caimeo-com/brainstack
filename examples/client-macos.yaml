@@ -1,12 +1,13 @@
+schema_version: 1
 profile: client-macos
 machine:
-  name: local-macos
-  user: swader
+  name: mac-client
+  user: operator
   role: client
-  sshUser: swader
-  hostname: local-macos
+  sshUser: operator
+  hostname: mac-client
 paths:
-  home: /Users/swader
+  home: /Users/operator
   productRepo: ~/brainstack
   sharedBrainRoot: ~/shared-brain
   privateBrainRoot: ~/private-brain
@@ -16,7 +17,7 @@ paths:
 brain:
   bind: 127.0.0.1
   port: 8080
-  publicBaseUrl: https://valkyrie.tailb647b6.ts.net
+  publicBaseUrl: https://brain-control.example.ts.net
   largeFileThresholdBytes: 10485760
 telemux:
   enabled: false
@@ -29,4 +30,4 @@ tailscale:
 client:
   localPath: ~/shared-brain
   envPath: ~/.config/shared-brain.env
-
+  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git

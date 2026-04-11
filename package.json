@@ -10,12 +10,12 @@
   "scripts": {
     "brainctl": "bun run packages/brainctl/src/main.ts",
     "test": "bun test",
-    "build:brainctl": "bun build packages/brainctl/src/main.ts --compile --outfile dist/brainctl",
+    "build:brainctl": "bun build packages/brainctl/src/main.ts --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --outfile dist/brainctl",
+    "release": "scripts/release.sh",
     "smoke:single-node": "bun run packages/brainctl/src/main.ts smoke --profile single-node --config examples/single-node.yaml",
     "smoke:control": "bun run packages/brainctl/src/main.ts smoke --profile control --config examples/control.yaml"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "1.3.11"
   }
 }
-

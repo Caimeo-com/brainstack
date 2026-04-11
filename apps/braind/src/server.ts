@@ -1,4 +1,6 @@
 import { existsSync } from "node:fs";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { basename, extname, join, resolve } from "node:path";
 import {
   backlinksForPath,
@@ -21,8 +23,18 @@ import {
   searchIndex,
   slugify,
   stripFrontmatter,
+  syncWritableRepo,
   withRepoLock
 } from "./brain-lib";
+
+class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string
+  ) {
+    super(message);
+  }
+}
 
 function expandHome(input: string): string {
   if (input === "~") {
@@ -35,7 +47,7 @@ function expandHome(input: string): string {
 }
 
 function defaultRepoRoot(): string {
-  const home = process.env.HOME || "/home/swader";
+  const home = process.env.HOME || "/home/brainstack";
   const serveClone = resolve(home, "shared-brain", "serve", "shared-brain");
   const legacyLiveClone = resolve(home, "shared-brain", "live", "shared-brain");
   return existsSync(serveClone) ? serveClone : legacyLiveClone;
@@ -60,6 +72,15 @@ const importToken = process.env.BRAIN_IMPORT_TOKEN || legacyWriteToken || "";
 const adminToken = process.env.BRAIN_ADMIN_TOKEN || legacyWriteToken || "";
 const host = process.env.BRAIN_BIND || "127.0.0.1";
 const port = Number(process.env.BRAIN_PORT || 8080);
+const configuredMaxImportBytes = Number(process.env.BRAIN_MAX_IMPORT_BYTES || "");
+const maxImportBytes =
+  Number.isFinite(configuredMaxImportBytes) && configuredMaxImportBytes > 0
+    ? configuredMaxImportBytes
+    : 25 * 1024 * 1024;
+const organizerLabel = process.env.BRAIN_ORGANIZER_LABEL || "organizer";
+const allowPrivateUrlImports = ["1", "true", "yes", "on"].includes(
+  (process.env.BRAIN_ALLOW_PRIVATE_URL_IMPORTS || "").toLowerCase()
+);
 
 if (!existsSync(join(repoRoot, "derived", "search.sqlite"))) {
   await rebuildIndex(repoRoot);
@@ -321,6 +342,108 @@ function wantsJson(request: Request, url: URL): boolean {
   return url.searchParams.get("format") === "json" || request.headers.get("accept")?.includes("application/json") === true;
 }
 
+function reject(status: number, message: string): never {
+  throw new HttpError(status, message);
+}
+
+function assertImportSize(size: number, label: string): void {
+  if (size > maxImportBytes) {
+    reject(413, `${label} is too large: ${size} bytes exceeds BRAIN_MAX_IMPORT_BYTES=${maxImportBytes}`);
+  }
+}
+
+function ipv4ToNumber(address: string): number {
+  return address.split(".").reduce((sum, part) => (sum << 8) + Number(part), 0) >>> 0;
+}
+
+function inCidr4(address: string, base: string, bits: number): boolean {
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+  return (ipv4ToNumber(address) & mask) === (ipv4ToNumber(base) & mask);
+}
+
+function isBlockedIp(address: string): boolean {
+  const version = isIP(address);
+  if (version === 4) {
+    return [
+      ["0.0.0.0", 8],
+      ["10.0.0.0", 8],
+      ["100.64.0.0", 10],
+      ["127.0.0.0", 8],
+      ["169.254.0.0", 16],
+      ["172.16.0.0", 12],
+      ["192.168.0.0", 16]
+    ].some(([base, bits]) => inCidr4(address, String(base), Number(bits)));
+  }
+  if (version === 6) {
+    const normalized = address.toLowerCase();
+    const ipv4Mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (ipv4Mapped) {
+      return isBlockedIp(ipv4Mapped[1]);
+    }
+    return (
+      normalized === "::1" ||
+      normalized.startsWith("fe80:") ||
+      normalized.startsWith("fc") ||
+      normalized.startsWith("fd")
+    );
+  }
+  return false;
+}
+
+async function assertSafeImportUrl(input: string): Promise<URL> {
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch {
+    reject(400, "URL import requires a valid URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    reject(400, "URL import only allows http and https URLs");
+  }
+  if (!allowPrivateUrlImports) {
+    const hostname = url.hostname.toLowerCase();
+    if (hostname === "localhost" || hostname.endsWith(".localhost")) {
+      reject(400, "URL import blocked private hostname; set BRAIN_ALLOW_PRIVATE_URL_IMPORTS=true only for trusted private fetches");
+    }
+    const directIpVersion = isIP(hostname);
+    let addresses: Array<{ address: string }>;
+    try {
+      addresses = directIpVersion
+        ? [{ address: hostname }]
+        : await lookup(hostname, { all: true, verbatim: true });
+    } catch (error) {
+      reject(400, `URL import DNS lookup failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const blocked = addresses.find((entry) => isBlockedIp(entry.address));
+    if (blocked) {
+      reject(400, `URL import blocked private address ${blocked.address}; set BRAIN_ALLOW_PRIVATE_URL_IMPORTS=true only for trusted private fetches`);
+    }
+  }
+  return url;
+}
+
+async function safeFetchImportUrl(input: string, redirectsLeft = 5): Promise<Response> {
+  const url = await assertSafeImportUrl(input);
+  let response: Response;
+  try {
+    response = await fetch(url, { redirect: "manual" });
+  } catch (error) {
+    reject(400, `URL import fetch failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (response.status >= 300 && response.status < 400 && response.headers.get("location")) {
+    if (redirectsLeft <= 0) {
+      reject(400, "URL import exceeded redirect limit");
+    }
+    const redirected = new URL(response.headers.get("location") || "", url);
+    return await safeFetchImportUrl(redirected.toString(), redirectsLeft - 1);
+  }
+  const length = Number(response.headers.get("content-length") || 0);
+  if (length) {
+    assertImportSize(length, "URL import response");
+  }
+  return response;
+}
+
 type AuthScope = "import" | "admin";
 
 function requestAuthScope(request: Request): AuthScope | null {
@@ -389,6 +512,7 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
     if (!(file instanceof File)) {
       throw new Error("multipart request requires a file field");
     }
+    assertImportSize(file.size, "Uploaded file");
     const input = {
       title: String(form.get("title") || file.name),
       source_harness: String(form.get("source_harness") || ""),
@@ -410,6 +534,7 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
       throw new Error("Forbidden: ingest_now requires the admin token");
     }
     return await withRepoLock(writeRepoRoot, async () => {
+      syncWritableRepo(writeRepoRoot);
       const imported = await createImportedArtifact(writeRepoRoot, input);
       let touchedFiles = [...imported.touchedFiles];
       if (input.ingest_now) {
@@ -428,11 +553,13 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
   const body = (await request.json()) as Record<string, unknown>;
   if (typeof body.text === "string") {
     const text = body.text;
+    const textBytes = new TextEncoder().encode(text);
+    assertImportSize(textBytes.byteLength, "Text import");
     const title = typeof body.title === "string" ? body.title : "Imported note";
     const input = {
       title,
       text,
-      bytes: new TextEncoder().encode(text),
+      bytes: textBytes,
       fileName: `${slugify(title) || "note"}.md`,
       contentType: "text/markdown",
       source_harness: String(body.source_harness || ""),
@@ -448,6 +575,7 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
       throw new Error("Forbidden: ingest_now requires the admin token");
     }
     return await withRepoLock(writeRepoRoot, async () => {
+      syncWritableRepo(writeRepoRoot);
       const imported = await createImportedArtifact(writeRepoRoot, input);
       let touchedFiles = [...imported.touchedFiles];
       if (input.ingest_now) {
@@ -465,13 +593,14 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
 
   if (typeof body.url === "string") {
     const sourceUrl = body.url;
-    const upstream = await fetch(sourceUrl);
+    const upstream = await safeFetchImportUrl(sourceUrl);
     if (!upstream.ok) {
       throw new Error(`URL fetch failed: ${upstream.status} ${upstream.statusText}`);
     }
     const upstreamType = upstream.headers.get("content-type")?.split(";")[0];
     const title = typeof body.title === "string" ? body.title : sourceUrl;
     const bytes = new Uint8Array(await upstream.arrayBuffer());
+    assertImportSize(bytes.byteLength, "URL import response");
     const input = {
       title,
       url: sourceUrl,
@@ -491,6 +620,7 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
       throw new Error("Forbidden: ingest_now requires the admin token");
     }
     return await withRepoLock(writeRepoRoot, async () => {
+      syncWritableRepo(writeRepoRoot);
       const imported = await createImportedArtifact(writeRepoRoot, input);
       let touchedFiles = [...imported.touchedFiles];
       if (input.ingest_now) {
@@ -519,7 +649,7 @@ async function renderHome(): Promise<Response> {
       <div>
         <span class="pill">canonical git wiki</span>
         <span class="pill">bun service</span>
-        <span class="pill">organizer: valkyrie</span>
+        <span class="pill">${htmlEscape(organizerLabel)}</span>
       </div>
       <h1>Shared Brain</h1>
       <p>One organizer-hosted canon for machines, harnesses, runbooks, source pages, and append-only raw evidence.</p>
@@ -730,6 +860,7 @@ const server = Bun.serve({
           return json({ error: "artifact_id or artifact_ids is required" }, 400);
         }
         const result = await withRepoLock(writeRepoRoot, async () => {
+          syncWritableRepo(writeRepoRoot);
           const ingest = await ingestArtifacts(writeRepoRoot, artifactIds);
           const commit = await gitCommitAndPush(writeRepoRoot, ingest.touchedFiles, `brain: ingest ${artifactIds.join(", ")}`);
           return { ok: true, artifact_ids: artifactIds, commit, touched_files: ingest.touchedFiles };
@@ -740,6 +871,7 @@ const server = Bun.serve({
         assertImportAuth(request);
         const body = (await request.json()) as Record<string, unknown>;
         const result = await withRepoLock(writeRepoRoot, async () => {
+          syncWritableRepo(writeRepoRoot);
           const proposal = await createProposal(writeRepoRoot, {
             title: String(body.title || ""),
             body: String(body.body || ""),
@@ -760,6 +892,7 @@ const server = Bun.serve({
       if (request.method === "POST" && url.pathname === "/api/lint") {
         assertAdminAuth(request);
         const result = await withRepoLock(writeRepoRoot, async () => {
+          syncWritableRepo(writeRepoRoot);
           const lint = await lintWiki(writeRepoRoot);
           const commit = await gitCommitAndPush(writeRepoRoot, lint.touchedFiles, `brain: lint ${isoNow()}`);
           return { ok: true, report_path: lint.reportPath, commit, touched_files: lint.touchedFiles };
@@ -769,6 +902,9 @@ const server = Bun.serve({
       return errorResponse(404, `Unknown route: ${url.pathname}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof HttpError) {
+        return json({ error: message }, error.status);
+      }
       if (message === "Unauthorized") {
         return json({ error: message }, 401);
       }

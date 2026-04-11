@@ -12,5 +12,4 @@ Runtime defaults:
 
 The service writes canonical changes through a git checkout supplied by `SHARED_BRAIN_REPO_ROOT`. For fresh `brainstack` installs this is the staging clone for write operations and the serve clone for read serving; the generated hook updates the serve clone after pushes.
 
-Current valkyrie compatibility can point `SHARED_BRAIN_REPO_ROOT` at `~/shared-brain/live/shared-brain` until migration is intentionally applied.
-
+Legacy compatibility can point `SHARED_BRAIN_REPO_ROOT` at `~/shared-brain/live/shared-brain` until migration is intentionally applied.

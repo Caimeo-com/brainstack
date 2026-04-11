@@ -13,7 +13,7 @@ Copy or fetch that bootstrap directory on the Mac, then run:
 
 ```bash
 cd /tmp/brainstack-client
-BRAIN_GIT_REMOTE=swader@valkyrie:/home/swader/shared-brain/bare/shared-brain.git ./install-client.sh
+BRAIN_GIT_REMOTE=operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git ./install-client.sh
 ```
 
 ## Client Env
@@ -21,12 +21,12 @@ BRAIN_GIT_REMOTE=swader@valkyrie:/home/swader/shared-brain/bare/shared-brain.git
 `~/.config/shared-brain.env` should contain:
 
 ```env
-BRAIN_BASE_URL=https://valkyrie.tailb647b6.ts.net
+BRAIN_BASE_URL=https://brain-control.example.ts.net
 BRAIN_IMPORT_TOKEN=
 SHARED_BRAIN_LOCAL_PATH=~/shared-brain
 ```
 
-Do not put `BRAIN_ADMIN_TOKEN` on ordinary clients.
+Do not put `BRAIN_ADMIN_TOKEN` on ordinary clients. The generated client env example intentionally omits it.
 
 ## Read/Write Model
 
@@ -34,4 +34,3 @@ Do not put `BRAIN_ADMIN_TOKEN` on ordinary clients.
 - Sync with `git -C ~/shared-brain pull --ff-only`.
 - Write imports/proposals with the HTTP API and import token.
 - Direct git push is trusted power-user mode only.
-

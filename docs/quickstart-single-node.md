@@ -1,6 +1,6 @@
 # Quickstart: Single Node
 
-Single-node is the reference profile for valkyrie-style installs: one machine runs `braind`, optional `telemux`, the shared-brain bare repo, the staging clone, and the serve clone.
+Single-node is the reference profile for a one-machine install: one machine runs `braind`, the shared-brain bare repo, the staging clone, and the serve clone. Telemux is optional and disabled in the public example by default.
 
 Read [`operator-preflight.md`](./operator-preflight.md) first. A control/single-node install assumes the chosen harness can run unattended as the current user. If you enable Codex or Claude yolo mode and passwordless sudo, telemux becomes a remote command path into that authority.
 
@@ -31,10 +31,16 @@ cd ~/brainstack
 bun run packages/brainctl/src/main.ts init --profile single-node --config examples/single-node.yaml
 systemctl --user daemon-reload
 systemctl --user enable --now braind.service
-systemctl --user enable --now telemux.service
 ```
 
-Do not run this on valkyrie until the migration plan is intentionally applied. The current valkyrie production services still use compatibility paths.
+Do not rerun `init` on an existing install. For product updates or service/hook/env re-rendering, use:
+
+```bash
+cd ~/brainstack
+bun run packages/brainctl/src/main.ts upgrade --profile single-node --config examples/single-node.yaml
+```
+
+To enable Telegram control explicitly, use `examples/control-telegram.yaml` and read `operator-preflight.md` first.
 
 ## Tailscale Serve
 
@@ -48,7 +54,8 @@ BRAIN_PORT=8080
 Expose it privately to the tailnet with:
 
 ```bash
-tailscale serve --bg 8080
+tailscale serve get-config --all > ~/.config/brainstack/tailscale-serve.before.json
+tailscale serve set-config --all ~/.local/state/brainstack/rendered/tailscale/serve-config.json
 tailscale serve status
 ```
 
@@ -58,7 +65,7 @@ Do not enable Funnel for the shared brain unless you explicitly intend public in
 
 ```bash
 curl -fsS http://127.0.0.1:8080/health
-curl -fsS https://valkyrie.tailb647b6.ts.net/health
+curl -fsS https://brain-control.example.ts.net/health
 systemctl --user status braind.service --no-pager
 journalctl --user -u braind.service -n 100 --no-pager
 ```

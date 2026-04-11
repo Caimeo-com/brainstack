@@ -1,12 +1,13 @@
+schema_version: 1
 profile: control
 machine:
-  name: valkyrie
-  user: swader
+  name: brain-control
+  user: operator
   role: control
-  sshUser: swader
-  hostname: valkyrie
+  sshUser: operator
+  hostname: brain-control
 paths:
-  home: /home/swader
+  home: /home/operator
   productRepo: ~/brainstack
   sharedBrainRoot: ~/shared-brain
   privateBrainRoot: ~/private-brain
@@ -16,28 +17,12 @@ paths:
 brain:
   bind: 127.0.0.1
   port: 8080
-  publicBaseUrl: https://valkyrie.tailb647b6.ts.net
+  publicBaseUrl: https://brain-control.example.ts.net
   largeFileThresholdBytes: 10485760
 telemux:
-  enabled: true
-  dashboardHost: 127.0.0.1
-  dashboardPort: 8787
-  localMachine: valkyrie
-  workers:
-    - name: valkyrie
-      transport: local
-      managedRepoRoot: ~/.local/state/brainstack/factory/repos
-      managedHostRoot: ~/.local/state/brainstack/factory/hostctx
-      managedScratchRoot: ~/.local/state/brainstack/factory/scratch
-    - name: erbine
-      transport: ssh
-      sshTarget: erbine
-      sshUser: factory
-      managedRepoRoot: ~/.local/state/brainstack/factory/repos
-      managedHostRoot: ~/.local/state/brainstack/factory/hostctx
-      managedScratchRoot: ~/.local/state/brainstack/factory/scratch
+  enabled: false
 tailscale:
-  tailnetHost: valkyrie.tailb647b6.ts.net
+  tailnetHost: brain-control.example.ts.net
   controlTag: tag:brain
   workerTag: tag:brain-worker
   advertiseTags:
