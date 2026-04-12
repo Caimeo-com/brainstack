@@ -30,7 +30,7 @@ Use grants:
     {
       "src": ["tag:brain-worker"],
       "dst": ["tag:brain"],
-      "ip": ["tcp:443", "icmp:*"]
+      "ip": ["tcp:22", "tcp:443", "icmp:*"]
     }
   ],
   "ssh": [],

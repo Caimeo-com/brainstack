@@ -1079,7 +1079,7 @@ function tailscalePolicyFragment(cfg: BrainstackConfig): string {
       {
         src: [cfg.tailscale.workerTag],
         dst: [cfg.tailscale.controlTag],
-        ip: ["tcp:443", "icmp:*"]
+        ip: ["tcp:22", "tcp:443", "icmp:*"]
       }
     ],
     ssh: [],
@@ -1314,6 +1314,9 @@ async function installLocalClientBootstrap(cfg: BrainstackConfig): Promise<strin
   if (!existsSync(codexAgents)) {
     await symlink(join(bootstrapRoot, "codex-shared-brain.include.md"), codexAgents);
     touched.push(codexAgents);
+  } else {
+    console.log(`Codex already has ${codexAgents}; append the real shared-brain guidance with:`);
+    console.log(`cat ${join(bootstrapRoot, "codex-shared-brain.include.md")} >> ${codexAgents}`);
   }
 
   const claudeHome = join(cfg.paths.home, ".claude");
@@ -1321,6 +1324,9 @@ async function installLocalClientBootstrap(cfg: BrainstackConfig): Promise<strin
   const claudeFile = join(claudeHome, "CLAUDE.md");
   if (await writeIfMissing(claudeFile, `@${join(bootstrapRoot, "claude-user-CLAUDE.md")}\n`)) {
     touched.push(claudeFile);
+  } else {
+    console.log(`Claude already has ${claudeFile}; append this exact import line manually:`);
+    console.log(`@${join(bootstrapRoot, "claude-user-CLAUDE.md")}`);
   }
 
   const cursorRules = join(cfg.paths.home, ".cursor", "rules");
@@ -1328,6 +1334,9 @@ async function installLocalClientBootstrap(cfg: BrainstackConfig): Promise<strin
   const cursorRule = join(cursorRules, "shared-brain.md");
   if (await writeIfMissing(cursorRule, bootstrapFiles["cursor-user-rule.md"])) {
     touched.push(cursorRule);
+  } else {
+    console.log(`Cursor shared-brain rule already exists at ${cursorRule}; append or merge the actual rule content with:`);
+    console.log(`cat ${join(bootstrapRoot, "cursor-user-rule.md")} >> ${cursorRule}`);
   }
 
   return touched;

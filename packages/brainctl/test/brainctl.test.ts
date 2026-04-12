@@ -433,6 +433,66 @@ describe("brainctl install safety", () => {
     }
   });
 
+  test("worker init prints exact manual merge instructions when user agent files already exist", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-worker-existing-agent-files-"));
+    try {
+      const home = join(dir, "home");
+      const configRoot = join(home, ".config", "brainstack");
+      const stateRoot = join(home, ".local", "state", "brainstack");
+      const bare = join(dir, "shared-brain.git");
+      const seed = join(dir, "seed");
+      const configPath = join(dir, "worker.yaml");
+      git(["init", "--bare", "--initial-branch=main", bare], dir);
+      git(["clone", bare, seed], dir);
+      await writeFile(join(seed, "AGENTS.shared-client.md"), "# Shared Client\n");
+      git(["add", "AGENTS.shared-client.md"], seed);
+      git(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "seed"], seed);
+      git(["push", "-u", "origin", "main"], seed);
+
+      await mkdir(join(home, ".codex"), { recursive: true });
+      await mkdir(join(home, ".claude"), { recursive: true });
+      await mkdir(join(home, ".cursor", "rules"), { recursive: true });
+      await writeFile(join(home, ".codex", "AGENTS.md"), "# Existing Codex\n");
+      await writeFile(join(home, ".claude", "CLAUDE.md"), "# Existing Claude\n");
+      await writeFile(join(home, ".cursor", "rules", "shared-brain.md"), "# Existing Cursor\n");
+
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: worker",
+          "machine:",
+          "  name: brain-worker",
+          "  user: operator",
+          "paths:",
+          `  home: ${home}`,
+          `  configRoot: ${configRoot}`,
+          `  stateRoot: ${stateRoot}`,
+          "client:",
+          "  localPath: ~/shared-brain",
+          `  remoteSsh: ${bare}`,
+          "brain:",
+          "  publicBaseUrl: https://brain-control.example.ts.net",
+          ""
+        ].join("\n")
+      );
+
+      const result = runBrainctl(["init", "--profile", "worker", "--config", configPath]);
+      expectSuccess(result);
+      expect(result.stdout).toContain(`Codex already has ${join(home, ".codex", "AGENTS.md")}`);
+      expect(result.stdout).toContain(`cat ${join(configRoot, "client-bootstrap", "codex-shared-brain.include.md")} >> ${join(home, ".codex", "AGENTS.md")}`);
+      expect(result.stdout).toContain(`Claude already has ${join(home, ".claude", "CLAUDE.md")}`);
+      expect(result.stdout).toContain(`@${join(configRoot, "client-bootstrap", "claude-user-CLAUDE.md")}`);
+      expect(result.stdout).toContain(`Cursor shared-brain rule already exists at ${join(home, ".cursor", "rules", "shared-brain.md")}`);
+      expect(result.stdout).toContain(`cat ${join(configRoot, "client-bootstrap", "cursor-user-rule.md")} >> ${join(home, ".cursor", "rules", "shared-brain.md")}`);
+      expect(await readFile(join(home, ".codex", "AGENTS.md"), "utf8")).toBe("# Existing Codex\n");
+      expect(await readFile(join(home, ".claude", "CLAUDE.md"), "utf8")).toBe("# Existing Claude\n");
+      expect(await readFile(join(home, ".cursor", "rules", "shared-brain.md"), "utf8")).toBe("# Existing Cursor\n");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("destroy dry-run and yes clean a disposable install for rerun", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-clean-retry-"));
     try {
@@ -985,6 +1045,29 @@ describe("public release hygiene", () => {
       expect(rendered).toContain("name: brain-worker");
       expect(rendered).toContain("sshUser: operator");
       expect(rendered).toContain("repos:");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rendered Tailscale policy grants worker freshness path back to control SSH", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-policy-"));
+    try {
+      const out = join(dir, "rendered");
+      expectSuccess(runBrainctl(["render", "--profile", "control", "--config", join(PRODUCT_ROOT, "examples", "control.yaml"), "--out", out]));
+      const rendered = JSON.parse(await readFile(join(out, "tailscale", "policy-fragment.json"), "utf8")) as {
+        grants: Array<{ src: string[]; dst: string[]; ip: string[] }>;
+      };
+      const workerToControl = rendered.grants.find((grant) => grant.src.includes("tag:brain-worker") && grant.dst.includes("tag:brain"));
+      expect(workerToControl?.ip).toContain("tcp:22");
+      expect(workerToControl?.ip).toContain("tcp:443");
+
+      const staticPolicy = JSON.parse(await readFile(join(PRODUCT_ROOT, "infra", "tailscale", "policy-fragment.example.json"), "utf8")) as {
+        grants: Array<{ src: string[]; dst: string[]; ip: string[] }>;
+      };
+      const staticWorkerToControl = staticPolicy.grants.find((grant) => grant.src.includes("tag:brain-worker") && grant.dst.includes("tag:brain"));
+      expect(staticWorkerToControl?.ip).toContain("tcp:22");
+      expect(staticWorkerToControl?.ip).toContain("tcp:443");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

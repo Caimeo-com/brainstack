@@ -11,7 +11,7 @@ Brainstack uses normal OpenSSH over Tailscale for control-to-worker transport. T
   - operator/admin identity to `tag:brain` on `tcp:22`, `tcp:443`, and ICMP
   - operator/admin identity to `tag:brain-worker` on `tcp:22` and ICMP
   - `tag:brain` to `tag:brain-worker` on `tcp:22` and ICMP
-  - `tag:brain-worker` to `tag:brain` on `tcp:443` and ICMP
+  - `tag:brain-worker` to `tag:brain` on `tcp:22`, `tcp:443`, and ICMP
 - The `ssh` section stays empty unless you intentionally enable Tailscale SSH.
 
 Use [`../infra/tailscale/policy-fragment.example.json`](../infra/tailscale/policy-fragment.example.json) as the clean tag-based policy shape.

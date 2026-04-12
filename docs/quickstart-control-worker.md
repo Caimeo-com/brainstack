@@ -83,6 +83,16 @@ If that fails with a timeout while ping works, the likely blocker is Tailscale g
 }
 ```
 
+Workers also need the reverse path back to the control host for shared-brain clone freshness and HTTPS/API access:
+
+```json
+{
+  "src": ["tag:brain-worker"],
+  "dst": ["tag:brain"],
+  "ip": ["tcp:22", "tcp:443", "icmp:*"]
+}
+```
+
 ## Tailscale Tags
 
 - Control hosts advertise `tag:brain`.
