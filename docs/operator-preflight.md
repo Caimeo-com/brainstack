@@ -51,6 +51,8 @@ If using Claude Code as a harness, configure its equivalent bypass/permission mo
 
 `brainctl provision --harness claude` tests Claude with `--dangerously-skip-permissions --permission-mode bypassPermissions`. `brainctl provision --harness codex` tests Codex with `--dangerously-bypass-approvals-and-sandbox`. Both tests ask the harness to run `sudo -n true`; failures mean the machine is not ready for unattended telemux control.
 
+Provisioning and doctor checks do not install packages or silently change sudo/harness policy. They stop with remediation text if Bun, Git, OpenSSH, Tailscale, Codex, Claude, passwordless sudo, or harness bypass behavior is missing. Use `brainctl doctor --deep` when you want to repeat the expensive harness sudo proof after installation.
+
 ## Telemux Trust Boundary
 
 Telemux is not a security sandbox. It receives Telegram messages from an allowed Telegram user, maps the topic to a workspace, and passes prompts/files to the configured local harness process, either Codex CLI or Claude Code.

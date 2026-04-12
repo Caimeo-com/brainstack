@@ -24,6 +24,8 @@ export interface ContextRecord {
   codexSessionId: string | null;
   lastRunAt: string | null;
   usageAdapter: string;
+  harness: string | null;
+  harnessBin: string | null;
   modelOverride: string | null;
   reasoningEffortOverride: CodexReasoningEffort | null;
   lastError: string | null;
@@ -105,6 +107,8 @@ function rowToContext(row: Record<string, unknown>): ContextRecord {
     codexSessionId: readNullableString(row, "codex_session_id", "codex_thread_id"),
     lastRunAt: readNullableString(row, "last_run_at"),
     usageAdapter: readNullableString(row, "usage_adapter") || "manual",
+    harness: readNullableString(row, "harness"),
+    harnessBin: readNullableString(row, "harness_bin"),
     modelOverride: readNullableString(row, "codex_model_override"),
     reasoningEffortOverride: (readNullableString(row, "codex_reasoning_effort") as CodexReasoningEffort | null) || null,
     lastError: readNullableString(row, "last_error"),
@@ -218,6 +222,8 @@ export class FactoryDb {
         codex_session_id TEXT,
         last_run_at TEXT,
         usage_adapter TEXT NOT NULL DEFAULT 'manual',
+        harness TEXT,
+        harness_bin TEXT,
         codex_model_override TEXT,
         codex_reasoning_effort TEXT,
         last_error TEXT,
@@ -314,6 +320,8 @@ export class FactoryDb {
     this.ensureColumn("contexts", "last_artifacts", "last_artifacts TEXT");
     this.ensureColumn("contexts", "codex_session_id", "codex_session_id TEXT");
     this.ensureColumn("contexts", "last_run_at", "last_run_at TEXT");
+    this.ensureColumn("contexts", "harness", "harness TEXT");
+    this.ensureColumn("contexts", "harness_bin", "harness_bin TEXT");
     this.ensureColumn("contexts", "codex_model_override", "codex_model_override TEXT");
     this.ensureColumn("contexts", "codex_reasoning_effort", "codex_reasoning_effort TEXT");
 
@@ -336,10 +344,10 @@ export class FactoryDb {
         INSERT INTO contexts (
           slug, telegram_chat_id, telegram_thread_id, machine, kind, state, transport, target, root_path,
           worktree_path, branch_name, base_branch, latest_run_log_path, last_summary, last_artifacts,
-          codex_session_id, last_run_at, usage_adapter, codex_model_override, codex_reasoning_effort,
+          codex_session_id, last_run_at, usage_adapter, harness, harness_bin, codex_model_override, codex_reasoning_effort,
           last_error, created_at, updated_at,
           worker_host, repo_root, status, latest_summary_snippet, latest_artifacts_snippet, codex_thread_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(slug) DO UPDATE SET
           telegram_chat_id = excluded.telegram_chat_id,
           telegram_thread_id = excluded.telegram_thread_id,
@@ -358,6 +366,8 @@ export class FactoryDb {
           codex_session_id = excluded.codex_session_id,
           last_run_at = excluded.last_run_at,
           usage_adapter = excluded.usage_adapter,
+          harness = excluded.harness,
+          harness_bin = excluded.harness_bin,
           codex_model_override = excluded.codex_model_override,
           codex_reasoning_effort = excluded.codex_reasoning_effort,
           last_error = excluded.last_error,
@@ -388,6 +398,8 @@ export class FactoryDb {
         updated.codexSessionId,
         updated.lastRunAt,
         updated.usageAdapter,
+        updated.harness,
+        updated.harnessBin,
         updated.modelOverride,
         updated.reasoningEffortOverride,
         updated.lastError,

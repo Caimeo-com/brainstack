@@ -13,10 +13,15 @@ export interface FactoryWorkerConfig {
   managedHostRoot: string;
   managedScratchRoot: string;
   localExecution: boolean;
+  harness: HarnessName | null;
+  harnessBin: string | null;
+  notes: string | null;
+  capabilities: string[];
 }
 
 export interface FactoryConfig {
   projectRoot: string;
+  stateRoot: string;
   controlRoot: string;
   dbPath: string;
   contextsDir: string;
@@ -43,6 +48,7 @@ export interface FactoryConfig {
   brainBaseUrl: string;
   brainImportToken: string;
   allowAbsoluteArtifactPaths: boolean;
+  textCoalesceMs: number;
 }
 
 interface WorkerConfigInput {
@@ -54,6 +60,10 @@ interface WorkerConfigInput {
   managedHostRoot?: string;
   managedScratchRoot?: string;
   localExecution?: boolean;
+  harness?: string | null;
+  harnessBin?: string | null;
+  notes?: string | null;
+  capabilities?: string[];
 }
 
 function readNumber(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
@@ -132,7 +142,11 @@ function normalizeWorkerConfig(
     managedRepoRoot: input.managedRepoRoot?.trim() ? resolvePath(input.managedRepoRoot.trim()) : defaults.managedRepoRoot,
     managedHostRoot: input.managedHostRoot?.trim() ? resolvePath(input.managedHostRoot.trim()) : defaults.managedHostRoot,
     managedScratchRoot: input.managedScratchRoot?.trim() ? resolvePath(input.managedScratchRoot.trim()) : defaults.managedScratchRoot,
-    localExecution: input.localExecution ?? transport === "local"
+    localExecution: input.localExecution ?? transport === "local",
+    harness: input.harness?.trim() ? normalizeHarness(input.harness.trim()) : null,
+    harnessBin: input.harnessBin?.trim() || null,
+    notes: input.notes?.trim() || null,
+    capabilities: Array.isArray(input.capabilities) ? input.capabilities.map(String).filter(Boolean) : []
   };
 }
 
@@ -203,6 +217,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
 
   return {
     projectRoot,
+    stateRoot,
     controlRoot,
     dbPath: resolve(controlRoot, "db.sqlite"),
     contextsDir: resolve(controlRoot, "contexts"),
@@ -228,7 +243,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
     codexBin: env.FACTORY_CODEX_BIN?.trim() || (harness === "codex" ? harnessBin : "codex"),
     brainBaseUrl: env.BRAIN_BASE_URL?.trim() || "",
     brainImportToken: env.BRAIN_IMPORT_TOKEN?.trim() || "",
-    allowAbsoluteArtifactPaths: ["1", "true", "yes", "on"].includes((env.FACTORY_ALLOW_ABSOLUTE_ARTIFACT_PATHS || "").toLowerCase())
+    allowAbsoluteArtifactPaths: ["1", "true", "yes", "on"].includes((env.FACTORY_ALLOW_ABSOLUTE_ARTIFACT_PATHS || "").toLowerCase()),
+    textCoalesceMs: readNumber(env, "FACTORY_TEXT_COALESCE_MS", 1500)
   };
 }
 
@@ -236,6 +252,7 @@ export const config = loadConfig();
 
 export function ensureProjectPaths(targetConfig: FactoryConfig = config): void {
   const dirs = [
+    targetConfig.stateRoot,
     targetConfig.controlRoot,
     targetConfig.contextsDir,
     targetConfig.cronSnapshotsDir,

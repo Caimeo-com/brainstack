@@ -51,10 +51,14 @@ systemctl --user restart braind.service
 To rehearse teardown without deleting data:
 
 ```bash
-bun run packages/brainctl/src/main.ts destroy --config ~/.config/brainstack/brainstack.yaml --dry-run
+bun run packages/brainctl/src/main.ts destroy --config ~/.config/brainstack/brainstack.yaml --scope all --dry-run
 ```
 
-Without `--dry-run`, `destroy` disables/stops rendered user services, removes `~/.config/brainstack` and `~/.local/state/brainstack`, and keeps `~/shared-brain`/`~/private-brain` unless explicit removal flags are passed.
+Without `--dry-run`, `destroy` requires `--yes`. It consumes `~/.config/brainstack/managed-artifacts.json`, disables/stops rendered user services, removes brainstack-owned config/state artifacts, and keeps `~/shared-brain`/`~/private-brain` unless explicit removal flags are passed.
+
+```bash
+bun run packages/brainctl/src/main.ts destroy --config ~/.config/brainstack/brainstack.yaml --scope all --yes
+```
 
 To enable Telegram control explicitly, use `examples/control-telegram.yaml` and read `operator-preflight.md` first.
 
@@ -89,8 +93,12 @@ Do not enable Funnel for the shared brain unless you explicitly intend public in
 ## Health
 
 ```bash
+bun run packages/brainctl/src/main.ts doctor --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts updates --config ~/.config/brainstack/brainstack.yaml
 curl -fsS http://127.0.0.1:8080/health
 curl -fsS https://brain-control.example.ts.net/health
 systemctl --user status braind.service --no-pager
 journalctl --user -u braind.service -n 100 --no-pager
 ```
+
+Use `brainctl doctor --deep` only when you intentionally want it to run the selected harness in bypass/yolo mode to prove `sudo -n true` works through the harness. Normal doctor reports versions, health, service drift, Tailscale status, token presence without values, and outbox state without invoking an LLM.

@@ -1,12 +1,15 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 type Profile = "single-node" | "control" | "worker" | "client-macos" | "private-journal";
 type SeedMode = "empty-only" | "missing" | "force";
 type HarnessName = "codex" | "claude";
+type DestroyScope = "control" | "worker" | "client" | "all";
+type CheckStatus = "PASS" | "WARN" | "FAIL";
 
 const CONFIG_SCHEMA_VERSION = 1;
 const MIN_BUN_VERSION = "1.3.11";
@@ -15,6 +18,48 @@ interface ParsedArgs {
   command: string;
   positional: string[];
   flags: Record<string, string | boolean | string[]>;
+}
+
+interface BrainstackWorkerConfig {
+  name: string;
+  transport: string;
+  sshTarget?: string | null;
+  sshUser?: string | null;
+  managedRepoRoot: string;
+  managedHostRoot: string;
+  managedScratchRoot: string;
+  harness?: HarnessName | null;
+  harnessBin?: string | null;
+  notes?: string;
+  capabilities?: string[];
+}
+
+interface ManagedArtifact {
+  path: string;
+  kind: "file" | "dir" | "symlink" | "service" | "repo" | "tailscale-serve";
+  scope: DestroyScope;
+  reason: string;
+  optional?: boolean;
+}
+
+interface ManagedArtifactsManifest {
+  schema_version: number;
+  product: "brainstack";
+  created_at: string;
+  updated_at: string;
+  profile: Profile;
+  config_root: string;
+  state_root: string;
+  artifacts: ManagedArtifact[];
+  manual_leftovers: string[];
+}
+
+interface DoctorCheck {
+  section: string;
+  name: string;
+  status: CheckStatus;
+  detail: string;
+  remediation?: string;
 }
 
 interface BrainstackConfig {
@@ -64,7 +109,7 @@ interface BrainstackConfig {
     controlRoot: string;
     factoryRoot: string;
     localMachine: string;
-    workers: Array<Record<string, unknown>>;
+    workers: BrainstackWorkerConfig[];
   };
   tailscale: {
     tailnetHost: string;
@@ -102,14 +147,18 @@ function usage(): string {
   brainctl provision --profile single-node|control|worker|client-macos [--out brainstack.yaml] [--harness codex|claude] [--enable-telemux] [--enroll-tailscale] [--tailscale-tag tag:brain] [--brain-base-url URL] [--brain-remote SSH_OR_PATH] [--test-bot]
   brainctl upgrade --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
   brainctl apply-runtime --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
-  brainctl doctor --config brainstack.yaml [--profile ...]
+  brainctl doctor --config brainstack.yaml [--profile ...] [--json] [--workers] [--deep]
+  brainctl updates --config brainstack.yaml [--profile ...]
   brainctl backup --config brainstack.yaml [--out DIR] [--pause-telemux]
   brainctl restore --backup DIR_OR_TGZ --target DIR [--apply]
   brainctl render --config brainstack.yaml --profile ... --out DIR
   brainctl bootstrap-client --profile client-macos --config brainstack.yaml --out DIR
   brainctl join-worker --config brainstack.yaml --worker WORKER_HOST [--ssh-user USER] [--out DIR]
   brainctl rotate-token --kind import|admin|telegram-placeholder --config brainstack.yaml [--env FILE]
-  brainctl destroy --config brainstack.yaml [--profile ...] [--dry-run] [--remove-shared-brain] [--remove-private-brain] [--remove-tailscale-serve]
+  brainctl import-text --config brainstack.yaml --title TITLE --text TEXT --source-harness HARNESS --source-machine MACHINE [--source-type note]
+  brainctl propose --config brainstack.yaml --title TITLE --body BODY
+  brainctl outbox status|list|flush|purge --config brainstack.yaml [--yes]
+  brainctl destroy --config brainstack.yaml [--profile ...] --dry-run|--yes [--scope control|worker|client|all] [--remove-shared-brain] [--remove-private-brain] [--remove-tailscale-serve]
   brainctl migrate-current-install [--out FILE]
   brainctl smoke --profile single-node|control|worker|client-macos --config brainstack.yaml`;
 }
@@ -402,6 +451,31 @@ function arrayAt(input: Record<string, unknown>, key: string): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
+function optionalStringAt(input: Record<string, unknown>, key: string): string | null {
+  const value = input[key];
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function normalizeWorkerConfig(input: Record<string, unknown>, cfg: Pick<BrainstackConfig, "machine" | "telemux" | "harness">): BrainstackWorkerConfig {
+  const name = stringAt(input, "name", cfg.machine.name);
+  const transport = stringAt(input, "transport", name === cfg.machine.name ? "local" : "ssh");
+  const harnessValue = optionalStringAt(input, "harness");
+  const capabilities = arrayAt(input, "capabilities").map(String).filter(Boolean);
+  return {
+    name,
+    transport,
+    sshTarget: optionalStringAt(input, "sshTarget"),
+    sshUser: optionalStringAt(input, "sshUser"),
+    managedRepoRoot: stringAt(input, "managedRepoRoot", join(cfg.telemux.factoryRoot, "repos")),
+    managedHostRoot: stringAt(input, "managedHostRoot", join(cfg.telemux.factoryRoot, "hostctx")),
+    managedScratchRoot: stringAt(input, "managedScratchRoot", join(cfg.telemux.factoryRoot, "scratch")),
+    harness: harnessValue ? normalizeHarness(harnessValue, cfg.harness.name) : null,
+    harnessBin: optionalStringAt(input, "harnessBin"),
+    notes: optionalStringAt(input, "notes") || undefined,
+    capabilities: capabilities.length ? capabilities : undefined
+  };
+}
+
 function validateRawConfig(raw: Record<string, unknown>): void {
   const unknownKeys = Object.keys(raw).filter((key) => !ALLOWED_TOP_LEVEL_CONFIG_KEYS.has(key));
   if (unknownKeys.length) {
@@ -462,12 +536,12 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
           ? []
           : [controlTag];
   const publicBaseUrl = stringAt(brain, "publicBaseUrl", "");
-  const workers = arrayAt(telemux, "workers") as Array<Record<string, unknown>>;
+  const workerInputs = arrayAt(telemux, "workers") as Array<Record<string, unknown>>;
   const remoteSsh = `${machineUser}@${machineName}:${join(sharedBrainRoot, "bare", "shared-brain.git")}`;
   const harnessName = normalizeHarness(stringAt(harness, "name", stringAt(telemux, "harness", "codex")));
   const harnessBin = stringAt(harness, "bin", harnessName);
 
-  return {
+  const cfg: BrainstackConfig = {
     schemaVersion,
     runtime: {
       bunBin: stringAt(runtime, "bunBin", "") || resolveBunBin()
@@ -514,7 +588,7 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
       controlRoot: join(stateRoot, "telemux"),
       factoryRoot: join(stateRoot, "factory"),
       localMachine: stringAt(telemux, "localMachine", machineName),
-      workers
+      workers: []
     },
     tailscale: {
       tailnetHost: stringAt(tailscale, "tailnetHost", publicBaseUrl.replace(/^https?:\/\//, "")),
@@ -529,6 +603,8 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
       remoteSsh: stringAt(client, "remoteSsh", remoteSsh)
     }
   };
+  cfg.telemux.workers = workerInputs.map((entry) => normalizeWorkerConfig(entry, cfg));
+  return cfg;
 }
 
 function run(args: string[], options: { cwd?: string; env?: Record<string, string>; check?: boolean } = {}) {
@@ -804,6 +880,7 @@ function telemuxRuntimeEnv(cfg: BrainstackConfig): string {
     `FACTORY_DASHBOARD_HOST=${cfg.telemux.dashboardHost}`,
     `FACTORY_DASHBOARD_PORT=${cfg.telemux.dashboardPort}`,
     "FACTORY_TELEGRAM_POLL_TIMEOUT_SECONDS=30",
+    "FACTORY_TEXT_COALESCE_MS=1500",
     "FACTORY_CRON_POLL_INTERVAL_SECONDS=30",
     `FACTORY_LOCAL_MACHINE=${cfg.telemux.localMachine}`,
     `BRAINSTACK_STATE_ROOT=${cfg.paths.stateRoot}`,
@@ -829,7 +906,7 @@ function telemuxSecretsEnv(): string {
   ].join("\n");
 }
 
-function defaultWorkers(cfg: BrainstackConfig): Array<Record<string, unknown>> {
+function defaultWorkers(cfg: BrainstackConfig): BrainstackWorkerConfig[] {
   if (cfg.telemux.workers.length) {
     return cfg.telemux.workers;
   }
@@ -842,7 +919,10 @@ function defaultWorkers(cfg: BrainstackConfig): Array<Record<string, unknown>> {
       transport: "local",
       managedRepoRoot: join(cfg.telemux.factoryRoot, "repos"),
       managedHostRoot: join(cfg.telemux.factoryRoot, "hostctx"),
-      managedScratchRoot: join(cfg.telemux.factoryRoot, "scratch")
+      managedScratchRoot: join(cfg.telemux.factoryRoot, "scratch"),
+      harness: cfg.harness.name,
+      harnessBin: null,
+      capabilities: ["control-local"]
     }
   ];
 }
@@ -1096,6 +1176,106 @@ function clientLocalPathAbs(cfg: BrainstackConfig): string {
 
 function clientEnvPathAbs(cfg: BrainstackConfig): string {
   return absWithHome(cfg.client.envPath, cfg.paths.home);
+}
+
+function managedManifestPath(cfg: BrainstackConfig): string {
+  return join(cfg.paths.configRoot, "managed-artifacts.json");
+}
+
+function destroyScopeFromProfile(profile: Profile): DestroyScope {
+  if (profile === "worker") return "worker";
+  if (profile === "client-macos") return "client";
+  return "control";
+}
+
+function artifactInScope(artifact: ManagedArtifact, scope: DestroyScope): boolean {
+  return scope === "all" || artifact.scope === scope;
+}
+
+function expectedManagedArtifacts(cfg: BrainstackConfig): ManagedArtifact[] {
+  const artifacts: ManagedArtifact[] = [
+    { path: cfg.paths.configRoot, kind: "dir", scope: "all", reason: "brainstack config root" },
+    { path: cfg.paths.stateRoot, kind: "dir", scope: "all", reason: "brainstack state root" },
+    { path: managedManifestPath(cfg), kind: "file", scope: "all", reason: "brainstack ownership manifest", optional: true },
+    { path: join(cfg.paths.stateRoot, "rendered"), kind: "dir", scope: "all", reason: "rendered brainstack artifacts", optional: true }
+  ];
+
+  if (runsBraind(cfg)) {
+    artifacts.push(
+      { path: join(cfg.paths.configRoot, "braind.runtime.env"), kind: "file", scope: "control", reason: "generated braind runtime env" },
+      { path: join(cfg.paths.systemdUserRoot, "braind.service"), kind: "service", scope: "control", reason: "generated braind user service" },
+      { path: join(cfg.repos.bare, "hooks", "post-receive"), kind: "file", scope: "control", reason: "generated shared-brain git hook", optional: true },
+      { path: join(cfg.repos.bare, "hooks", "pre-receive"), kind: "file", scope: "control", reason: "generated shared-brain git hook", optional: true }
+    );
+  }
+
+  if (cfg.telemux.enabled) {
+    artifacts.push(
+      { path: join(cfg.paths.configRoot, "telemux.runtime.env"), kind: "file", scope: "control", reason: "generated telemux runtime env" },
+      { path: join(cfg.paths.configRoot, "workers.json"), kind: "file", scope: "control", reason: "generated worker config render" },
+      { path: join(cfg.paths.systemdUserRoot, "telemux.service"), kind: "service", scope: "control", reason: "generated telemux user service" },
+      { path: cfg.telemux.controlRoot, kind: "dir", scope: "control", reason: "telemux control state root", optional: true },
+      { path: cfg.telemux.factoryRoot, kind: "dir", scope: "control", reason: "telemux factory workspace root", optional: true }
+    );
+  }
+
+  artifacts.push(
+    { path: join(cfg.paths.configRoot, "client-bootstrap"), kind: "dir", scope: cfg.profile === "worker" ? "worker" : "client", reason: "product-owned client bootstrap files", optional: true },
+    { path: clientEnvPathAbs(cfg), kind: "file", scope: cfg.profile === "worker" ? "worker" : "client", reason: "shared-brain client env created from example", optional: true },
+    { path: join(cfg.paths.home, ".codex", "AGENTS.md"), kind: "symlink", scope: cfg.profile === "worker" ? "worker" : "client", reason: "Codex shared-brain include symlink", optional: true },
+    { path: join(cfg.paths.home, ".claude", "CLAUDE.md"), kind: "file", scope: cfg.profile === "worker" ? "worker" : "client", reason: "Claude shared-brain import stub", optional: true },
+    { path: join(cfg.paths.home, ".cursor", "rules", "shared-brain.md"), kind: "file", scope: cfg.profile === "worker" ? "worker" : "client", reason: "Cursor shared-brain rule", optional: true }
+  );
+
+  return artifacts;
+}
+
+function manualLeftovers(cfg: BrainstackConfig): string[] {
+  return [
+    "Bun/Git/OpenSSH/Tailscale packages are never removed by brainctl.",
+    "Tailscale enrollment, auth keys, and device tags are never removed by brainctl.",
+    "Codex/Claude binaries, authentication, and permission/yolo settings are never removed by brainctl.",
+    "Passwordless sudo policy is never removed by brainctl.",
+    `${cfg.paths.sharedBrainRoot} is kept unless --remove-shared-brain is explicitly passed.`,
+    `${cfg.paths.privateBrainRoot} is kept unless --remove-private-brain is explicitly passed.`
+  ];
+}
+
+async function writeManagedManifest(cfg: BrainstackConfig): Promise<void> {
+  const manifest: ManagedArtifactsManifest = {
+    schema_version: 1,
+    product: "brainstack",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    profile: cfg.profile,
+    config_root: cfg.paths.configRoot,
+    state_root: cfg.paths.stateRoot,
+    artifacts: expectedManagedArtifacts(cfg),
+    manual_leftovers: manualLeftovers(cfg)
+  };
+  await writeText(managedManifestPath(cfg), `${JSON.stringify(manifest, null, 2)}\n`, 0o600);
+}
+
+async function loadManagedManifest(cfg: BrainstackConfig): Promise<ManagedArtifactsManifest> {
+  const path = managedManifestPath(cfg);
+  if (existsSync(path)) {
+    return JSON.parse(await readFile(path, "utf8")) as ManagedArtifactsManifest;
+  }
+  return {
+    schema_version: 1,
+    product: "brainstack",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    profile: cfg.profile,
+    config_root: cfg.paths.configRoot,
+    state_root: cfg.paths.stateRoot,
+    artifacts: expectedManagedArtifacts(cfg),
+    manual_leftovers: manualLeftovers(cfg)
+  };
+}
+
+function sha256Hex(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
 }
 
 async function installLocalClientBootstrap(cfg: BrainstackConfig): Promise<string[]> {
@@ -1473,6 +1653,9 @@ async function commandProvision(args: ParsedArgs): Promise<void> {
   const config = buildProvisionConfig(profile, { name: selectedHarness.name, bin: selectedHarness.bin }, args);
   const out = abs(flag(args, "out") || "~/.config/brainstack/brainstack.yaml");
   await writeText(out, stringifySimpleYaml(config));
+  const cfg = await loadConfig(out, profile);
+  await ensureDir(cfg.paths.configRoot);
+  await writeManagedManifest(cfg);
   if (hasFlag(args, "enroll-tailscale")) {
     const authKeyEnv = flag(args, "tailscale-auth-key-env") || "TAILSCALE_AUTH_KEY";
     if (!process.env[authKeyEnv]) {
@@ -1486,6 +1669,7 @@ async function commandProvision(args: ParsedArgs): Promise<void> {
     console.log(`home path: ${String(paths.home)}`);
   }
   console.log(`provision config written: ${out}`);
+  console.log(`ownership manifest written: ${managedManifestPath(cfg)}`);
   console.log(`detected tools: ${Object.entries(found).map(([name, path]) => `${name}=${path}`).join(" ")}`);
   console.log(`selected harness: ${selectedHarness.name} (${selectedHarness.bin})`);
   console.log("next:");
@@ -1610,6 +1794,7 @@ async function commandInit(args: ParsedArgs): Promise<void> {
     console.log(`client bootstrap touched: ${touched.length ? touched.join(", ") : "(none)"}`);
   }
   await writeFileMap(join(cfg.paths.stateRoot, "rendered"), renderFiles(cfg));
+  await writeManagedManifest(cfg);
   console.log(`initialized ${cfg.profile} at ${cfg.paths.sharedBrainRoot}`);
   console.log(`env: ${cfg.paths.configRoot}`);
   console.log(`user units: ${cfg.paths.systemdUserRoot}`);
@@ -1641,6 +1826,8 @@ async function applyRuntime(cfg: BrainstackConfig): Promise<string[]> {
   }
   await writeFileMap(join(cfg.paths.stateRoot, "rendered"), renderFiles(cfg));
   touched.push(join(cfg.paths.stateRoot, "rendered"));
+  await writeManagedManifest(cfg);
+  touched.push(managedManifestPath(cfg));
   return touched;
 }
 
@@ -1669,48 +1856,541 @@ async function commandApplyRuntime(args: ParsedArgs, withBackup: boolean): Promi
   }
 }
 
-async function commandDoctor(args: ParsedArgs): Promise<void> {
-  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
-  const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
-  const commandOk = (name: string) => run(["bash", "-lc", `command -v ${name}`], { check: false }).code === 0;
+function check(status: CheckStatus, section: string, name: string, detail: string, remediation?: string): DoctorCheck {
+  return { status, section, name, detail, remediation };
+}
+
+function commandOk(name: string): boolean {
+  return run(["bash", "-lc", `command -v ${shellSingleQuote(name)}`], { check: false }).code === 0;
+}
+
+function commandVersion(name: string): string {
+  const proc = name === "ssh" ? run([name, "-V"], { check: false }) : run([name, "--version"], { check: false });
+  return (proc.stdout || proc.stderr).trim().split(/\r?\n/)[0] || "unknown";
+}
+
+function commandHelp(name: string, args: string[] = ["--help"]): string {
+  const proc = run([name, ...args], { check: false });
+  return `${proc.stdout}\n${proc.stderr}`;
+}
+
+function harnessCompatibility(name: HarnessName, bin: string): DoctorCheck {
+  if (!commandOk(bin)) {
+    return check("FAIL", "versions", `${name}-harness`, `${bin} not found in PATH`, installHint(name));
+  }
+  const version = commandVersion(bin);
+  const help = name === "codex" ? commandHelp(bin, ["exec", "--help"]) : commandHelp(bin, ["--help"]);
+  const required =
+    name === "codex"
+      ? ["--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"]
+      : ["--dangerously-skip-permissions", "--permission-mode", "--output-format"];
+  const missing = required.filter((needle) => !help.includes(needle));
+  if (missing.length) {
+    return check(
+      "FAIL",
+      "versions",
+      `${name}-harness`,
+      `${version}; missing required CLI surface: ${missing.join(", ")}`,
+      `Update ${name} manually, then rerun doctor. ${installHint(name)}`
+    );
+  }
+  return check("PASS", "versions", `${name}-harness`, `${version}; required CLI surface present`);
+}
+
+function envHasKey(path: string, key: string): boolean {
+  if (!existsSync(path)) {
+    return false;
+  }
+  const text = readFileSync(path, "utf8");
+  return new RegExp(`^${key}=.+`, "m").test(text);
+}
+
+function gitClean(path: string): DoctorCheck {
+  if (!gitExists(path)) {
+    return check("FAIL", "git", `git-clean:${path}`, "not a git worktree");
+  }
+  const dirty = run(["git", "status", "--porcelain"], { cwd: path, check: false }).stdout.trim();
+  return dirty
+    ? check("WARN", "git", `git-clean:${path}`, "worktree has uncommitted changes", "Inspect before applying runtime changes.")
+    : check("PASS", "git", `git-clean:${path}`, "clean");
+}
+
+function outboxRoot(cfg: BrainstackConfig): string {
+  return join(cfg.paths.stateRoot, "outbox", brainInstanceId(cfg));
+}
+
+function brainInstanceId(cfg: BrainstackConfig): string {
+  const base = cfg.brain.publicBaseUrl || cfg.client.remoteSsh || cfg.client.localPath;
+  return sha256Hex(base).slice(0, 16);
+}
+
+async function countOutboxItems(cfg: BrainstackConfig): Promise<number> {
+  const root = outboxRoot(cfg);
+  if (!existsSync(root)) {
+    return 0;
+  }
+  return (await readdir(root)).filter((name) => name.endsWith(".json")).length;
+}
+
+async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Promise<DoctorCheck[]> {
+  const checks: DoctorCheck[] = [];
   const bunVersion = installedBunVersion();
-  checks.push({
-    name: "bun",
-    ok: Boolean(bunVersion) && compareVersions(bunVersion || "0.0.0", MIN_BUN_VERSION) >= 0,
-    detail: bunVersion ? `Bun ${bunVersion}; required >= ${MIN_BUN_VERSION}` : "Bun runtime missing"
-  });
-  checks.push({
-    name: "bun-bin",
-    ok: existsSync(cfg.runtime.bunBin),
-    detail: cfg.runtime.bunBin
-  });
-  checks.push({ name: "git", ok: commandOk("git"), detail: "Git CLI" });
-  checks.push({ name: "ssh", ok: commandOk("ssh"), detail: "OpenSSH client" });
-  checks.push({ name: "tailscale", ok: commandOk("tailscale"), detail: "Tailscale CLI optional for clients" });
-  checks.push({ name: "harness", ok: commandOk(cfg.harness.bin), detail: `${cfg.harness.name} via ${cfg.harness.bin}` });
+  checks.push(
+    bunVersion && compareVersions(bunVersion, MIN_BUN_VERSION) >= 0
+      ? check("PASS", "versions", "bun", `Bun ${bunVersion}; required >= ${MIN_BUN_VERSION}`)
+      : check("FAIL", "versions", "bun", bunVersion ? `Bun ${bunVersion}; required >= ${MIN_BUN_VERSION}` : "Bun runtime missing", installHint("bun"))
+  );
+  checks.push(existsSync(cfg.runtime.bunBin) ? check("PASS", "versions", "bun-bin", cfg.runtime.bunBin) : check("FAIL", "versions", "bun-bin", `${cfg.runtime.bunBin} does not exist`));
+  for (const name of ["git", "ssh", "tailscale"]) {
+    checks.push(commandOk(name) ? check("PASS", "versions", name, commandVersion(name)) : check("FAIL", "versions", name, "missing", installHint(name)));
+  }
+  checks.push(harnessCompatibility(cfg.harness.name, cfg.harness.bin));
+  if (hasFlag(args, "deep")) {
+    const sudo = run(["sudo", "-n", "true"], { check: false });
+    checks.push(sudo.code === 0 ? check("PASS", "privileges", "sudo-noninteractive", "sudo -n true works") : check("FAIL", "privileges", "sudo-noninteractive", "sudo -n true failed", "Configure passwordless sudo if this profile requires privileged harness operations."));
+    try {
+      await testHarnessSudo(cfg.harness);
+      checks.push(check("PASS", "privileges", "harness-bypass-sudo", `${cfg.harness.name} proved bypass/yolo sudo execution`));
+    } catch (error) {
+      checks.push(check("FAIL", "privileges", "harness-bypass-sudo", error instanceof Error ? error.message : String(error), `Verify ${cfg.harness.name} bypass/yolo permissions manually.`));
+    }
+  }
+
+  checks.push(check("PASS", "config", "schema", `schema_version=${cfg.schemaVersion}`));
+  checks.push(existsSync(cfg.paths.configRoot) ? check("PASS", "config", "config-root", cfg.paths.configRoot) : check("WARN", "config", "config-root", `${cfg.paths.configRoot} missing`, "Run brainctl init/apply-runtime after provisioning."));
+  checks.push(existsSync(cfg.paths.stateRoot) ? check("PASS", "config", "state-root", cfg.paths.stateRoot) : check("WARN", "config", "state-root", `${cfg.paths.stateRoot} missing`, "Run brainctl init/apply-runtime after provisioning."));
+  checks.push(existsSync(managedManifestPath(cfg)) ? check("PASS", "config", "ownership-manifest", managedManifestPath(cfg)) : check("WARN", "config", "ownership-manifest", "missing", "Run brainctl init/apply-runtime so destroy has a deterministic manifest."));
+
+  if (runsBraind(cfg)) {
+    checks.push(existsSync(join(cfg.paths.configRoot, "braind.runtime.env")) ? check("PASS", "secrets", "braind-runtime-env", "present") : check("WARN", "secrets", "braind-runtime-env", "missing"));
+    checks.push(envHasKey(join(cfg.paths.configRoot, "braind.secrets.env"), "BRAIN_IMPORT_TOKEN") ? check("PASS", "secrets", "brain-import-token", "present") : check("WARN", "secrets", "brain-import-token", "missing or empty"));
+    checks.push(envHasKey(join(cfg.paths.configRoot, "braind.secrets.env"), "BRAIN_ADMIN_TOKEN") ? check("PASS", "secrets", "brain-admin-token", "present") : check("WARN", "secrets", "brain-admin-token", "missing or empty"));
+    checks.push(existsSync(cfg.repos.bare) ? check("PASS", "git", "bare-repo", cfg.repos.bare) : check("WARN", "git", "bare-repo", `${cfg.repos.bare} missing`));
+    if (gitExists(cfg.repos.staging)) checks.push(gitClean(cfg.repos.staging)); else checks.push(check("WARN", "git", "staging-clone", `${cfg.repos.staging} missing`));
+    if (gitExists(cfg.repos.serve)) checks.push(gitClean(cfg.repos.serve)); else checks.push(check("WARN", "git", "serve-clone", `${cfg.repos.serve} missing`));
+    try {
+      const response = await fetch(`http://${cfg.brain.bind}:${cfg.brain.port}/health`, { signal: AbortSignal.timeout(2000) });
+      checks.push(response.ok ? check("PASS", "health", "braind-health", `HTTP ${response.status}`) : check("WARN", "health", "braind-health", `HTTP ${response.status}`));
+    } catch (error) {
+      checks.push(check("WARN", "health", "braind-health", error instanceof Error ? error.message : String(error), "Start braind or ignore before runtime is installed."));
+    }
+  }
+
+  if (cfg.telemux.enabled) {
+    checks.push(envHasKey(join(cfg.paths.configRoot, "telemux.secrets.env"), "FACTORY_TELEGRAM_BOT_TOKEN") ? check("PASS", "secrets", "telegram-token", "present") : check("WARN", "secrets", "telegram-token", "missing or empty"));
+    try {
+      const response = await fetch(`http://${cfg.telemux.dashboardHost}:${cfg.telemux.dashboardPort}/health`, { signal: AbortSignal.timeout(1500) });
+      checks.push(response.ok ? check("PASS", "health", "telemux-health", `HTTP ${response.status}`) : check("WARN", "health", "telemux-health", `HTTP ${response.status}`));
+    } catch (error) {
+      checks.push(check("WARN", "health", "telemux-health", error instanceof Error ? error.message : String(error)));
+    }
+  }
+
   if (usesUserServices(cfg) && commandOk("loginctl")) {
     const linger = run(["loginctl", "show-user", cfg.machine.user, "--property=Linger", "--value"], { check: false });
-    const enabled = linger.stdout.trim() === "yes";
-    checks.push({
-      name: "user-service-linger",
-      ok: enabled,
-      detail: enabled ? `linger enabled for ${cfg.machine.user}` : `run: loginctl enable-linger ${cfg.machine.user}`
+    checks.push(
+      linger.stdout.trim() === "yes"
+        ? check("PASS", "services", "user-service-linger", `linger enabled for ${cfg.machine.user}`)
+        : check("WARN", "services", "user-service-linger", `linger disabled for ${cfg.machine.user}`, `sudo loginctl enable-linger ${cfg.machine.user}`)
+    );
+  }
+
+  if (commandOk("tailscale")) {
+    const status = run(["tailscale", "status", "--json"], { check: false });
+    checks.push(status.code === 0 ? check("PASS", "tailscale", "status", "tailscale status --json succeeded") : check("WARN", "tailscale", "status", (status.stderr || status.stdout).trim()));
+    const serve = run(["tailscale", "serve", "status"], { check: false });
+    checks.push(serve.code === 0 ? check("PASS", "tailscale", "serve", "serve status available") : check("WARN", "tailscale", "serve", (serve.stderr || serve.stdout).trim()));
+  }
+
+  checks.push(check("PASS", "outbox", "queued-items", `${await countOutboxItems(cfg)} queued item(s)`));
+
+  if (hasFlag(args, "workers") || hasFlag(args, "deep")) {
+    checks.push(...(await workerDoctorChecks(cfg, hasFlag(args, "deep"))));
+  }
+
+  return checks;
+}
+
+function formatDoctorChecks(checks: DoctorCheck[]): string {
+  return checks
+    .map((item) => `${item.status} [${item.section}] ${item.name}: ${item.detail}${item.remediation ? `\n  remediation: ${item.remediation}` : ""}`)
+    .join("\n");
+}
+
+function workerHarnessFamily(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, contextOverride?: HarnessName | null): HarnessName {
+  return contextOverride || worker.harness || cfg.harness.name;
+}
+
+function workerHarnessBin(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, family: HarnessName, contextBin?: string | null): string {
+  if (contextBin?.trim()) return contextBin.trim();
+  if (worker.harnessBin?.trim()) return worker.harnessBin.trim();
+  if (worker.transport === "local" && family === cfg.harness.name) return cfg.harness.bin;
+  return family;
+}
+
+function workerRemoteTarget(worker: BrainstackWorkerConfig): string {
+  const target = worker.sshTarget || worker.name;
+  return worker.sshUser ? `${worker.sshUser}@${target}` : target;
+}
+
+function runWorkerShell(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, script: string, timeoutSeconds = 10) {
+  if (worker.transport === "local") {
+    return run(["bash", "-lc", script], { check: false });
+  }
+  const sshArgs =
+    worker.transport === "tailscale-ssh"
+      ? ["tailscale", "ssh", workerRemoteTarget(worker), "bash", "-lc", script]
+      : [
+          "ssh",
+          "-o",
+          "BatchMode=yes",
+          "-o",
+          "ConnectTimeout=8",
+          "-o",
+          "StrictHostKeyChecking=accept-new",
+          workerRemoteTarget(worker),
+          "bash",
+          "-lc",
+          script
+        ];
+  return run(["timeout", `${timeoutSeconds}s`, ...sshArgs], { check: false });
+}
+
+async function workerDoctorChecks(cfg: BrainstackConfig, deep: boolean): Promise<DoctorCheck[]> {
+  const checks: DoctorCheck[] = [];
+  for (const worker of defaultWorkers(cfg)) {
+    const family = workerHarnessFamily(cfg, worker);
+    const bin = workerHarnessBin(cfg, worker, family);
+    const required =
+      family === "codex"
+        ? ["--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"]
+        : ["--dangerously-skip-permissions", "--permission-mode", "--output-format"];
+    const script = [
+      "set -euo pipefail",
+      `harness_bin=${quoteForBash(bin)}`,
+      `harness_family=${quoteForBash(family)}`,
+      "printf 'worker=%s\\n' \"$(hostname)\"",
+      "if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then printf 'sudo=ok\\n'; else printf 'sudo=fail\\n'; fi",
+      "if ! command -v \"$harness_bin\" >/dev/null 2>&1; then printf 'harness_bin=missing\\n'; exit 7; fi",
+      "printf 'harness_bin=%s\\n' \"$(command -v \"$harness_bin\")\"",
+      "\"$harness_bin\" --version 2>&1 | head -n 1 | sed 's/^/version=/' || true",
+      "if [ \"$harness_family\" = codex ]; then help=\"$($harness_bin exec --help 2>&1 || true)\"; else help=\"$($harness_bin --help 2>&1 || true)\"; fi",
+      ...required.map((needle) => `case "$help" in *${quoteForBash(needle)}*) printf 'flag:${needle}=ok\\n' ;; *) printf 'flag:${needle}=missing\\n' ;; esac`),
+      deep
+        ? [
+            "tmpdir=\"$(mktemp -d)\"",
+            "trap 'rm -rf \"$tmpdir\"' EXIT",
+            "cd \"$tmpdir\"",
+            "prompt='Run exactly this shell command and then stop: sudo -n true && printf BRAINSTACK_HARNESS_SUDO_OK'",
+            "if [ \"$harness_family\" = codex ]; then",
+            "  output=\"$(printf '%s' \"$prompt\" | \"$harness_bin\" exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox - 2>&1 || true)\"",
+            "else",
+            "  output=\"$(printf '%s' \"$prompt\" | \"$harness_bin\" -p --dangerously-skip-permissions --permission-mode bypassPermissions --output-format text 2>&1 || true)\"",
+            "fi",
+            "case \"$output\" in *BRAINSTACK_HARNESS_SUDO_OK*) printf 'harness_sudo=ok\\n' ;; *) printf 'harness_sudo=fail\\n' ;; esac"
+          ].join("\n")
+        : "printf 'deep=skipped\\n'"
+    ].join("\n");
+    const result = runWorkerShell(cfg, worker, script, deep ? 30 : 12);
+    const combined = `${result.stdout}\n${result.stderr}`.trim();
+    if (result.code !== 0) {
+      checks.push(check("FAIL", "workers", `worker:${worker.name}`, combined || `exit ${result.code}`, `Verify SSH and ${family} on the worker.`));
+      continue;
+    }
+    checks.push(check("PASS", "workers", `worker:${worker.name}`, `reachable via ${worker.transport}; ${family} bin=${bin}`));
+    checks.push(combined.includes("sudo=ok") ? check("PASS", "workers", `worker:${worker.name}:sudo`, "sudo -n true works") : check("WARN", "workers", `worker:${worker.name}:sudo`, "sudo -n true failed", "Configure passwordless sudo only if this worker profile needs privileged operations."));
+    const missingFlags = required.filter((needle) => combined.includes(`flag:${needle}=missing`));
+    checks.push(
+      missingFlags.length
+        ? check("FAIL", "workers", `worker:${worker.name}:harness-compat`, `missing ${missingFlags.join(", ")}`, `Update ${family} on ${worker.name}.`)
+        : check("PASS", "workers", `worker:${worker.name}:harness-compat`, `${family} required CLI surface present`)
+    );
+    if (deep) {
+      checks.push(
+        combined.includes("harness_sudo=ok")
+          ? check("PASS", "workers", `worker:${worker.name}:harness-sudo`, `${family} proved sudo in bypass/yolo mode`)
+          : check("FAIL", "workers", `worker:${worker.name}:harness-sudo`, `${family} did not prove sudo in bypass/yolo mode`, `Inspect ${family} auth and permission bypass settings on ${worker.name}.`)
+      );
+    }
+  }
+  return checks;
+}
+
+function quoteForBash(value: string): string {
+  return shellSingleQuote(value);
+}
+
+async function commandDoctor(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const checks = await collectDoctorChecks(cfg, args);
+  if (hasFlag(args, "json")) {
+    console.log(JSON.stringify({ ok: !checks.some((item) => item.status === "FAIL"), checks }, null, 2));
+  } else {
+    console.log(formatDoctorChecks(checks));
+  }
+  const failures = checks.filter((item) => item.status === "FAIL");
+  if (failures.length) {
+    throw new Error(`doctor failed: ${failures.map((item) => item.name).join(", ")}`);
+  }
+}
+
+function readEnvFile(path: string): Record<string, string> {
+  if (!existsSync(path)) {
+    return {};
+  }
+  const env: Record<string, string> = {};
+  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (match) {
+      env[match[1]] = match[2].replace(/^['"]|['"]$/g, "");
+    }
+  }
+  return env;
+}
+
+function brainWriteConfig(cfg: BrainstackConfig): { baseUrl: string; token: string } {
+  const env = readEnvFile(clientEnvPathAbs(cfg));
+  const baseUrl = process.env.BRAIN_BASE_URL || env.BRAIN_BASE_URL || cfg.brain.publicBaseUrl;
+  const tokenValue = process.env.BRAIN_IMPORT_TOKEN || env.BRAIN_IMPORT_TOKEN || process.env.BRAIN_WRITE_TOKEN || "";
+  return { baseUrl, token: tokenValue };
+}
+
+function brainWriteTimeoutMs(): number {
+  const value = Number(process.env.BRAINSTACK_BRAIN_WRITE_TIMEOUT_MS || "15000");
+  return Number.isFinite(value) && value > 0 ? value : 15000;
+}
+
+interface OutboxItem {
+  id: string;
+  endpoint: "import" | "propose";
+  url: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+  source_machine: string;
+  source_harness: string;
+  retry_count: number;
+  idempotency_key: string;
+  last_error: string | null;
+}
+
+async function queueOutboxItem(cfg: BrainstackConfig, item: Omit<OutboxItem, "id" | "created_at" | "retry_count" | "idempotency_key" | "last_error">, error: string): Promise<string> {
+  const created = new Date().toISOString();
+  const idempotencyKey = sha256Hex(JSON.stringify({ endpoint: item.endpoint, payload: item.payload }));
+  const id = `${created.replace(/[:.]/g, "-")}-${idempotencyKey.slice(0, 16)}`;
+  const root = outboxRoot(cfg);
+  await ensureDir(root);
+  const path = join(root, `${id}.json`);
+  if (!existsSync(path)) {
+    await writeText(
+      path,
+      `${JSON.stringify(
+        {
+          ...item,
+          id,
+          created_at: created,
+          retry_count: 0,
+          idempotency_key: idempotencyKey,
+          last_error: error
+        } satisfies OutboxItem,
+        null,
+        2
+      )}\n`,
+      0o600
+    );
+  }
+  return path;
+}
+
+async function postBrainWriteOrQueue(cfg: BrainstackConfig, endpoint: "import" | "propose", payload: Record<string, unknown>): Promise<void> {
+  const { baseUrl, token: writeToken } = brainWriteConfig(cfg);
+  if (!baseUrl || !writeToken) {
+    const queued = await queueOutboxItem(
+      cfg,
+      {
+        endpoint,
+        url: baseUrl || "",
+        payload,
+        source_machine: String(payload.source_machine || cfg.machine.name),
+        source_harness: String(payload.source_harness || cfg.harness.name)
+      },
+      "brain base URL or import token is missing"
+    );
+    console.warn(`shared-brain write queued: ${queued}`);
+    return;
+  }
+
+  try {
+    const response = await fetch(new URL(`/api/${endpoint}`, baseUrl).toString(), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${writeToken}`,
+        "Content-Type": "application/json",
+        "Idempotency-Key": sha256Hex(JSON.stringify({ endpoint, payload }))
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(brainWriteTimeoutMs())
     });
+    if (!response.ok) {
+      throw new Error(`brain returned HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
+    }
+    console.log(`shared-brain ${endpoint} accepted`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const queued = await queueOutboxItem(
+      cfg,
+      {
+        endpoint,
+        url: baseUrl,
+        payload,
+        source_machine: String(payload.source_machine || cfg.machine.name),
+        source_harness: String(payload.source_harness || cfg.harness.name)
+      },
+      message
+    );
+    console.warn(`shared-brain write queued: ${queued}`);
   }
-  checks.push({ name: "config-root", ok: existsSync(cfg.paths.configRoot), detail: cfg.paths.configRoot });
-  checks.push({ name: "state-root", ok: existsSync(cfg.paths.stateRoot), detail: cfg.paths.stateRoot });
-  if (runsBraind(cfg)) {
-    checks.push({ name: "bare-repo", ok: existsSync(cfg.repos.bare), detail: cfg.repos.bare });
-    checks.push({ name: "staging-clone", ok: gitExists(cfg.repos.staging), detail: cfg.repos.staging });
-    checks.push({ name: "serve-clone", ok: gitExists(cfg.repos.serve), detail: cfg.repos.serve });
+}
+
+async function listOutboxItems(cfg: BrainstackConfig): Promise<Array<{ path: string; item: OutboxItem }>> {
+  const root = outboxRoot(cfg);
+  if (!existsSync(root)) {
+    return [];
   }
-  for (const check of checks) {
-    console.log(`${check.ok ? "ok" : "warn"} ${check.name}: ${check.detail}`);
+  const names = (await readdir(root)).filter((name) => name.endsWith(".json")).sort();
+  const items: Array<{ path: string; item: OutboxItem }> = [];
+  for (const name of names) {
+    const path = join(root, name);
+    items.push({ path, item: JSON.parse(await readFile(path, "utf8")) as OutboxItem });
   }
-  const hardFailures = checks.filter((check) => !check.ok && ["bun", "bun-bin", "git"].includes(check.name));
-  if (hardFailures.length) {
-    throw new Error(`doctor failed: ${hardFailures.map((item) => item.name).join(", ")}`);
+  return items;
+}
+
+async function flushOutbox(cfg: BrainstackConfig): Promise<{ flushed: number; kept: number }> {
+  const { token: writeToken } = brainWriteConfig(cfg);
+  const items = await listOutboxItems(cfg);
+  let flushed = 0;
+  let kept = 0;
+  for (const { path, item } of items) {
+    const baseUrl = item.url || brainWriteConfig(cfg).baseUrl;
+    if (!baseUrl || !writeToken) {
+      kept += 1;
+      continue;
+    }
+    try {
+      const response = await fetch(new URL(`/api/${item.endpoint}`, baseUrl).toString(), {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${writeToken}`,
+          "Content-Type": "application/json",
+          "Idempotency-Key": item.idempotency_key
+        },
+        body: JSON.stringify(item.payload),
+        signal: AbortSignal.timeout(brainWriteTimeoutMs())
+      });
+      if (response.ok || response.status === 409) {
+        await rm(path, { force: true });
+        flushed += 1;
+      } else {
+        item.retry_count += 1;
+        item.last_error = `HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`;
+        await writeText(path, `${JSON.stringify(item, null, 2)}\n`, 0o600);
+        kept += 1;
+      }
+    } catch (error) {
+      item.retry_count += 1;
+      item.last_error = error instanceof Error ? error.message : String(error);
+      await writeText(path, `${JSON.stringify(item, null, 2)}\n`, 0o600);
+      kept += 1;
+    }
   }
+  return { flushed, kept };
+}
+
+async function commandImportText(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const title = flag(args, "title");
+  const text = flag(args, "text") || args.positional.join(" ");
+  if (!title || !text) {
+    throw new Error("import-text requires --title and --text");
+  }
+  await postBrainWriteOrQueue(cfg, "import", {
+    title,
+    text,
+    source_harness: flag(args, "source-harness") || cfg.harness.name,
+    source_machine: flag(args, "source-machine") || cfg.machine.name,
+    source_type: flag(args, "source-type") || "note",
+    tags: flag(args, "tags") ? String(flag(args, "tags")).split(",").map((item) => item.trim()).filter(Boolean) : []
+  });
+}
+
+async function commandPropose(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const title = flag(args, "title");
+  const body = flag(args, "body") || args.positional.join(" ");
+  if (!title || !body) {
+    throw new Error("propose requires --title and --body");
+  }
+  await postBrainWriteOrQueue(cfg, "propose", {
+    title,
+    body,
+    source_harness: flag(args, "source-harness") || cfg.harness.name,
+    source_machine: flag(args, "source-machine") || cfg.machine.name
+  });
+}
+
+async function commandOutbox(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const sub = args.positional[0] || "status";
+  const items = await listOutboxItems(cfg);
+  switch (sub) {
+    case "status":
+      console.log(`outbox=${outboxRoot(cfg)}`);
+      console.log(`queued=${items.length}`);
+      return;
+    case "list":
+      console.log(items.length ? items.map(({ item }) => `${item.id} ${item.endpoint} retries=${item.retry_count} ${item.source_machine}/${item.source_harness}`).join("\n") : "(empty)");
+      return;
+    case "flush": {
+      const result = await flushOutbox(cfg);
+      console.log(`flushed=${result.flushed} kept=${result.kept}`);
+      return;
+    }
+    case "purge":
+      if (!hasFlag(args, "yes")) {
+        throw new Error("outbox purge is destructive; rerun with --yes");
+      }
+      await rm(outboxRoot(cfg), { recursive: true, force: true });
+      console.log(`purged ${outboxRoot(cfg)}`);
+      return;
+    default:
+      throw new Error("outbox subcommand must be status|list|flush|purge");
+  }
+}
+
+async function commandUpdates(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd: PRODUCT_ROOT, check: false }).stdout.trim() || "unknown";
+  const head = run(["git", "rev-parse", "HEAD"], { cwd: PRODUCT_ROOT, check: false }).stdout.trim() || "unknown";
+  const origin = run(["git", "rev-parse", "--verify", "origin/main"], { cwd: PRODUCT_ROOT, check: false }).stdout.trim();
+  const aheadBehind = origin
+    ? run(["git", "rev-list", "--left-right", "--count", `HEAD...origin/main`], { cwd: PRODUCT_ROOT, check: false }).stdout.trim()
+    : "unknown";
+  const codex = commandOk("codex") ? commandVersion("codex") : "missing";
+  const claude = commandOk("claude") ? commandVersion("claude") : "missing";
+  const compat = [harnessCompatibility("codex", "codex"), harnessCompatibility("claude", "claude")];
+  console.log(`brainstack_branch=${branch}`);
+  console.log(`brainstack_head=${head}`);
+  console.log(`origin_main=${origin || "unavailable"}`);
+  console.log(`ahead_behind=${aheadBehind}`);
+  console.log(`codex=${codex}`);
+  console.log(`claude=${claude}`);
+  for (const item of compat) {
+    console.log(`${item.status} ${item.name}: ${item.detail}`);
+    if (item.remediation) console.log(`  remediation: ${item.remediation}`);
+  }
+  console.log("manual_update_commands:");
+  console.log("  brainstack: git pull --ff-only && bun install --frozen-lockfile && bun test");
+  console.log(`  selected harness: ${installHint(cfg.harness.name)}`);
 }
 
 async function copyIfExists(source: string, target: string): Promise<void> {
@@ -1867,12 +2547,21 @@ async function removeFileIfExact(path: string, expectedContent: string, dryRun: 
 async function commandDestroy(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
   const dryRun = hasFlag(args, "dry-run");
+  const scope = (flag(args, "scope") || "all") as DestroyScope;
+  if (!["control", "worker", "client", "all"].includes(scope)) {
+    throw new Error("destroy --scope must be control|worker|client|all");
+  }
+  if (!dryRun && !hasFlag(args, "yes")) {
+    throw new Error("destroy is destructive; rerun with --dry-run to inspect or --yes to remove brainstack-owned artifacts");
+  }
   const removed: string[] = [];
   const skipped: string[] = [];
+  const manual: string[] = [];
+  const manifest = await loadManagedManifest(cfg);
   const bootstrapRoot = join(cfg.paths.configRoot, "client-bootstrap");
   const bootstrapFiles = clientBootstrapFiles(cfg);
 
-  if (!dryRun && commandPath("systemctl")) {
+  if ((scope === "all" || scope === "control") && !dryRun && commandPath("systemctl")) {
     if (runsBraind(cfg)) {
       run(["systemctl", "--user", "disable", "--now", "braind.service"], { check: false });
     }
@@ -1880,57 +2569,76 @@ async function commandDestroy(args: ParsedArgs): Promise<void> {
       run(["systemctl", "--user", "disable", "--now", "telemux.service"], { check: false });
     }
   }
-  if (runsBraind(cfg)) {
-    await removePath(join(cfg.paths.systemdUserRoot, "braind.service"), dryRun, removed);
+
+  if (scope === "all" || scope === "client" || scope === "worker") {
+    await removeSymlinkIfTarget(
+      join(cfg.paths.home, ".codex", "AGENTS.md"),
+      join(bootstrapRoot, "codex-shared-brain.include.md"),
+      dryRun,
+      removed,
+      skipped
+    );
+    await removeFileIfExact(
+      join(cfg.paths.home, ".claude", "CLAUDE.md"),
+      `@${join(bootstrapRoot, "claude-user-CLAUDE.md")}\n`,
+      dryRun,
+      removed,
+      skipped
+    );
+    await removeFileIfExact(
+      join(cfg.paths.home, ".cursor", "rules", "shared-brain.md"),
+      bootstrapFiles["cursor-user-rule.md"],
+      dryRun,
+      removed,
+      skipped
+    );
+    await removeFileIfExact(clientEnvPathAbs(cfg), bootstrapFiles["client.env.example"], dryRun, removed, skipped);
   }
-  if (cfg.telemux.enabled) {
-    await removePath(join(cfg.paths.systemdUserRoot, "telemux.service"), dryRun, removed);
-  }
-  await removeSymlinkIfTarget(
+
+  const exactHandled = new Set([
     join(cfg.paths.home, ".codex", "AGENTS.md"),
-    join(bootstrapRoot, "codex-shared-brain.include.md"),
-    dryRun,
-    removed,
-    skipped
-  );
-  await removeFileIfExact(
     join(cfg.paths.home, ".claude", "CLAUDE.md"),
-    `@${join(bootstrapRoot, "claude-user-CLAUDE.md")}\n`,
-    dryRun,
-    removed,
-    skipped
-  );
-  await removeFileIfExact(
     join(cfg.paths.home, ".cursor", "rules", "shared-brain.md"),
-    bootstrapFiles["cursor-user-rule.md"],
-    dryRun,
-    removed,
-    skipped
-  );
-  await removeFileIfExact(clientEnvPathAbs(cfg), bootstrapFiles["client.env.example"], dryRun, removed, skipped);
-  await removePath(cfg.paths.configRoot, dryRun, removed);
-  await removePath(cfg.paths.stateRoot, dryRun, removed);
+    clientEnvPathAbs(cfg)
+  ]);
+  const artifacts = manifest.artifacts
+    .filter((artifact) => artifactInScope(artifact, scope))
+    .filter((artifact) => !exactHandled.has(artifact.path))
+    .sort((left, right) => right.path.length - left.path.length);
+
+  for (const artifact of artifacts) {
+    if (artifact.kind === "tailscale-serve") {
+      continue;
+    }
+    await removePath(artifact.path, dryRun, removed);
+  }
+
   if (hasFlag(args, "remove-shared-brain")) {
     await removePath(cfg.paths.sharedBrainRoot, dryRun, removed);
   } else if (existsSync(cfg.paths.sharedBrainRoot)) {
-    skipped.push(`${cfg.paths.sharedBrainRoot} (pass --remove-shared-brain to delete)`);
+    manual.push(`${cfg.paths.sharedBrainRoot} kept; pass --remove-shared-brain if this product-managed clone/repo should be deleted`);
   }
   if (hasFlag(args, "remove-private-brain")) {
     await removePath(cfg.paths.privateBrainRoot, dryRun, removed);
   } else if (existsSync(cfg.paths.privateBrainRoot)) {
-    skipped.push(`${cfg.paths.privateBrainRoot} (pass --remove-private-brain to delete)`);
+    manual.push(`${cfg.paths.privateBrainRoot} kept; pass --remove-private-brain if this product-managed private brain should be deleted`);
   }
   if (hasFlag(args, "remove-tailscale-serve")) {
     removed.push("tailscale serve config");
     if (!dryRun) {
       run(["tailscale", "serve", "reset", "--yes"], { check: false });
     }
+  } else {
+    manual.push("Tailscale Serve config kept; pass --remove-tailscale-serve only if brainstack owns that Serve config.");
   }
-  console.log(`${dryRun ? "dry-run destroy plan" : "destroy complete"} for ${cfg.profile}`);
+  manual.push(...(manifest.manual_leftovers || manualLeftovers(cfg)));
+  console.log(`${dryRun ? "dry-run destroy plan" : "destroy complete"} for ${cfg.profile} scope=${scope}`);
   console.log("removed:");
   console.log(removed.length ? removed.map((item) => `  ${item}`).join("\n") : "  (none)");
   console.log("skipped:");
   console.log(skipped.length ? skipped.map((item) => `  ${item}`).join("\n") : "  (none)");
+  console.log("manual leftovers:");
+  console.log(manual.length ? [...new Set(manual)].map((item) => `  ${item}`).join("\n") : "  (none)");
   if (!dryRun) {
     console.log("activation commands:");
     console.log("  systemctl --user daemon-reload");
@@ -1960,7 +2668,12 @@ async function commandJoinWorker(args: ParsedArgs): Promise<void> {
     sshUser,
     managedRepoRoot: join(cfg.telemux.factoryRoot, "repos"),
     managedHostRoot: join(cfg.telemux.factoryRoot, "hostctx"),
-    managedScratchRoot: join(cfg.telemux.factoryRoot, "scratch")
+    managedScratchRoot: join(cfg.telemux.factoryRoot, "scratch"),
+    harness: normalizeHarness(flag(args, "harness"), cfg.harness.name),
+    harnessBin: flag(args, "harness-bin") || null,
+    capabilities: flag(args, "capabilities")
+      ? String(flag(args, "capabilities")).split(",").map((item) => item.trim()).filter(Boolean)
+      : ["worker"]
   };
   const workers = [...cfg.telemux.workers, snippet];
   const text = [
@@ -2141,6 +2854,14 @@ async function main(): Promise<void> {
       return await commandApplyRuntime(args, false);
     case "doctor":
       return await commandDoctor(args);
+    case "updates":
+      return await commandUpdates(args);
+    case "import-text":
+      return await commandImportText(args);
+    case "propose":
+      return await commandPropose(args);
+    case "outbox":
+      return await commandOutbox(args);
     case "backup":
       return await commandBackup(args);
     case "restore":

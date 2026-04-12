@@ -13,6 +13,7 @@ build/
 coverage/
 tmp/
 .brainstack-render/
+.factory/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

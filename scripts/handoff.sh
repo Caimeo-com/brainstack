@@ -206,6 +206,77 @@ bun run packages/brainctl/src/main.ts destroy \
 
 bun test > "$bundle_dir/command-outputs/bun-test.txt" 2>&1
 
+bun run packages/brainctl/src/main.ts doctor \
+  --config examples/control.yaml \
+  --workers \
+  > "$bundle_dir/command-outputs/brainctl-doctor-workers.txt" 2>&1 || true
+
+bun run packages/brainctl/src/main.ts updates \
+  --config examples/control.yaml \
+  > "$bundle_dir/command-outputs/brainctl-updates.txt" 2>&1 || true
+
+bun test apps/telemux/test/phase1.test.ts -t "Telegram text coalescing" \
+  > "$bundle_dir/command-outputs/telemux-coalescing-test.txt" 2>&1
+
+bun test apps/telemux/test/phase1.test.ts -t "worker harness" \
+  > "$bundle_dir/command-outputs/worker-harness-path-neutral-test.txt" 2>&1
+
+cp docs/diagrams.md "$bundle_dir/generated/diagrams.md"
+
+outbox_smoke_root="$bundle_dir/generated/outbox-smoke"
+mkdir -p "$outbox_smoke_root"
+outbox_config="$outbox_smoke_root/config.yaml"
+outbox_received="$outbox_smoke_root/received.jsonl"
+outbox_server="$outbox_smoke_root/server.ts"
+outbox_port="45$((10#${utc:9:2} + 10))"
+cat > "$outbox_config" <<YAML
+schema_version: 1
+profile: client-macos
+machine:
+  name: client
+  user: operator
+paths:
+  home: $outbox_smoke_root/home
+  stateRoot: $outbox_smoke_root/state
+client:
+  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git
+YAML
+cat > "$outbox_server" <<EOF
+const receivedPath = ${outbox_received@Q};
+Bun.serve({
+  hostname: "127.0.0.1",
+  port: $outbox_port,
+  async fetch(req) {
+    if (new URL(req.url).pathname === "/health") return Response.json({ ok: true });
+    const payload = await req.json();
+    const existing = await Bun.file(receivedPath).exists() ? await Bun.file(receivedPath).text() : "";
+    await Bun.write(receivedPath, \`\${existing}\${JSON.stringify(payload)}\\n\`);
+    return Response.json({ ok: true });
+  }
+});
+await new Promise(() => {});
+EOF
+{
+  export BRAIN_BASE_URL="http://127.0.0.1:$outbox_port"
+  export BRAIN_IMPORT_TOKEN="handoff-token"
+  export BRAINSTACK_BRAIN_WRITE_TIMEOUT_MS=300
+  bun run packages/brainctl/src/main.ts import-text --config "$outbox_config" --title "handoff offline note" --text "offline queue smoke" --source-harness codex --source-machine client
+  bun run packages/brainctl/src/main.ts outbox status --config "$outbox_config"
+  bun run "$outbox_server" >/tmp/brainstack-handoff-outbox-server.log 2>&1 &
+  server_pid=$!
+  trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+  for _ in $(seq 1 40); do
+    curl -fsS "http://127.0.0.1:$outbox_port/health" >/dev/null 2>&1 && break
+    sleep 0.05
+  done
+  bun run packages/brainctl/src/main.ts outbox flush --config "$outbox_config"
+  bun run packages/brainctl/src/main.ts outbox status --config "$outbox_config"
+  kill "$server_pid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
+  trap - EXIT
+  echo "received_lines=$(test -f "$outbox_received" && wc -l < "$outbox_received" || echo 0)"
+} > "$bundle_dir/command-outputs/outbox-queue-flush-smoke.txt" 2>&1
+
 tailscale_ip_for_name() {
   local target="$1"
   tailscale status --json | TAILSCALE_TARGET="$target" bun --eval '
@@ -294,6 +365,12 @@ cat > "$bundle_dir/CLAIMS_AND_PROOF.md" <<'EOF'
 | Worker join paths are derived from config state roots. | `generated/join-worker-custom-state.md` |
 | `brainctl provision` generates a discovered first-stage config without installing system packages. | `generated/provision-client-macos.yaml` and `command-outputs/provision-client-macos.txt` |
 | `brainctl destroy` has a dry-run teardown plan and does not delete brain repos by default. | `command-outputs/destroy-client-macos-dry-run.txt` |
+| `brainctl doctor` reports worker/harness compatibility without auto-updating anything. | `command-outputs/brainctl-doctor-workers.txt` |
+| `brainctl updates` is read-only manual update visibility. | `command-outputs/brainctl-updates.txt` |
+| Offline import/propose writes queue locally and flush later. | `command-outputs/outbox-queue-flush-smoke.txt` |
+| Telegram text coalescing is covered by tests. | `command-outputs/telemux-coalescing-test.txt` |
+| Worker harness execution is override-capable and path-neutral for remote workers. | `command-outputs/worker-harness-path-neutral-test.txt` |
+| Mermaid diagrams are checked in and included for reviewer context. | `generated/diagrams.md` |
 | Bun tests passed for the product tree at HEAD. | `command-outputs/bun-test.txt` |
 | Local braind health was checked when available. | `service-state/braind-health.json` or `service-state/braind-health.txt` |
 | Tailscale whois evidence uses Tailscale IPs, not bare hostnames. | `command-outputs/tailscale-whois-valkyrie.txt` and `command-outputs/tailscale-whois-erbine.txt` |
@@ -344,6 +421,10 @@ See \`CLAIMS_AND_PROOF.md\` for the claim-to-evidence map.
 - \`brainctl join-worker\` with a custom \`paths.stateRoot\`
 - \`brainctl provision\` for a generated client-macos config
 - \`brainctl destroy --dry-run\` against the generated provision config
+- \`brainctl doctor --workers\`
+- \`brainctl updates\`
+- Offline outbox queue/flush smoke
+- Focused telemux coalescing and worker-harness tests
 - Optional local \`tailscale status/whois\` summary when Tailscale is installed
 - Optional local \`GET http://127.0.0.1:8080/health\` when braind is running
 

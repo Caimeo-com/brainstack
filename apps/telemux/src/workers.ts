@@ -1,7 +1,7 @@
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { CodexReasoningEffort } from "./codex-runtime";
-import { FactoryConfig, FactoryWorkerConfig } from "./config";
+import { FactoryConfig, FactoryWorkerConfig, HarnessName } from "./config";
 import { ContextKind, ContextRecord, ContextState, FactoryDb, WorkerRecord } from "./db";
 import { TELEGRAM_ATTACHMENTS_WORKSPACE_PATH } from "./telegram-attachments";
 
@@ -112,6 +112,12 @@ function parseSessionId(output: string): string | null {
   return null;
 }
 
+function requiredHarnessFlags(harness: HarnessName): string[] {
+  return harness === "codex"
+    ? ["--dangerously-bypass-approvals-and-sandbox", "--output-last-message"]
+    : ["--dangerously-skip-permissions", "--permission-mode", "--output-format"];
+}
+
 function buildWorkspaceSeedScript(files: WorkspaceSeedFile[]): string {
   return files
     .map((file, index) => {
@@ -170,6 +176,7 @@ export class WorkerService {
       });
     }
 
+    const harness = this.resolveHarness(worker);
     const result = await this.runWorkerScript(
       worker,
       [
@@ -177,9 +184,13 @@ export class WorkerService {
         "printf 'hostname=%s\\n' \"$(hostname)\"",
         "printf 'cwd=%s\\n' \"$PWD\"",
         "if command -v git >/dev/null 2>&1; then printf 'git=1\\n'; else printf 'git=0\\n'; fi",
-        `harness_bin=${quoteSh(this.config.harnessBin)}`,
-        `printf 'harness=%s\\n' ${quoteSh(this.config.harness)}`,
+        `harness=${quoteSh(harness.family)}`,
+        `harness_bin=${quoteSh(harness.bin)}`,
+        "printf 'harness=%s\\n' \"$harness\"",
         "if command -v \"$harness_bin\" >/dev/null 2>&1; then printf 'harness_bin=1\\n'; else printf 'harness_bin=0\\n'; fi",
+        "printf 'harness_version=%s\\n' \"$($harness_bin --version 2>&1 | head -n 1 || true)\"",
+        "if [ \"$harness\" = codex ]; then help=\"$($harness_bin exec --help 2>&1 || true)\"; else help=\"$($harness_bin --help 2>&1 || true)\"; fi",
+        ...requiredHarnessFlags(harness.family).map((needle) => `case "$help" in *${quoteSh(needle)}*) printf 'flag:${needle}=1\\n' ;; *) printf 'flag:${needle}=0\\n' ;; esac`),
         "printf 'home=%s\\n' \"$HOME\""
       ].join("\n"),
       undefined,
@@ -256,9 +267,9 @@ export class WorkerService {
     options: CodexRunOptions = {}
   ): Promise<CodexRunResult> {
     await mkdir(dirname(logPath), { recursive: true });
-    await appendFile(logPath, `== ${new Date().toISOString()} ${mode} ${context.slug} on ${context.machine} via ${this.config.harness} ==\n`);
-
     const worker = this.requireWorker(context.machine);
+    const harness = this.resolveHarness(worker, context);
+    await appendFile(logPath, `== ${new Date().toISOString()} ${mode} ${context.slug} on ${context.machine} via ${harness.family} ==\n`);
     const promptBase64 = Buffer.from(prompt, "utf8").toString("base64");
     const shouldResume = mode !== "run" && Boolean(context.codexSessionId);
     const resumeSessionId = context.codexSessionId || "";
@@ -299,8 +310,8 @@ expand_home_path() {
 worktree_raw=${quoteSh(context.worktreePath)}
 prompt_b64=${quoteSh(promptBase64)}
 resume_session=${quoteSh(resumeSessionId)}
-harness=${quoteSh(this.config.harness)}
-harness_bin=${quoteSh(this.config.harnessBin)}
+harness=${quoteSh(harness.family)}
+harness_bin=${quoteSh(harness.bin)}
 worktree="$(expand_home_path "$worktree_raw")"
 launcher_dir="$(mktemp -d "\${TMPDIR:-/tmp}/clawdex-run.XXXXXX")"
 prompt_file="$launcher_dir/control-plane.prompt.md"
@@ -617,6 +628,14 @@ fi
     }
 
     return worker;
+  }
+
+  private resolveHarness(worker: FactoryWorkerConfig, context?: ContextRecord): { family: HarnessName; bin: string } {
+    const contextHarness = context?.harness === "claude" || context?.harness === "codex" ? context.harness : null;
+    const family = contextHarness || worker.harness || this.config.harness;
+    const contextBin = context?.harnessBin?.trim() || null;
+    const bin = contextBin || worker.harnessBin || (worker.transport === "local" && family === this.config.harness ? this.config.harnessBin : family);
+    return { family, bin };
   }
 
   private planContext(worker: FactoryWorkerConfig, request: ContextBootstrapRequest): ContextPlan {

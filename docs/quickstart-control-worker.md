@@ -38,6 +38,14 @@ cd ~/brainstack
 bun run packages/brainctl/src/main.ts join-worker --config examples/control.yaml --worker brain-worker
 ```
 
+The join plan is a YAML patch for `brainstack.yaml`; `workers.json` remains rendered output. Workers may override the global harness:
+
+```bash
+bun run packages/brainctl/src/main.ts join-worker --config examples/control.yaml --worker brain-worker --harness claude
+```
+
+Harness precedence is explicit context override, then worker default, then global default. Remote workers resolve `codex` or `claude` via their own `PATH` unless a worker-specific `harnessBin` is configured; the control host's local absolute harness path is not reused on workers.
+
 The worker transport default is normal OpenSSH over Tailscale:
 
 ```bash
@@ -55,6 +63,15 @@ bun run packages/brainctl/src/main.ts init --profile worker --config examples/wo
 ```
 
 That clones the shared-brain repo to the configured client path, writes `~/.config/shared-brain.env` if missing, and installs Codex/Claude/Cursor shared-brain guidance. It does not run local `braind`, does not run Telegram polling, and does not write an admin ingest token.
+
+Before a yoda/worker canary, run:
+
+```bash
+bun run packages/brainctl/src/main.ts doctor --config ~/.config/brainstack/brainstack.yaml --workers
+bun run packages/brainctl/src/main.ts updates --config ~/.config/brainstack/brainstack.yaml
+```
+
+Use `--deep` only when you want doctor to invoke the configured harness on the control/worker to prove bypass/yolo sudo behavior. It can consume LLM quota and should not be part of every health check.
 
 If that fails with a timeout while ping works, the likely blocker is Tailscale grants. The required grant shape is:
 
@@ -107,4 +124,6 @@ Generated user services load both runtime and secrets env files and invoke Bun w
 
 When telemux is enabled, `telemux.runtime.env` includes `BRAIN_BASE_URL` and `telemux.secrets.env` includes a blank `BRAIN_IMPORT_TOKEN`. Filling both opts successful runs into shared-brain raw imports of `SUMMARY.md` and `ARTIFACTS.md`; leaving either blank disables the bridge.
 
-`telemux.runtime.env` also includes `FACTORY_HARNESS` and `FACTORY_HARNESS_BIN`. Use `harness.name: claude` and `harness.bin: claude` in `brainstack.yaml` to route jobs through Claude Code instead of Codex.
+`telemux.runtime.env` also includes `FACTORY_HARNESS`, `FACTORY_HARNESS_BIN`, and `FACTORY_TEXT_COALESCE_MS`. Use `harness.name: claude` and `harness.bin: claude` in `brainstack.yaml` to route jobs through Claude Code instead of Codex by default. Text coalescing merges only short-window plain-text Telegram messages from the same user/chat/topic; commands and attachments flush pending text first.
+
+If the shared brain is unreachable, telemux queues opted-in run-summary imports under the same outbox root used by `brainctl outbox`.

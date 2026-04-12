@@ -19,6 +19,7 @@ import {
 } from "./telegram-inputs";
 import { WorkerService, type WorkspaceSeedFile } from "./workers";
 import { summarizeUsage } from "./usage";
+import { postBrainImportOrQueue } from "./brain-outbox";
 import type { FactoryConfig } from "./config";
 import type { TelegramBot, TelegramTarget } from "./telegram";
 
@@ -398,33 +399,19 @@ export class Dispatcher {
       ""
     ].join("\n");
 
-    try {
-      const response = await fetch(new URL("/api/import", this.config.brainBaseUrl).toString(), {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.config.brainImportToken}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          title: `telemux run notes: ${context.slug}`,
-          text: body,
-          source_harness: "telemux",
-          source_machine: context.machine,
-          source_type: "telemux-run",
-          conversation_id: context.slug,
-          tags: ["telemux", "factory-run"]
-        })
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        console.error(`shared brain import failed for ${context.slug}: ${response.status} ${text.slice(0, 500)}`);
-        return;
-      }
-
+    const status = await postBrainImportOrQueue(this.config, {
+      title: `telemux run notes: ${context.slug}`,
+      text: body,
+      source_harness: "telemux",
+      source_machine: context.machine,
+      source_type: "telemux-run",
+      conversation_id: context.slug,
+      tags: ["telemux", "factory-run"]
+    });
+    if (status === "sent") {
       console.log(`shared brain import succeeded for ${context.slug}`);
-    } catch (error) {
-      console.error(`shared brain import failed for ${context.slug}`, error);
+    } else if (status === "queued") {
+      console.warn(`shared brain import queued for ${context.slug}`);
     }
   }
 

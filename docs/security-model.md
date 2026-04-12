@@ -48,6 +48,8 @@ Examples must leave secret values blank. `brainctl rotate-token` writes generate
 
 Runtime env files are generated and may be overwritten by upgrade. Secrets env files are operator-managed and must not be overwritten by upgrade.
 
+Offline outbox files store pending import/propose payloads under the local state root. They are not secrets by design, but they may contain sensitive note text or proposal bodies. Treat the state root as private user data and do not sync it through public storage.
+
 ## Import Guardrails
 
 `braind` keeps originals but rejects risky imports before storing them:
@@ -68,6 +70,8 @@ These checks reduce server-side request forgery risk. They do not make arbitrary
 ## Harness Execution Risk
 
 Telemux passes authorized Telegram-topic prompts and staged files to the configured harness process, either Codex CLI or Claude Code. It does not sandbox the harness. If the harness is configured with bypass-all-permissions/yolo settings and the Unix user has passwordless sudo, telemux can indirectly execute privileged commands as that user.
+
+Worker harness resolution is intentionally per-worker: context override, worker default, then global default. Remote workers resolve their harness binary through the worker's own `PATH` by default. This avoids accidentally executing a path discovered on the control host.
 
 Before enabling telemux on a control host, read [`operator-preflight.md`](./operator-preflight.md).
 

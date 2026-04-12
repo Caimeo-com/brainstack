@@ -240,6 +240,14 @@ async function createFixture(envOverrides: Record<string, string> = {}) {
     fakeCodex,
     `#!/usr/bin/env bash
 set -euo pipefail
+if (($# >= 2)) && [[ "$1" == "exec" && "$2" == "--help" ]]; then
+  echo '--dangerously-bypass-approvals-and-sandbox --output-last-message --skip-git-repo-check'
+  exit 0
+fi
+if (($# >= 1)) && [[ "$1" == "--version" ]]; then
+  echo 'codex fake'
+  exit 0
+fi
 mode="new"
 session_id=""
 output_file=""
@@ -369,6 +377,11 @@ printf '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens
   await makeExecutable(
     fakeSsh,
     `#!/usr/bin/env bash
+if [[ -n "\${FACTORY_TEST_CAPTURE_SSH_SCRIPT:-}" ]]; then
+  cat > "$FACTORY_TEST_CAPTURE_SSH_SCRIPT"
+  echo "ssh capture: No route to host" >&2
+  exit 255
+fi
 echo "ssh: connect to host unreachable: No route to host" >&2
 exit 255
 `
@@ -378,6 +391,14 @@ exit 255
     fakeClaude,
     `#!/usr/bin/env bash
 set -euo pipefail
+if (($# >= 1)) && [[ "$1" == "--help" ]]; then
+  echo '--dangerously-skip-permissions --permission-mode --output-format'
+  exit 0
+fi
+if (($# >= 1)) && [[ "$1" == "--version" ]]; then
+  echo 'claude fake'
+  exit 0
+fi
 while (($#)); do
   shift
 done
@@ -413,7 +434,9 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
           transport: "local",
           managedRepoRoot: resolve(factoryRoot, "repos"),
           managedHostRoot: resolve(factoryRoot, "hostctx"),
-          managedScratchRoot: resolve(factoryRoot, "scratch")
+          managedScratchRoot: resolve(factoryRoot, "scratch"),
+          harness: envOverrides.TEST_CONTROL_WORKER_HARNESS || null,
+          harnessBin: envOverrides.TEST_CONTROL_WORKER_HARNESS_BIN || null
         },
         {
           name: "worker1",
@@ -422,7 +445,9 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
           sshUser: "factory",
           managedRepoRoot: "/srv/factory/repos",
           managedHostRoot: "/srv/factory/hostctx",
-          managedScratchRoot: "/srv/factory/scratch"
+          managedScratchRoot: "/srv/factory/scratch",
+          harness: envOverrides.TEST_WORKER1_HARNESS || null,
+          harnessBin: envOverrides.TEST_WORKER1_HARNESS_BIN || null
         }
       ],
       null,
@@ -443,6 +468,7 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
     FACTORY_CODEX_BIN: fakeCodex,
     FACTORY_HARNESS: selectedHarness,
     FACTORY_HARNESS_BIN: envOverrides.FACTORY_HARNESS_BIN || (selectedHarness === "claude" ? fakeClaude : fakeCodex),
+    FACTORY_TEXT_COALESCE_MS: envOverrides.FACTORY_TEXT_COALESCE_MS || "20",
     FACTORY_TELEGRAM_BOT_TOKEN: "test-token",
     FACTORY_ALLOWED_TELEGRAM_USER_ID: String(TEST_ALLOWED_TELEGRAM_USER_ID),
     ...envOverrides
@@ -465,8 +491,10 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
     factoryRoot,
     fakeCodex,
     fakeClaude,
+    fakeSsh,
     previousPath,
     db,
+    contexts,
     cronManager,
     cronScheduler,
     dispatcher,
@@ -813,6 +841,81 @@ test("telemux can run Claude as the selected harness", async () => {
     expect(await readFile(join(fixture.factoryRoot, "scratch", "claudeharness", ".factory", "SUMMARY.md"), "utf8")).toContain(
       "Claude turn 1"
     );
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("worker harness selection supports worker and context overrides without control-host binary leakage", async () => {
+  const capture = join(tmpdir(), `telemux-ssh-capture-${Date.now()}.sh`);
+  const fixture = await createFixture({
+    FACTORY_HARNESS: "codex",
+    TEST_CONTROL_WORKER_HARNESS: "claude"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx workerharness control scratch", 69));
+    await fixture.commands.handleMessage(telegramMessage("Worker default should choose Claude.", 69));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Claude reply turn 1 for workerharness.")));
+
+    const context = fixture.db.getContextBySlug("workerharness");
+    fixture.contexts.saveContext({
+      ...context!,
+      harness: "codex",
+      harnessBin: null
+    });
+    await fixture.commands.handleMessage(telegramMessage("Context override should choose Codex.", 69));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for workerharness.")));
+
+    process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT = capture;
+    await fixture.workers.probeWorker("worker1");
+    const capturedScript = await readFile(capture, "utf8");
+    expect(capturedScript).toContain("harness_bin='codex'");
+    expect(capturedScript).not.toContain(fixture.fakeCodex);
+  } finally {
+    delete process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT;
+    process.env.PATH = fixture.previousPath;
+    await rm(capture, { force: true });
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("Telegram text coalescing merges quick text and commands flush pending text", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "80"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx coalesce control scratch", 71));
+    await fixture.commands.handleMessage(telegramMessage("First part", 71));
+    await fixture.commands.handleMessage(telegramMessage("Second part", 71));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for coalesce.")));
+    const prompt = await readFile(join(fixture.factoryRoot, "scratch", "coalesce", ".factory", "control-plane.prompt.md"), "utf8");
+    expect(prompt).toContain("First part\n\nSecond part");
+
+    await fixture.commands.handleMessage(telegramMessage("Flush before command", 71));
+    await fixture.commands.handleMessage(telegramMessage("/topicinfo", 71));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 2 for coalesce.")));
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("Context: coalesce"))).toBe(true);
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("Telegram text outside coalesce window stays separate", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "20"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx coalesce-gap control scratch", 72));
+    await fixture.commands.handleMessage(telegramMessage("One message", 72));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for coalesce-gap.")));
+    await Bun.sleep(60);
+    await fixture.commands.handleMessage(telegramMessage("Second message", 72));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 2 for coalesce-gap.")));
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });

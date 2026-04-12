@@ -293,14 +293,19 @@ describe("brainctl install safety", () => {
       expect(existsSync(configRoot)).toBe(true);
       expect(dryRun.stdout).toContain("dry-run destroy plan");
 
-      const destroy = runBrainctl(["destroy", "--config", configPath]);
+      const unsafe = runBrainctl(["destroy", "--config", configPath]);
+      expect(unsafe.code).not.toBe(0);
+      expect(`${unsafe.stdout}\n${unsafe.stderr}`).toContain("--yes");
+
+      const destroy = runBrainctl(["destroy", "--config", configPath, "--yes"]);
       expectSuccess(destroy);
       expect(existsSync(configRoot)).toBe(false);
       expect(existsSync(stateRoot)).toBe(false);
       expect(existsSync(join(systemdRoot, "braind.service"))).toBe(false);
       expect(existsSync(sharedBrainRoot)).toBe(true);
       expect(existsSync(privateBrainRoot)).toBe(true);
-      expect(destroy.stdout).toContain("pass --remove-shared-brain to delete");
+      expect(destroy.stdout).toContain("manual leftovers");
+      expect(destroy.stdout).toContain("pass --remove-shared-brain");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -356,6 +361,7 @@ describe("brainctl install safety", () => {
       expect(await Bun.file(join(configRoot, "braind.env")).exists()).toBe(false);
       expect(await Bun.file(join(configRoot, "braind.runtime.env")).exists()).toBe(true);
       expect(await Bun.file(join(configRoot, "braind.secrets.env")).exists()).toBe(true);
+      expect(await Bun.file(join(configRoot, "managed-artifacts.json")).exists()).toBe(true);
       await writeFile(join(configRoot, "braind.runtime.env"), "BRAIN_BIND=0.0.0.0\n");
       await writeFile(join(configRoot, "braind.secrets.env"), "BRAIN_IMPORT_TOKEN=operator-owned\nBRAIN_ADMIN_TOKEN=operator-owned-admin\n");
 
@@ -422,6 +428,54 @@ describe("brainctl install safety", () => {
       expect(await Bun.file(join(configRoot, "braind.runtime.env")).exists()).toBe(false);
       expect(await Bun.file(join(configRoot, "braind.secrets.env")).exists()).toBe(false);
       expect(await Bun.file(join(configRoot, "telemux.secrets.env")).exists()).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("destroy dry-run and yes clean a disposable install for rerun", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-clean-retry-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      const root = join(dir, "install");
+      await writeFixtureConfig(configPath);
+      expectSuccess(runBrainctl(["init", "--profile", "single-node", "--config", configPath, "--root", root]));
+      const manifest = join(root, "config", "managed-artifacts.json");
+      expect(await Bun.file(manifest).exists()).toBe(true);
+
+      const dryRun = runBrainctl([
+        "destroy",
+        "--profile",
+        "single-node",
+        "--config",
+        configPath,
+        "--root",
+        root,
+        "--dry-run",
+        "--remove-shared-brain"
+      ]);
+      expectSuccess(dryRun);
+      expect(dryRun.stdout).toContain("dry-run destroy plan");
+      expect(dryRun.stdout).toContain("managed-artifacts.json");
+      expect(await Bun.file(manifest).exists()).toBe(true);
+
+      expectSuccess(
+        runBrainctl([
+          "destroy",
+          "--profile",
+          "single-node",
+          "--config",
+          configPath,
+          "--root",
+          root,
+          "--yes",
+          "--remove-shared-brain"
+        ])
+      );
+      expect(await Bun.file(join(root, "config")).exists()).toBe(false);
+      expect(await Bun.file(join(root, "state")).exists()).toBe(false);
+      expect(await Bun.file(join(root, "shared-brain")).exists()).toBe(false);
+      expectSuccess(runBrainctl(["init", "--profile", "single-node", "--config", configPath, "--root", root]));
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -931,6 +985,168 @@ describe("public release hygiene", () => {
       expect(rendered).toContain("name: brain-worker");
       expect(rendered).toContain("sshUser: operator");
       expect(rendered).toContain("repos:");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("outbox queues unreachable writes and flushes later", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-outbox-"));
+    const port = 41_000 + Math.floor(Math.random() * 5_000);
+    const received: Array<Record<string, unknown>> = [];
+    try {
+      const configPath = join(dir, "config.yaml");
+      const stateRoot = join(dir, "state");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  stateRoot: ${stateRoot}`,
+          "client:",
+          "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+      const env = {
+        BRAIN_BASE_URL: `http://127.0.0.1:${port}`,
+        BRAIN_IMPORT_TOKEN: "outbox-token",
+        BRAINSTACK_BRAIN_WRITE_TIMEOUT_MS: "1000"
+      };
+      const queued = runBrainctl(
+        [
+          "import-text",
+          "--config",
+          configPath,
+          "--title",
+          "Queued note",
+          "--text",
+          "offline body",
+          "--source-harness",
+          "codex",
+          "--source-machine",
+          "client"
+        ],
+        env
+      );
+      expectSuccess(queued);
+      expect(`${queued.stdout}\n${queued.stderr}`).toContain("shared-brain write queued");
+      const statusBefore = runBrainctl(["outbox", "status", "--config", configPath], env);
+      expectSuccess(statusBefore);
+      expect(statusBefore.stdout).toContain("queued=1");
+
+      const receivedPath = join(dir, "received.jsonl");
+      const serverScript = join(dir, "server.ts");
+      await writeFile(
+        serverScript,
+        [
+          `const port = ${port};`,
+          `const receivedPath = ${JSON.stringify(receivedPath)};`,
+          "Bun.serve({",
+          "  hostname: '127.0.0.1',",
+          "  port,",
+          "  async fetch(req) {",
+          "    if (new URL(req.url).pathname === '/health') return Response.json({ ok: true });",
+          "    const payload = await req.json();",
+          "    const existing = await Bun.file(receivedPath).exists() ? await Bun.file(receivedPath).text() : '';",
+          "    await Bun.write(receivedPath, `${existing}${JSON.stringify(payload)}\\n`);",
+          "    return Response.json({ ok: true });",
+          "  }",
+          "});",
+          "await new Promise(() => {});",
+          ""
+        ].join("\n")
+      );
+      const server = Bun.spawn(["bun", "run", serverScript], {
+        stdout: "pipe",
+        stderr: "pipe"
+      });
+      try {
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          try {
+            await fetch(`http://127.0.0.1:${port}/health`);
+            break;
+          } catch {
+            await Bun.sleep(25);
+          }
+        }
+        const flush = runBrainctl(["outbox", "flush", "--config", configPath], env);
+        expectSuccess(flush);
+        expect(flush.stdout).toContain("flushed=1 kept=0");
+        const receivedText = await readFile(receivedPath, "utf8");
+        received.push(...receivedText.trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>));
+        expect(received).toHaveLength(1);
+        const statusAfter = runBrainctl(["outbox", "status", "--config", configPath], env);
+        expectSuccess(statusAfter);
+        expect(statusAfter.stdout).toContain("queued=0");
+      } finally {
+        server.kill();
+        await server.exited;
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("updates command is read-only and reports versions", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-updates-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      await writeFixtureConfig(configPath);
+      const result = runBrainctl(["updates", "--config", configPath]);
+      expectSuccess(result);
+      expect(result.stdout).toContain("brainstack_head=");
+      expect(result.stdout).toContain("manual_update_commands:");
+      expect(result.stdout).toContain("selected harness:");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("doctor fails when worker harness CLI surface is incompatible", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-doctor-worker-"));
+    try {
+      const fakeCodex = join(dir, "codex");
+      await writeFile(
+        fakeCodex,
+        [
+          "#!/usr/bin/env sh",
+          "if [ \"$1\" = \"--version\" ]; then echo 'codex fake'; exit 0; fi",
+          "if [ \"$1\" = \"exec\" ] && [ \"$2\" = \"--help\" ]; then echo 'Usage: codex exec'; exit 0; fi",
+          "exit 0",
+          ""
+        ].join("\n")
+      );
+      await chmod(fakeCodex, 0o755);
+      const configPath = join(dir, "config.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "harness:",
+          "  name: codex",
+          `  bin: ${fakeCodex}`,
+          "machine:",
+          "  name: brain-control",
+          "  user: operator",
+          "telemux:",
+          "  enabled: true",
+          "  workers:",
+          "    - name: brain-control",
+          "      transport: local",
+          `      harnessBin: ${fakeCodex}`,
+          ""
+        ].join("\n")
+      );
+      const result = runBrainctl(["doctor", "--config", configPath, "--workers"]);
+      expect(result.code).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("missing required CLI surface");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

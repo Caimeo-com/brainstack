@@ -106,6 +106,8 @@ export class ContextService {
       codexSessionId: resetSession ? null : (existing?.codexSessionId || null),
       lastRunAt: resetSession ? null : (existing?.lastRunAt || null),
       usageAdapter: args.usageAdapter || existing?.usageAdapter || this.defaultUsageAdapter,
+      harness: existing?.harness || null,
+      harnessBin: existing?.harnessBin || null,
       modelOverride: existing?.modelOverride || null,
       reasoningEffortOverride: existing?.reasoningEffortOverride || null,
       lastError: args.lastError ?? (resetSession ? null : (existing?.lastError || null)),

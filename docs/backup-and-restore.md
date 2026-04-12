@@ -31,6 +31,8 @@ The backup command copies configured repo/state/config paths into a timestamped 
 
 Keep backup permissions restricted because env files may be included. Backups are not fully crash-consistent for all git working trees or factory workspaces; pausing telemux reduces concurrent writes, but external editors or harnesses can still modify files during backup.
 
+`brainctl destroy` is not a backup substitute. It removes only artifacts recorded in the brainstack ownership manifest or otherwise proven to be product-owned. It intentionally leaves system packages, Tailscale enrollment, Codex/Claude auth, sudo policy, and brain repos unless explicit removal flags are supplied.
+
 ## Restore Dry Run
 
 ```bash

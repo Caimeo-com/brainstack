@@ -1,4 +1,5 @@
 import { deliverAttachmentRequests, formatAttachmentDeliveryIssues } from "./attachment-delivery";
+import { resolve } from "node:path";
 import {
   CODEX_MODE_PRESETS,
   formatCodexRuntimeOverrides,
@@ -100,6 +101,16 @@ function formatRegisteredCommands(commands: Array<{ command: string; description
   return commands.map((command) => `/${command.command} - ${command.description}`).join("\n");
 }
 
+interface PendingTextPrompt {
+  key: string;
+  target: TelegramTarget;
+  userId: number | null;
+  contextSlug: string;
+  parts: string[];
+  timer: Timer;
+  createdAt: number;
+}
+
 function audioNotSupportedText(): string {
   return "Audio and voice Telegram messages are not forwarded to Codex yet. Phase 2 will transcribe them first.";
 }
@@ -130,6 +141,8 @@ function codexModeSummary(context: ContextRecord): string {
 }
 
 export class CommandHandler {
+  private readonly pendingText = new Map<string, PendingTextPrompt>();
+
   constructor(
     private readonly config: FactoryConfig,
     private readonly db: FactoryDb,
@@ -151,6 +164,10 @@ export class CommandHandler {
 
     const target = messageTarget(message);
     const parsed = parseCommand(text);
+    const hasAttachments = Boolean(rawTelegramInput?.attachments.length);
+    if (parsed || hasAttachments) {
+      await this.flushPendingText(target, message.from?.id ?? null);
+    }
     const boundContext = this.contexts.getContextByTopic(target.chatId, target.threadId);
     const allowed = message.from?.id === this.config.allowedTelegramUserId;
 
@@ -192,6 +209,11 @@ export class CommandHandler {
           return;
         }
 
+        if (!hasAttachments && this.config.textCoalesceMs > 0) {
+          this.enqueuePendingText(boundContext, text, target, message.from?.id ?? null);
+          return;
+        }
+
         const response = await this.dispatcher.dispatch("resume", boundContext, text, target, {
           notifyAccepted: false,
           telegramInput
@@ -222,6 +244,7 @@ export class CommandHandler {
               "/showcommands",
               "/whoami",
               "/workers",
+              "/updates",
               "/crons",
               "/cron <subcommand>",
               "/mode [fast|normal|max|clear]",
@@ -312,6 +335,38 @@ export class CommandHandler {
                   )
                   .join("\n")
               : "No workers configured."
+          );
+          return;
+        }
+
+        case "/updates": {
+          const productRoot = resolve(this.config.projectRoot, "..", "..");
+          const head = Bun.spawnSync(["git", "-C", productRoot, "rev-parse", "--short", "HEAD"], {
+            stdout: "pipe",
+            stderr: "pipe"
+          }).stdout.toString().trim() || "unknown";
+          const branch = Bun.spawnSync(["git", "-C", productRoot, "rev-parse", "--abbrev-ref", "HEAD"], {
+            stdout: "pipe",
+            stderr: "pipe"
+          }).stdout.toString().trim() || "unknown";
+          const codex = Bun.spawnSync(["bash", "-lc", "command -v codex >/dev/null && codex --version || true"], {
+            stdout: "pipe",
+            stderr: "pipe"
+          }).stdout.toString().trim() || "missing";
+          const claude = Bun.spawnSync(["bash", "-lc", "command -v claude >/dev/null && claude --version || true"], {
+            stdout: "pipe",
+            stderr: "pipe"
+          }).stdout.toString().trim() || "missing";
+          await this.telegram.sendText(
+            target,
+            [
+              "Updates are manual/read-only.",
+              `brainstack=${branch}@${head}`,
+              `selected_harness=${this.config.harness}`,
+              `codex=${codex.split(/\r?\n/)[0]}`,
+              `claude=${claude.split(/\r?\n/)[0]}`,
+              "Run on control host: brainctl updates --config ~/.config/brainstack/brainstack.yaml"
+            ].join("\n")
           );
           return;
         }
@@ -807,6 +862,59 @@ export class CommandHandler {
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
       await this.telegram.sendText(target, `Error: ${messageText}`);
+    }
+  }
+
+  private pendingKey(target: TelegramTarget, userId: number | null): string {
+    return `${target.chatId}:${target.threadId ?? "none"}:${userId ?? "unknown"}`;
+  }
+
+  private enqueuePendingText(context: ContextRecord, text: string, target: TelegramTarget, userId: number | null): void {
+    const key = this.pendingKey(target, userId);
+    const existing = this.pendingText.get(key);
+    if (existing && existing.contextSlug === context.slug) {
+      clearTimeout(existing.timer);
+      existing.parts.push(text);
+      existing.timer = setTimeout(() => void this.flushPendingText(target, userId), this.config.textCoalesceMs);
+      return;
+    }
+    if (existing) {
+      void this.flushPendingText(target, userId);
+    }
+    const pending: PendingTextPrompt = {
+      key,
+      target,
+      userId,
+      contextSlug: context.slug,
+      parts: [text],
+      createdAt: Date.now(),
+      timer: setTimeout(() => void this.flushPendingText(target, userId), this.config.textCoalesceMs)
+    };
+    this.pendingText.set(key, pending);
+  }
+
+  private async flushPendingText(target: TelegramTarget, userId: number | null): Promise<void> {
+    const key = this.pendingKey(target, userId);
+    const pending = this.pendingText.get(key);
+    if (!pending) {
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingText.delete(key);
+    const context = this.contexts.getContextBySlug(pending.contextSlug);
+    if (!context || context.state === "archived") {
+      return;
+    }
+    const prompt = pending.parts.join("\n\n");
+    if (pending.parts.length > 1) {
+      console.log(`coalesced ${pending.parts.length} Telegram text messages for ${context.slug}`);
+    }
+    const response = await this.dispatcher.dispatch("resume", context, prompt, pending.target, {
+      notifyAccepted: false,
+      telegramInput: null
+    });
+    if (response.message) {
+      await this.telegram.sendText(pending.target, response.message);
     }
   }
 
