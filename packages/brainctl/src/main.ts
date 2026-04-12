@@ -1072,6 +1072,11 @@ function tailscalePolicyFragment(cfg: BrainstackConfig): string {
         ip: ["tcp:22", "tcp:443", "icmp:*"]
       },
       {
+        src: ["group:brain-admins", "autogroup:admin"],
+        dst: [cfg.tailscale.workerTag],
+        ip: ["tcp:22", "icmp:*"]
+      },
+      {
         src: [cfg.tailscale.controlTag],
         dst: [cfg.tailscale.workerTag],
         ip: ["tcp:22", "icmp:*"]
@@ -2708,15 +2713,32 @@ async function commandJoinWorker(args: ParsedArgs): Promise<void> {
     "# if telemux is enabled: systemctl --user restart telemux.service",
     "```",
     "",
-    "## Tailscale grant needed if blocked",
+    "## Tailscale grants needed if blocked",
     "",
     "```json",
     JSON.stringify(
-      {
-        src: [cfg.tailscale.controlTag],
-        dst: [cfg.tailscale.workerTag],
-        ip: ["tcp:22", "icmp:*"]
-      },
+      [
+        {
+          src: ["group:brain-admins", "autogroup:admin"],
+          dst: [cfg.tailscale.controlTag],
+          ip: ["tcp:22", "tcp:443", "icmp:*"]
+        },
+        {
+          src: ["group:brain-admins", "autogroup:admin"],
+          dst: [cfg.tailscale.workerTag],
+          ip: ["tcp:22", "icmp:*"]
+        },
+        {
+          src: [cfg.tailscale.controlTag],
+          dst: [cfg.tailscale.workerTag],
+          ip: ["tcp:22", "icmp:*"]
+        },
+        {
+          src: [cfg.tailscale.workerTag],
+          dst: [cfg.tailscale.controlTag],
+          ip: ["tcp:22", "tcp:443", "icmp:*"]
+        }
+      ],
       null,
       2
     ),

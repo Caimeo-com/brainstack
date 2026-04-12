@@ -20,6 +20,8 @@ tailscale ping brain-worker
 ssh brain-worker true
 ```
 
+The tailnet policy must allow the operator to reach workers on `tcp:22`, the control host to reach workers on `tcp:22`, and workers to reach the control host on `tcp:22` plus `tcp:443`. See [`tailscale-control-worker.md`](./tailscale-control-worker.md) for the full grant shape and why each direction exists.
+
 If SSH reports `tailscale: tailnet policy does not permit you to SSH to this node`, you are hitting Tailscale SSH, not normal OpenSSH. Disable Tailscale SSH on that worker and ensure `sshd.service` is active.
 
 Example sudoers fragment:

@@ -23,6 +23,11 @@ Use grants:
       "ip": ["tcp:22", "tcp:443", "icmp:*"]
     },
     {
+      "src": ["group:brain-admins", "autogroup:admin"],
+      "dst": ["tag:brain-worker"],
+      "ip": ["tcp:22", "icmp:*"]
+    },
+    {
       "src": ["tag:brain"],
       "dst": ["tag:brain-worker"],
       "ip": ["tcp:22", "icmp:*"]
@@ -37,6 +42,8 @@ Use grants:
   "nodeAttrs": []
 }
 ```
+
+This means operators can reach control and worker hosts directly, control hosts can SSH to workers, and workers can reach the control host for shared-brain Git freshness plus HTTPS/API access. Grants are directional; the reverse path must be listed separately when needed.
 
 ## Tokens
 

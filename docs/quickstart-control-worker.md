@@ -77,13 +77,23 @@ If that fails with a timeout while ping works, the likely blocker is Tailscale g
 
 ```json
 {
+  "src": ["group:brain-admins", "autogroup:admin"],
+  "dst": ["tag:brain-worker"],
+  "ip": ["tcp:22", "icmp:*"]
+}
+```
+
+That lets the operator reach workers directly for setup and debugging. The control host also needs worker SSH:
+
+```json
+{
   "src": ["tag:brain"],
   "dst": ["tag:brain-worker"],
   "ip": ["tcp:22", "icmp:*"]
 }
 ```
 
-Workers also need the reverse path back to the control host for shared-brain clone freshness and HTTPS/API access:
+Workers need the reverse path back to the control host for shared-brain clone freshness and HTTPS/API access:
 
 ```json
 {
@@ -101,6 +111,7 @@ Workers also need the reverse path back to the control host for shared-brain clo
 - Tailscale SSH is not the default; leave `"ssh": []` in policy unless intentionally enabling it later.
 - Validate server-applied tags with `tailscale status` plus `tailscale whois <tailscale-ip>`, not only `tailscale debug prefs`.
 - If SSH says `tailscale: tailnet policy does not permit you to SSH to this node`, Tailscale SSH is still intercepting port 22 on the target. Disable Tailscale SSH on the target before using normal OpenSSH.
+- During a canary, temporary host/IP aliases are acceptable while you verify tags. Remove them after `tailscale whois <tailscale-ip>` shows the expected tag for each host.
 
 ## Headless Control Enrollment
 

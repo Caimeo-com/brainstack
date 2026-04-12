@@ -13,6 +13,11 @@
       "ip": ["tcp:22", "tcp:443", "icmp:*"]
     },
     {
+      "src": ["group:brain-admins", "autogroup:admin"],
+      "dst": ["tag:brain-worker"],
+      "ip": ["tcp:22", "icmp:*"]
+    },
+    {
       "src": ["tag:brain"],
       "dst": ["tag:brain-worker"],
       "ip": ["tcp:22", "icmp:*"]

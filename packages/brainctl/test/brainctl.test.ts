@@ -976,6 +976,9 @@ describe("public release hygiene", () => {
     expect(result.stdout).toContain("sshUser: operator");
     expect(result.stdout).toContain("brainctl upgrade --config brainstack.yaml --profile control");
     expect(result.stdout).toContain("ssh operator@brain-worker true");
+    expect(result.stdout).toContain('"dst": [\n      "tag:brain-worker"');
+    expect(result.stdout).toContain('"src": [\n      "tag:brain-worker"');
+    expect(result.stdout).toContain('"tcp:443"');
     expect(result.stdout).not.toContain("sshUser: factory");
     expect(result.stdout).not.toContain("Add to workers.json");
   });
@@ -1061,6 +1064,10 @@ describe("public release hygiene", () => {
       const workerToControl = rendered.grants.find((grant) => grant.src.includes("tag:brain-worker") && grant.dst.includes("tag:brain"));
       expect(workerToControl?.ip).toContain("tcp:22");
       expect(workerToControl?.ip).toContain("tcp:443");
+      const adminToWorker = rendered.grants.find(
+        (grant) => grant.src.includes("group:brain-admins") && grant.dst.includes("tag:brain-worker")
+      );
+      expect(adminToWorker?.ip).toContain("tcp:22");
 
       const staticPolicy = JSON.parse(await readFile(join(PRODUCT_ROOT, "infra", "tailscale", "policy-fragment.example.json"), "utf8")) as {
         grants: Array<{ src: string[]; dst: string[]; ip: string[] }>;
@@ -1068,6 +1075,10 @@ describe("public release hygiene", () => {
       const staticWorkerToControl = staticPolicy.grants.find((grant) => grant.src.includes("tag:brain-worker") && grant.dst.includes("tag:brain"));
       expect(staticWorkerToControl?.ip).toContain("tcp:22");
       expect(staticWorkerToControl?.ip).toContain("tcp:443");
+      const staticAdminToWorker = staticPolicy.grants.find(
+        (grant) => grant.src.includes("group:brain-admins") && grant.dst.includes("tag:brain-worker")
+      );
+      expect(staticAdminToWorker?.ip).toContain("tcp:22");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
