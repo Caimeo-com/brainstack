@@ -872,6 +872,8 @@ test("worker harness selection supports worker and context overrides without con
     await fixture.workers.probeWorker("worker1");
     const capturedScript = await readFile(capture, "utf8");
     expect(capturedScript).toContain("harness_bin='codex'");
+    expect(capturedScript).toContain("__BRAINSTACK_PATH__");
+    expect(capturedScript).toContain("BRAINSTACK_WORKER_PATH");
     expect(capturedScript).not.toContain(fixture.fakeCodex);
   } finally {
     delete process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT;

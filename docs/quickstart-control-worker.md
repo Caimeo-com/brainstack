@@ -46,6 +46,8 @@ bun run packages/brainctl/src/main.ts join-worker --config examples/control.yaml
 
 Harness precedence is explicit context override, then worker default, then global default. Remote workers resolve `codex` or `claude` via their own `PATH` unless a worker-specific `harnessBin` is configured; the control host's local absolute harness path is not reused on workers.
 
+For remote workers, Brainstack first asks the worker user's own shell for its interactive-login `PATH` and then resolves `codex` or `claude` there. That means user-owned wrappers are acceptable if `codex --version` or `claude --version` works for the SSH user. Brainstack itself still uses Bun; it does not install or invoke Node/npm/npx as part of its own product code. If a worker uses a nonstandard binary location that is not in the user's shell PATH, set that worker's `harnessBin` explicitly in `brainstack.yaml`.
+
 The worker transport default is normal OpenSSH over Tailscale:
 
 ```bash

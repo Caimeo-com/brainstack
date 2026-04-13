@@ -1202,6 +1202,103 @@ describe("public release hygiene", () => {
     }
   });
 
+  test("doctor resolves remote worker harness through the worker user's shell PATH", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-remote-path-"));
+    try {
+      const controlBin = join(dir, "control-bin");
+      const remoteBin = join(dir, "remote-bin");
+      await mkdir(controlBin, { recursive: true });
+      await mkdir(remoteBin, { recursive: true });
+
+      const fakeCodex = join(remoteBin, "codex");
+      await writeFile(
+        fakeCodex,
+        [
+          "#!/usr/bin/env bash",
+          "set -euo pipefail",
+          "if [ \"${1:-}\" = \"--version\" ]; then echo 'codex remote fake'; exit 0; fi",
+          "if [ \"${1:-}\" = \"exec\" ] && [ \"${2:-}\" = \"--help\" ]; then",
+          "  echo '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --output-last-message'",
+          "  exit 0",
+          "fi",
+          "exit 0",
+          ""
+        ].join("\n")
+      );
+      await chmod(fakeCodex, 0o755);
+
+      const fakeShell = join(dir, "worker-shell");
+      await writeFile(
+        fakeShell,
+        [
+          "#!/usr/bin/env bash",
+          "if [[ \"$*\" == *__BRAINSTACK_PATH__* ]]; then",
+          `  printf '__BRAINSTACK_PATH__%s\\n' '${remoteBin}:/usr/bin:/bin'`,
+          "  exit 0",
+          "fi",
+          "exec /usr/bin/bash \"$@\"",
+          ""
+        ].join("\n")
+      );
+      await chmod(fakeShell, 0o755);
+
+      const fakeSsh = join(controlBin, "ssh");
+      await writeFile(
+        fakeSsh,
+        [
+          "#!/usr/bin/env bash",
+          "set -euo pipefail",
+          "while (($#)); do",
+          "  case \"$1\" in",
+          "    -o) shift 2 ;;",
+          "    -*) shift ;;",
+          "    *) break ;;",
+          "  esac",
+          "done",
+          "shift", // remote target
+          "export PATH=/usr/bin:/bin",
+          `export SHELL='${fakeShell}'`,
+          "exec \"$@\"",
+          ""
+        ].join("\n")
+      );
+      await chmod(fakeSsh, 0o755);
+
+      const configPath = join(dir, "config.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "harness:",
+          "  name: codex",
+          "  bin: codex",
+          "machine:",
+          "  name: brain-control",
+          "  user: operator",
+          "telemux:",
+          "  enabled: true",
+          "  workers:",
+          "    - name: worker1",
+          "      transport: ssh",
+          "      sshTarget: worker1.example",
+          "      sshUser: operator",
+          "      harness: codex",
+          ""
+        ].join("\n")
+      );
+
+      const result = runBrainctl(["doctor", "--config", configPath, "--workers"], {
+        PATH: `${controlBin}:${process.env.PATH || ""}`
+      });
+      expectSuccess(result);
+      expect(result.stdout).toContain("PASS [workers] worker:worker1");
+      expect(result.stdout).toContain("PASS [workers] worker:worker1:harness-compat");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("doctor fails when worker harness CLI surface is incompatible", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-doctor-worker-"));
     try {

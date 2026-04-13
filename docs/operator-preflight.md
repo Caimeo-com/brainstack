@@ -24,6 +24,15 @@ The tailnet policy must allow the operator to reach workers on `tcp:22`, the con
 
 If SSH reports `tailscale: tailnet policy does not permit you to SSH to this node`, you are hitting Tailscale SSH, not normal OpenSSH. Disable Tailscale SSH on that worker and ensure `sshd.service` is active.
 
+For harness compatibility, test from the same Unix user Brainstack will SSH as:
+
+```bash
+command -v codex || command -v claude
+codex --version || claude --version
+```
+
+Brainstack resolves worker harnesses through that user's shell PATH. It does not care whether the harness command is a standalone binary or a user-managed wrapper, as long as the command works for that user. Brainstack's own installer/runtime remains Bun-only.
+
 Example sudoers fragment:
 
 ```sudoers

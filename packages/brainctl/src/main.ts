@@ -2047,13 +2047,40 @@ function workerRemoteTarget(worker: BrainstackWorkerConfig): string {
   return worker.sshUser ? `${worker.sshUser}@${target}` : target;
 }
 
+function workerUserPathPrelude(): string {
+  return `
+# Brainstack itself stays Bun-only, but worker harness commands are resolved
+# through the target user's own shell PATH so existing codex/claude installs work.
+if [ -z "\${BRAINSTACK_SKIP_USER_PATH_RESOLVE:-}" ]; then
+  __brainstack_detected_path=""
+  if [ -n "\${BRAINSTACK_WORKER_PATH:-}" ]; then
+    __brainstack_detected_path="$BRAINSTACK_WORKER_PATH"
+  elif [ -n "\${SHELL:-}" ] && [ -x "$SHELL" ]; then
+    __brainstack_detected_path="$(
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 5s "$SHELL" -lic 'printf "__BRAINSTACK_PATH__%s\\n" "$PATH"' 2>/dev/null
+      else
+        "$SHELL" -lic 'printf "__BRAINSTACK_PATH__%s\\n" "$PATH"' 2>/dev/null
+      fi | sed -n 's/.*__BRAINSTACK_PATH__//p' | tail -n 1
+    )"
+  fi
+  if [ -n "$__brainstack_detected_path" ]; then
+    PATH="$__brainstack_detected_path"
+    export PATH
+  fi
+  unset __brainstack_detected_path
+fi
+`.trim();
+}
+
 function runWorkerShell(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, script: string, timeoutSeconds = 10) {
   if (worker.transport === "local") {
     return run(["bash", "-lc", script], { check: false });
   }
+  const wrappedScript = `${workerUserPathPrelude()}\n${script}`;
   const sshArgs =
     worker.transport === "tailscale-ssh"
-      ? ["tailscale", "ssh", workerRemoteTarget(worker), "bash", "-lc", script]
+      ? ["tailscale", "ssh", workerRemoteTarget(worker), "bash", "-lc", wrappedScript]
       : [
           "ssh",
           "-o",
@@ -2065,7 +2092,7 @@ function runWorkerShell(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, s
           workerRemoteTarget(worker),
           "bash",
           "-lc",
-          script
+          wrappedScript
         ];
   return run(["timeout", `${timeoutSeconds}s`, ...sshArgs], { check: false });
 }
