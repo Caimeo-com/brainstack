@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { syncWritableRepo } from "../../../apps/braind/src/brain-lib";
 import { loadConfig, parseSimpleYaml } from "../src/main";
 
@@ -1294,6 +1294,78 @@ describe("public release hygiene", () => {
       expectSuccess(result);
       expect(result.stdout).toContain("PASS [workers] worker:worker1");
       expect(result.stdout).toContain("PASS [workers] worker:worker1:harness-compat");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("doctor runs local harness wrappers with the user's shell PATH", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-local-harness-path-"));
+    try {
+      const helperBin = join(dir, "helper-bin");
+      const wrapperBin = join(dir, "wrapper-bin");
+      await mkdir(helperBin, { recursive: true });
+      await mkdir(wrapperBin, { recursive: true });
+
+      const fakeNpx = join(helperBin, "npx");
+      await writeFile(
+        fakeNpx,
+        [
+          "#!/usr/bin/env bash",
+          "set -euo pipefail",
+          "if [ \"${1:-}\" = \"--version\" ]; then echo 'codex-cli 9.9.9'; exit 0; fi",
+          "if [ \"${1:-}\" = \"exec\" ] && [ \"${2:-}\" = \"--help\" ]; then",
+          "  echo '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --output-last-message'",
+          "  exit 0",
+          "fi",
+          "exit 0",
+          ""
+        ].join("\n")
+      );
+      await chmod(fakeNpx, 0o755);
+
+      const codexWrapper = join(wrapperBin, "codex");
+      await writeFile(codexWrapper, "#!/usr/bin/env bash\nexec npx \"$@\"\n");
+      await chmod(codexWrapper, 0o755);
+
+      const fakeShell = join(dir, "worker-shell");
+      await writeFile(
+        fakeShell,
+        [
+          "#!/usr/bin/env bash",
+          "if [[ \"$*\" == *__BRAINSTACK_PATH__* ]]; then",
+          `  printf '__BRAINSTACK_PATH__%s\\n' '${helperBin}:/usr/bin:/bin'`,
+          "  exit 0",
+          "fi",
+          "exec /usr/bin/bash \"$@\"",
+          ""
+        ].join("\n")
+      );
+      await chmod(fakeShell, 0o755);
+
+      const configPath = join(dir, "config.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: worker",
+          "harness:",
+          "  name: codex",
+          `  bin: ${codexWrapper}`,
+          "machine:",
+          "  name: worker",
+          "  user: operator",
+          ""
+        ].join("\n")
+      );
+
+      const result = runBrainctl(["doctor", "--config", configPath], {
+        SHELL: fakeShell,
+        PATH: `${dirname(process.execPath)}:/usr/bin:/bin`
+      });
+      expectSuccess(result);
+      expect(result.stdout).toContain("PASS [versions] codex-harness");
+      expect(result.stdout).toContain("codex-cli 9.9.9");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

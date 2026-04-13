@@ -1348,8 +1348,44 @@ async function installLocalClientBootstrap(cfg: BrainstackConfig): Promise<strin
 }
 
 function commandPath(name: string): string | null {
-  const proc = run(["bash", "-lc", `command -v ${shellSingleQuote(name)}`], { check: false });
+  const proc = run(["bash", "-lc", `command -v ${shellSingleQuote(name)}`], { check: false, env: userShellPathEnv() });
   return proc.code === 0 && proc.stdout.trim() ? proc.stdout.trim().split(/\r?\n/)[0] : null;
+}
+
+let cachedUserShellPath: string | null | undefined;
+
+function detectUserShellPath(): string | null {
+  if (cachedUserShellPath !== undefined) return cachedUserShellPath;
+  if (process.env.BRAINSTACK_SKIP_USER_PATH_RESOLVE) {
+    cachedUserShellPath = null;
+    return cachedUserShellPath;
+  }
+  if (process.env.BRAINSTACK_WORKER_PATH?.trim()) {
+    cachedUserShellPath = process.env.BRAINSTACK_WORKER_PATH.trim();
+    return cachedUserShellPath;
+  }
+  const shell = process.env.SHELL;
+  if (!shell || !existsSync(shell)) {
+    cachedUserShellPath = null;
+    return cachedUserShellPath;
+  }
+  const script = [
+    "__brainstack_path=\"\"",
+    "if command -v timeout >/dev/null 2>&1; then",
+    `  __brainstack_path="$(timeout 5s ${shellSingleQuote(shell)} -lic 'printf "__BRAINSTACK_PATH__%s\\n" "$PATH"' 2>/dev/null | sed -n 's/.*__BRAINSTACK_PATH__//p' | tail -n 1)"`,
+    "else",
+    `  __brainstack_path="$(${shellSingleQuote(shell)} -lic 'printf "__BRAINSTACK_PATH__%s\\n" "$PATH"' 2>/dev/null | sed -n 's/.*__BRAINSTACK_PATH__//p' | tail -n 1)"`,
+    "fi",
+    "printf '%s\\n' \"$__brainstack_path\""
+  ].join("\n");
+  const proc = run(["bash", "-lc", script], { check: false });
+  cachedUserShellPath = proc.code === 0 && proc.stdout.trim() ? proc.stdout.trim().split(/\r?\n/).at(-1) || null : null;
+  return cachedUserShellPath;
+}
+
+function userShellPathEnv(): Record<string, string> | undefined {
+  const path = detectUserShellPath();
+  return path ? { PATH: `${process.env.PATH ? `${process.env.PATH}:` : ""}${path}` } : undefined;
 }
 
 function whereisPath(name: string): string | null {
@@ -1875,16 +1911,16 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
 }
 
 function commandOk(name: string): boolean {
-  return run(["bash", "-lc", `command -v ${shellSingleQuote(name)}`], { check: false }).code === 0;
+  return run(["bash", "-lc", `command -v ${shellSingleQuote(name)}`], { check: false, env: userShellPathEnv() }).code === 0;
 }
 
 function commandVersion(name: string): string {
-  const proc = name === "ssh" ? run([name, "-V"], { check: false }) : run([name, "--version"], { check: false });
+  const proc = name === "ssh" ? run([name, "-V"], { check: false, env: userShellPathEnv() }) : run([name, "--version"], { check: false, env: userShellPathEnv() });
   return (proc.stdout || proc.stderr).trim().split(/\r?\n/)[0] || "unknown";
 }
 
 function commandHelp(name: string, args: string[] = ["--help"]): string {
-  const proc = run([name, ...args], { check: false });
+  const proc = run([name, ...args], { check: false, env: userShellPathEnv() });
   return `${proc.stdout}\n${proc.stderr}`;
 }
 
