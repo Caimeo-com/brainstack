@@ -78,6 +78,74 @@ ssh brain-worker true
 
 `tailscale debug prefs` shows local requested tags under `AdvertiseTags`. That is not the same as the control plane applying those tags. Use `tailscale status` to get the device's Tailscale IP, then run `tailscale whois <tailscale-ip>`. The `whois` output should show `Tags: tag:...` when the server-side tag is actually active.
 
+## OpenSSH Key Shape
+
+Brainstack needs two different SSH paths:
+
+- Control-to-worker SSH for dispatch: the control host logs into the worker as the worker Unix user.
+- Worker-to-control Git SSH for shared-brain freshness: the worker runs `git pull --ff-only` against the control host's bare shared-brain repo.
+
+Do not confuse these. The first path normally needs shell access on the worker. The second path only needs Git read access on the control host and can be restricted.
+
+For a worker read-only shared-brain key, create a worker key and put a forced command in the control host's `authorized_keys`:
+
+```bash
+# on the worker
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/brainstack_shared_brain_read_ed25519 -C "brainstack-shared-brain-read"
+cat ~/.ssh/brainstack_shared_brain_read_ed25519.pub
+```
+
+```bash
+# on the control host
+cat > ~/.ssh/brainstack-shared-brain-readonly.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+repo="$HOME/shared-brain/bare/shared-brain.git"
+cmd="${SSH_ORIGINAL_COMMAND:-}"
+
+case "$cmd" in
+  "git-upload-pack "*)
+    requested="${cmd#git-upload-pack }"
+    requested="${requested#\'}"
+    requested="${requested%\'}"
+    requested="${requested#\"}"
+    requested="${requested%\"}"
+    if [ "$requested" = "$repo" ] || [ "$requested" = "shared-brain/bare/shared-brain.git" ]; then
+      exec git-upload-pack "$repo"
+    fi
+    ;;
+esac
+
+echo "brainstack ssh guard: only git-upload-pack $repo is allowed" >&2
+exit 126
+EOF
+chmod 700 ~/.ssh/brainstack-shared-brain-readonly.sh
+```
+
+Then add the worker public key to the control host's `~/.ssh/authorized_keys` with restrictions:
+
+```text
+restrict,command="/home/operator/.ssh/brainstack-shared-brain-readonly.sh" ssh-ed25519 AAAA... brainstack-shared-brain-read
+```
+
+Update the worker's `~/.ssh/config` if the key is not the default identity:
+
+```sshconfig
+Host brain-control
+  HostName brain-control
+  User operator
+  IdentityFile ~/.ssh/brainstack_shared_brain_read_ed25519
+  IdentitiesOnly yes
+```
+
+Validate from the worker:
+
+```bash
+git ls-remote operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git HEAD
+```
+
+If that works but `ssh operator@brain-control true` is denied by the guard, the read-only Git key is doing its job.
+
 ## Caveats Found On Valkyrie/Erbine
 
 - Saving a tailnet policy in the Tailscale dashboard is a control-plane change; it normally does not require restarting `tailscaled` on each device. Offline devices receive the policy when they reconnect.
@@ -87,6 +155,7 @@ ssh brain-worker true
 - To use normal OpenSSH, disable Tailscale SSH on the worker with `sudo tailscale up ... --ssh=false` or `sudo tailscale set --ssh=false` when supported.
 - If `tailscale ping` works but `ssh` times out, suspect grants/firewall/sshd.
 - If SSH reaches OpenSSH but fails with `Permission denied (publickey)`, the network path is fixed and the remaining task is key installation.
+- If `brainctl init --profile worker` fails while cloning the shared brain with `Permission denied (publickey)`, install a worker-to-control Git key or configure the worker's SSH agent. The worker does not need full shell access to the control host just to read the shared-brain repo.
 - Tags may need dashboard approval or re-enrollment depending on tailnet policy and device state. Do not remove temporary host/IP fallback grants until `tailscale whois` confirms the expected tags.
 
 ## Temporary Recovery Rule

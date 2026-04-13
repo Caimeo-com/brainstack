@@ -24,6 +24,14 @@ The tailnet policy must allow the operator to reach workers on `tcp:22`, the con
 
 If SSH reports `tailscale: tailnet policy does not permit you to SSH to this node`, you are hitting Tailscale SSH, not normal OpenSSH. Disable Tailscale SSH on that worker and ensure `sshd.service` is active.
 
+For shared-brain worker bootstrap, separately verify worker-to-control Git SSH:
+
+```bash
+git ls-remote operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git HEAD
+```
+
+This is the path `brainctl init --profile worker` uses to clone `~/shared-brain`. It may use a restricted read-only Git key rather than a full shell-login key. If it fails with `Permission denied (publickey)`, fix the control host's `authorized_keys` or the worker's SSH identity before rerunning init.
+
 For harness compatibility, test from the same Unix user Brainstack will SSH as:
 
 ```bash

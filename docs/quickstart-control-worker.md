@@ -55,6 +55,14 @@ loginctl enable-linger "$USER"
 ssh operator@brain-worker true
 ```
 
+Also verify the reverse Git freshness path from the worker to the control host before running worker init:
+
+```bash
+git ls-remote operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git HEAD
+```
+
+If this fails with `Permission denied (publickey)`, the network path is already working and the missing piece is SSH key authorization on the control host. Prefer a restricted worker-to-control Git read key for this path; see [`tailscale-control-worker.md`](./tailscale-control-worker.md#openssh-key-shape). The worker does not need full shell access to the control host just to clone/pull the shared-brain repo.
+
 ## Worker Bootstrap
 
 On a worker host, `brainctl init --profile worker` performs a real client bootstrap:
