@@ -419,11 +419,53 @@ async function loadRawConfig(path?: string): Promise<Record<string, unknown>> {
   if (!path) {
     return {};
   }
-  const text = await readFile(abs(path), "utf8");
-  if (path.endsWith(".json")) {
+  const configPath = abs(path);
+  if (!existsSync(configPath)) {
+    throw new Error(await missingConfigMessage(configPath));
+  }
+  const text = await readFile(configPath, "utf8");
+  if (configPath.endsWith(".json")) {
     return JSON.parse(text) as Record<string, unknown>;
   }
   return parseSimpleYaml(text);
+}
+
+async function discoverConfigCandidates(configDir: string): Promise<string[]> {
+  if (!existsSync(configDir)) {
+    return [];
+  }
+  const names = await readdir(configDir);
+  return names
+    .filter((name) => /\.(ya?ml|json)$/.test(name))
+    .filter((name) => name === "brainstack.yaml" || name.includes("brainstack"))
+    .map((name) => join(configDir, name))
+    .sort((a, b) => {
+      const score = (path: string): number => {
+        if (path.endsWith("/brainstack.yaml")) return 0;
+        if (path.endsWith("/current-install.brainstack.yaml")) return 1;
+        if (path.endsWith(".brainstack.yaml")) return 2;
+        return 3;
+      };
+      return score(a) - score(b) || a.localeCompare(b);
+    });
+}
+
+async function missingConfigMessage(configPath: string): Promise<string> {
+  const candidates = await discoverConfigCandidates(dirname(configPath));
+  return [
+    `Brainstack config not found: ${configPath}`,
+    "",
+    "Create one with:",
+    `  brainctl provision --profile control --out ${configPath} --harness codex`,
+    "",
+    "Or pass an existing config explicitly:",
+    ...candidates.map((candidate) => `  brainctl doctor --config ${candidate}`),
+    candidates.length ? "" : "  (no existing brainstack config files found beside the requested path)",
+    "Common config paths:",
+    "  ~/.config/brainstack/brainstack.yaml",
+    "  ~/.config/brainstack/current-install.brainstack.yaml",
+    "  ~/.config/brainstack/<machine>.brainstack.yaml"
+  ].join("\n");
 }
 
 function objectAt(input: Record<string, unknown>, key: string): Record<string, unknown> {

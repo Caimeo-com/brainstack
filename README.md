@@ -30,6 +30,8 @@ bun run packages/brainctl/src/main.ts destroy --config ~/.config/brainstack/brai
 
 `init` is fresh-install only. Use `upgrade` or `apply-runtime` for existing installs; those commands do not silently seed or rewrite canonical shared-brain content.
 
+The normal installed config path is `~/.config/brainstack/brainstack.yaml`. If a command points at a missing config, `brainctl` prints the provision command to create it and lists nearby existing `*.brainstack.yaml` candidates instead of surfacing a raw filesystem `ENOENT`.
+
 Build a current-platform standalone CLI:
 
 ```bash

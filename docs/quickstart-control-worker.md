@@ -19,6 +19,8 @@ For a fresh control host install, run `brainctl init`. For later product updates
 
 `provision` only checks prerequisites and writes config. It does not install Bun, Git, OpenSSH, Tailscale, Codex, or Claude. If both Codex and Claude are installed in a non-interactive run, pass `--harness codex` or `--harness claude`.
 
+Keep the active control config at `~/.config/brainstack/brainstack.yaml`. Machine-specific compatibility configs such as `brain-control-current.brainstack.yaml` are useful during migration, but the default path should exist before operators copy/paste doctor, upgrade, or worker commands. If the path is missing, rerun `provision --out ~/.config/brainstack/brainstack.yaml` or pass the existing config explicitly.
+
 ```bash
 cd ~/brainstack
 bun run packages/brainctl/src/main.ts init --profile control --config examples/control.yaml

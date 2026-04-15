@@ -165,6 +165,26 @@ telemux:
     }
   });
 
+  test("missing config errors are actionable and list nearby candidates", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-missing-config-"));
+    try {
+      const configDir = join(dir, ".config", "brainstack");
+      await mkdir(configDir, { recursive: true });
+      const candidate = join(configDir, "valkyrie-current.brainstack.yaml");
+      await writeFile(candidate, "schema_version: 1\nprofile: control\n");
+      const missing = join(configDir, "brainstack.yaml");
+      const result = runBrainctl(["doctor", "--config", missing], { HOME: dir });
+      expect(result.code).not.toBe(0);
+      const output = `${result.stdout}\n${result.stderr}`;
+      expect(output).toContain(`Brainstack config not found: ${missing}`);
+      expect(output).toContain(`brainctl provision --profile control --out ${missing}`);
+      expect(output).toContain(`brainctl doctor --config ${candidate}`);
+      expect(output).not.toContain("ENOENT");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("resolves bun path dynamically from PATH", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-bun-path-"));
     const previousPath = process.env.PATH;
