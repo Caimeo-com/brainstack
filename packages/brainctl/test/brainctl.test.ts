@@ -1052,6 +1052,8 @@ describe("public release hygiene", () => {
           "  home: /home/operator",
           "telemux:",
           "  enabled: true",
+          "  controlRoot: /srv/telemux",
+          "  factoryRoot: /srv/factory",
           "  workers:",
           "    - name: brain-worker",
           "      transport: ssh",
@@ -1064,6 +1066,8 @@ describe("public release hygiene", () => {
       const rendered = await readFile(join(out, "brainstack.yaml"), "utf8");
       expect(rendered).toContain("telemux:");
       expect(rendered).toContain("enabled: true");
+      expect(rendered).toContain("controlRoot: /srv/telemux");
+      expect(rendered).toContain("factoryRoot: /srv/factory");
       expect(rendered).toContain("workers:");
       expect(rendered).toContain("name: brain-worker");
       expect(rendered).toContain("sshUser: operator");
@@ -1210,9 +1214,21 @@ describe("public release hygiene", () => {
   test("updates command is read-only and reports versions", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-updates-"));
     try {
+      const binDir = join(dir, "bin");
       const configPath = join(dir, "config.yaml");
+      await mkdir(binDir, { recursive: true });
+      await writeFile(
+        join(binDir, "codex"),
+        "#!/usr/bin/env sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'codex-cli 0.133.0\\n'; exit 0; fi\nprintf '%s\\n' '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check'\n"
+      );
+      await writeFile(
+        join(binDir, "claude"),
+        "#!/usr/bin/env sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '2.1.133 (Claude Code)\\n'; exit 0; fi\nprintf '%s\\n' '--dangerously-skip-permissions --permission-mode --output-format'\n"
+      );
+      await chmod(join(binDir, "codex"), 0o755);
+      await chmod(join(binDir, "claude"), 0o755);
       await writeFixtureConfig(configPath);
-      const result = runBrainctl(["updates", "--config", configPath]);
+      const result = runBrainctl(["updates", "--config", configPath], { PATH: `${binDir}:${process.env.PATH || ""}` });
       expectSuccess(result);
       expect(result.stdout).toContain("brainstack_head=");
       expect(result.stdout).toContain("manual_update_commands:");

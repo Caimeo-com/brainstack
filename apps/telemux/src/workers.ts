@@ -153,12 +153,26 @@ function buildWorkspaceSeedScript(files: WorkspaceSeedFile[]): string {
 
       return [
         `mkdir -p ${quoteSh(dirname(safePath))}`,
-        `cat <<'${marker}' | base64 -d > ${quoteSh(safePath)}`,
+        `cat <<'${marker}' | brainstack_base64_decode > ${quoteSh(safePath)}`,
         encoded,
         marker
       ].join("\n");
     })
     .join("\n");
+}
+
+function base64DecodeShellFunction(): string {
+  return `
+brainstack_base64_decode() {
+  if printf '' | base64 --decode >/dev/null 2>&1; then
+    base64 --decode
+  elif printf '' | base64 -d >/dev/null 2>&1; then
+    base64 -d
+  else
+    base64 -D
+  fi
+}
+`.trim();
 }
 
 export class WorkerService {
@@ -325,6 +339,7 @@ export class WorkerService {
 
     const script = `
 set -euo pipefail
+${base64DecodeShellFunction()}
 expand_home_path() {
   case "$1" in
     "~") printf '%s\\n' "$HOME" ;;
@@ -351,19 +366,19 @@ terminate_harness_run() {
   if [ -n "\${harness_pgid:-}" ]; then
     kill -TERM -- "-$harness_pgid" 2>/dev/null || true
   fi
-  kill "$harness_pid" 2>/dev/null || true
   if command -v pkill >/dev/null 2>&1; then
     pkill -TERM -P "$harness_pid" 2>/dev/null || true
   fi
+  kill "$harness_pid" 2>/dev/null || true
   sleep 1
   if [ -n "\${harness_pgid:-}" ] && kill -0 -- "-$harness_pgid" 2>/dev/null; then
     kill -KILL -- "-$harness_pgid" 2>/dev/null || true
   fi
-  if kill -0 "$harness_pid" 2>/dev/null; then
-    kill -9 "$harness_pid" 2>/dev/null || true
-  fi
   if command -v pkill >/dev/null 2>&1; then
     pkill -KILL -P "$harness_pid" 2>/dev/null || true
+  fi
+  if kill -0 "$harness_pid" 2>/dev/null; then
+    kill -9 "$harness_pid" 2>/dev/null || true
   fi
 }
 
@@ -374,9 +389,10 @@ if ! command -v "$harness_bin" >/dev/null 2>&1; then
   exit 30
 fi
 
-printf '%s' "$prompt_b64" | base64 -d > "$prompt_file"
+printf '%s' "$prompt_b64" | brainstack_base64_decode > "$prompt_file"
 cat > "$runner_file" <<'__CLAWDEX_RUNNER__'
 set -euo pipefail
+${base64DecodeShellFunction()}
 ${codexModelArgScript}
 ${claudeArgScript}
 image_args=()
@@ -390,11 +406,22 @@ ${codexImageArgScript}
 if [ "$harness" = "claude" ]; then
   exec "$harness_bin" "\${claude_args[@]}" < "$prompt_file" | tee .factory/last-message.txt
 else
+  codex_args=("$harness_bin" exec)
   if ${shouldResume ? "true" : "false"}; then
-    exec "$harness_bin" exec resume --json --output-last-message .factory/last-message.txt --dangerously-bypass-approvals-and-sandbox "\${model_args[@]}" "\${image_args[@]}" "$resume_session" - < "$prompt_file"
-  else
-    exec "$harness_bin" exec --json --output-last-message .factory/last-message.txt --dangerously-bypass-approvals-and-sandbox "\${model_args[@]}" "\${image_args[@]}" - < "$prompt_file"
+    codex_args+=(resume)
   fi
+  codex_args+=(--json --output-last-message .factory/last-message.txt --dangerously-bypass-approvals-and-sandbox)
+  if ((\${#model_args[@]})); then
+    codex_args+=("\${model_args[@]}")
+  fi
+  if ((\${#image_args[@]})); then
+    codex_args+=("\${image_args[@]}")
+  fi
+  if ${shouldResume ? "true" : "false"}; then
+    codex_args+=("$resume_session")
+  fi
+  codex_args+=(-)
+  exec "\${codex_args[@]}" < "$prompt_file"
 fi
 __CLAWDEX_RUNNER__
 chmod +x "$runner_file"
@@ -489,7 +516,8 @@ expand_home_path() {
 
 cd "$(expand_home_path ${quoteSh(context.worktreePath)})"
 mkdir -p ${quoteSh(dirname(safePath))}
-cat <<'${marker}' | base64 -d > ${quoteSh(safePath)}
+${base64DecodeShellFunction()}
+cat <<'${marker}' | brainstack_base64_decode > ${quoteSh(safePath)}
 ${encoded}
 ${marker}
 `;
@@ -590,7 +618,7 @@ printf 'FILE_MIME=%s\\n' "$mime"
 printf '__BASE64__\\n'
 
 if command -v base64 >/dev/null 2>&1; then
-  base64 "$resolved"
+  base64 < "$resolved"
 else
   python3 - <<'PY' "$resolved"
 import base64
@@ -983,7 +1011,8 @@ printf 'BRANCH=%s\\n' "$branch_name"
     onStdoutChunk?: (chunk: string) => Promise<void> | void
   ): Promise<WorkerExecResult> {
     const startedAt = Date.now();
-    const fullArgs = timeoutSeconds && timeoutSeconds > 0 ? ["timeout", `${timeoutSeconds}s`, ...args] : args;
+    const timeoutBin = timeoutSeconds && timeoutSeconds > 0 ? Bun.which("timeout") : null;
+    const fullArgs = timeoutBin ? [timeoutBin, `${timeoutSeconds}s`, ...args] : args;
 
     const proc = Bun.spawn(fullArgs, {
       stdin: "pipe",

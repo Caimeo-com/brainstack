@@ -652,7 +652,10 @@ test("cron jobs can be created from a normal Codex turn, tuned later, mirrored i
     expect(created?.nextRunAt).not.toBeNull();
 
     const cronRoot = join(fixture.factoryRoot, "scratch", "cronlab");
-    await waitFor(() => Bun.file(join(cronRoot, ".factory", "CRONS.md")).exists());
+    await waitFor(async () => {
+      const cronsPath = join(cronRoot, ".factory", "CRONS.md");
+      return (await Bun.file(cronsPath).exists()) && (await readFile(cronsPath, "utf8")).includes("stripe-reminder");
+    });
     expect(await readFile(join(cronRoot, ".factory", "CRONS.md"), "utf8")).toContain("stripe-reminder");
 
     await fixture.commands.handleMessage(telegramMessage("/crons", 80));

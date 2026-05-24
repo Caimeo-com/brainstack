@@ -6,6 +6,8 @@ Read [`operator-preflight.md`](./operator-preflight.md) before installing the co
 
 Read [`tailscale-control-worker.md`](./tailscale-control-worker.md) before pairing a control host with workers. The worker transport is normal OpenSSH over Tailscale, not Tailscale SSH.
 
+For first real hardware validation, follow [`runbooks/worker-canary.md`](./runbooks/worker-canary.md) before destructive legacy cleanup or demo work.
+
 ## Control Dry Run
 
 ```bash
@@ -76,7 +78,7 @@ bun run packages/brainctl/src/main.ts init --profile worker --config examples/wo
 
 That clones the shared-brain repo to the configured client path, writes `~/.config/shared-brain.env` if missing, and installs Codex/Claude/Cursor shared-brain guidance. It does not run local `braind`, does not run Telegram polling, and does not write an admin ingest token.
 
-Before a yoda/worker canary, run:
+Before a first real worker canary, run:
 
 ```bash
 bun run packages/brainctl/src/main.ts doctor --config ~/.config/brainstack/brainstack.yaml --workers
@@ -158,5 +160,7 @@ Generated user services load both runtime and secrets env files and invoke Bun w
 When telemux is enabled, `telemux.runtime.env` includes `BRAIN_BASE_URL` and `telemux.secrets.env` includes a blank `BRAIN_IMPORT_TOKEN`. Filling both opts successful runs into shared-brain raw imports of `SUMMARY.md` and `ARTIFACTS.md`; leaving either blank disables the bridge.
 
 `telemux.runtime.env` also includes `FACTORY_HARNESS`, `FACTORY_HARNESS_BIN`, and `FACTORY_TEXT_COALESCE_MS`. Use `harness.name: claude` and `harness.bin: claude` in `brainstack.yaml` to route jobs through Claude Code instead of Codex by default. Text coalescing merges only short-window plain-text Telegram messages from the same user/chat/topic; commands and attachments flush pending text first.
+
+Compatibility installs may set `telemux.controlRoot` and `telemux.factoryRoot` in `brainstack.yaml` to preserve an existing telemux SQLite DB and factory workspaces such as `/srv/telemux` and `/srv/factory`. Fresh installs should normally use the defaults under `~/.local/state/brainstack`.
 
 If the shared brain is unreachable, telemux queues opted-in run-summary imports under the same outbox root used by `brainctl outbox`.

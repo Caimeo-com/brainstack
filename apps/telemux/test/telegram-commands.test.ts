@@ -4,6 +4,14 @@ import { TELEGRAM_BOT_COMMANDS, TelegramBot } from "../src/telegram";
 
 const TEST_ALLOWED_TELEGRAM_USER_ID = 123456789;
 
+test("registered Telegram commands include implemented operator commands", () => {
+  const commands = new Set(TELEGRAM_BOT_COMMANDS.map((command) => command.command));
+
+  for (const command of ["whoami", "workers", "updates", "crons", "run", "resume", "loop", "artifacts", "usage"]) {
+    expect(commands.has(command)).toBe(true);
+  }
+});
+
 test("syncCommands registers and verifies commands for all configured scopes", async () => {
   const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
   const originalFetch = globalThis.fetch;

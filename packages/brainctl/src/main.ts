@@ -12,7 +12,7 @@ type DestroyScope = "control" | "worker" | "client" | "all";
 type CheckStatus = "PASS" | "WARN" | "FAIL";
 
 const CONFIG_SCHEMA_VERSION = 1;
-const MIN_BUN_VERSION = "1.3.11";
+const MIN_BUN_VERSION = "1.3.10";
 
 interface ParsedArgs {
   command: string;
@@ -627,8 +627,8 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
       enabled: enableTelemux,
       dashboardHost: stringAt(telemux, "dashboardHost", "127.0.0.1"),
       dashboardPort: numberAt(telemux, "dashboardPort", 8787),
-      controlRoot: join(stateRoot, "telemux"),
-      factoryRoot: join(stateRoot, "factory"),
+      controlRoot: root ? join(stateRoot, "telemux") : absWithHome(stringAt(telemux, "controlRoot", join(stateRoot, "telemux")), home),
+      factoryRoot: root ? join(stateRoot, "factory") : absWithHome(stringAt(telemux, "factoryRoot", join(stateRoot, "factory")), home),
       localMachine: stringAt(telemux, "localMachine", machineName),
       workers: []
     },
@@ -1953,16 +1953,20 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
 }
 
 function commandOk(name: string): boolean {
-  return run(["bash", "-lc", `command -v ${shellSingleQuote(name)}`], { check: false, env: userShellPathEnv() }).code === 0;
+  return commandPath(name) !== null;
 }
 
 function commandVersion(name: string): string {
-  const proc = name === "ssh" ? run([name, "-V"], { check: false, env: userShellPathEnv() }) : run([name, "--version"], { check: false, env: userShellPathEnv() });
+  const executable = commandPath(name) || name;
+  const proc =
+    name === "ssh"
+      ? run([executable, "-V"], { check: false, env: userShellPathEnv() })
+      : run([executable, "--version"], { check: false, env: userShellPathEnv() });
   return (proc.stdout || proc.stderr).trim().split(/\r?\n/)[0] || "unknown";
 }
 
 function commandHelp(name: string, args: string[] = ["--help"]): string {
-  const proc = run([name, ...args], { check: false, env: userShellPathEnv() });
+  const proc = run([commandPath(name) || name, ...args], { check: false, env: userShellPathEnv() });
   return `${proc.stdout}\n${proc.stderr}`;
 }
 
@@ -2087,10 +2091,11 @@ async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Pro
     );
   }
 
-  if (commandOk("tailscale")) {
-    const status = run(["tailscale", "status", "--json"], { check: false });
+  const tailscaleBin = commandPath("tailscale");
+  if (tailscaleBin) {
+    const status = run([tailscaleBin, "status", "--json"], { check: false });
     checks.push(status.code === 0 ? check("PASS", "tailscale", "status", "tailscale status --json succeeded") : check("WARN", "tailscale", "status", (status.stderr || status.stdout).trim()));
-    const serve = run(["tailscale", "serve", "status"], { check: false });
+    const serve = run([tailscaleBin, "serve", "status"], { check: false });
     checks.push(serve.code === 0 ? check("PASS", "tailscale", "serve", "serve status available") : check("WARN", "tailscale", "serve", (serve.stderr || serve.stdout).trim()));
   }
 
@@ -2172,7 +2177,8 @@ function runWorkerShell(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, s
           "-lc",
           wrappedScript
         ];
-  return run(["timeout", `${timeoutSeconds}s`, ...sshArgs], { check: false });
+  const timeoutBin = Bun.which("timeout");
+  return run(timeoutBin ? [timeoutBin, `${timeoutSeconds}s`, ...sshArgs] : sshArgs, { check: false });
 }
 
 async function workerDoctorChecks(cfg: BrainstackConfig, deep: boolean): Promise<DoctorCheck[]> {
