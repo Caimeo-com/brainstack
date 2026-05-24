@@ -47,6 +47,33 @@ function compact(text: string | null, limit = 280): string {
   return `${normalized.slice(0, limit - 1)}…`;
 }
 
+function artifactSendFilterFromText(text: string): string | null | undefined {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized || !/\b(?:send|attach|upload)\b/i.test(normalized)) {
+    return undefined;
+  }
+
+  const quotedPath = normalized.match(/`([^`\s]+\.[^`\s]+)`/);
+  if (quotedPath?.[1]) {
+    return quotedPath[1];
+  }
+
+  const pathLike = normalized.match(/(?:^|\s)((?:\.{0,2}\/|~\/)?[\w.-]+(?:\/[\w.-]+)*\.[A-Za-z0-9]{1,12})(?=$|[\s),.;:!?])/);
+  if (pathLike?.[1]) {
+    return pathLike[1];
+  }
+
+  if (/\b(?:artifact|artifacts|attachment|attachments)\b/i.test(normalized)) {
+    return null;
+  }
+
+  if (/\b(?:this|that|the|latest|last|current)\s+(?:file|files|document|documents|report|reports)\b/i.test(normalized)) {
+    return null;
+  }
+
+  return undefined;
+}
+
 async function readTail(path: string, lines = 40): Promise<string> {
   const file = Bun.file(path);
   if (!(await file.exists())) {
@@ -206,6 +233,10 @@ export class CommandHandler {
 
         if (rawTelegramInput && isAudioOnlyTelegramInput(rawTelegramInput)) {
           await this.telegram.sendText(target, audioNotSupportedText());
+          return;
+        }
+
+        if (!hasAttachments && (await this.maybeSendArtifactsFromPlainText(boundContext, text, target))) {
           return;
         }
 
@@ -819,29 +850,7 @@ export class CommandHandler {
             return;
           }
 
-          const requests = this.attachmentRequestsForArtifacts(artifacts, sendMatch[1] || null);
-          if (!requests.length) {
-            await this.telegram.sendText(
-              target,
-              sendMatch[1]?.trim()
-                ? `No artifact file paths matched: ${sendMatch[1].trim()}`
-                : "No artifact file paths were found in .factory/ARTIFACTS.md."
-            );
-            return;
-          }
-
-          const delivery = await deliverAttachmentRequests(this.workers, this.telegram, boundContext, target, requests);
-          const notes = formatAttachmentDeliveryIssues(delivery);
-
-          if (!delivery.sent.length) {
-            await this.telegram.sendText(target, notes || "No recorded artifact files could be uploaded.");
-            return;
-          }
-
-          if (notes) {
-            await this.telegram.sendText(target, notes);
-          }
-
+          await this.sendArtifacts(boundContext, target, artifacts, sendMatch[1] || null);
           return;
         }
 
@@ -908,6 +917,9 @@ export class CommandHandler {
     const prompt = pending.parts.join("\n\n");
     if (pending.parts.length > 1) {
       console.log(`coalesced ${pending.parts.length} Telegram text messages for ${context.slug}`);
+    }
+    if (await this.maybeSendArtifactsFromPlainText(context, prompt, pending.target)) {
+      return;
     }
     const response = await this.dispatcher.dispatch("resume", context, prompt, pending.target, {
       notifyAccepted: false,
@@ -1062,6 +1074,47 @@ export class CommandHandler {
       path: entry.path,
       type: null
     }));
+  }
+
+  private async maybeSendArtifactsFromPlainText(context: ContextRecord, text: string, target: TelegramTarget): Promise<boolean> {
+    const filterText = artifactSendFilterFromText(text);
+    if (filterText === undefined) {
+      return false;
+    }
+
+    const artifacts = await this.workers.readFactoryFile(context, "ARTIFACTS.md");
+    await this.sendArtifacts(context, target, artifacts, filterText);
+    return true;
+  }
+
+  private async sendArtifacts(
+    context: ContextRecord,
+    target: TelegramTarget,
+    artifacts: string | null,
+    filterText: string | null
+  ): Promise<void> {
+    const requests = this.attachmentRequestsForArtifacts(artifacts, filterText);
+    if (!requests.length) {
+      await this.telegram.sendText(
+        target,
+        filterText?.trim()
+          ? `No artifact file paths matched: ${filterText.trim()}`
+          : "No artifact file paths were found in .factory/ARTIFACTS.md."
+      );
+      return;
+    }
+
+    const delivery = await deliverAttachmentRequests(this.workers, this.telegram, context, target, requests);
+    const notes = formatAttachmentDeliveryIssues(delivery);
+
+    if (!delivery.sent.length) {
+      await this.telegram.sendText(target, notes || "No recorded artifact files could be uploaded.");
+      return;
+    }
+
+    if (notes) {
+      await this.telegram.sendText(target, notes);
+    }
   }
 
   private formatCronSchedule(job: CronJobRecord): string {

@@ -820,6 +820,10 @@ test("artifact delivery supports backticked bare relative filenames", async () =
     const sent = fixture.telegram.attachments.find((entry) => entry.fileName === "yoda-openclaw-audit.md");
     expect(sent?.text).toBe("audit contents");
     expect(fixture.telegram.sent.some((entry) => entry.text.includes("No artifact file paths matched"))).toBe(false);
+
+    await fixture.commands.handleMessage(telegramMessage("Send me this artifact", 67));
+    await waitFor(() => fixture.telegram.attachments.filter((entry) => entry.fileName === "yoda-openclaw-audit.md").length >= 2);
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn"))).toBe(false);
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
