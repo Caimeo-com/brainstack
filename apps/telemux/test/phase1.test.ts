@@ -9,7 +9,7 @@ import { CronScheduler } from "../src/cron-scheduler";
 import { ContextService } from "../src/contexts";
 import { FactoryDb } from "../src/db";
 import { Dispatcher } from "../src/dispatcher";
-import type { TelegramAttachmentKind } from "../src/telegram-attachments";
+import { parseArtifactEntries, resolveManifestRequests, type TelegramAttachmentKind } from "../src/telegram-attachments";
 import type { TelegramMessage, TelegramTarget } from "../src/telegram";
 import { WorkerService } from "../src/workers";
 
@@ -788,6 +788,38 @@ test("artifact delivery rejects absolute paths recorded in ARTIFACTS by default"
 
     expect(fixture.telegram.attachments).toHaveLength(0);
     expect(fixture.telegram.sent.at(-1)?.text).toContain("absolute artifact paths are disabled");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("artifact delivery supports backticked bare relative filenames", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx bareartifact control scratch", 67));
+    const context = fixture.db.getContextBySlug("bareartifact");
+    expect(context?.worktreePath).toBeTruthy();
+
+    const artifactMarkdown = "# Artifacts\n\n- `yoda-openclaw-audit.md` - read-only audit report on `yoda`\n";
+    await writeFile(join(context!.worktreePath, "yoda-openclaw-audit.md"), "audit contents");
+    await writeFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), artifactMarkdown);
+
+    expect(parseArtifactEntries(artifactMarkdown).map((entry) => entry.path)).toEqual(["yoda-openclaw-audit.md"]);
+    expect(
+      resolveManifestRequests(
+        '{"attachments":[{"path":"yoda-openclaw-audit.md","type":"document"}]}',
+        artifactMarkdown
+      ).requests.map((request) => request.path)
+    ).toEqual(["yoda-openclaw-audit.md"]);
+
+    await fixture.commands.handleMessage(telegramMessage("/artifacts send yoda-openclaw-audit.md", 67));
+    await waitFor(() => fixture.telegram.attachments.some((entry) => entry.fileName === "yoda-openclaw-audit.md"));
+
+    const sent = fixture.telegram.attachments.find((entry) => entry.fileName === "yoda-openclaw-audit.md");
+    expect(sent?.text).toBe("audit contents");
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("No artifact file paths matched"))).toBe(false);
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });

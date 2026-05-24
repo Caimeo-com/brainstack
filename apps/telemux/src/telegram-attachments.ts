@@ -22,11 +22,24 @@ export interface ParsedAttachmentManifest {
 export const TELEGRAM_ATTACHMENTS_FILE_NAME = "TELEGRAM_ATTACHMENTS.json";
 export const TELEGRAM_ATTACHMENTS_WORKSPACE_PATH = `.factory/${TELEGRAM_ATTACHMENTS_FILE_NAME}`;
 
-const ARTIFACT_PATH_PATTERN = /`((?:\/|~\/|\.?[\w.-][^`\s]*\/)[^`]+)`|((?:\/|~\/|\.?[\w.-][^\s]*\/)\S+)/g;
+const BACKTICK_ARTIFACT_PATH_PATTERN = /`([^`\n]+)`/g;
+const UNQUOTED_ARTIFACT_PATH_PATTERN = /((?:\/|~\/|\.?[\w.-][^\s]*\/)\S+)/g;
 const PHOTO_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
 
 function normalizePathCandidate(value: string): string {
   return value.trim().replace(/[),.;:]+$/, "");
+}
+
+function isArtifactPathCandidate(value: string, quoted: boolean): boolean {
+  if (!value || /\s/.test(value)) {
+    return false;
+  }
+
+  if (value.startsWith("/") || value.startsWith("~/") || value.includes("/")) {
+    return true;
+  }
+
+  return quoted && Boolean(extname(basename(value)));
 }
 
 function normalizeAttachmentRequest(input: unknown): TelegramAttachmentRequest | null {
@@ -55,16 +68,26 @@ export function parseArtifactEntries(markdown: string | null): ArtifactEntry[] {
   const seen = new Set<string>();
 
   for (const line of markdown.split("\n")) {
-    ARTIFACT_PATH_PATTERN.lastIndex = 0;
+    const candidates: string[] = [];
+    BACKTICK_ARTIFACT_PATH_PATTERN.lastIndex = 0;
+    UNQUOTED_ARTIFACT_PATH_PATTERN.lastIndex = 0;
 
-    for (const match of line.matchAll(ARTIFACT_PATH_PATTERN)) {
-      const raw = match[1] || match[2];
-      if (!raw) {
-        continue;
+    for (const match of line.matchAll(BACKTICK_ARTIFACT_PATH_PATTERN)) {
+      const path = normalizePathCandidate(match[1] || "");
+      if (isArtifactPathCandidate(path, true)) {
+        candidates.push(path);
       }
+    }
 
-      const path = normalizePathCandidate(raw);
-      if (!path || seen.has(path)) {
+    for (const match of line.matchAll(UNQUOTED_ARTIFACT_PATH_PATTERN)) {
+      const path = normalizePathCandidate(match[1] || "");
+      if (isArtifactPathCandidate(path, false)) {
+        candidates.push(path);
+      }
+    }
+
+    for (const path of candidates) {
+      if (seen.has(path)) {
         continue;
       }
 
