@@ -33,7 +33,7 @@ Only set `FACTORY_WORKERS_FILE` in `.env` if you want the worker config somewher
 
 At that point, the control host is usable even if the remote worker is still offline.
 
-Once a topic is active, artifact files can be returned into the same Telegram topic either by asking for them in plain language or by using `/artifacts send [filter]`.
+Once a topic is active, artifact files can be returned into the same Telegram topic by asking for them in plain language, using `/artifacts send [filter]`, or using the numbered `/artifact_N` shortcuts shown by `/artifacts`. Generic requests such as "send artifact", "send file", or "send it" send only the latest recorded artifact. Use an explicit filename/filter or a numbered shortcut when you want an older artifact.
 
 Supported inbound Telegram media now stages into the bound workspace automatically. Voice and audio transcription is still a later phase.
 

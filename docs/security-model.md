@@ -92,6 +92,8 @@ Rotate via BotFather after any log leak because logs, backups, terminal scrollba
 
 Telemux only delivers requested artifacts from the active workspace by default. `.factory/TELEGRAM_ATTACHMENTS.json` and `.factory/ARTIFACTS.md` should record relative paths inside the workspace. Absolute paths such as `/etc/passwd` are rejected unless `FACTORY_ALLOW_ABSOLUTE_ARTIFACT_PATHS=true` is explicitly set, which should be treated as an exfiltration-risk override for trusted local debugging only.
 
+`.factory/ARTIFACTS.md` is the topic-local send allowlist and user-facing artifact history. New deliverables should be appended so the latest entry is the default target for generic Telegram requests such as "send artifact", "send file", or "send it". Sending a file does not remove the entry. Remove or mark an entry superseded only when the file was deleted, replaced by a newer deliverable, became misleading, or should no longer be offered for Telegram delivery. Internal state files such as `.factory/STATE.json`, `.factory/SUMMARY.md`, and `.factory/TODO.md` should stay out of the artifact list unless the operator explicitly asks for them as deliverables.
+
 ## Private Journal Boundary
 
 Personal/private journaling is a separate profile/repo/service/token boundary:

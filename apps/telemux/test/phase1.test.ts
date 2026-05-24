@@ -802,11 +802,20 @@ test("artifact delivery supports backticked bare relative filenames", async () =
     const context = fixture.db.getContextBySlug("bareartifact");
     expect(context?.worktreePath).toBeTruthy();
 
-    const artifactMarkdown = "# Artifacts\n\n- `yoda-openclaw-audit.md` - read-only audit report on `yoda`\n";
+    const artifactMarkdown = [
+      "# Artifacts",
+      "",
+      "- `yoda-openclaw-audit.md` - read-only audit report on `yoda`",
+      "- `openclaw-retirement-phase1.md` - phase 1 cleanup report"
+    ].join("\n");
     await writeFile(join(context!.worktreePath, "yoda-openclaw-audit.md"), "audit contents");
+    await writeFile(join(context!.worktreePath, "openclaw-retirement-phase1.md"), "phase 1 contents");
     await writeFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), artifactMarkdown);
 
-    expect(parseArtifactEntries(artifactMarkdown).map((entry) => entry.path)).toEqual(["yoda-openclaw-audit.md"]);
+    expect(parseArtifactEntries(artifactMarkdown).map((entry) => entry.path)).toEqual([
+      "yoda-openclaw-audit.md",
+      "openclaw-retirement-phase1.md"
+    ]);
     expect(
       resolveManifestRequests(
         '{"attachments":[{"path":"yoda-openclaw-audit.md","type":"document"}]}',
@@ -821,9 +830,29 @@ test("artifact delivery supports backticked bare relative filenames", async () =
     expect(sent?.text).toBe("audit contents");
     expect(fixture.telegram.sent.some((entry) => entry.text.includes("No artifact file paths matched"))).toBe(false);
 
-    await fixture.commands.handleMessage(telegramMessage("Send me this artifact", 67));
+    await fixture.commands.handleMessage(telegramMessage("/artifacts", 67));
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("/artifact_1 yoda-openclaw-audit.md");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("/artifact_2 openclaw-retirement-phase1.md");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("/artifact_latest");
+
+    await fixture.commands.handleMessage(telegramMessage("/artifact_1", 67));
     await waitFor(() => fixture.telegram.attachments.filter((entry) => entry.fileName === "yoda-openclaw-audit.md").length >= 2);
+
+    await fixture.commands.handleMessage(telegramMessage("Send me this artifact", 67));
+    await waitFor(() => fixture.telegram.attachments.some((entry) => entry.fileName === "openclaw-retirement-phase1.md"));
+    expect(fixture.telegram.attachments.at(-1)?.fileName).toBe("openclaw-retirement-phase1.md");
+    expect(fixture.telegram.attachments.at(-1)?.text).toBe("phase 1 contents");
     expect(fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn"))).toBe(false);
+
+    const attachmentCount = fixture.telegram.attachments.length;
+    await fixture.commands.handleMessage(telegramMessage("Send file", 67));
+    await waitFor(() => fixture.telegram.attachments.length > attachmentCount);
+    expect(fixture.telegram.attachments.at(-1)?.fileName).toBe("openclaw-retirement-phase1.md");
+
+    const noFilterSendCount = fixture.telegram.attachments.length;
+    await fixture.commands.handleMessage(telegramMessage("/artifacts send", 67));
+    await waitFor(() => fixture.telegram.attachments.length > noFilterSendCount);
+    expect(fixture.telegram.attachments.at(-1)?.fileName).toBe("openclaw-retirement-phase1.md");
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });

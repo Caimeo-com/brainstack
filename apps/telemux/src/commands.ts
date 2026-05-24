@@ -12,7 +12,7 @@ import { ContextRecord, FactoryDb } from "./db";
 import { ContextService, nextRecommendedAction, normalizeSlug } from "./contexts";
 import { Dispatcher } from "./dispatcher";
 import { CronJobRecord } from "./cron-jobs";
-import { selectArtifactEntries, TelegramAttachmentRequest } from "./telegram-attachments";
+import { parseArtifactEntries, selectArtifactEntries, type ArtifactEntry } from "./telegram-attachments";
 import { extractTelegramInput, filterPhaseOneTelegramInput, isAudioOnlyTelegramInput, telegramMessageText } from "./telegram-inputs";
 import { summarizeUsage } from "./usage";
 import { WorkerService } from "./workers";
@@ -47,31 +47,40 @@ function compact(text: string | null, limit = 280): string {
   return `${normalized.slice(0, limit - 1)}…`;
 }
 
-function artifactSendFilterFromText(text: string): string | null | undefined {
+interface ArtifactSendIntent {
+  filterText: string | null;
+  latestOnly: boolean;
+}
+
+function artifactSendIntentFromText(text: string): ArtifactSendIntent | null {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (!normalized || !/\b(?:send|attach|upload)\b/i.test(normalized)) {
-    return undefined;
+    return null;
   }
 
   const quotedPath = normalized.match(/`([^`\s]+\.[^`\s]+)`/);
   if (quotedPath?.[1]) {
-    return quotedPath[1];
+    return { filterText: quotedPath[1], latestOnly: false };
   }
 
   const pathLike = normalized.match(/(?:^|\s)((?:\.{0,2}\/|~\/)?[\w.-]+(?:\/[\w.-]+)*\.[A-Za-z0-9]{1,12})(?=$|[\s),.;:!?])/);
   if (pathLike?.[1]) {
-    return pathLike[1];
+    return { filterText: pathLike[1], latestOnly: false };
   }
 
-  if (/\b(?:artifact|artifacts|attachment|attachments)\b/i.test(normalized)) {
-    return null;
+  if (/\b(?:artifact|artifacts|attachment|attachments|file|files|document|documents|report|reports)\b/i.test(normalized)) {
+    return { filterText: null, latestOnly: true };
   }
 
   if (/\b(?:this|that|the|latest|last|current)\s+(?:file|files|document|documents|report|reports)\b/i.test(normalized)) {
-    return null;
+    return { filterText: null, latestOnly: true };
   }
 
-  return undefined;
+  if (/\b(?:send|attach|upload)(?:\s+me)?\s+(?:it|this|that)\b/i.test(normalized)) {
+    return { filterText: null, latestOnly: true };
+  }
+
+  return null;
 }
 
 async function readTail(path: string, lines = 40): Promise<string> {
@@ -255,6 +264,18 @@ export class CommandHandler {
         return;
       }
 
+      const artifactShortcut = parsed.command.match(/^\/artifact_?(\d+|latest|last)$/);
+      if (artifactShortcut) {
+        if (!boundContext) {
+          await this.telegram.sendText(target, "This topic is not bound.");
+          return;
+        }
+
+        const artifacts = await this.workers.readFactoryFile(boundContext, "ARTIFACTS.md");
+        await this.sendArtifactShortcut(boundContext, target, artifacts, artifactShortcut[1] || "");
+        return;
+      }
+
       switch (parsed.command) {
         case "/help":
           await this.telegram.sendText(
@@ -291,9 +312,12 @@ export class CommandHandler {
               "/detach",
               "/tail",
               "/artifacts",
+              "/artifact_latest",
+              "/artifact_N",
               "/usage",
               "",
               "In a bound topic, plain text starts or resumes the stored Codex session.",
+              "Use /artifacts to list sendable artifact shortcuts. Generic requests such as \"send it\" send the latest artifact.",
               "Use /mode, /model, and /effort to change Codex runtime behavior for this topic without rebinding it.",
               "Use /crons to inspect scheduled jobs linked to this topic/context. Use /cron with a job id from /crons to pause, resume, move, retarget context, or tune job runtime."
             ].join("\n")
@@ -839,7 +863,7 @@ export class CommandHandler {
           if (!parsed.rest) {
             await this.telegram.sendText(
               target,
-              artifacts ? artifacts : `No artifact file available. Cached snippet: ${boundContext.lastArtifacts || "n/a"}`
+              artifacts ? this.formatArtifactsList(artifacts) : `No artifact file available. Cached snippet: ${boundContext.lastArtifacts || "n/a"}`
             );
             return;
           }
@@ -850,7 +874,8 @@ export class CommandHandler {
             return;
           }
 
-          await this.sendArtifacts(boundContext, target, artifacts, sendMatch[1] || null);
+          const filterText = sendMatch[1] || null;
+          await this.sendArtifacts(boundContext, target, artifacts, filterText, !filterText);
           return;
         }
 
@@ -1067,40 +1092,97 @@ export class CommandHandler {
       .join("\n");
   }
 
-  private attachmentRequestsForArtifacts(artifacts: string | null, filterText: string | null): TelegramAttachmentRequest[] {
+  private formatArtifactsList(artifacts: string): string {
+    const entries = parseArtifactEntries(artifacts);
+    if (!entries.length) {
+      return `${artifacts}\n\nNo sendable artifact paths were found. Record artifacts as file paths, for example: - \`report.md\``;
+    }
+
+    const lines = [
+      "# Artifacts",
+      "",
+      "Tap or send one of these commands:",
+      "- /artifact_latest"
+    ];
+
+    entries.forEach((entry, index) => {
+      lines.push(`- /artifact_${index + 1} ${entry.fileName}`);
+      lines.push(`  path: ${entry.path}`);
+    });
+
+    return lines.join("\n");
+  }
+
+  private artifactEntriesForSend(artifacts: string | null, filterText: string | null, latestOnly: boolean): ArtifactEntry[] {
     const maxAttachments = 10;
-    const entries = selectArtifactEntries(artifacts, filterText).slice(0, maxAttachments);
-    return entries.map((entry) => ({
-      path: entry.path,
-      type: null
-    }));
+    const entries = selectArtifactEntries(artifacts, filterText);
+    return latestOnly ? entries.slice(-1) : entries.slice(0, maxAttachments);
   }
 
   private async maybeSendArtifactsFromPlainText(context: ContextRecord, text: string, target: TelegramTarget): Promise<boolean> {
-    const filterText = artifactSendFilterFromText(text);
-    if (filterText === undefined) {
+    const intent = artifactSendIntentFromText(text);
+    if (!intent) {
       return false;
     }
 
     const artifacts = await this.workers.readFactoryFile(context, "ARTIFACTS.md");
-    await this.sendArtifacts(context, target, artifacts, filterText);
+    await this.sendArtifacts(context, target, artifacts, intent.filterText, intent.latestOnly);
     return true;
+  }
+
+  private async sendArtifactShortcut(
+    context: ContextRecord,
+    target: TelegramTarget,
+    artifacts: string | null,
+    selector: string
+  ): Promise<void> {
+    const entries = parseArtifactEntries(artifacts);
+    if (!entries.length) {
+      await this.telegram.sendText(target, "No artifact file paths were found in .factory/ARTIFACTS.md.");
+      return;
+    }
+
+    const entry =
+      selector === "latest" || selector === "last"
+        ? entries.at(-1)
+        : entries[Number(selector) - 1];
+
+    if (!entry) {
+      await this.telegram.sendText(target, `No artifact exists for ${selector}. Use /artifacts to list available artifact commands.`);
+      return;
+    }
+
+    await this.deliverArtifactEntries(context, target, [entry]);
   }
 
   private async sendArtifacts(
     context: ContextRecord,
     target: TelegramTarget,
     artifacts: string | null,
-    filterText: string | null
+    filterText: string | null,
+    latestOnly = false
   ): Promise<void> {
-    const requests = this.attachmentRequestsForArtifacts(artifacts, filterText);
-    if (!requests.length) {
+    const entries = this.artifactEntriesForSend(artifacts, filterText, latestOnly);
+    if (!entries.length) {
       await this.telegram.sendText(
         target,
         filterText?.trim()
           ? `No artifact file paths matched: ${filterText.trim()}`
           : "No artifact file paths were found in .factory/ARTIFACTS.md."
       );
+      return;
+    }
+
+    await this.deliverArtifactEntries(context, target, entries);
+  }
+
+  private async deliverArtifactEntries(context: ContextRecord, target: TelegramTarget, entries: ArtifactEntry[]): Promise<void> {
+    const requests = entries.map((entry) => ({
+      path: entry.path,
+      type: null
+    }));
+    if (!requests.length) {
+      await this.telegram.sendText(target, "No artifact file paths were found in .factory/ARTIFACTS.md.");
       return;
     }
 
