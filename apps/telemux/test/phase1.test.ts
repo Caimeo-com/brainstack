@@ -788,6 +788,11 @@ test("artifact delivery rejects absolute paths recorded in ARTIFACTS by default"
 
     expect(fixture.telegram.attachments).toHaveLength(0);
     expect(fixture.telegram.sent.at(-1)?.text).toContain("absolute artifact paths are disabled");
+
+    await fixture.commands.handleMessage(telegramMessage("/shred_1", 66));
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Not deleted:");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Unsafe artifact delete path");
+    expect(parseArtifactEntries(await readFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), "utf8"))).toHaveLength(1);
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
@@ -831,8 +836,9 @@ test("artifact delivery supports backticked bare relative filenames", async () =
     expect(fixture.telegram.sent.some((entry) => entry.text.includes("No artifact file paths matched"))).toBe(false);
 
     await fixture.commands.handleMessage(telegramMessage("/artifacts", 67));
-    expect(fixture.telegram.sent.at(-1)?.text).toContain("/artifact_1 yoda-openclaw-audit.md");
-    expect(fixture.telegram.sent.at(-1)?.text).toContain("/artifact_2 openclaw-retirement-phase1.md");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("send: /artifact_1");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("send + del: /artifact_2_senddel");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("del: /shred_1");
     expect(fixture.telegram.sent.at(-1)?.text).toContain("/artifact_latest");
 
     await fixture.commands.handleMessage(telegramMessage("/artifact_1", 67));
@@ -853,6 +859,26 @@ test("artifact delivery supports backticked bare relative filenames", async () =
     await fixture.commands.handleMessage(telegramMessage("/artifacts send", 67));
     await waitFor(() => fixture.telegram.attachments.length > noFilterSendCount);
     expect(fixture.telegram.attachments.at(-1)?.fileName).toBe("openclaw-retirement-phase1.md");
+
+    await fixture.commands.handleMessage(telegramMessage("/shred", 67));
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("/shred_1 yoda-openclaw-audit.md");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("/shred_2 openclaw-retirement-phase1.md");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("/shred_latest");
+
+    await fixture.commands.handleMessage(telegramMessage("/shred_1", 67));
+    expect(await Bun.file(join(context!.worktreePath, "yoda-openclaw-audit.md")).exists()).toBe(false);
+    const afterFirstShred = await readFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), "utf8");
+    expect(parseArtifactEntries(afterFirstShred).map((entry) => entry.path)).toEqual(["openclaw-retirement-phase1.md"]);
+    expect(fixture.db.getContextBySlug("bareartifact")?.lastArtifacts).toContain("openclaw-retirement-phase1.md");
+    expect(fixture.db.getContextBySlug("bareartifact")?.lastArtifacts).not.toContain("yoda-openclaw-audit.md");
+
+    const sendDeleteCount = fixture.telegram.attachments.length;
+    await fixture.commands.handleMessage(telegramMessage("/artifact_latest_senddel", 67));
+    await waitFor(() => fixture.telegram.attachments.length > sendDeleteCount);
+    expect(fixture.telegram.attachments.at(-1)?.fileName).toBe("openclaw-retirement-phase1.md");
+    expect(await Bun.file(join(context!.worktreePath, "openclaw-retirement-phase1.md")).exists()).toBe(false);
+    const afterSendDel = await readFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), "utf8");
+    expect(parseArtifactEntries(afterSendDel)).toHaveLength(0);
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });

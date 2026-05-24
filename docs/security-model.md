@@ -94,6 +94,8 @@ Telemux only delivers requested artifacts from the active workspace by default. 
 
 `.factory/ARTIFACTS.md` is the topic-local send allowlist and user-facing artifact history. New deliverables should be appended so the latest entry is the default target for generic Telegram requests such as "send artifact", "send file", or "send it". Sending a file does not remove the entry. Remove or mark an entry superseded only when the file was deleted, replaced by a newer deliverable, became misleading, or should no longer be offered for Telegram delivery. Internal state files such as `.factory/STATE.json`, `.factory/SUMMARY.md`, and `.factory/TODO.md` should stay out of the artifact list unless the operator explicitly asks for them as deliverables.
 
+`/shred` is the operator cleanup path for artifacts. It deletes only regular files addressed by relative artifact paths inside the active context workspace, then removes matching lines from `.factory/ARTIFACTS.md` and updates the context cache. Absolute paths, home-relative paths, parent traversal, directories, and paths escaping the workspace through symlinks are rejected. Despite the name, this is an unlink/delete operation, not a guaranteed secure overwrite on SSDs or journaled filesystems.
+
 ## Private Journal Boundary
 
 Personal/private journaling is a separate profile/repo/service/token boundary:

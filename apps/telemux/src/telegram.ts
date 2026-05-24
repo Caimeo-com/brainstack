@@ -46,6 +46,7 @@ export const TELEGRAM_BOT_COMMANDS: TelegramBotCommand[] = [
   { command: "detach", description: "Detach this topic without deleting files" },
   { command: "tail", description: "Show the latest local run log tail" },
   { command: "artifacts", description: "Show cached or live artifacts notes" },
+  { command: "shred", description: "List artifact cleanup shortcuts" },
   { command: "usage", description: "Show token usage from the latest log" }
 ];
 

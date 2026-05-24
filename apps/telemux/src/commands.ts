@@ -12,7 +12,12 @@ import { ContextRecord, FactoryDb } from "./db";
 import { ContextService, nextRecommendedAction, normalizeSlug } from "./contexts";
 import { Dispatcher } from "./dispatcher";
 import { CronJobRecord } from "./cron-jobs";
-import { parseArtifactEntries, selectArtifactEntries, type ArtifactEntry } from "./telegram-attachments";
+import {
+  parseArtifactEntries,
+  removeArtifactEntriesFromMarkdown,
+  selectArtifactEntries,
+  type ArtifactEntry
+} from "./telegram-attachments";
 import { extractTelegramInput, filterPhaseOneTelegramInput, isAudioOnlyTelegramInput, telegramMessageText } from "./telegram-inputs";
 import { summarizeUsage } from "./usage";
 import { WorkerService } from "./workers";
@@ -35,6 +40,19 @@ function parseCommand(text: string): { command: string; rest: string } | null {
 }
 
 function compact(text: string | null, limit = 280): string {
+  if (!text) {
+    return "n/a";
+  }
+
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= limit) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, limit - 1)}…`;
+}
+
+function snippet(text: string | null, limit = 240): string {
   if (!text) {
     return "n/a";
   }
@@ -264,7 +282,7 @@ export class CommandHandler {
         return;
       }
 
-      const artifactShortcut = parsed.command.match(/^\/artifact_?(\d+|latest|last)$/);
+      const artifactShortcut = parsed.command.match(/^\/artifact_?(\d+|latest|last)(?:_(senddel|del|shred))?$/);
       if (artifactShortcut) {
         if (!boundContext) {
           await this.telegram.sendText(target, "This topic is not bound.");
@@ -272,7 +290,24 @@ export class CommandHandler {
         }
 
         const artifacts = await this.workers.readFactoryFile(boundContext, "ARTIFACTS.md");
-        await this.sendArtifactShortcut(boundContext, target, artifacts, artifactShortcut[1] || "");
+        const action = artifactShortcut[2] || "send";
+        if (action === "del" || action === "shred") {
+          await this.shredArtifactShortcut(boundContext, target, artifacts, artifactShortcut[1] || "");
+        } else {
+          await this.sendArtifactShortcut(boundContext, target, artifacts, artifactShortcut[1] || "", action === "senddel");
+        }
+        return;
+      }
+
+      const shredShortcut = parsed.command.match(/^\/shred_?(\d+|latest|last)$/);
+      if (shredShortcut) {
+        if (!boundContext) {
+          await this.telegram.sendText(target, "This topic is not bound.");
+          return;
+        }
+
+        const artifacts = await this.workers.readFactoryFile(boundContext, "ARTIFACTS.md");
+        await this.shredArtifactShortcut(boundContext, target, artifacts, shredShortcut[1] || "");
         return;
       }
 
@@ -314,10 +349,13 @@ export class CommandHandler {
               "/artifacts",
               "/artifact_latest",
               "/artifact_N",
+              "/shred",
+              "/shred_N",
               "/usage",
               "",
               "In a bound topic, plain text starts or resumes the stored Codex session.",
               "Use /artifacts to list sendable artifact shortcuts. Generic requests such as \"send it\" send the latest artifact.",
+              "Use /shred to list artifact cleanup shortcuts.",
               "Use /mode, /model, and /effort to change Codex runtime behavior for this topic without rebinding it.",
               "Use /crons to inspect scheduled jobs linked to this topic/context. Use /cron with a job id from /crons to pause, resume, move, retarget context, or tune job runtime."
             ].join("\n")
@@ -879,6 +917,17 @@ export class CommandHandler {
           return;
         }
 
+        case "/shred": {
+          if (!boundContext) {
+            await this.telegram.sendText(target, "This topic is not bound.");
+            return;
+          }
+
+          const artifacts = await this.workers.readFactoryFile(boundContext, "ARTIFACTS.md");
+          await this.telegram.sendText(target, this.formatShredList(artifacts, parsed.rest || null));
+          return;
+        }
+
         case "/usage": {
           if (!boundContext) {
             await this.telegram.sendText(target, "This topic is not bound.");
@@ -1101,12 +1150,50 @@ export class CommandHandler {
     const lines = [
       "# Artifacts",
       "",
-      "Tap or send one of these commands:",
-      "- /artifact_latest"
+      "Tap or send a command under a file:",
+      "- latest send: /artifact_latest",
+      "- latest send + del: /artifact_latest_senddel",
+      "- latest del: /shred_latest"
     ];
 
     entries.forEach((entry, index) => {
-      lines.push(`- /artifact_${index + 1} ${entry.fileName}`);
+      const number = index + 1;
+      lines.push(`- ${entry.fileName}`);
+      lines.push(`  send: /artifact_${number}`);
+      lines.push(`  send + del: /artifact_${number}_senddel`);
+      lines.push(`  del: /shred_${number}`);
+      lines.push(`  path: ${entry.path}`);
+    });
+
+    return lines.join("\n");
+  }
+
+  private formatShredList(artifacts: string | null, filterText: string | null): string {
+    const filter = filterText?.trim().toLowerCase() || "";
+    const entries = parseArtifactEntries(artifacts)
+      .map((entry, index) => ({ entry, index }))
+      .filter(({ entry }) => {
+        if (!filter) {
+          return true;
+        }
+
+        return [entry.path, entry.fileName, entry.line].some((value) => value.toLowerCase().includes(filter));
+      });
+    if (!entries.length) {
+      return filterText?.trim()
+        ? `No artifact file paths matched for shredding: ${filterText.trim()}`
+        : "No artifact file paths were found in .factory/ARTIFACTS.md.";
+    }
+
+    const lines = [
+      "# Shred Artifacts",
+      "",
+      "Tap or send one command to delete the file from disk and remove it from .factory/ARTIFACTS.md:",
+      "- /shred_latest"
+    ];
+
+    entries.forEach(({ entry, index }) => {
+      lines.push(`- /shred_${index + 1} ${entry.fileName}`);
       lines.push(`  path: ${entry.path}`);
     });
 
@@ -1134,7 +1221,8 @@ export class CommandHandler {
     context: ContextRecord,
     target: TelegramTarget,
     artifacts: string | null,
-    selector: string
+    selector: string,
+    deleteAfterSend = false
   ): Promise<void> {
     const entries = parseArtifactEntries(artifacts);
     if (!entries.length) {
@@ -1152,7 +1240,35 @@ export class CommandHandler {
       return;
     }
 
-    await this.deliverArtifactEntries(context, target, [entry]);
+    const delivery = await this.deliverArtifactEntries(context, target, [entry]);
+    if (deleteAfterSend && delivery.sent.length) {
+      await this.shredArtifactEntries(context, target, artifacts, [entry], "Sent and deleted");
+    }
+  }
+
+  private async shredArtifactShortcut(
+    context: ContextRecord,
+    target: TelegramTarget,
+    artifacts: string | null,
+    selector: string
+  ): Promise<void> {
+    const entries = parseArtifactEntries(artifacts);
+    if (!entries.length) {
+      await this.telegram.sendText(target, "No artifact file paths were found in .factory/ARTIFACTS.md.");
+      return;
+    }
+
+    const entry =
+      selector === "latest" || selector === "last"
+        ? entries.at(-1)
+        : entries[Number(selector) - 1];
+
+    if (!entry) {
+      await this.telegram.sendText(target, `No artifact exists for ${selector}. Use /shred to list available cleanup commands.`);
+      return;
+    }
+
+    await this.shredArtifactEntries(context, target, artifacts, [entry], "Deleted");
   }
 
   private async sendArtifacts(
@@ -1176,14 +1292,18 @@ export class CommandHandler {
     await this.deliverArtifactEntries(context, target, entries);
   }
 
-  private async deliverArtifactEntries(context: ContextRecord, target: TelegramTarget, entries: ArtifactEntry[]): Promise<void> {
+  private async deliverArtifactEntries(context: ContextRecord, target: TelegramTarget, entries: ArtifactEntry[]) {
     const requests = entries.map((entry) => ({
       path: entry.path,
       type: null
     }));
     if (!requests.length) {
       await this.telegram.sendText(target, "No artifact file paths were found in .factory/ARTIFACTS.md.");
-      return;
+      return {
+        sent: [],
+        skipped: [],
+        failed: []
+      };
     }
 
     const delivery = await deliverAttachmentRequests(this.workers, this.telegram, context, target, requests);
@@ -1191,12 +1311,64 @@ export class CommandHandler {
 
     if (!delivery.sent.length) {
       await this.telegram.sendText(target, notes || "No recorded artifact files could be uploaded.");
-      return;
+      return delivery;
     }
 
     if (notes) {
       await this.telegram.sendText(target, notes);
     }
+
+    return delivery;
+  }
+
+  private async shredArtifactEntries(
+    context: ContextRecord,
+    target: TelegramTarget,
+    artifacts: string | null,
+    entries: ArtifactEntry[],
+    verb: string
+  ): Promise<void> {
+    const removedPaths: string[] = [];
+    const deleted: string[] = [];
+    const missing: string[] = [];
+    const failed: string[] = [];
+
+    for (const entry of entries) {
+      try {
+        const result = await this.workers.deleteArtifactFile(context, entry.path);
+        removedPaths.push(entry.path);
+        if (result.status === "deleted") {
+          deleted.push(entry.fileName);
+        } else {
+          missing.push(entry.fileName);
+        }
+      } catch (error) {
+        failed.push(`${entry.path}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    if (removedPaths.length) {
+      const updatedArtifacts = removeArtifactEntriesFromMarkdown(artifacts, removedPaths);
+      await this.workers.writeWorkspaceFile(context, ".factory/ARTIFACTS.md", updatedArtifacts);
+      this.contexts.saveContext({
+        ...context,
+        lastArtifacts: snippet(updatedArtifacts)
+      });
+    }
+
+    const lines = [`${verb} ${deleted.length + missing.length} artifact(s).`];
+    if (deleted.length) {
+      lines.push(`Deleted: ${deleted.join(", ")}`);
+    }
+    if (missing.length) {
+      lines.push(`Removed stale entries for missing files: ${missing.join(", ")}`);
+    }
+    if (failed.length) {
+      lines.push("Not deleted:");
+      lines.push(...failed.map((entry) => `- ${entry}`));
+    }
+
+    await this.telegram.sendText(target, lines.join("\n"));
   }
 
   private formatCronSchedule(job: CronJobRecord): string {

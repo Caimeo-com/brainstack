@@ -68,25 +68,7 @@ export function parseArtifactEntries(markdown: string | null): ArtifactEntry[] {
   const seen = new Set<string>();
 
   for (const line of markdown.split("\n")) {
-    const candidates: string[] = [];
-    BACKTICK_ARTIFACT_PATH_PATTERN.lastIndex = 0;
-    UNQUOTED_ARTIFACT_PATH_PATTERN.lastIndex = 0;
-
-    for (const match of line.matchAll(BACKTICK_ARTIFACT_PATH_PATTERN)) {
-      const path = normalizePathCandidate(match[1] || "");
-      if (isArtifactPathCandidate(path, true)) {
-        candidates.push(path);
-      }
-    }
-
-    for (const match of line.matchAll(UNQUOTED_ARTIFACT_PATH_PATTERN)) {
-      const path = normalizePathCandidate(match[1] || "");
-      if (isArtifactPathCandidate(path, false)) {
-        candidates.push(path);
-      }
-    }
-
-    for (const path of candidates) {
+    for (const path of artifactPathCandidatesForLine(line)) {
       if (seen.has(path)) {
         continue;
       }
@@ -101,6 +83,46 @@ export function parseArtifactEntries(markdown: string | null): ArtifactEntry[] {
   }
 
   return entries;
+}
+
+function artifactPathCandidatesForLine(line: string): string[] {
+  const candidates: string[] = [];
+  BACKTICK_ARTIFACT_PATH_PATTERN.lastIndex = 0;
+  UNQUOTED_ARTIFACT_PATH_PATTERN.lastIndex = 0;
+
+  for (const match of line.matchAll(BACKTICK_ARTIFACT_PATH_PATTERN)) {
+    const path = normalizePathCandidate(match[1] || "");
+    if (isArtifactPathCandidate(path, true)) {
+      candidates.push(path);
+    }
+  }
+
+  for (const match of line.matchAll(UNQUOTED_ARTIFACT_PATH_PATTERN)) {
+    const path = normalizePathCandidate(match[1] || "");
+    if (isArtifactPathCandidate(path, false)) {
+      candidates.push(path);
+    }
+  }
+
+  return candidates;
+}
+
+export function removeArtifactEntriesFromMarkdown(markdown: string | null, paths: string[]): string {
+  const remove = new Set(paths);
+  if (!markdown || !remove.size) {
+    return markdown || "# Artifacts\n";
+  }
+
+  const keptLines = markdown
+    .split("\n")
+    .filter((line) => !artifactPathCandidatesForLine(line).some((path) => remove.has(path)));
+  const kept = keptLines.join("\n").trimEnd();
+
+  if (!parseArtifactEntries(kept).length) {
+    return "# Artifacts\n";
+  }
+
+  return `${kept}\n`;
 }
 
 export function selectArtifactEntries(markdown: string | null, filterText: string | null): ArtifactEntry[] {

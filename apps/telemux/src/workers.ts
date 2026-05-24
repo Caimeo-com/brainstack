@@ -38,6 +38,13 @@ export interface WorkspaceArtifactFile {
   content: Uint8Array;
 }
 
+export interface WorkspaceArtifactDeleteResult {
+  requestedPath: string;
+  resolvedPath: string | null;
+  fileName: string;
+  status: "deleted" | "missing";
+}
+
 export interface WorkspaceSeedFile {
   relativePath: string;
   content: Uint8Array;
@@ -119,6 +126,21 @@ function cleanRelativePath(relativePath: string): string {
   const normalized = relativePath.replaceAll("\\", "/").replace(/^\/+/, "");
   if (!normalized || normalized.split("/").includes("..")) {
     throw new Error(`Unsafe workspace file path: ${relativePath}`);
+  }
+
+  return normalized;
+}
+
+function cleanArtifactDeletePath(filePath: string): string {
+  const normalized = filePath.replaceAll("\\", "/");
+  if (
+    !normalized ||
+    normalized.startsWith("/") ||
+    normalized === "~" ||
+    normalized.startsWith("~/") ||
+    normalized.split("/").includes("..")
+  ) {
+    throw new Error(`Unsafe artifact delete path: ${filePath}`);
   }
 
   return normalized;
@@ -672,6 +694,99 @@ fi
       sizeBytes: Number.isFinite(sizeBytes) ? sizeBytes : 0,
       mimeType,
       content: Buffer.from(base64Text, "base64")
+    };
+  }
+
+  async deleteArtifactFile(context: ContextRecord, filePath: string): Promise<WorkspaceArtifactDeleteResult> {
+    const worker = this.requireWorker(context.machine);
+    const safePath = cleanArtifactDeletePath(filePath);
+    const script = `
+set -euo pipefail
+expand_home_path() {
+  case "$1" in
+    "~") printf '%s\\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
+    *) printf '%s\\n' "$1" ;;
+  esac
+}
+
+worktree_raw=${quoteSh(context.worktreePath)}
+requested_raw=${quoteSh(safePath)}
+worktree="$(expand_home_path "$worktree_raw")"
+resolved="$worktree/$requested_raw"
+
+worktree_real="$(realpath "$worktree")"
+parent_real="$(realpath "$(dirname "$resolved")" 2>/dev/null || true)"
+if [ -z "$parent_real" ]; then
+  echo "STATUS=missing"
+  echo "REQUESTED_PATH=$requested_raw"
+  echo "RESOLVED_PATH="
+  echo "FILE_NAME=$(basename "$requested_raw")"
+  exit 0
+fi
+
+case "$parent_real" in
+  "$worktree_real"|"$worktree_real"/*) ;;
+  *)
+    echo "artifact path escapes workspace: $requested_raw" >&2
+    exit 45
+    ;;
+esac
+
+if [ ! -e "$resolved" ]; then
+  echo "STATUS=missing"
+  echo "REQUESTED_PATH=$requested_raw"
+  echo "RESOLVED_PATH=$parent_real/$(basename "$resolved")"
+  echo "FILE_NAME=$(basename "$requested_raw")"
+  exit 0
+fi
+
+resolved_real="$(realpath "$resolved")"
+case "$resolved_real" in
+  "$worktree_real"|"$worktree_real"/*) ;;
+  *)
+    echo "artifact path escapes workspace: $requested_raw" >&2
+    exit 45
+    ;;
+esac
+
+if [ ! -f "$resolved_real" ]; then
+  echo "not a regular file: $resolved_real" >&2
+  exit 42
+fi
+
+rm -f -- "$resolved_real"
+echo "STATUS=deleted"
+echo "REQUESTED_PATH=$requested_raw"
+echo "RESOLVED_PATH=$resolved_real"
+echo "FILE_NAME=$(basename "$resolved_real")"
+`;
+
+    const result = await this.runWorkerScript(worker, script, undefined, 10);
+    if (!result.ok) {
+      throw new Error(result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`);
+    }
+
+    const metadata = new Map<string, string>();
+    for (const line of result.stdout.split("\n")) {
+      const separatorIndex = line.indexOf("=");
+      if (separatorIndex === -1) {
+        continue;
+      }
+
+      metadata.set(line.slice(0, separatorIndex), line.slice(separatorIndex + 1).trim());
+    }
+
+    const status = metadata.get("STATUS");
+    if (status !== "deleted" && status !== "missing") {
+      throw new Error("artifact delete response did not include a valid status");
+    }
+
+    return {
+      requestedPath: metadata.get("REQUESTED_PATH") || safePath,
+      resolvedPath: metadata.get("RESOLVED_PATH") || null,
+      fileName: metadata.get("FILE_NAME") || safePath.split("/").at(-1) || safePath,
+      status
     };
   }
 
