@@ -229,6 +229,14 @@ outbox_config="$outbox_smoke_root/config.yaml"
 outbox_received="$outbox_smoke_root/received.jsonl"
 outbox_server="$outbox_smoke_root/server.ts"
 outbox_port="45$((10#${utc:9:2} + 10))"
+json_string_literal() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  printf '"%s"' "$value"
+}
+outbox_received_js="$(json_string_literal "$outbox_received")"
 cat > "$outbox_config" <<YAML
 schema_version: 1
 profile: client-macos
@@ -242,7 +250,7 @@ client:
   remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git
 YAML
 cat > "$outbox_server" <<EOF
-const receivedPath = ${outbox_received@Q};
+const receivedPath = $outbox_received_js;
 Bun.serve({
   hostname: "127.0.0.1",
   port: $outbox_port,
