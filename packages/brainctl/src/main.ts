@@ -2588,7 +2588,7 @@ function collectOsUpdateProbes(): Array<{ label: string; code: number; output: s
       "brew outdated --quiet (HOMEBREW_NO_AUTO_UPDATE=1)"
     )
   );
-  add(updateProbe("pacman", ["-Qu"]));
+  add(updateProbe("pacman", ["-Qu"], [0, 1]));
   add(updateProbe("checkupdates", []));
   add(updateProbe("apt", ["list", "--upgradable"]));
   add(updateProbe("dnf", ["--cacheonly", "check-update", "--quiet"], [0, 100]));
@@ -2600,9 +2600,12 @@ async function commandUpdates(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
   const branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd: PRODUCT_ROOT, check: false }).stdout.trim() || "unknown";
   const head = run(["git", "rev-parse", "HEAD"], { cwd: PRODUCT_ROOT, check: false }).stdout.trim() || "unknown";
-  const origin = run(["git", "rev-parse", "--verify", "origin/main"], { cwd: PRODUCT_ROOT, check: false }).stdout.trim();
-  const aheadBehind = origin
-    ? run(["git", "rev-list", "--left-right", "--count", `HEAD...origin/main`], { cwd: PRODUCT_ROOT, check: false }).stdout.trim()
+  const remoteCandidates = ["origin/main", "refs/remotes/https-main"];
+  const remoteRef =
+    remoteCandidates.find((candidate) => run(["git", "rev-parse", "--verify", candidate], { cwd: PRODUCT_ROOT, check: false }).code === 0) || null;
+  const origin = remoteRef ? run(["git", "rev-parse", "--verify", remoteRef], { cwd: PRODUCT_ROOT, check: false }).stdout.trim() : "";
+  const aheadBehind = remoteRef
+    ? run(["git", "rev-list", "--left-right", "--count", `HEAD...${remoteRef}`], { cwd: PRODUCT_ROOT, check: false }).stdout.trim()
     : "unknown";
   const codex = commandOk("codex") ? commandVersion("codex") : "missing";
   const claude = commandOk("claude") ? commandVersion("claude") : "missing";
@@ -2610,6 +2613,7 @@ async function commandUpdates(args: ParsedArgs): Promise<void> {
   console.log(`brainstack_branch=${branch}`);
   console.log(`brainstack_head=${head}`);
   console.log(`origin_main=${origin || "unavailable"}`);
+  console.log(`remote_main_ref=${remoteRef || "unavailable"}`);
   console.log(`ahead_behind=${aheadBehind}`);
   console.log(`codex=${codex}`);
   console.log(`claude=${claude}`);

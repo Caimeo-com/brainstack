@@ -1245,6 +1245,7 @@ describe("public release hygiene", () => {
       });
       expectSuccess(result);
       expect(result.stdout).toContain("brainstack_head=");
+      expect(result.stdout).toContain("remote_main_ref=");
       expect(result.stdout).toContain("os_update_checks:");
       expect(result.stdout).toContain("brew outdated --quiet (HOMEBREW_NO_AUTO_UPDATE=1):");
       expect(result.stdout).toContain("brew-pkg 1.0 -> 1.1");
