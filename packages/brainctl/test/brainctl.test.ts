@@ -271,6 +271,44 @@ describe("brainctl install safety", () => {
     }
   });
 
+  test("client-macos provision does not require passwordless sudo", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-provision-client-"));
+    try {
+      const binDir = join(dir, "bin");
+      const configPath = join(dir, "brainstack.yaml");
+      await mkdir(binDir, { recursive: true });
+      await writeFile(join(binDir, "codex"), "#!/usr/bin/env sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'codex fake\\n'; exit 0; fi\nexit 0\n");
+      await writeFile(join(binDir, "sudo"), "#!/usr/bin/env sh\necho 'sudo should not run for client-macos provision' >&2\nexit 42\n");
+      await chmod(join(binDir, "codex"), 0o755);
+      await chmod(join(binDir, "sudo"), 0o755);
+
+      const result = runBrainctl(
+        [
+          "provision",
+          "--profile",
+          "client-macos",
+          "--out",
+          configPath,
+          "--harness",
+          "codex",
+          "--brain-base-url",
+          "https://brain-control.example.ts.net",
+          "--brain-remote",
+          "operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          "--skip-harness-sudo-test"
+        ],
+        {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        }
+      );
+      expectSuccess(result);
+      expect(await readFile(configPath, "utf8")).toContain("profile: client-macos");
+      expect(`${result.stdout}\n${result.stderr}`).not.toContain("sudo should not run");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("destroy removes rendered runtime paths but keeps canonical repos unless requested", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-destroy-"));
     try {

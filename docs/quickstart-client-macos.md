@@ -2,6 +2,8 @@
 
 The macOS client profile installs no services. It clones the shared-brain repo, writes a local env file if missing, and installs Codex/Claude/Cursor instruction snippets without silently overwriting existing files. The installer normalizes `~/shared-brain` to an absolute path before clone/pull operations, so the default path works on macOS and Linux.
 
+`client-macos` provisioning checks Bun, Git, SSH, Tailscale, and the selected harness, but it does not require passwordless sudo because ordinary clients do not run Brainstack machine-administration services.
+
 ## Render Bootstrap
 
 ```bash

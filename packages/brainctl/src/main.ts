@@ -1499,6 +1499,10 @@ function requiredProvisionCommands(profile: Profile): string[] {
   return commands;
 }
 
+function profileRequiresPasswordlessSudo(profile: Profile): boolean {
+  return profile === "single-node" || profile === "control" || profile === "worker";
+}
+
 function ensureProvisionPrereqs(profile: Profile): Record<string, string> {
   const found: Record<string, string> = {};
   const missing: string[] = [];
@@ -1751,8 +1755,10 @@ async function commandProvision(args: ParsedArgs): Promise<void> {
   }
   const found = ensureProvisionPrereqs(profile);
   const selectedHarness = await selectProvisionHarness(args);
-  ensurePasswordlessSudo();
-  if (!hasFlag(args, "skip-harness-sudo-test")) {
+  if (profileRequiresPasswordlessSudo(profile)) {
+    ensurePasswordlessSudo();
+  }
+  if (profileRequiresPasswordlessSudo(profile) && !hasFlag(args, "skip-harness-sudo-test")) {
     await testHarnessSudo(selectedHarness);
   }
   if (hasFlag(args, "test-bot")) {
