@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { CommandHandler } from "../src/commands";
 import { loadConfig, ensureProjectPaths } from "../src/config";
 import { CronManager } from "../src/cron-manager";
@@ -882,6 +882,33 @@ test("worker harness selection supports worker and context overrides without con
     delete process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT;
     process.env.PATH = fixture.previousPath;
     await rm(capture, { force: true });
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("local worker resolves harness through BRAINSTACK_WORKER_PATH when service PATH is minimal", async () => {
+  const fixture = await createFixture({
+    FACTORY_CODEX_BIN: "codex",
+    FACTORY_HARNESS_BIN: "codex"
+  });
+  const previousPath = process.env.PATH;
+  const previousWorkerPath = process.env.BRAINSTACK_WORKER_PATH;
+
+  try {
+    process.env.PATH = "/usr/bin:/bin";
+    process.env.BRAINSTACK_WORKER_PATH = dirname(fixture.fakeCodex);
+
+    await fixture.commands.handleMessage(telegramMessage("/newctx localpath control scratch", 70));
+    await fixture.commands.handleMessage(telegramMessage("Use codex from worker path.", 70));
+
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for localpath.")));
+  } finally {
+    process.env.PATH = previousPath;
+    if (previousWorkerPath === undefined) {
+      delete process.env.BRAINSTACK_WORKER_PATH;
+    } else {
+      process.env.BRAINSTACK_WORKER_PATH = previousWorkerPath;
+    }
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 15_000);

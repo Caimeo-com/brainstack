@@ -83,6 +83,8 @@ if [ -z "\${BRAINSTACK_SKIP_USER_PATH_RESOLVE:-}" ]; then
   __brainstack_detected_path=""
   if [ -n "\${BRAINSTACK_WORKER_PATH:-}" ]; then
     __brainstack_detected_path="$BRAINSTACK_WORKER_PATH"
+  elif [ -n "\${harness_bin:-}" ] && command -v "$harness_bin" >/dev/null 2>&1; then
+    __brainstack_detected_path=""
   elif [ -n "\${SHELL:-}" ] && [ -x "$SHELL" ]; then
     __brainstack_detected_path="$(
       if command -v timeout >/dev/null 2>&1; then
@@ -93,7 +95,7 @@ if [ -z "\${BRAINSTACK_SKIP_USER_PATH_RESOLVE:-}" ]; then
     )"
   fi
   if [ -n "$__brainstack_detected_path" ]; then
-    PATH="$__brainstack_detected_path"
+    PATH="$__brainstack_detected_path:$PATH"
     export PATH
   fi
   unset __brainstack_detected_path
@@ -226,6 +228,7 @@ export class WorkerService {
         "if command -v git >/dev/null 2>&1; then printf 'git=1\\n'; else printf 'git=0\\n'; fi",
         `harness=${quoteSh(harness.family)}`,
         `harness_bin=${quoteSh(harness.bin)}`,
+        ...(worker.transport === "local" ? [workerUserPathPrelude()] : []),
         "printf 'harness=%s\\n' \"$harness\"",
         "if command -v \"$harness_bin\" >/dev/null 2>&1; then printf 'harness_bin=1\\n'; else printf 'harness_bin=0\\n'; fi",
         "printf 'harness_version=%s\\n' \"$($harness_bin --version 2>&1 | head -n 1 || true)\"",
@@ -353,6 +356,7 @@ prompt_b64=${quoteSh(promptBase64)}
 resume_session=${quoteSh(resumeSessionId)}
 harness=${quoteSh(harness.family)}
 harness_bin=${quoteSh(harness.bin)}
+${worker.transport === "local" ? workerUserPathPrelude() : ""}
 worktree="$(expand_home_path "$worktree_raw")"
 launcher_dir="$(mktemp -d "\${TMPDIR:-/tmp}/clawdex-run.XXXXXX")"
 prompt_file="$launcher_dir/control-plane.prompt.md"

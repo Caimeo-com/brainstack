@@ -1072,6 +1072,10 @@ describe("public release hygiene", () => {
       expect(rendered).toContain("name: brain-worker");
       expect(rendered).toContain("sshUser: operator");
       expect(rendered).toContain("repos:");
+      const runtimeEnv = await readFile(join(out, "env", "telemux.runtime.env"), "utf8");
+      expect(runtimeEnv).toContain("PATH=/home/operator/.local/bin:");
+      expect(runtimeEnv).toContain("BRAINSTACK_WORKER_PATH=/home/operator/.local/bin:");
+      expect(runtimeEnv).toContain("/home/operator/.bun/bin");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

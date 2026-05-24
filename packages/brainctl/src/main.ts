@@ -918,7 +918,10 @@ function braindSecretsEnv(includeSecrets: boolean): string {
 }
 
 function telemuxRuntimeEnv(cfg: BrainstackConfig): string {
+  const toolPath = brainstackToolPath(cfg);
   return [
+    `PATH=${toolPath}`,
+    `BRAINSTACK_WORKER_PATH=${toolPath}`,
     `FACTORY_DASHBOARD_HOST=${cfg.telemux.dashboardHost}`,
     `FACTORY_DASHBOARD_PORT=${cfg.telemux.dashboardPort}`,
     "FACTORY_TELEGRAM_POLL_TIMEOUT_SECONDS=30",
@@ -936,6 +939,19 @@ function telemuxRuntimeEnv(cfg: BrainstackConfig): string {
     `BRAIN_BASE_URL=${cfg.brain.publicBaseUrl}`,
     ""
   ].join("\n");
+}
+
+function brainstackToolPath(cfg: BrainstackConfig): string {
+  return [
+    join(cfg.paths.home, ".local", "bin"),
+    join(cfg.paths.home, ".local", "share", "mise", "shims"),
+    join(cfg.paths.home, ".local", "share", "omarchy", "bin"),
+    join(cfg.paths.home, ".bun", "bin"),
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin"
+  ].join(":");
 }
 
 function telemuxSecretsEnv(): string {
@@ -2138,6 +2154,8 @@ if [ -z "\${BRAINSTACK_SKIP_USER_PATH_RESOLVE:-}" ]; then
   __brainstack_detected_path=""
   if [ -n "\${BRAINSTACK_WORKER_PATH:-}" ]; then
     __brainstack_detected_path="$BRAINSTACK_WORKER_PATH"
+  elif [ -n "\${harness_bin:-}" ] && command -v "$harness_bin" >/dev/null 2>&1; then
+    __brainstack_detected_path=""
   elif [ -n "\${SHELL:-}" ] && [ -x "$SHELL" ]; then
     __brainstack_detected_path="$(
       if command -v timeout >/dev/null 2>&1; then
@@ -2148,7 +2166,7 @@ if [ -z "\${BRAINSTACK_SKIP_USER_PATH_RESOLVE:-}" ]; then
     )"
   fi
   if [ -n "$__brainstack_detected_path" ]; then
-    PATH="$__brainstack_detected_path"
+    PATH="$__brainstack_detected_path:$PATH"
     export PATH
   fi
   unset __brainstack_detected_path
