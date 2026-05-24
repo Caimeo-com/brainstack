@@ -273,7 +273,6 @@ export class CommandHandler {
         }
 
         const response = await this.dispatcher.dispatch("resume", boundContext, text, target, {
-          notifyAccepted: false,
           telegramInput
         });
         if (response.message) {
@@ -996,7 +995,6 @@ export class CommandHandler {
       return;
     }
     const response = await this.dispatcher.dispatch("resume", context, prompt, pending.target, {
-      notifyAccepted: false,
       telegramInput: null
     });
     if (response.message) {

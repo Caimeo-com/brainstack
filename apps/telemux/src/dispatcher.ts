@@ -93,6 +93,7 @@ function buildPrompt(context: ContextRecord, mode: DispatchMode, instruction: st
     "Start by reading those files and the current git status.",
     "Before finishing, update all relevant .factory files so the next run can resume cleanly.",
     "Record artifact paths in .factory/ARTIFACTS.md.",
+    "Do not dump large or private state files such as browser profiles, keyrings, histories, token files, or full JSON preference stores into logs or chat. Use narrow structured queries, paths, counts, and redacted summaries instead.",
     `These messages are coming through Telegram. If the user explicitly asks you to send or attach a file into the Telegram thread, keep your normal answer and also write ${TELEGRAM_ATTACHMENTS_WORKSPACE_PATH} as JSON like {"attachments":[{"path":"relative/path/inside/workspace","caption":"optional short caption","type":"document"}]}.`,
     `Only list regular files that already exist and are already recorded in .factory/ARTIFACTS.md. Use type "photo" for images only when you want Telegram to render them inline. Do not create ${TELEGRAM_ATTACHMENTS_FILE_NAME} unless the user explicitly asked for a Telegram attachment.`,
     `If the user explicitly asks to create, change, move, pause, resume, or delete a scheduled job, keep your normal answer and also write ${CRON_REQUESTS_WORKSPACE_PATH} as JSON like {"actions":[{"type":"create","job":{"label":"example","kind":"reminder","schedule":{"type":"once","at":"2026-04-08T09:00:00+02:00"},"reminderText":"Example reminder"}}]}.`,

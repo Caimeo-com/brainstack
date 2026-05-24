@@ -544,6 +544,7 @@ test("phase 1 workflow covers local host/scratch and pending remote behavior", a
     expect(explainText).toContain("Old Telegram messages stay in Telegram");
 
     await fixture.commands.handleMessage(telegramMessage("Check free disk space and leave a note.", 10));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Dispatched resume for control-general.")));
     await waitFor(() => Boolean(fixture.db.getContextBySlug("control-general")?.codexSessionId));
     const firstSession = fixture.db.getContextBySlug("control-general")?.codexSessionId || "";
     await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for control-general.")));
