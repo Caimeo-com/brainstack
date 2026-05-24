@@ -1229,12 +1229,27 @@ describe("public release hygiene", () => {
         join(binDir, "claude"),
         "#!/usr/bin/env sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '2.1.133 (Claude Code)\\n'; exit 0; fi\nprintf '%s\\n' '--dangerously-skip-permissions --permission-mode --output-format'\n"
       );
+      await writeFile(
+        join(binDir, "brew"),
+        "#!/usr/bin/env sh\nif [ \"${HOMEBREW_NO_AUTO_UPDATE:-}\" != \"1\" ]; then echo 'brew auto-update was not disabled' >&2; exit 42; fi\nprintf 'brew-pkg 1.0 -> 1.1\\n'\n"
+      );
+      await writeFile(join(binDir, "pacman"), "#!/usr/bin/env sh\nprintf 'codex-cli 0.134.0-1 -> 0.135.0-1\\n'\n");
       await chmod(join(binDir, "codex"), 0o755);
       await chmod(join(binDir, "claude"), 0o755);
+      await chmod(join(binDir, "brew"), 0o755);
+      await chmod(join(binDir, "pacman"), 0o755);
       await writeFixtureConfig(configPath);
-      const result = runBrainctl(["updates", "--config", configPath], { PATH: `${binDir}:${process.env.PATH || ""}` });
+      const result = runBrainctl(["updates", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1"
+      });
       expectSuccess(result);
       expect(result.stdout).toContain("brainstack_head=");
+      expect(result.stdout).toContain("os_update_checks:");
+      expect(result.stdout).toContain("brew outdated --quiet (HOMEBREW_NO_AUTO_UPDATE=1):");
+      expect(result.stdout).toContain("brew-pkg 1.0 -> 1.1");
+      expect(result.stdout).toContain("pacman -Qu:");
+      expect(result.stdout).toContain("codex-cli 0.134.0-1 -> 0.135.0-1");
       expect(result.stdout).toContain("manual_update_commands:");
       expect(result.stdout).toContain("selected harness:");
     } finally {

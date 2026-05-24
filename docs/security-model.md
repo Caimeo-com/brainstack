@@ -98,9 +98,11 @@ Telemux only delivers requested artifacts from the active workspace by default. 
 
 ## Private Journal Boundary
 
-Personal/private journaling is a separate profile/repo/service/token boundary:
+Personal/private journaling should use a separate repo/service/token boundary:
 
 - Shared dev brain: collaborative development canon.
 - Private brain: personal journal/private memory.
 
 Do not co-mingle private journaling secrets or content into the shared dev brain.
+
+Automatic multi-brain routing and a first-class `private-journal` provisioning profile are not implemented yet. Until that exists, run private journaling through an explicit separate Brainstack install/config and keep its tokens, repo paths, and Telegram topics separate from the shared dev brain.

@@ -482,8 +482,8 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
   const telegram = new FakeTelegram();
   const cronManager = new CronManager(config, db, workers);
   const dispatcher = new Dispatcher(config, db, contexts, workers, telegram as never, cronManager);
-  const commands = new CommandHandler(config, db, telegram as never, contexts, workers, dispatcher, cronManager);
   const cronScheduler = new CronScheduler(config, db, cronManager, dispatcher, telegram as never);
+  const commands = new CommandHandler(config, db, telegram as never, contexts, workers, dispatcher, cronManager, cronScheduler);
 
   return {
     root,
@@ -661,6 +661,8 @@ test("cron jobs can be created from a normal Codex turn, tuned later, mirrored i
 
     await fixture.commands.handleMessage(telegramMessage("/crons", 80));
     expect(fixture.telegram.sent.at(-1)?.text).toContain("stripe-reminder");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("/cron_run_1");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("/cron_install_update_check");
 
     await fixture.commands.handleMessage(telegramMessage("Change mode to fast for stripe cron.", 80));
     await waitFor(() => fixture.db.listCronJobs()[0]?.modelOverride === "gpt-5.4-mini");
@@ -721,11 +723,59 @@ test("cron jobs can be created from a normal Codex turn, tuned later, mirrored i
     const cronsText = fixture.telegram.sent.at(-1)?.text || "";
     expect(cronsText).toContain("stripe-reminder");
     expect(cronsText).toContain("email-cron");
+    expect(cronsText).toContain("/cron_show_");
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 20_000);
+
+test("deterministic cron commands install built-ins and run jobs immediately", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx routines control scratch", 81));
+
+    await fixture.commands.handleMessage(
+      telegramMessage("/cron create reminder water daily 09:00 Europe/Zagreb Drink water.", 81)
+    );
+    let water = fixture.db.listCronJobs().find((job) => job.label === "water");
+    expect(water?.kind).toBe("reminder");
+    expect(water?.reminderText).toBe("Drink water.");
+
+    await fixture.commands.handleMessage(telegramMessage("/cron_run water", 81));
+    expect(fixture.telegram.sent.at(-2)?.text).toBe("Drink water.");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Cron run sent:");
+
+    await fixture.commands.handleMessage(telegramMessage("/cron install update-check daily 08:00 Europe/Zagreb", 81));
+    const updateCheck = fixture.db.listCronJobs().find((job) => job.label === "update-check");
+    expect(updateCheck?.kind).toBe("codex");
+    expect(updateCheck?.executionContextSlug).toBe("routines");
+    expect(updateCheck?.instruction).toContain("read-only update check");
+    expect(updateCheck?.instruction).toContain("pacman -Qu");
+    expect(updateCheck?.instruction).toContain("Do not install, upgrade, remove, reboot, restart");
+
+    await fixture.commands.handleMessage(telegramMessage("/cron_install_daily_checkin", 81));
+    const checkin = fixture.db.listCronJobs().find((job) => job.label === "daily-checkin");
+    expect(checkin?.kind).toBe("reminder");
+    expect(checkin?.reminderText).toContain("Daily check-in.");
+
+    await fixture.commands.handleMessage(telegramMessage("/cron install brain-curator daily 06:30 Europe/Zagreb", 81));
+    const curator = fixture.db.listCronJobs().find((job) => job.label === "brain-curator");
+    expect(curator?.kind).toBe("codex");
+    expect(curator?.instruction).toContain("shared-brain curator pass");
+    expect(curator?.instruction).toContain("Preserve raw imports and proposals");
+
+    await fixture.commands.handleMessage(telegramMessage("/crons", 81));
+    const overview = fixture.telegram.sent.at(-1)?.text || "";
+    expect(overview).toContain("/cron_install_brain_curator");
+    expect(overview).toContain("/cron_run_");
+    expect(overview).toContain("daily-checkin");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
 
 test("per-topic Codex mode, model, and effort overrides persist across resume without losing the session", async () => {
   const fixture = await createFixture();

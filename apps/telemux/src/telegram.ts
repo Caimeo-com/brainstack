@@ -33,6 +33,7 @@ export const TELEGRAM_BOT_COMMANDS: TelegramBotCommand[] = [
   { command: "updates", description: "Show manual update and harness version status" },
   { command: "crons", description: "List scheduled jobs for this topic/context" },
   { command: "cron", description: "Inspect or manage one scheduled job" },
+  { command: "cron_run", description: "Run one scheduled job immediately" },
   { command: "mode", description: "Set or show the Codex mode for this topic" },
   { command: "model", description: "Set or show the Codex model override" },
   { command: "effort", description: "Set or show the Codex reasoning effort" },

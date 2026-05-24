@@ -42,13 +42,21 @@ export function startDashboard(config: FactoryConfig, db: FactoryDb, workers: Wo
       const url = new URL(request.url);
 
       if (url.pathname === "/healthz") {
+        const cronRows = db.listCronJobs();
+        const now = new Date().toISOString();
+        const cronDue = cronRows.filter(
+          (job) => job.enabled && (job.pendingRunAt || (job.nextRunAt && job.nextRunAt <= now))
+        ).length;
         return Response.json({
           ok: true,
           dashboard: `${config.dashboardHost}:${config.dashboardPort}`,
           telegramConfigured: Boolean(config.telegramBotToken),
           workers: workers.knownHosts().length,
           contexts: db.listContexts().length,
-          crons: db.listCronJobs().length
+          crons: cronRows.length,
+          cronEnabled: cronRows.filter((job) => job.enabled).length,
+          cronPending: cronRows.filter((job) => job.pendingRunAt).length,
+          cronDue
         });
       }
 

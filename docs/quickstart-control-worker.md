@@ -164,3 +164,5 @@ When telemux is enabled, `telemux.runtime.env` includes `BRAIN_BASE_URL` and `te
 Compatibility installs may set `telemux.controlRoot` and `telemux.factoryRoot` in `brainstack.yaml` to preserve an existing telemux SQLite DB and factory workspaces such as `/srv/telemux` and `/srv/factory`. Fresh installs should normally use the defaults under `~/.local/state/brainstack`.
 
 If the shared brain is unreachable, telemux queues opted-in run-summary imports under the same outbox root used by `brainctl outbox`.
+
+After telemux is healthy, use [`routines.md`](./routines.md) to add built-in scheduled workflows such as `update-check`, `brain-curator`, and `daily-checkin`.

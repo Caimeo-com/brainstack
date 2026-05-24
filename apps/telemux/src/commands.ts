@@ -11,7 +11,8 @@ import { CronManager } from "./cron-manager";
 import { ContextRecord, FactoryDb } from "./db";
 import { ContextService, nextRecommendedAction, normalizeSlug } from "./contexts";
 import { Dispatcher } from "./dispatcher";
-import { CronJobRecord } from "./cron-jobs";
+import { CronJobDraft, CronJobRecord, CronSchedule, normalizeCronSchedule, scheduleSummary } from "./cron-jobs";
+import { CronScheduler } from "./cron-scheduler";
 import {
   parseArtifactEntries,
   removeArtifactEntriesFromMarkdown,
@@ -19,6 +20,13 @@ import {
   type ArtifactEntry
 } from "./telegram-attachments";
 import { extractTelegramInput, filterPhaseOneTelegramInput, isAudioOnlyTelegramInput, telegramMessageText } from "./telegram-inputs";
+import {
+  builtinRoutineCommandToken,
+  builtinRoutineDraft,
+  defaultBuiltinSchedule,
+  getBuiltinRoutine,
+  listBuiltinRoutines
+} from "./routine-builtins";
 import { summarizeUsage } from "./usage";
 import { WorkerService } from "./workers";
 import type { FactoryConfig } from "./config";
@@ -194,6 +202,127 @@ function codexModeSummary(context: ContextRecord): string {
   })})`;
 }
 
+interface ParsedScheduleArgs {
+  schedule: CronSchedule;
+  consumed: number;
+}
+
+function cronCommandUsage(): string {
+  return [
+    "Usage:",
+    "/cron show <id|label>",
+    "/cron run <id|label>",
+    "/cron pause <id|label>",
+    "/cron resume <id|label>",
+    "/cron delete <id|label>",
+    "/cron create reminder <label> daily <HH:MM> <Timezone> <text>",
+    "/cron create codex <label> daily <HH:MM> <Timezone> <instruction>",
+    "/cron create reminder <label> weekly <weekday> <HH:MM> <Timezone> <text>",
+    "/cron create codex <label> once <ISO timestamp> <instruction>",
+    "/cron install <update-check|brain-curator|daily-checkin> [schedule]",
+    "/cron builtins",
+    "/cron move <id|label> here",
+    "/cron context <id|label> <slug-or-path>",
+    "/cron mode <id|label> [fast|normal|max|clear]",
+    "/cron model <id|label> [model-id|clear]",
+    "/cron effort <id|label> [low|medium|high|xhigh|clear]"
+  ].join("\n");
+}
+
+function parseScheduleArgs(parts: string[], offset = 0): ParsedScheduleArgs {
+  const type = parts[offset]?.toLowerCase();
+  if (!type) {
+    throw new Error("Missing schedule. Use daily, weekly, monthly, once, or interval.");
+  }
+
+  if (type === "once") {
+    const at = parts[offset + 1];
+    if (!at) {
+      throw new Error("One-off schedules require an ISO timestamp.");
+    }
+    return {
+      schedule: normalizeCronSchedule({ type: "once", at }),
+      consumed: 2
+    };
+  }
+
+  if (type === "daily") {
+    const time = parts[offset + 1];
+    const timezone = parts[offset + 2];
+    if (!time || !timezone) {
+      throw new Error("Daily schedules require <HH:MM> <Timezone>.");
+    }
+    return {
+      schedule: normalizeCronSchedule({ type: "daily", time, timezone }),
+      consumed: 3
+    };
+  }
+
+  if (type === "weekly") {
+    const weekday = parts[offset + 1];
+    const time = parts[offset + 2];
+    const timezone = parts[offset + 3];
+    if (!weekday || !time || !timezone) {
+      throw new Error("Weekly schedules require <weekday> <HH:MM> <Timezone>.");
+    }
+    return {
+      schedule: normalizeCronSchedule({ type: "weekly", weekday, time, timezone }),
+      consumed: 4
+    };
+  }
+
+  if (type === "monthly") {
+    const dayOfMonth = parts[offset + 1];
+    const time = parts[offset + 2];
+    const timezone = parts[offset + 3];
+    if (!dayOfMonth || !time || !timezone) {
+      throw new Error("Monthly schedules require <day> <HH:MM> <Timezone>.");
+    }
+    return {
+      schedule: normalizeCronSchedule({ type: "monthly", dayOfMonth, time, timezone }),
+      consumed: 4
+    };
+  }
+
+  if (type === "interval") {
+    const everyMinutes = parts[offset + 1];
+    if (!everyMinutes) {
+      throw new Error("Interval schedules require <minutes>.");
+    }
+    return {
+      schedule: normalizeCronSchedule({
+        type: "interval",
+        everyMinutes,
+        anchorAt: parts[offset + 2] || new Date().toISOString()
+      }),
+      consumed: parts[offset + 2] ? 3 : 2
+    };
+  }
+
+  throw new Error(`Unknown schedule type: ${type}`);
+}
+
+function cronSelectorForShortcut(selector: string, jobs: CronJobRecord[]): CronJobRecord | null {
+  if (selector === "latest" || selector === "last") {
+    return jobs[0] || null;
+  }
+
+  const index = Number(selector) - 1;
+  if (!Number.isInteger(index) || index < 0) {
+    return null;
+  }
+
+  return jobs[index] || null;
+}
+
+function commandTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
 export class CommandHandler {
   private readonly pendingText = new Map<string, PendingTextPrompt>();
 
@@ -204,7 +333,8 @@ export class CommandHandler {
     private readonly contexts: ContextService,
     private readonly workers: WorkerService,
     private readonly dispatcher: Dispatcher,
-    private readonly cronManager: CronManager
+    private readonly cronManager: CronManager,
+    private readonly cronScheduler: CronScheduler
   ) {}
 
   async handleMessage(message: TelegramMessage): Promise<void> {
@@ -310,6 +440,24 @@ export class CommandHandler {
         return;
       }
 
+      const cronShortcut = parsed.command.match(/^\/cron_(show|run|pause|resume)_?(\d+|latest|last)$/);
+      if (cronShortcut) {
+        const jobs = this.cronManager.listRelevantJobs(boundContext, target);
+        const job = cronSelectorForShortcut(cronShortcut[2] || "", jobs);
+        if (!job) {
+          await this.telegram.sendText(target, "No scheduled job matched that shortcut. Use /crons to refresh the list.");
+          return;
+        }
+        await this.handleCronJobAction(cronShortcut[1] || "", job, target);
+        return;
+      }
+
+      const cronInstallShortcut = parsed.command.match(/^\/cron_install_(update_check|brain_curator|daily_checkin)$/);
+      if (cronInstallShortcut) {
+        await this.installBuiltinRoutine(cronInstallShortcut[1] || "", [], boundContext, target);
+        return;
+      }
+
       switch (parsed.command) {
         case "/help":
           await this.telegram.sendText(
@@ -333,6 +481,7 @@ export class CommandHandler {
               "/updates",
               "/crons",
               "/cron <subcommand>",
+              "/cron_run <id|label>",
               "/mode [fast|normal|max|clear]",
               "/model [model-id|clear]",
               "/effort [low|medium|high|xhigh|clear]",
@@ -356,7 +505,8 @@ export class CommandHandler {
               "Use /artifacts to list sendable artifact shortcuts. Generic requests such as \"send it\" send the latest artifact.",
               "Use /shred to list artifact cleanup shortcuts.",
               "Use /mode, /model, and /effort to change Codex runtime behavior for this topic without rebinding it.",
-              "Use /crons to inspect scheduled jobs linked to this topic/context. Use /cron with a job id from /crons to pause, resume, move, retarget context, or tune job runtime."
+              "Use /crons to inspect scheduled jobs linked to this topic/context. Use /cron install update-check, brain-curator, or daily-checkin to add built-in routines.",
+              "Use /cron_run <id|label> or the shortcuts from /crons to test a scheduled job immediately."
             ].join("\n")
           );
           return;
@@ -464,78 +614,72 @@ export class CommandHandler {
         }
 
         case "/crons": {
-          await this.telegram.sendText(target, this.cronManager.formatJobsOverview(boundContext, target));
+          await this.telegram.sendText(target, this.formatCronOverview(boundContext, target));
+          return;
+        }
+
+        case "/cron_run": {
+          const selectorText = parsed.rest.trim();
+          if (!selectorText) {
+            await this.telegram.sendText(target, "Usage: /cron_run <id|label>");
+            return;
+          }
+
+          const job = this.resolveCronJobFromText(selectorText, boundContext, target);
+          await this.handleCronJobAction("run", job, target);
           return;
         }
 
         case "/cron": {
           const parts = parsed.rest.split(/\s+/).filter(Boolean);
+          if (!parts.length) {
+            await this.telegram.sendText(target, cronCommandUsage());
+            return;
+          }
+
+          if (parts[0]?.toLowerCase() === "builtins") {
+            await this.telegram.sendText(target, this.formatBuiltinRoutineList());
+            return;
+          }
+
+          if (parts[0]?.toLowerCase() === "install") {
+            if (parts.length < 2) {
+              await this.telegram.sendText(target, "Usage: /cron install <update-check|brain-curator|daily-checkin> [schedule]");
+              return;
+            }
+            await this.installBuiltinRoutine(parts[1] || "", parts.slice(2), boundContext, target);
+            return;
+          }
+
+          if (parts[0]?.toLowerCase() === "create") {
+            await this.createCronFromCommand(parts.slice(1), boundContext, target);
+            return;
+          }
+
           if (parts.length < 2) {
-            await this.telegram.sendText(
-              target,
-              [
-                "Usage:",
-                "/cron show <id>",
-                "/cron pause <id>",
-                "/cron resume <id>",
-                "/cron delete <id>",
-                "/cron move <id> here",
-                "/cron context <id> <slug-or-path>",
-                "/cron mode <id> [fast|normal|max|clear]",
-                "/cron model <id> [model-id|clear]",
-                "/cron effort <id> [low|medium|high|xhigh|clear]"
-              ].join("\n")
-            );
+            await this.telegram.sendText(target, cronCommandUsage());
             return;
           }
 
           const [subcommand, selectorText, ...restParts] = parts;
-          const job = this.cronManager.resolveJob({ id: selectorText, label: selectorText }, { context: boundContext, target });
+          const job = this.resolveCronJobFromText(selectorText, boundContext, target);
           const restText = restParts.join(" ").trim();
 
           switch (subcommand.toLowerCase()) {
             case "show": {
-              const effectiveContext = job.executionContextSlug ? this.db.getContextBySlug(job.executionContextSlug) : null;
-              const runtimeModel = job.modelOverride || effectiveContext?.modelOverride || "default";
-              const runtimeEffort = job.reasoningEffortOverride || effectiveContext?.reasoningEffortOverride || "default";
-              await this.telegram.sendText(
-                target,
-                [
-                  `Cron: ${job.id}`,
-                  `Label: ${job.label}`,
-                  `Kind: ${job.kind}`,
-                  `Enabled: ${job.enabled ? "yes" : "no"}`,
-                  `Schedule: ${this.formatCronSchedule(job)}`,
-                  `Next run: ${job.nextRunAt || "none"}`,
-                  `Pending run: ${job.pendingRunAt || "none"}`,
-                  `Context: ${job.executionContextSlug || "none"}`,
-                  `Target: ${job.targetChatId}:${job.targetThreadId ?? "none"}`,
-                  `Mode: model=${runtimeModel} effort=${runtimeEffort}`,
-                  job.reminderText ? `Reminder: ${job.reminderText}` : null,
-                  job.instruction ? `Instruction: ${job.instruction}` : null,
-                  job.lastError ? `Last error: ${compact(job.lastError)}` : null
-                ]
-                  .filter(Boolean)
-                  .join("\n")
-              );
+              await this.handleCronJobAction("show", job, target);
               return;
             }
 
-            case "pause": {
-              const updated = await this.cronManager.pauseJob(job);
-              await this.telegram.sendText(target, `Cron paused: ${updated.id} (${updated.label})`);
+            case "run": {
+              await this.handleCronJobAction("run", job, target);
               return;
             }
 
-            case "resume": {
-              const updated = await this.cronManager.resumeJob(job);
-              await this.telegram.sendText(target, `Cron resumed: ${updated.id} (${updated.label}) next=${updated.nextRunAt || "none"}`);
-              return;
-            }
-
+            case "pause":
+            case "resume":
             case "delete": {
-              await this.cronManager.deleteJob(job);
-              await this.telegram.sendText(target, `Cron deleted: ${job.id} (${job.label})`);
+              await this.handleCronJobAction(subcommand.toLowerCase(), job, target);
               return;
             }
 
@@ -1139,6 +1283,232 @@ export class CommandHandler {
       .join("\n");
   }
 
+  private formatCronOverview(context: ContextRecord | null, target: TelegramTarget): string {
+    const jobs = this.cronManager.listRelevantJobs(context, target);
+    const timezone = commandTimezone();
+    const lines = [
+      "# Scheduled Jobs",
+      "",
+      "Built-ins:",
+      ...listBuiltinRoutines().map(
+        (routine) => `- ${routine.label}: /cron_install_${builtinRoutineCommandToken(routine.name)} - ${routine.description}`
+      ),
+      "",
+      "Generic create examples:",
+      `- /cron create reminder standup daily 09:00 ${timezone} Write your standup.`,
+      `- /cron create codex repo-sweep weekly monday 08:30 ${timezone} Inspect the repo and summarize risks.`,
+      ""
+    ];
+
+    if (!jobs.length) {
+      lines.push("No scheduled jobs are linked to this topic or context.");
+      return lines.join("\n");
+    }
+
+    lines.push("Tap or send a command under a job:");
+    jobs.forEach((job, index) => {
+      const number = index + 1;
+      lines.push(`- ${number}. ${job.label} (${job.kind}, ${job.enabled ? "enabled" : "paused"})`);
+      lines.push(`  next: ${job.nextRunAt || "none"}`);
+      lines.push(`  schedule: ${scheduleSummary(job.schedule)}`);
+      lines.push(`  show: /cron_show_${number}`);
+      lines.push(`  run now: /cron_run_${number}`);
+      lines.push(`  pause: /cron_pause_${number}`);
+      lines.push(`  resume: /cron_resume_${number}`);
+      lines.push(`  id: ${job.id}`);
+    });
+
+    return lines.join("\n");
+  }
+
+  private formatBuiltinRoutineList(): string {
+    return [
+      "# Built-in Routines",
+      "",
+      ...listBuiltinRoutines().flatMap((routine) => {
+        const schedule = defaultBuiltinSchedule(routine);
+        const custom =
+          schedule.type === "weekly"
+            ? `/cron install ${routine.name} weekly ${schedule.weekday} ${schedule.time} ${schedule.timezone}`
+            : schedule.type === "daily"
+              ? `/cron install ${routine.name} daily ${schedule.time} ${schedule.timezone}`
+              : `/cron_install_${builtinRoutineCommandToken(routine.name)}`;
+        return [
+          `- ${routine.label}`,
+          `  ${routine.description}`,
+          `  install: /cron_install_${builtinRoutineCommandToken(routine.name)}`,
+          `  custom: ${custom}`
+        ];
+      })
+    ].join("\n");
+  }
+
+  private async createCronFromCommand(
+    parts: string[],
+    context: ContextRecord | null,
+    target: TelegramTarget
+  ): Promise<void> {
+    const [kind, label] = parts;
+    if ((kind !== "reminder" && kind !== "codex") || !label) {
+      await this.telegram.sendText(target, cronCommandUsage());
+      return;
+    }
+
+    if (kind === "codex" && !context) {
+      await this.telegram.sendText(target, "Codex scheduled jobs require this topic to be bound to a context first.");
+      return;
+    }
+
+    const parsedSchedule = parseScheduleArgs(parts, 2);
+    const bodyParts = parts.slice(2 + parsedSchedule.consumed);
+    const body = bodyParts.join(" ").trim();
+    if (!body) {
+      await this.telegram.sendText(
+        target,
+        kind === "reminder" ? "Reminder jobs require reminder text." : "Codex jobs require an instruction."
+      );
+      return;
+    }
+
+    const draft: CronJobDraft = {
+      label,
+      kind,
+      schedule: parsedSchedule.schedule,
+      executionContextSlug: kind === "codex" ? context?.slug || null : context?.slug || null,
+      targetChatId: target.chatId,
+      targetThreadId: target.threadId,
+      instruction: kind === "codex" ? body : null,
+      reminderText: kind === "reminder" ? body : null
+    };
+    const job = await this.cronManager.createJob(draft, { context, target });
+    await this.telegram.sendText(target, `Cron created: ${job.id} (${job.label}) next=${job.nextRunAt || "none"}`);
+  }
+
+  private resolveCronJobFromText(selectorText: string, context: ContextRecord | null, target: TelegramTarget): CronJobRecord {
+    const byId = this.db.getCronJob(selectorText);
+    if (byId) {
+      return byId;
+    }
+
+    return this.cronManager.resolveJob({ label: selectorText }, { context, target });
+  }
+
+  private async installBuiltinRoutine(
+    routineName: string,
+    scheduleParts: string[],
+    context: ContextRecord | null,
+    target: TelegramTarget
+  ): Promise<void> {
+    const routine = getBuiltinRoutine(routineName);
+    if (!routine) {
+      await this.telegram.sendText(target, "Unknown built-in routine. Use /cron builtins.");
+      return;
+    }
+
+    if (!context) {
+      await this.telegram.sendText(
+        target,
+        `Built-in routine ${routine.label} needs a bound context so replies and artifacts have a durable workspace. Use /newctx first.`
+      );
+      return;
+    }
+
+    let schedule = defaultBuiltinSchedule(routine);
+    if (scheduleParts.length) {
+      const parsedSchedule = parseScheduleArgs(scheduleParts, 0);
+      if (parsedSchedule.consumed !== scheduleParts.length) {
+        await this.telegram.sendText(target, "Built-in routine schedule syntax does not accept trailing text. Use /cron install <builtin> daily <HH:MM> <Timezone>.");
+        return;
+      }
+      schedule = parsedSchedule.schedule;
+    }
+    const draft = {
+      ...builtinRoutineDraft(routine, schedule, context.slug),
+      targetChatId: target.chatId,
+      targetThreadId: target.threadId
+    };
+    const existing = this.cronManager
+      .listRelevantJobs(context, target)
+      .find((job) => job.label.toLowerCase() === routine.label.toLowerCase());
+
+    if (existing) {
+      const updated = await this.cronManager.updateJob(existing, {
+        schedule,
+        executionContextSlug: context.slug,
+        targetChatId: target.chatId,
+        targetThreadId: target.threadId,
+        instruction: draft.instruction || null,
+        reminderText: draft.reminderText || null,
+        enabled: true
+      });
+      await this.telegram.sendText(target, `Built-in routine updated: ${updated.id} (${updated.label}) next=${updated.nextRunAt || "none"}`);
+      return;
+    }
+
+    const created = await this.cronManager.createJob(draft, { context, target });
+    await this.telegram.sendText(target, `Built-in routine installed: ${created.id} (${created.label}) next=${created.nextRunAt || "none"}`);
+  }
+
+  private async handleCronJobAction(
+    action: string,
+    job: CronJobRecord,
+    target: TelegramTarget
+  ): Promise<void> {
+    switch (action) {
+      case "show":
+        await this.telegram.sendText(target, this.formatCronJobDetails(job));
+        return;
+      case "run": {
+        const result = await this.cronScheduler.runJobNow(job);
+        await this.telegram.sendText(target, result);
+        return;
+      }
+      case "pause": {
+        const updated = await this.cronManager.pauseJob(job);
+        await this.telegram.sendText(target, `Cron paused: ${updated.id} (${updated.label})`);
+        return;
+      }
+      case "resume": {
+        const updated = await this.cronManager.resumeJob(job);
+        await this.telegram.sendText(target, `Cron resumed: ${updated.id} (${updated.label}) next=${updated.nextRunAt || "none"}`);
+        return;
+      }
+      case "delete": {
+        await this.cronManager.deleteJob(job);
+        await this.telegram.sendText(target, `Cron deleted: ${job.id} (${job.label})`);
+        return;
+      }
+      default:
+        await this.telegram.sendText(target, `Unknown cron action: ${action}`);
+        return;
+    }
+  }
+
+  private formatCronJobDetails(job: CronJobRecord): string {
+    const effectiveContext = job.executionContextSlug ? this.db.getContextBySlug(job.executionContextSlug) : null;
+    const runtimeModel = job.modelOverride || effectiveContext?.modelOverride || "default";
+    const runtimeEffort = job.reasoningEffortOverride || effectiveContext?.reasoningEffortOverride || "default";
+    return [
+      `Cron: ${job.id}`,
+      `Label: ${job.label}`,
+      `Kind: ${job.kind}`,
+      `Enabled: ${job.enabled ? "yes" : "no"}`,
+      `Schedule: ${scheduleSummary(job.schedule)}`,
+      `Next run: ${job.nextRunAt || "none"}`,
+      `Pending run: ${job.pendingRunAt || "none"}`,
+      `Last run: ${job.lastRunAt || "never"}`,
+      `Context: ${job.executionContextSlug || "none"}`,
+      `Target: ${job.targetChatId}:${job.targetThreadId ?? "none"}`,
+      `Mode: model=${runtimeModel} effort=${runtimeEffort}`,
+      job.reminderText ? `Reminder: ${job.reminderText}` : null,
+      job.instruction ? `Instruction: ${compact(job.instruction, 900)}` : null,
+      job.lastResult ? `Last result: ${compact(job.lastResult)}` : null,
+      job.lastError ? `Last error: ${compact(job.lastError)}` : null
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
   private formatArtifactsList(artifacts: string): string {
     const entries = parseArtifactEntries(artifacts);
     if (!entries.length) {
@@ -1369,18 +1739,4 @@ export class CommandHandler {
     await this.telegram.sendText(target, lines.join("\n"));
   }
 
-  private formatCronSchedule(job: CronJobRecord): string {
-    switch (job.schedule.type) {
-      case "once":
-        return `once at ${job.schedule.at}`;
-      case "daily":
-        return `daily at ${job.schedule.time} ${job.schedule.timezone}`;
-      case "weekly":
-        return `every ${job.schedule.weekday} at ${job.schedule.time} ${job.schedule.timezone}`;
-      case "monthly":
-        return `day ${job.schedule.dayOfMonth} monthly at ${job.schedule.time} ${job.schedule.timezone}`;
-      case "interval":
-        return `every ${job.schedule.everyMinutes} minute(s) from ${job.schedule.anchorAt}`;
-    }
-  }
 }

@@ -18,6 +18,8 @@ Before sharing brainstack with another machine or person:
 - The shared-brain content repo remains markdown/manifests/raw/proposals, not a vector DB or hidden memory service.
 - Large binary policy is documented and tested.
 - Backup and restore docs are sufficient without tribal knowledge.
+- Routine docs explain deterministic `/cron create`, built-in routine installation, read-only update checks, and scheduler health checks.
+- Private-journal docs are honest about the current boundary: separate explicit installs/configs only, no automatic multi-brain routing yet.
 
 ## Release Artifacts
 

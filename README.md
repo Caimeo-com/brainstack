@@ -49,10 +49,12 @@ Generated source-run services also invoke Bun with `--no-env-file` and load expl
 - `control`: control host with `braind`, optional `telemux`, and worker orchestration.
 - `worker`: worker host reachable by normal OpenSSH over Tailscale; no Telegram polling and no admin ingest token.
 - `client-macos`: local clone plus Codex/Claude/Cursor bootstrap; no local services.
-- `private-journal`: optional separate private brain repo/service/token boundary.
+
+Private journaling should use an explicit separate repo/service/token boundary. Automatic multi-brain routing and a first-class `private-journal` provisioning profile are not implemented yet.
 
 Start with the quickstart docs in `docs/`.
 See [`docs/diagrams.md`](./docs/diagrams.md) for the read/write/outbox, Telegram coalescing, and control/client/worker topology diagrams.
+See [`docs/routines.md`](./docs/routines.md) for scheduled routines, built-in update checks, brain-curator setup, and daily check-ins.
 
 `provision` is a first-stage checker/config generator. It does not install Bun, Git, SSH, Tailscale, Codex, or Claude; it fails with install hints when they are missing.
 

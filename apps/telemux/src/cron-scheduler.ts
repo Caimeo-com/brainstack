@@ -75,6 +75,91 @@ export class CronScheduler {
     }
   }
 
+  async runJobNow(job: CronJobRecord, referenceIso = nowIso()): Promise<string> {
+    if (job.kind === "reminder") {
+      try {
+        await this.telegram.sendText(
+          {
+            chatId: job.targetChatId,
+            threadId: job.targetThreadId
+          },
+          job.reminderText || `Scheduled reminder: ${job.label}`
+        );
+        await this.manager.saveJob({
+          ...job,
+          lastRunAt: referenceIso,
+          lastScheduledFor: referenceIso,
+          lastResult: `Manual reminder sent for ${referenceIso}`,
+          lastError: null,
+          updatedAt: nowIso()
+        });
+        this.db.saveCronRun(this.manager.createRunRecord(job.id, referenceIso, "sent", `Manual reminder sent: ${job.label}`));
+        return `Cron run sent: ${job.id} (${job.label})`;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await this.manager.saveJob({
+          ...job,
+          lastRunAt: referenceIso,
+          lastScheduledFor: referenceIso,
+          lastResult: null,
+          lastError: message,
+          updatedAt: nowIso()
+        });
+        this.db.saveCronRun(this.manager.createRunRecord(job.id, referenceIso, "failed", message));
+        throw error;
+      }
+    }
+
+    const context = job.executionContextSlug ? this.db.getContextBySlug(job.executionContextSlug) : null;
+    if (!context) {
+      throw new Error(`Cron ${job.id} has no valid execution context`);
+    }
+
+    if (this.dispatcher.isActive(context.slug)) {
+      throw new Error(`Context ${context.slug} is busy; retry after the active run completes.`);
+    }
+
+    const accepted = await this.dispatcher.dispatch(
+      "resume",
+      context,
+      job.instruction || `Run scheduled cron job ${job.label}.`,
+      {
+        chatId: job.targetChatId,
+        threadId: job.targetThreadId
+      },
+      {
+        notifyAccepted: false,
+        modelOverride: job.modelOverride,
+        reasoningEffortOverride: job.reasoningEffortOverride,
+        sourceLabel: `manual cron run ${job.id}`
+      }
+    );
+
+    if (!accepted.accepted) {
+      await this.manager.saveJob({
+        ...job,
+        lastRunAt: referenceIso,
+        lastScheduledFor: referenceIso,
+        lastResult: null,
+        lastError: accepted.message,
+        updatedAt: nowIso()
+      });
+      this.db.saveCronRun(this.manager.createRunRecord(job.id, referenceIso, "failed", accepted.message));
+      return accepted.message || `Cron run failed: ${job.id} (${job.label})`;
+    }
+
+    await this.manager.saveJob({
+      ...job,
+      lastRunAt: referenceIso,
+      lastScheduledFor: referenceIso,
+      lastResult: `Manual Codex dispatch accepted for ${referenceIso}`,
+      lastError: null,
+      updatedAt: nowIso()
+    });
+    this.db.saveCronRun(this.manager.createRunRecord(job.id, referenceIso, "dispatched", `Manual dispatch ${job.id}`));
+    return `Cron run dispatched: ${job.id} (${job.label})`;
+  }
+
   private async advanceWhilePending(job: CronJobRecord, referenceIso: string): Promise<void> {
     if (!job.pendingRunAt || !job.nextRunAt) {
       return;

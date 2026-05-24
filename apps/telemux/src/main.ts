@@ -17,8 +17,8 @@ const workers = new WorkerService(config, db);
 const telegram = new TelegramBot(config, db);
 const cronManager = new CronManager(config, db, workers);
 const dispatcher = new Dispatcher(config, db, contexts, workers, telegram, cronManager);
-const commands = new CommandHandler(config, db, telegram, contexts, workers, dispatcher, cronManager);
 const cronScheduler = new CronScheduler(config, db, cronManager, dispatcher, telegram);
+const commands = new CommandHandler(config, db, telegram, contexts, workers, dispatcher, cronManager, cronScheduler);
 
 startDashboard(config, db, workers);
 

@@ -1,4 +1,4 @@
-# Clawdex
+# Telemux
 
 Telegram-driven harness control plane for one control host, with optional remote workers.
 
@@ -74,6 +74,7 @@ If `BRAIN_BASE_URL` and `BRAIN_IMPORT_TOKEN` are set, successful runs import `.f
 - `/workers`
 - `/crons`
 - `/cron <subcommand>`
+- `/cron_run <id-or-label>`
 - `/mode [fast|normal|max|clear]`
 - `/model [model-id|clear]`
 - `/effort [low|medium|high|xhigh|clear]`
@@ -93,15 +94,20 @@ If `BRAIN_BASE_URL` and `BRAIN_IMPORT_TOKEN` are set, successful runs import `.f
 
 `/cron` subcommands currently include:
 
-- `show <id>`
-- `pause <id>`
-- `resume <id>`
-- `delete <id>`
-- `move <id> here`
-- `context <id> <slug-or-path>`
-- `mode <id> [fast|normal|max|clear]`
-- `model <id> [model-id|clear]`
-- `effort <id> [low|medium|high|xhigh|clear]`
+- `show <id-or-label>`
+- `run <id-or-label>`
+- `pause <id-or-label>`
+- `resume <id-or-label>`
+- `delete <id-or-label>`
+- `create reminder <label> <schedule> <text>`
+- `create codex <label> <schedule> <instruction>`
+- `install <update-check|brain-curator|daily-checkin> [schedule]`
+- `builtins`
+- `move <id-or-label> here`
+- `context <id-or-label> <slug-or-path>`
+- `mode <id-or-label> [fast|normal|max|clear]`
+- `model <id-or-label> [model-id|clear]`
+- `effort <id-or-label> [low|medium|high|xhigh|clear]`
 
 ## Topic patterns
 
@@ -125,9 +131,17 @@ Use `/mode`, `/model`, and `/effort` to change the Codex runtime for just that t
 
 Captioned image and file messages work in the same bound-topic flow. The control plane stages the inbound files into the workspace first, then runs Codex against that updated workspace.
 
-Scheduled jobs can be created either by normal conversation in a bound topic, where Codex writes `.factory/CRON_REQUESTS.json`, or by deterministic job-management commands like `/crons` and `/cron ...`.
+Scheduled jobs can be created either by normal conversation in a bound topic, where Codex writes `.factory/CRON_REQUESTS.json`, or by deterministic job-management commands like `/crons`, `/cron create ...`, and `/cron install ...`.
 
 One-off reminders do not invoke Codex when they fire. Scheduled Codex jobs do, and they reuse the stored context session so proactive thread messages stay in-context.
+
+Built-in routines:
+
+- `update-check`: read-only OS, Brainstack, Codex, and Claude update visibility.
+- `brain-curator`: shared-brain raw/proposal review and sourced curation report.
+- `daily-checkin`: daily Telegram prompt that flows through the bound topic when the operator replies.
+
+See [`docs/routines.md`](../../docs/routines.md).
 
 If Codex records a real file in `.factory/ARTIFACTS.md` and the user explicitly asks for that file to be sent into Telegram, the control plane can upload it into the same topic instead of replying with a path only.
 
@@ -167,8 +181,7 @@ Recommended phase-1 automation path:
 
 ## Docs
 
-- [docs/architecture.md](./docs/architecture.md)
-- [docs/operations.md](./docs/operations.md)
-- [docs/fresh-machine-bootstrap.md](./docs/fresh-machine-bootstrap.md)
-- [docs/publication-readiness.md](./docs/publication-readiness.md)
-- [NEXT_STEPS.md](./NEXT_STEPS.md)
+- [architecture](../../docs/architecture.md)
+- [operator preflight](../../docs/operator-preflight.md)
+- [routines](../../docs/routines.md)
+- [publication readiness](../../docs/publication-readiness.md)

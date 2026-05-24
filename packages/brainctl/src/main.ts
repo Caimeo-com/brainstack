@@ -2096,6 +2096,25 @@ async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Pro
     } catch (error) {
       checks.push(check("WARN", "health", "telemux-health", error instanceof Error ? error.message : String(error)));
     }
+    try {
+      const response = await fetch(`http://${cfg.telemux.dashboardHost}:${cfg.telemux.dashboardPort}/healthz`, { signal: AbortSignal.timeout(1500) });
+      if (response.ok) {
+        const body = (await response.json()) as Record<string, unknown>;
+        const crons = Number(body.crons ?? 0);
+        const enabled = Number(body.cronEnabled ?? 0);
+        const pending = Number(body.cronPending ?? 0);
+        const due = Number(body.cronDue ?? 0);
+        checks.push(
+          due > 0 || pending > 0
+            ? check("WARN", "health", "telemux-crons", `total=${crons} enabled=${enabled} due=${due} pending=${pending}`, "Inspect /crons and telemux logs if due or pending jobs do not clear after the scheduler interval.")
+            : check("PASS", "health", "telemux-crons", `total=${crons} enabled=${enabled} due=${due} pending=${pending}`)
+        );
+      } else {
+        checks.push(check("WARN", "health", "telemux-crons", `healthz HTTP ${response.status}`));
+      }
+    } catch (error) {
+      checks.push(check("WARN", "health", "telemux-crons", error instanceof Error ? error.message : String(error)));
+    }
   }
 
   if (usesUserServices(cfg) && commandOk("loginctl")) {
@@ -2510,6 +2529,73 @@ async function commandOutbox(args: ParsedArgs): Promise<void> {
   }
 }
 
+function summarizeLines(text: string, maxLines = 40): string {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!lines.length) {
+    return "(none)";
+  }
+  const shown = lines.slice(0, maxLines);
+  if (lines.length > maxLines) {
+    shown.push(`... ${lines.length - maxLines} more`);
+  }
+  return shown.join("\n");
+}
+
+function updateProbe(
+  command: string,
+  args: string[],
+  okCodes: number[] = [0],
+  envOverrides: Record<string, string> = {},
+  label: string | null = null
+): { label: string; code: number; output: string } | null {
+  const executable = commandPath(command);
+  if (!executable) {
+    return null;
+  }
+  const timeoutBin = commandPath("timeout");
+  const env = { ...userShellPathEnv(), ...envOverrides };
+  const proc = timeoutBin
+    ? run([timeoutBin, "20s", executable, ...args], { check: false, env })
+    : run([executable, ...args], { check: false, env });
+  const output = `${proc.stdout}${proc.stderr ? `\n${proc.stderr}` : ""}`.trim();
+  const status = okCodes.includes(proc.code) ? "ok" : `exit-${proc.code}`;
+  return {
+    label: label || `${command} ${args.join(" ")}`.trim(),
+    code: proc.code,
+    output: `${status}\n${summarizeLines(output)}`
+  };
+}
+
+function collectOsUpdateProbes(): Array<{ label: string; code: number; output: string }> {
+  const probes: Array<{ label: string; code: number; output: string }> = [];
+  const add = (probe: { label: string; code: number; output: string } | null) => {
+    if (probe) probes.push(probe);
+  };
+
+  add(
+    updateProbe(
+      "brew",
+      ["outdated", "--quiet"],
+      [0],
+      {
+        HOMEBREW_NO_AUTO_UPDATE: "1",
+        HOMEBREW_NO_ENV_HINTS: "1",
+        HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      },
+      "brew outdated --quiet (HOMEBREW_NO_AUTO_UPDATE=1)"
+    )
+  );
+  add(updateProbe("pacman", ["-Qu"]));
+  add(updateProbe("checkupdates", []));
+  add(updateProbe("apt", ["list", "--upgradable"]));
+  add(updateProbe("dnf", ["--cacheonly", "check-update", "--quiet"], [0, 100]));
+  add(updateProbe("zypper", ["--no-refresh", "list-updates"]));
+  return probes;
+}
+
 async function commandUpdates(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
   const branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd: PRODUCT_ROOT, check: false }).stdout.trim() || "unknown";
@@ -2531,8 +2617,21 @@ async function commandUpdates(args: ParsedArgs): Promise<void> {
     console.log(`${item.status} ${item.name}: ${item.detail}`);
     if (item.remediation) console.log(`  remediation: ${item.remediation}`);
   }
+  const osProbes = collectOsUpdateProbes();
+  console.log("os_update_checks:");
+  if (!osProbes.length) {
+    console.log("  no supported package manager found");
+  } else {
+    for (const probe of osProbes) {
+      console.log(`  ${probe.label}:`);
+      for (const line of probe.output.split(/\r?\n/)) {
+        console.log(`    ${line}`);
+      }
+    }
+  }
   console.log("manual_update_commands:");
   console.log("  brainstack: git pull --ff-only && bun install --frozen-lockfile && bun test");
+  console.log("  os packages: use your package manager manually after reviewing the read-only check above");
   console.log(`  selected harness: ${installHint(cfg.harness.name)}`);
 }
 

@@ -7,7 +7,7 @@ const TEST_ALLOWED_TELEGRAM_USER_ID = 123456789;
 test("registered Telegram commands include implemented operator commands", () => {
   const commands = new Set(TELEGRAM_BOT_COMMANDS.map((command) => command.command));
 
-  for (const command of ["whoami", "workers", "updates", "crons", "run", "resume", "loop", "artifacts", "shred", "usage"]) {
+  for (const command of ["whoami", "workers", "updates", "crons", "cron_run", "run", "resume", "loop", "artifacts", "shred", "usage"]) {
     expect(commands.has(command)).toBe(true);
   }
 });
