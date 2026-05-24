@@ -15,11 +15,13 @@ List jobs linked to the current topic or context:
 The list includes tap-friendly shortcuts:
 
 ```text
-/cron_show_1
-/cron_run_1
-/cron_pause_1
-/cron_resume_1
+/cron_show_<token>_1
+/cron_run_<token>_1
+/cron_pause_<token>_1
+/cron_resume_<token>_1
 ```
+
+The token is a short-lived snapshot of the job list shown by `/crons`. Refresh `/crons` before using an older shortcut so list reordering cannot target the wrong job.
 
 Deletion is intentionally explicit: use `/cron delete <id-or-label>` after checking the job.
 
@@ -52,7 +54,7 @@ Supported schedules:
 
 Use an IANA timezone such as `Europe/Zagreb`, `America/New_York`, or `UTC`.
 
-Codex jobs require the Telegram topic to be bound to a Brainstack context, because the run needs a durable workspace and session. Reminder jobs can post to a topic, but the built-in routines require a bound context so replies and artifacts have somewhere to land.
+Codex jobs require the Telegram topic to be bound to a Brainstack context, because the run needs a durable workspace and session. Codex interval jobs must be at least 15 minutes apart. Reminder jobs can post to a topic, but the built-in routines require a bound context so replies and artifacts have somewhere to land.
 
 ## Built-ins
 
@@ -82,7 +84,7 @@ You can override the default schedule:
 
 ### `update-check`
 
-Runs a read-only update report. It checks Brainstack git state, Codex/Claude versions and compatibility, and supported OS package managers where available:
+Runs a deterministic read-only update report without invoking an LLM harness. Telemux runs Brainstack's `brainctl updates` path on the target worker when available, writes a report artifact, records it in `.factory/ARTIFACTS.md`, and posts a concise Telegram summary. The report checks Brainstack git state, Codex/Claude versions and compatibility, and supported OS package managers where available:
 
 - Homebrew: `HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew outdated --quiet`
 - Arch/Omarchy: `pacman -Qu`, plus `checkupdates` when installed
@@ -90,7 +92,7 @@ Runs a read-only update report. It checks Brainstack git state, Codex/Claude ver
 - Fedora/RHEL: `dnf --cacheonly check-update --quiet`
 - openSUSE: `zypper --no-refresh list-updates`
 
-The routine must not install, upgrade, remove, reboot, restart, or mutate packages/services. It reports manual commands only.
+The routine does not install, upgrade, remove, reboot, restart, or mutate packages/services. It reports manual commands only.
 
 ### `brain-curator`
 

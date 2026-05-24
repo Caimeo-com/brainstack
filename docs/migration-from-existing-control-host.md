@@ -1,13 +1,13 @@
-# Migration From Current Valkyrie
+# Migration From Existing Control Host
 
-Current valkyrie is intentionally not switched automatically by creating `~/brainstack`.
+An existing control host is intentionally not switched automatically by creating `~/brainstack`.
 
 ## Current Production Inputs
 
 - Shared brain app source: `~/shared-brain/app`
 - Shared brain canonical live checkout: `~/shared-brain/live/shared-brain`
 - Shared brain bare repo: `~/shared-brain/bare/shared-brain.git`
-- Clawdex/private-dev-factory source: `~/private-dev-factory`
+- Legacy telemux source: `<legacy-telemux-source>`
 - Telemux state: `/srv/telemux`
 - Factory workspaces: `/srv/factory`
 - System service: `shared-brain.service`
@@ -23,11 +23,11 @@ Fresh installs use:
 
 The web server reads from the serve clone. Write APIs use the staging clone and push to the bare repo. The bare repo post-receive hook updates the serve clone and reindexes. This removes the dangerous old behavior where a hook could hard-reset a checkout humans were editing.
 
-As of the valkyrie remodel, production `shared-brain.service` uses `/home/swader/brainstack/apps/braind/src/server.ts`, reads from `/home/swader/shared-brain/serve/shared-brain`, and writes through `/home/swader/shared-brain/staging/shared-brain`.
+After the remodel, production `shared-brain.service` should use `<home>/brainstack/apps/braind/src/server.ts`, read from `<home>/shared-brain/serve/shared-brain`, and write through `<home>/shared-brain/staging/shared-brain`.
 
 ## Compatibility Plan
 
-On valkyrie, preserve the current service until a deliberate cutover:
+On the control host, preserve the current service until a deliberate cutover:
 
 ```bash
 cd ~/brainstack
@@ -37,7 +37,7 @@ bun run packages/brainctl/src/main.ts migrate-current-install
 This writes a compatibility config at:
 
 ```text
-~/.config/brainstack/valkyrie-current.brainstack.yaml
+~/.config/brainstack/current-control.brainstack.yaml
 ```
 
 It does not stop services, move repos, rewrite hooks, or delete `/srv`.
@@ -53,9 +53,9 @@ It does not stop services, move repos, rewrite hooks, or delete `/srv`.
 7. Test `/health`, page rendering, search, import, ingest, and git push.
 8. Only then retire the old `~/shared-brain/app` compatibility source.
 
-## Current Known Valkyrie Issues
+## Current Known Legacy Issues
 
-- Historical journald logs contained leaked Telegram bot-token material. The customer-zero token was rotated and telemux was restarted successfully; future operators should still rotate any leaked bot token in BotFather and sanitize logs according to local retention policy.
-- `valkyrie -> erbine tcp:22` was unblocked during customer-zero setup by disabling Tailscale SSH on erbine, enabling normal `sshd.service`, installing a dedicated `valkyrie_to_erbine_ed25519` key for `swader@erbine`, and changing current telemux worker config to `sshUser: swader`.
-- Erbine now advertises `tag:brain-worker`. Valkyrie locally requests `tag:brain`; validate server-side application with `tailscale status` plus `tailscale whois <valkyrie-tailscale-ip>` before removing any temporary host/IP fallback grants from the live tailnet policy.
+- Review historical service logs for sensitive values according to local retention policy. Rotate any potentially exposed bot token or API token before relying on a migrated service.
+- Control-to-worker `tcp:22` may require disabling Tailscale SSH on the worker, enabling normal `sshd.service`, installing a dedicated control-to-worker SSH key, and setting the worker's `sshUser` explicitly.
+- Worker hosts should advertise `tag:brain-worker`; control hosts should request `tag:brain`. Validate server-side tag application with `tailscale status` plus `tailscale whois <control-tailscale-ip>` before removing any temporary host/IP fallback grants from the live tailnet policy.
 - Current production telemux still uses `/srv/telemux` and `/srv/factory`; brainstack defaults are home-directory based for future installs.

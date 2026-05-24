@@ -13,6 +13,7 @@ Defaults:
 
 Environment:
   BRAINSTACK_HANDOFF_UTC=YYYYMMDDTHHMMSSZ  Override bundle timestamp.
+  BRAINSTACK_HANDOFF_LIVE_HOSTS="host1 host2"  In forensic mode only, collect opt-in live SSH/Tailscale checks.
 
 The bundle is for review/audit handoff only. It is not a release artifact.
 USAGE
@@ -86,10 +87,23 @@ if ! command -v zip >/dev/null 2>&1; then
 fi
 
 utc="${BRAINSTACK_HANDOFF_UTC:-$(date -u +%Y%m%dT%H%M%SZ)}"
+if ! printf '%s\n' "$utc" | grep -Eq '^[0-9]{8}T[0-9]{6}Z$'; then
+  echo "handoff refused: BRAINSTACK_HANDOFF_UTC must match YYYYMMDDTHHMMSSZ" >&2
+  exit 1
+fi
 top="handoff-${utc}"
+mkdir -p "$out_dir"
 out_dir="$(cd "$out_dir" && pwd)"
 bundle_dir="${out_dir}/${top}"
 zip_path="${out_dir}/${top}.zip"
+case "$bundle_dir" in
+  "$out_dir"/*) ;;
+  *) echo "handoff refused: bundle path escaped output directory" >&2; exit 1 ;;
+esac
+case "$zip_path" in
+  "$out_dir"/*) ;;
+  *) echo "handoff refused: zip path escaped output directory" >&2; exit 1 ;;
+esac
 
 rm -rf "$bundle_dir" "$zip_path" "${zip_path}.sha256"
 mkdir -p "$bundle_dir"/{source,generated,command-outputs,service-state,shared-brain}
@@ -105,17 +119,17 @@ elif base_commit="$(git rev-parse --verify HEAD^ 2>/dev/null)"; then
 else
   base_commit=""
 fi
-shared_brain_root="${SHARED_BRAIN_ROOT:-$HOME/shared-brain/staging/shared-brain}"
-private_factory_root="${PRIVATE_DEV_FACTORY_ROOT:-$HOME/private-dev-factory}"
+shared_brain_root="${SHARED_BRAIN_ROOT:-}"
+handoff_factory_root="${BRAINSTACK_HANDOFF_FACTORY_ROOT:-}"
 
-shared_head="not-present"
-if [ -d "$shared_brain_root/.git" ]; then
+shared_head="not-collected"
+if [ "$mode" = "forensic" ] && [ "${BRAINSTACK_HANDOFF_INCLUDE_SHARED_BRAIN:-}" = "1" ] && [ -n "$shared_brain_root" ] && [ -d "$shared_brain_root/.git" ]; then
   shared_head="$(git -C "$shared_brain_root" rev-parse HEAD)"
 fi
 
-factory_head="not-present"
-if [ -d "$private_factory_root/.git" ]; then
-  factory_head="$(git -C "$private_factory_root" rev-parse HEAD)"
+factory_head="not-collected"
+if [ "$mode" = "forensic" ] && [ -n "$handoff_factory_root" ] && [ -d "$handoff_factory_root/.git" ]; then
+  factory_head="$(git -C "$handoff_factory_root" rev-parse HEAD)"
 fi
 
 # Exactly one source representation: source/ as a git archive at HEAD.
@@ -148,7 +162,7 @@ machine:
 paths:
   home: /Users/operator
 client:
-  localPath: /Users/operator/brain/customer-zero-shared-brain
+  localPath: /Users/operator/brain/shared-brain
   remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git
 brain:
   publicBaseUrl: https://brain-control.example.ts.net
@@ -182,10 +196,13 @@ bun run packages/brainctl/src/main.ts join-worker \
   > "$bundle_dir/generated/join-worker-custom-state.md" 2>&1
 
 provision_config="$bundle_dir/generated/provision-client-macos.yaml"
-bun run packages/brainctl/src/main.ts provision \
+env USER=operator HOME=/home/operator bun run packages/brainctl/src/main.ts provision \
   --profile client-macos \
   --out "$provision_config" \
+  --root "$bundle_dir/generated/provision-root" \
   --harness codex \
+  --machine client-laptop \
+  --hostname client-laptop \
   --brain-base-url https://brain-control.example.ts.net \
   --brain-remote operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git \
   --skip-harness-sudo-test \
@@ -228,7 +245,7 @@ mkdir -p "$outbox_smoke_root"
 outbox_config="$outbox_smoke_root/config.yaml"
 outbox_received="$outbox_smoke_root/received.jsonl"
 outbox_server="$outbox_smoke_root/server.ts"
-outbox_port="45$((10#${utc:9:2} + 10))"
+outbox_port="$((45000 + (10#${utc:9:2} % 500)))"
 json_string_literal() {
   local value="$1"
   value="${value//\\/\\\\}"
@@ -304,13 +321,15 @@ if (node?.TailscaleIPs?.length) {
 '
 }
 
-if command -v tailscale >/dev/null 2>&1; then
+live_hosts="${BRAINSTACK_HANDOFF_LIVE_HOSTS:-}"
+if [ "$mode" = "forensic" ] && [ -n "$live_hosts" ] && command -v tailscale >/dev/null 2>&1; then
   {
     tailscale status 2>&1 || true
   } > "$bundle_dir/command-outputs/tailscale-summary.txt"
 
-  for host in valkyrie erbine; do
-    output="$bundle_dir/command-outputs/tailscale-whois-${host}.txt"
+  for host in $live_hosts; do
+    safe_host="$(printf '%s' "$host" | sed 's/[^A-Za-z0-9_.-]/_/g')"
+    output="$bundle_dir/command-outputs/tailscale-whois-${safe_host}.txt"
     {
       ip="$(tailscale_ip_for_name "$host" 2>/dev/null || true)"
       if [ -n "$ip" ]; then
@@ -323,22 +342,29 @@ if command -v tailscale >/dev/null 2>&1; then
   done
 fi
 
-if command -v ssh >/dev/null 2>&1; then
-  {
-    echo '$ ssh -o BatchMode=yes -o ConnectTimeout=5 erbine true'
-    if ssh -o BatchMode=yes -o ConnectTimeout=5 erbine true 2>&1; then
-      echo "exit=0"
-    else
-      status=$?
-      echo "exit=$status"
-    fi
-  } > "$bundle_dir/command-outputs/ssh-erbine-true.txt"
+if [ "$mode" = "forensic" ] && [ -n "$live_hosts" ] && command -v ssh >/dev/null 2>&1; then
+  for host in $live_hosts; do
+    safe_host="$(printf '%s' "$host" | sed 's/[^A-Za-z0-9_.-]/_/g')"
+    {
+      echo "$ ssh -o BatchMode=yes -o ConnectTimeout=5 ${safe_host} true"
+      if ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" true 2>&1; then
+        echo "exit=0"
+      else
+        status=$?
+        echo "exit=$status"
+      fi
+    } > "$bundle_dir/command-outputs/ssh-${safe_host}-true.txt"
+  done
 fi
 
-if curl -fsS --max-time 2 http://127.0.0.1:8080/health > "$bundle_dir/service-state/braind-health.json" 2>/dev/null; then
+if [ "$mode" = "forensic" ] && curl -fsS --max-time 2 http://127.0.0.1:8080/health > "$bundle_dir/service-state/braind-health.json" 2>/dev/null; then
   :
 else
-  echo "braind health unavailable on http://127.0.0.1:8080/health" > "$bundle_dir/service-state/braind-health.txt"
+  if [ "$mode" = "forensic" ]; then
+    echo "braind health unavailable on http://127.0.0.1:8080/health" > "$bundle_dir/service-state/braind-health.txt"
+  else
+    echo "braind live health is not collected in review mode because it can include local absolute paths. Use --mode forensic only when live host evidence is intended." > "$bundle_dir/service-state/braind-health.txt"
+  fi
   rm -f "$bundle_dir/service-state/braind-health.json"
 fi
 
@@ -354,7 +380,7 @@ if [ "$mode" = "forensic" ]; then
   fi
 fi
 
-if [ -d "$shared_brain_root" ]; then
+if [ "$mode" = "forensic" ] && [ "${BRAINSTACK_HANDOFF_INCLUDE_SHARED_BRAIN:-}" = "1" ] && [ -d "$shared_brain_root" ]; then
   for file in AGENTS.md AGENTS.shared-client.md CLAUDE.md; do
     if [ -f "$shared_brain_root/$file" ]; then
       cp "$shared_brain_root/$file" "$bundle_dir/shared-brain/$file"
@@ -380,9 +406,8 @@ cat > "$bundle_dir/CLAIMS_AND_PROOF.md" <<'EOF'
 | Worker harness execution is override-capable and path-neutral for remote workers. | `command-outputs/worker-harness-path-neutral-test.txt` |
 | Mermaid diagrams are checked in and included for reviewer context. | `generated/diagrams.md` |
 | Bun tests passed for the product tree at HEAD. | `command-outputs/bun-test.txt` |
-| Local braind health was checked when available. | `service-state/braind-health.json` or `service-state/braind-health.txt` |
-| Tailscale whois evidence uses Tailscale IPs, not bare hostnames. | `command-outputs/tailscale-whois-valkyrie.txt` and `command-outputs/tailscale-whois-erbine.txt` |
-| Valkyrie-to-erbine SSH was smoke-tested without an interactive prompt. | `command-outputs/ssh-erbine-true.txt` |
+| Local braind health is skipped in review mode and collected only in forensic mode. | `service-state/braind-health.json` or `service-state/braind-health.txt` |
+| Optional live host evidence is forensic-only and opt-in. | `BRAINSTACK_HANDOFF_LIVE_HOSTS` |
 | Secret-looking tokens and private keys were scanned before zipping. | `command-outputs/secret-scan.txt` |
 EOF
 
@@ -417,7 +442,7 @@ See \`CHANGES.txt\` for the base commit, head commit, changed files, and diff st
 
 See \`CLAIMS_AND_PROOF.md\` for the claim-to-evidence map.
 
-## Valkyrie Production Touches
+## Production Touches
 
 - This handoff script collects service state only; it does not restart, stop, destroy, or cut over production services.
 - Pass-specific notes above are authoritative for whether the implementation pass touched production outside the product repo.
@@ -433,8 +458,8 @@ See \`CLAIMS_AND_PROOF.md\` for the claim-to-evidence map.
 - \`brainctl updates\`
 - Offline outbox queue/flush smoke
 - Focused telemux coalescing and worker-harness tests
-- Optional local \`tailscale status/whois\` summary when Tailscale is installed
-- Optional local \`GET http://127.0.0.1:8080/health\` when braind is running
+- Optional forensic-only \`tailscale status/whois\` and SSH checks when \`BRAINSTACK_HANDOFF_LIVE_HOSTS\` is explicitly set
+- Optional forensic-only local \`GET http://127.0.0.1:8080/health\` when braind is running
 
 ## Remaining Blockers
 
@@ -456,7 +481,7 @@ Mode: $mode
 Base commit: ${base_commit:-none}
 Product HEAD: $product_head
 Shared brain HEAD: $shared_head
-Private dev factory HEAD: $factory_head
+Factory workspace HEAD: $factory_head
 Pass notes included: $([ -n "$notes_file" ] && echo yes || echo no)
 Source representation: source/
 Secrets included: no
@@ -488,15 +513,29 @@ if find "$bundle_dir" -name '.DS_Store' -print -quit | grep -q .; then
   exit 1
 fi
 
+if find "$bundle_dir" -type l -print -quit | grep -q .; then
+  echo "handoff refused: symlink found in bundle" >&2
+  find "$bundle_dir" -type l -print >&2
+  exit 1
+fi
+
+scan_secret_detector() {
+  detector="$1"
+  pattern="$2"
+  rg -n -e "$pattern" "$bundle_dir" 2>/dev/null \
+    | awk -F: -v detector="$detector" '{print $1 ":" $2 ": [REDACTED " detector "]"}' \
+    || true
+}
+
 secret_hits="$(
-  rg -n \
-    -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' \
-    -e 'github_pat_[A-Za-z0-9_]{20,}' \
-    -e 'gh[pousr]_[A-Za-z0-9_]{20,}' \
-    -e '[0-9]{8,12}:[A-Za-z0-9_-]{30,}' \
-    -e 'sk-[A-Za-z0-9_-]{30,}' \
-    -e 'tskey-[A-Za-z0-9_-]{20,}' \
-    "$bundle_dir" || true
+  {
+    scan_secret_detector "private-key" '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+    scan_secret_detector "github-token" 'github_pat_[A-Za-z0-9_]{20,}'
+    scan_secret_detector "github-token" 'gh[pousr]_[A-Za-z0-9_]{20,}'
+    scan_secret_detector "telegram-token" '[0-9]{8,12}:[A-Za-z0-9_-]{30,}'
+    scan_secret_detector "openai-key" 'sk-[A-Za-z0-9_-]{30,}'
+    scan_secret_detector "tailscale-key" 'tskey-[A-Za-z0-9_-]{20,}'
+  } || true
 )"
 if [ -n "$secret_hits" ]; then
   echo "handoff refused: secrets-looking patterns detected" >&2
@@ -512,6 +551,16 @@ fi
   -x '*/.git/*' '*/dist/*' '*/node_modules/*' '*/.bun/*' '*/.DS_Store' '*/__MACOSX/*' \
   -x '*.env' '*.pem' '*.key' '*.token')
 
-sha256sum "$zip_path" > "${zip_path}.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum "$zip_path" > "${zip_path}.sha256"
+elif command -v shasum >/dev/null 2>&1; then
+  shasum -a 256 "$zip_path" > "${zip_path}.sha256"
+elif command -v openssl >/dev/null 2>&1; then
+  digest="$(openssl dgst -sha256 "$zip_path" | awk '{print $2}')"
+  printf '%s  %s\n' "$digest" "$zip_path" > "${zip_path}.sha256"
+else
+  echo "handoff refused: need sha256sum, shasum, or openssl for checksum" >&2
+  exit 1
+fi
 echo "$zip_path"
 cat "${zip_path}.sha256"

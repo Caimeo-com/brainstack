@@ -3,21 +3,25 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { syncWritableRepo } from "../../../apps/braind/src/brain-lib";
 import { loadConfig, parseSimpleYaml } from "../src/main";
 
 const PRODUCT_ROOT = resolve(import.meta.dir, "..", "..", "..");
 const BRAINCTL = join(PRODUCT_ROOT, "packages", "brainctl", "src", "main.ts");
 const SERVER = join(PRODUCT_ROOT, "apps", "braind", "src", "server.ts");
-const FORBIDDEN_PUBLIC_IDENTIFIERS = [
-  ["val", "kyrie"].join(""),
-  ["er", "bine"].join(""),
-  ["swa", "der"].join(""),
-  ["tail", "b647b6"].join(""),
-  ["/home/", "swa", "der"].join(""),
-  ["/Users/", "swa", "der"].join(""),
-  ["Bru", "no"].join("")
+const FORBIDDEN_PUBLIC_PATTERNS: Array<{ label: string; pattern: RegExp }> = [
+  { label: "non-placeholder macOS home path", pattern: /\/Users\/(?!operator\b)[A-Za-z0-9._-]+/ },
+  { label: "non-placeholder Linux home path", pattern: /\/home\/(?!operator\b|factory\b|brainstack\b)[A-Za-z0-9._-]+/ },
+  { label: "non-placeholder Tailscale DNS name", pattern: /(?<!example)\.ts\.net\b/ },
+  { label: "old GitHub remote marker", pattern: /github\.com[:/][^"'\s]*(?:proto|legacy)/i },
+  { label: "old telemux product name", pattern: new RegExp("claw" + "dex", "i") },
+  { label: "old private source name", pattern: new RegExp("private-dev" + "-factory", "i") },
+  { label: "old private source env var", pattern: new RegExp("PRIVATE_DEV" + "_FACTORY_ROOT") },
+  { label: "old factory phrase spaced", pattern: new RegExp("private\\s+dev\\s+factory", "i") },
+  { label: "old factory phrase", pattern: new RegExp("private\\s+factory", "i") },
+  { label: "c0 marker", pattern: new RegExp("customer" + "-zero", "i") },
+  { label: "generic old-code marker", pattern: new RegExp("\\bproto" + "type\\b", "i") }
 ];
 
 function runCommand(args: string[], options: { cwd?: string; env?: Record<string, string> } = {}) {
@@ -165,12 +169,23 @@ telemux:
     }
   });
 
+  test("rejects private-journal until separate private-brain routing is implemented", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-private-profile-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      await writeFile(configPath, ["schema_version: 1", "profile: private-journal", ""].join("\n"));
+      await expect(loadConfig(configPath)).rejects.toThrow("Unsupported profile private-journal");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("missing config errors are actionable and list nearby candidates", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-missing-config-"));
     try {
       const configDir = join(dir, ".config", "brainstack");
       await mkdir(configDir, { recursive: true });
-      const candidate = join(configDir, "valkyrie-current.brainstack.yaml");
+      const candidate = join(configDir, "current-control.brainstack.yaml");
       await writeFile(candidate, "schema_version: 1\nprofile: control\n");
       const missing = join(configDir, "brainstack.yaml");
       const result = runBrainctl(["doctor", "--config", missing], { HOME: dir });
@@ -241,10 +256,11 @@ describe("brainctl install safety", () => {
       const rendered = await readFile(configPath, "utf8");
       expect(rendered).toContain("harness:");
       expect(rendered).toContain("name: codex");
-      expect(rendered).toContain(`bin: ${fakeCodex}`);
+      expect(rendered).toContain("bin: codex");
       expect(rendered).toContain("enabled: true");
       expect(rendered).toContain('publicBaseUrl: "https://brain-control.example.ts.net"');
-      expect(result.stdout).toContain("selected harness: codex");
+      expect(result.stdout).toContain("selected harness: codex (config bin: codex)");
+      expect(result.stdout).not.toContain(fakeCodex);
       expect(result.stdout).toContain("brainctl init --profile control");
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -266,6 +282,17 @@ describe("brainctl install safety", () => {
       });
       expect(result.code).not.toBe(0);
       expect(`${result.stdout}\n${result.stderr}`).toContain("pass --harness codex or --harness claude");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("provision rejects --config so custom output paths are not silently ignored", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-provision-config-"));
+    try {
+      const result = runBrainctl(["provision", "--profile", "client-macos", "--config", join(dir, "brainstack.yaml")]);
+      expect(result.code).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("provision writes a new config with --out");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -304,6 +331,32 @@ describe("brainctl install safety", () => {
       expectSuccess(result);
       expect(await readFile(configPath, "utf8")).toContain("profile: client-macos");
       expect(`${result.stdout}\n${result.stderr}`).not.toContain("sudo should not run");
+
+      const enrollConfigPath = join(dir, "enroll.yaml");
+      const enroll = runBrainctl(
+        [
+          "provision",
+          "--profile",
+          "client-macos",
+          "--out",
+          enrollConfigPath,
+          "--harness",
+          "codex",
+          "--brain-base-url",
+          "https://brain-control.example.ts.net",
+          "--brain-remote",
+          "operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          "--skip-harness-sudo-test",
+          "--enroll-tailscale"
+        ],
+        {
+          PATH: `${binDir}:${process.env.PATH || ""}`,
+          TAILSCALE_AUTH_KEY: "tskey-fake-test-value"
+        }
+      );
+      expect(enroll.code).not.toBe(0);
+      expect(`${enroll.stdout}\n${enroll.stderr}`).toContain("sudo should not run for client-macos provision");
+      expect(await Bun.file(enrollConfigPath).exists()).toBe(false);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -357,11 +410,12 @@ describe("brainctl install safety", () => {
 
       const destroy = runBrainctl(["destroy", "--config", configPath, "--yes"]);
       expectSuccess(destroy);
-      expect(existsSync(configRoot)).toBe(false);
-      expect(existsSync(stateRoot)).toBe(false);
-      expect(existsSync(join(systemdRoot, "braind.service"))).toBe(false);
+      expect(existsSync(configRoot)).toBe(true);
+      expect(existsSync(stateRoot)).toBe(true);
+      expect(existsSync(join(systemdRoot, "braind.service"))).toBe(true);
       expect(existsSync(sharedBrainRoot)).toBe(true);
       expect(existsSync(privateBrainRoot)).toBe(true);
+      expect(destroy.stdout).toContain("ownership manifest missing");
       expect(destroy.stdout).toContain("manual leftovers");
       expect(destroy.stdout).toContain("pass --remove-shared-brain");
     } finally {
@@ -821,7 +875,7 @@ describe("braind write safety", () => {
         await Bun.sleep(100);
       }
       expect(html).toContain("Shared Brain");
-      expect(html).not.toContain("Valkyrie.md");
+      expect(html).not.toContain("Legacy-Control.md");
       expect(html).not.toContain("Local-Codex.md");
       expect(html).not.toContain("Shared-Brain-v1.md");
 
@@ -841,15 +895,16 @@ describe("braind write safety", () => {
 });
 
 describe("public release hygiene", () => {
-  test("public examples and bootstrap snippets contain no customer-zero identifiers", async () => {
+  test("public examples and bootstrap snippets contain no private or local identifiers", async () => {
     const roots = [
+      "AGENTS.md",
+      "apps",
       "examples",
-      "packages/client-bootstrap",
+      "packages",
       "infra/tailscale",
-      "docs/quickstart-single-node.md",
-      "docs/quickstart-control-worker.md",
-      "docs/quickstart-client-macos.md",
-      "README.md"
+      "docs",
+      "README.md",
+      "scripts"
     ];
     const files: string[] = [];
     for (const entry of roots) {
@@ -866,14 +921,58 @@ describe("public release hygiene", () => {
     }
     const offenders: string[] = [];
     for (const file of files) {
+      const relativeFile = file.slice(PRODUCT_ROOT.length + 1);
       const text = await readFile(file, "utf8");
-      for (const identifier of FORBIDDEN_PUBLIC_IDENTIFIERS) {
-        if (text.includes(identifier)) {
-          offenders.push(`${file}: ${identifier}`);
+      for (const { label, pattern } of FORBIDDEN_PUBLIC_PATTERNS) {
+        if (pattern.test(relativeFile)) {
+          offenders.push(`${relativeFile}: path contains ${label}`);
+        }
+        pattern.lastIndex = 0;
+        if (pattern.test(text)) {
+          offenders.push(`${relativeFile}: ${label}`);
         }
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  test("handoff script rejects unsafe timestamps and keeps safety fallbacks checked in", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainstack-handoff-safety-"));
+    let sentinel = "";
+    try {
+      await mkdir(join(dir, "scripts"), { recursive: true });
+      const scriptText = await readFile(join(PRODUCT_ROOT, "scripts", "handoff.sh"), "utf8");
+      const copiedScript = join(dir, "scripts", "handoff.sh");
+      await writeFile(copiedScript, scriptText);
+      await chmod(copiedScript, 0o755);
+      expectSuccess(runCommand(["git", "init"], { cwd: dir }));
+      expectSuccess(runCommand(["git", "config", "user.email", "test@example.invalid"], { cwd: dir }));
+      expectSuccess(runCommand(["git", "config", "user.name", "Test"], { cwd: dir }));
+      expectSuccess(runCommand(["git", "add", "scripts/handoff.sh"], { cwd: dir }));
+      expectSuccess(runCommand(["git", "commit", "-m", "fixture"], { cwd: dir }));
+
+      sentinel = join(dirname(dir), `${basename(dir)}-sentinel`);
+      await writeFile(sentinel, "keep");
+      const unsafe = runCommand(["bash", "scripts/handoff.sh", "--out", dir], {
+        cwd: dir,
+        env: { BRAINSTACK_HANDOFF_UTC: "x/../../sentinel" }
+      });
+      expect(unsafe.code).not.toBe(0);
+      expect(unsafe.stderr).toContain("BRAINSTACK_HANDOFF_UTC must match");
+      expect(await readFile(sentinel, "utf8")).toBe("keep");
+
+      expect(scriptText).toContain("[REDACTED ");
+      expect(scriptText).toContain("shasum -a 256");
+      expect(scriptText).toContain("openssl dgst -sha256");
+      expect(scriptText).toContain("BRAINSTACK_HANDOFF_LIVE_HOSTS");
+      expect(scriptText).toContain("BRAINSTACK_HANDOFF_INCLUDE_SHARED_BRAIN");
+      expect(scriptText).toContain("find \"$bundle_dir\" -type l");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      if (sentinel) {
+        await rm(sentinel, { force: true });
+      }
+    }
   });
 
   test("generated client bootstrap remains generic", async () => {
@@ -895,9 +994,10 @@ describe("public release hygiene", () => {
       const offenders: string[] = [];
       for (const file of files) {
         const text = await readFile(file, "utf8");
-        for (const identifier of FORBIDDEN_PUBLIC_IDENTIFIERS) {
-          if (text.includes(identifier)) {
-            offenders.push(`${file}: ${identifier}`);
+        for (const { label, pattern } of FORBIDDEN_PUBLIC_PATTERNS) {
+          pattern.lastIndex = 0;
+          if (pattern.test(text)) {
+            offenders.push(`${file}: ${label}`);
           }
         }
       }
@@ -1271,15 +1371,21 @@ describe("public release hygiene", () => {
         join(binDir, "brew"),
         "#!/usr/bin/env sh\nif [ \"${HOMEBREW_NO_AUTO_UPDATE:-}\" != \"1\" ]; then echo 'brew auto-update was not disabled' >&2; exit 42; fi\nprintf 'brew-pkg 1.0 -> 1.1\\n'\n"
       );
-      await writeFile(join(binDir, "pacman"), "#!/usr/bin/env sh\nprintf 'codex-cli 0.134.0-1 -> 0.135.0-1\\n'\n");
+      await writeFile(
+        join(binDir, "pacman"),
+        "#!/usr/bin/env sh\nif [ \"${PACMAN_FAIL:-}\" = \"1\" ]; then echo 'database read failed' >&2; exit 1; fi\nif [ \"${PACMAN_EMPTY:-}\" = \"1\" ]; then exit 1; fi\nprintf 'codex-cli 0.134.0-1 -> 0.135.0-1\\n'\n"
+      );
+      await writeFile(join(binDir, "sleepy-shell"), "#!/usr/bin/env sh\nsleep 5\n");
       await chmod(join(binDir, "codex"), 0o755);
       await chmod(join(binDir, "claude"), 0o755);
       await chmod(join(binDir, "brew"), 0o755);
       await chmod(join(binDir, "pacman"), 0o755);
+      await chmod(join(binDir, "sleepy-shell"), 0o755);
       await writeFixtureConfig(configPath);
       const result = runBrainctl(["updates", "--config", configPath], {
         PATH: `${binDir}:${process.env.PATH || ""}`,
-        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1"
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1",
+        BRAINSTACK_UPDATE_PROBE_COMMANDS: "brew,pacman"
       });
       expectSuccess(result);
       expect(result.stdout).toContain("brainstack_head=");
@@ -1291,6 +1397,91 @@ describe("public release hygiene", () => {
       expect(result.stdout).toContain("codex-cli 0.134.0-1 -> 0.135.0-1");
       expect(result.stdout).toContain("manual_update_commands:");
       expect(result.stdout).toContain("selected harness:");
+
+      const noUpdates = runBrainctl(["updates", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1",
+        BRAINSTACK_UPDATE_PROBE_COMMANDS: "brew,pacman",
+        PACMAN_EMPTY: "1"
+      });
+      expectSuccess(noUpdates);
+      expect(noUpdates.stdout).toContain("pacman -Qu:\n    ok\n    (none)");
+
+      const pacmanFailure = runBrainctl(["updates", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1",
+        BRAINSTACK_UPDATE_PROBE_COMMANDS: "brew,pacman",
+        PACMAN_FAIL: "1"
+      });
+      expectSuccess(pacmanFailure);
+      expect(pacmanFailure.stdout).toContain("pacman -Qu:\n    exit-1\n    database read failed");
+
+      await writeFile(join(binDir, "brew"), "#!/usr/bin/env sh\nsleep 5\n");
+      await chmod(join(binDir, "brew"), 0o755);
+      const timeout = runBrainctl(["updates", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1",
+        BRAINSTACK_UPDATE_PROBE_COMMANDS: "brew",
+        BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS: "100"
+      });
+      expectSuccess(timeout);
+      expect(timeout.stdout).toContain("brew outdated --quiet (HOMEBREW_NO_AUTO_UPDATE=1):\n    exit-124");
+      expect(timeout.stdout).toContain("timed out after 100ms");
+
+      const shellPathTimeout = runBrainctl(["updates", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        SHELL: join(binDir, "sleepy-shell"),
+        BRAINSTACK_SHELL_PATH_TIMEOUT_MS: "100",
+        BRAINSTACK_UPDATE_PROBE_COMMANDS: "pacman",
+        PACMAN_EMPTY: "1"
+      });
+      expectSuccess(shellPathTimeout);
+      expect(shellPathTimeout.stdout).toContain("pacman -Qu:\n    ok\n    (none)");
+
+      await writeFile(join(binDir, "codex"), "#!/usr/bin/env sh\nsleep 5\n");
+      await chmod(join(binDir, "codex"), 0o755);
+      const harnessTimeout = runBrainctl(["updates", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1",
+        BRAINSTACK_UPDATE_PROBE_COMMANDS: "none",
+        BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS: "100"
+      });
+      expectSuccess(harnessTimeout);
+      expect(harnessTimeout.stdout).toContain("codex=timed out after 100ms");
+      expect(harnessTimeout.stdout).toContain("FAIL codex-harness: timed out after 100ms; CLI compatibility probe timed out");
+
+      await writeFile(
+        join(binDir, "codex"),
+        [
+          "#!/usr/bin/env sh",
+          "if [ \"${1:-}\" = \"--version\" ]; then printf 'codex-cli partial\\n'; exit 0; fi",
+          "printf '%s\\n' '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check'",
+          "sleep 5",
+          ""
+        ].join("\n")
+      );
+      await chmod(join(binDir, "codex"), 0o755);
+      const partialHelpTimeout = runBrainctl(["updates", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1",
+        BRAINSTACK_UPDATE_PROBE_COMMANDS: "none",
+        BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS: "100"
+      });
+      expectSuccess(partialHelpTimeout);
+      expect(partialHelpTimeout.stdout).toContain("codex=codex-cli partial");
+      expect(partialHelpTimeout.stdout).toContain("FAIL codex-harness: codex-cli partial; CLI compatibility probe timed out");
+
+      await writeFile(join(binDir, "git"), "#!/usr/bin/env sh\nsleep 5\n");
+      await chmod(join(binDir, "git"), 0o755);
+      const gitTimeout = runBrainctl(["updates", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1",
+        BRAINSTACK_UPDATE_PROBE_COMMANDS: "none",
+        BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS: "100"
+      });
+      expectSuccess(gitTimeout);
+      expect(gitTimeout.stdout).toContain("brainstack_branch=unknown");
+      expect(gitTimeout.stdout).toContain("brainstack_head=unknown");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

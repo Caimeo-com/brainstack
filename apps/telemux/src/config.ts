@@ -35,10 +35,12 @@ export interface FactoryConfig {
   dashboardHost: string;
   dashboardPort: number;
   telegramBotToken: string;
+  telegramBotUsername: string | null;
   telegramControlChatId: number | null;
   allowedTelegramUserId: number;
   telegramPollTimeoutSeconds: number;
   cronPollIntervalSeconds: number;
+  workerRunTimeoutSeconds: number;
   localMachine: string;
   workers: FactoryWorkerConfig[];
   usageAdapter: string;
@@ -231,10 +233,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
     dashboardHost: env.FACTORY_DASHBOARD_HOST?.trim() || "127.0.0.1",
     dashboardPort: readNumber(env, "FACTORY_DASHBOARD_PORT", 8787),
     telegramBotToken: env.FACTORY_TELEGRAM_BOT_TOKEN?.trim() || "",
+    telegramBotUsername: env.FACTORY_TELEGRAM_BOT_USERNAME?.trim().replace(/^@/, "").toLowerCase() || null,
     telegramControlChatId: readOptionalNumber(env, "FACTORY_TELEGRAM_CONTROL_CHAT_ID"),
     allowedTelegramUserId: readNumber(env, "FACTORY_ALLOWED_TELEGRAM_USER_ID", 0),
     telegramPollTimeoutSeconds: readNumber(env, "FACTORY_TELEGRAM_POLL_TIMEOUT_SECONDS", 30),
     cronPollIntervalSeconds: readNumber(env, "FACTORY_CRON_POLL_INTERVAL_SECONDS", 30),
+    workerRunTimeoutSeconds: readNumber(env, "FACTORY_WORKER_RUN_TIMEOUT_SECONDS", 21600),
     localMachine,
     workers,
     usageAdapter: env.FACTORY_USAGE_ADAPTER?.trim() || "manual",

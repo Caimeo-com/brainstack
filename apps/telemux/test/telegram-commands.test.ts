@@ -322,6 +322,32 @@ test("getFile requests Telegram file metadata and downloadFile fetches the file 
     expect(calls[0]?.body).toContain("\"file_id\":\"abc123\"");
     expect(calls[1]?.url).toBe("https://api.telegram.org/file/bottest-token/photos/test.jpg");
     expect(calls[1]?.method).toBe("GET");
+
+    globalThis.fetch = (async () =>
+      new Response(new TextEncoder().encode("large body"), {
+        status: 200,
+        headers: {
+          "content-type": "application/octet-stream",
+          "content-length": "10"
+        }
+      })) as typeof fetch;
+    await expect(telegram.downloadFile("photos/large.jpg", 5)).rejects.toThrow("content-length");
+
+    globalThis.fetch = (async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("1234"));
+            controller.enqueue(new TextEncoder().encode("5678"));
+            controller.close();
+          }
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/octet-stream" }
+        }
+      )) as typeof fetch;
+    await expect(telegram.downloadFile("photos/stream.jpg", 5)).rejects.toThrow("exceeds 5 bytes");
   } finally {
     globalThis.fetch = originalFetch;
   }

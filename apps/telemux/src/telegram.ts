@@ -306,7 +306,7 @@ export class TelegramBot {
     });
   }
 
-  async downloadFile(filePath: string): Promise<Uint8Array> {
+  async downloadFile(filePath: string, maxBytes?: number): Promise<Uint8Array> {
     if (!this.isConfigured()) {
       throw new Error("telegram bot token is not configured");
     }
@@ -321,7 +321,43 @@ export class TelegramBot {
       throw new Error(`telegram file download failed with ${response.status}`);
     }
 
-    return new Uint8Array(await response.arrayBuffer());
+    const contentLength = Number(response.headers.get("content-length") || "0");
+    if (maxBytes !== undefined && Number.isFinite(contentLength) && contentLength > maxBytes) {
+      throw new Error(`telegram file download exceeds ${maxBytes} bytes by content-length`);
+    }
+
+    if (!response.body) {
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (maxBytes !== undefined && bytes.byteLength > maxBytes) {
+        throw new Error(`telegram file download exceeds ${maxBytes} bytes`);
+      }
+      return bytes;
+    }
+
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        break;
+      }
+      totalBytes += chunk.value.byteLength;
+      if (maxBytes !== undefined && totalBytes > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error(`telegram file download exceeds ${maxBytes} bytes`);
+      }
+      chunks.push(chunk.value);
+    }
+
+    const bytes = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes;
   }
 
   async getCommands(scope: TelegramBotCommandScope): Promise<TelegramBotCommand[]> {

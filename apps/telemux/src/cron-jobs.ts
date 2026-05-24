@@ -2,6 +2,7 @@ import type { CodexReasoningEffort } from "./codex-runtime";
 
 export type CronJobKind = "reminder" | "codex";
 export type CronWeekday = "sunday" | "monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday";
+export type CronJobRunner = "deterministic-update-check";
 
 export interface CronScheduleOnce {
   type: "once";
@@ -45,6 +46,7 @@ export interface CronJobRecord {
   id: string;
   label: string;
   kind: CronJobKind;
+  runner: CronJobRunner | null;
   enabled: boolean;
   schedule: CronSchedule;
   nextRunAt: string | null;
@@ -70,13 +72,14 @@ export interface CronRunRecord {
   scheduledFor: string | null;
   startedAt: string;
   finishedAt: string | null;
-  status: "queued" | "sent" | "dispatched" | "skipped" | "failed";
+  status: "claimed" | "queued" | "sent" | "dispatched" | "skipped" | "failed";
   note: string | null;
 }
 
 export interface CronJobDraft {
   label: string;
   kind: CronJobKind;
+  runner?: CronJobRunner | null;
   schedule: CronSchedule;
   executionContextSlug?: string | null;
   targetChatId?: number | null;
@@ -95,6 +98,7 @@ export interface CronJobSelector {
 
 export interface CronJobChanges {
   label?: string | null;
+  runner?: CronJobRunner | null;
   schedule?: CronSchedule | null;
   executionContextSlug?: string | null;
   targetChatId?: number | null;
@@ -579,15 +583,13 @@ function normalizeDraft(input: unknown): CronJobDraft {
   }
 
   const raw = input as Record<string, unknown>;
+  const scopedKeys = ["executionContextSlug", "targetChatId", "targetThreadId"].filter((key) => raw[key] !== undefined);
+  if (scopedKeys.length) {
+    throw new Error(`Cron manifest create actions cannot set scoped fields: ${scopedKeys.join(", ")}`);
+  }
   const label = typeof raw.label === "string" ? raw.label.trim() : "";
   const kind = raw.kind === "reminder" || raw.kind === "codex" ? raw.kind : null;
   const schedule = normalizeCronSchedule(raw.schedule);
-  const executionContextSlug =
-    typeof raw.executionContextSlug === "string" && raw.executionContextSlug.trim()
-      ? raw.executionContextSlug.trim()
-      : null;
-  const targetChatId = parseInteger(raw.targetChatId);
-  const targetThreadId = raw.targetThreadId === null ? null : parseInteger(raw.targetThreadId);
   const instruction = typeof raw.instruction === "string" && raw.instruction.trim() ? raw.instruction.trim() : null;
   const reminderText =
     typeof raw.reminderText === "string" && raw.reminderText.trim() ? raw.reminderText.trim() : null;
@@ -622,9 +624,6 @@ function normalizeDraft(input: unknown): CronJobDraft {
     label,
     kind,
     schedule,
-    executionContextSlug,
-    targetChatId,
-    targetThreadId,
     instruction,
     reminderText,
     modelOverride,
@@ -639,6 +638,10 @@ function normalizeChanges(input: unknown): CronJobChanges {
   }
 
   const raw = input as Record<string, unknown>;
+  const scopedKeys = ["executionContextSlug", "targetChatId", "targetThreadId"].filter((key) => raw[key] !== undefined);
+  if (scopedKeys.length) {
+    throw new Error(`Cron manifest update actions cannot change scoped fields: ${scopedKeys.join(", ")}`);
+  }
   const changes: CronJobChanges = {};
 
   if (raw.label !== undefined) {
@@ -647,6 +650,10 @@ function normalizeChanges(input: unknown): CronJobChanges {
 
   if (raw.schedule !== undefined) {
     changes.schedule = raw.schedule === null ? null : normalizeCronSchedule(raw.schedule);
+  }
+
+  if (raw.runner !== undefined) {
+    throw new Error("Cron manifest update actions cannot change runner");
   }
 
   if (raw.executionContextSlug !== undefined) {

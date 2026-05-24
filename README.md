@@ -1,6 +1,6 @@
 # brainstack
 
-`brainstack` is a Bun-first shared-brain and optional telemux/clawdex control-plane product.
+`brainstack` is a Bun-first shared-brain and optional telemux control-plane product.
 
 It packages:
 

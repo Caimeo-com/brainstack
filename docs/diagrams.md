@@ -1,6 +1,6 @@
 # Brainstack Diagrams
 
-These diagrams show the current customer-zero architecture without adding new services or hidden state.
+These diagrams show the current architecture without adding new services or hidden state.
 
 ## Shared-Brain Read, Write, And Outbox Flow
 
@@ -76,7 +76,7 @@ flowchart LR
   end
 
   subgraph WorkerSide[Worker side]
-    W1[yoda worker]
+    W1[worker host]
     C2[Worker local clone\n~/shared-brain]
     O2[Worker outbox]
   end

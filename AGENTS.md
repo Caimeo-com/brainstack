@@ -20,4 +20,4 @@ This repo contains the versioned product code for `brainstack`, not the canonica
 - Handoffs must include `CHANGES.txt` and `CLAIMS_AND_PROOF.md` so a fresh-context auditor can see the delta and the evidence map without reverse-engineering the tree.
 - Handoff bundles are review/audit artifacts, not releases. Do not include compiled binaries, `dist/`, `.git`, dependency trees, env files, private keys, tokens, caches, or Finder/macOS junk.
 - Use exactly one source representation in a handoff bundle. The checked-in script uses `source/` from `git archive HEAD`.
-- If Telegram delivery is requested on valkyrie, send the resulting zip through the existing telemux/Telegram path without printing secrets.
+- If Telegram delivery is requested on a control host, send the resulting zip through the existing telemux/Telegram path without printing secrets.

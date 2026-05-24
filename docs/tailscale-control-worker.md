@@ -146,7 +146,7 @@ git ls-remote operator@brain-control:/home/operator/shared-brain/bare/shared-bra
 
 If that works but `ssh operator@brain-control true` is denied by the guard, the read-only Git key is doing its job.
 
-## Caveats Found On Valkyrie/Erbine
+## Early-Operator Caveats
 
 - Saving a tailnet policy in the Tailscale dashboard is a control-plane change; it normally does not require restarting `tailscaled` on each device. Offline devices receive the policy when they reconnect.
 - `tailscale set --advertise-tags=...` can fail on some client versions even though `tailscale up --advertise-tags=...` works.

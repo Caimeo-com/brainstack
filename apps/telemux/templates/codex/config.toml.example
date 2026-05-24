@@ -6,7 +6,7 @@ model_reasoning_effort = "xhigh"
 [projects."/home/factory"]
 trust_level = "trusted"
 
-[projects."/home/factory/clawdex"]
+[projects."/home/factory/brainstack"]
 trust_level = "trusted"
 
 [notice]

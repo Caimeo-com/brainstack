@@ -1,6 +1,7 @@
 import type { CronJobDraft, CronSchedule } from "./cron-jobs";
 
 export type BuiltinRoutineName = "update-check" | "brain-curator" | "daily-checkin";
+export const DETERMINISTIC_UPDATE_CHECK_RUNNER = "deterministic-update-check";
 
 export interface BuiltinRoutineDefinition {
   name: BuiltinRoutineName;
@@ -24,24 +25,11 @@ function defaultTimezone(): string {
 
 function updateCheckInstruction(): string {
   return [
-    "Run Brainstack's built-in read-only update check.",
+    "Run Brainstack's deterministic built-in update check.",
     "",
-    "Rules:",
-    "- Do not install, upgrade, remove, reboot, restart, or mutate packages/services.",
-    "- Do not print tokens, raw env files, SSH keys, browser profiles, keyrings, or private state dumps.",
-    "- Report only versions, counts, package names, and manual commands. Redact anything secret-looking.",
+    "This built-in is executed by telemux directly, not by an LLM harness. It runs Brainstack's read-only `brainctl updates` path or a deterministic fallback probe, writes a report artifact, and posts a concise Telegram summary.",
     "",
-    "Checklist:",
-    "1. If `~/brainstack` exists, run `cd ~/brainstack && bun run packages/brainctl/src/main.ts updates --config ~/.config/brainstack/brainstack.yaml` and summarize the output.",
-    "2. Detect the OS package manager and run only read-only checks:",
-    "   - Homebrew: `HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew outdated --quiet`.",
-    "   - Arch/Omarchy: `pacman -Qu`; if `checkupdates` exists, include its count separately.",
-    "   - Debian/Ubuntu: `apt list --upgradable 2>/dev/null`.",
-    "   - Fedora/RHEL: `dnf --cacheonly check-update --quiet` and treat exit code 100 as updates available.",
-    "   - openSUSE: `zypper --no-refresh list-updates`.",
-    "3. Report configured and installed Codex/Claude versions, and whether Brainstack's required CLI surface appears present.",
-    "4. Write a concise markdown report under `reports/update-check-YYYYMMDD.md` and record it in `.factory/ARTIFACTS.md`.",
-    "5. End with manual next steps only. Never claim that anything was updated."
+    "Do not replace this instruction with package install, upgrade, remove, reboot, restart, or service mutation steps."
   ].join("\n");
 }
 
@@ -127,6 +115,10 @@ export function getBuiltinRoutine(value: string): BuiltinRoutineDefinition | nul
   return name ? ROUTINES.find((routine) => routine.name === name) || null : null;
 }
 
+export function isDeterministicRoutine(runner: string | null | undefined, name: BuiltinRoutineName): boolean {
+  return name === "update-check" && runner === DETERMINISTIC_UPDATE_CHECK_RUNNER;
+}
+
 export function builtinRoutineCommandToken(name: BuiltinRoutineName): string {
   return name.replaceAll("-", "_");
 }
@@ -157,6 +149,7 @@ export function builtinRoutineDraft(
   return {
     label: definition.label,
     kind: definition.kind,
+    runner: definition.name === "update-check" ? DETERMINISTIC_UPDATE_CHECK_RUNNER : null,
     schedule,
     executionContextSlug: contextSlug,
     instruction: definition.instruction || null,

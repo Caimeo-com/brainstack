@@ -1,4 +1,4 @@
-# Clawdex Publication Readiness
+# Telemux Publication Readiness
 
 ## Current status
 
@@ -6,7 +6,7 @@ This folder is already a git repository and already has a usable ignore policy f
 
 Intended public home:
 
-- `github.com/swader/clawdex`
+- `github.com/example/brainstack`
 
 Tracked today:
 
@@ -60,8 +60,8 @@ These can be done without breaking the current machine because they only affect 
 
 These are relevant to the system, but should not be committed with live values:
 
-- `~/clawdex/.env`
-- `~/clawdex/workers.json`
+- `~/.config/brainstack/telemux.env`
+- `~/.config/brainstack/workers.json`
 - `/srv/telemux/db.sqlite`
 - `/srv/telemux/contexts/`
 - `/srv/telemux/crons/`

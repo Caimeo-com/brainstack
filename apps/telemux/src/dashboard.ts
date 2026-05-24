@@ -129,7 +129,7 @@ export function startDashboard(config: FactoryConfig, db: FactoryDb, workers: Wo
             <meta charset="utf-8" />
             <meta name="viewport" content="width=device-width, initial-scale=1" />
             <meta http-equiv="refresh" content="15" />
-            <title>Private Dev Factory</title>
+            <title>Brainstack Telemux</title>
             <style>
               :root {
                 color-scheme: light;
@@ -181,7 +181,7 @@ export function startDashboard(config: FactoryConfig, db: FactoryDb, workers: Wo
           <body>
             <main>
               <div class="panel">
-                <h1>Private Dev Factory</h1>
+                <h1>Brainstack Telemux</h1>
                 <div class="meta">
                   <span>dashboard: ${escapeHtml(`${config.dashboardHost}:${config.dashboardPort}`)}</span>
                   <span>telegram: ${config.telegramBotToken ? "configured" : "missing token"}</span>

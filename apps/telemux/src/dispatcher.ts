@@ -133,6 +133,27 @@ export class Dispatcher {
     return this.activeJobs.has(slug);
   }
 
+  async withContextLock<T>(context: ContextRecord, run: () => Promise<T>): Promise<T> {
+    if (this.activeJobs.has(context.slug)) {
+      throw new Error(`${context.slug} already has an active job. Use /topicinfo or /tail.`);
+    }
+
+    let releaseLock: () => void = () => undefined;
+    const lock = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    this.activeJobs.set(context.slug, lock);
+
+    try {
+      return await run();
+    } finally {
+      if (this.activeJobs.get(context.slug) === lock) {
+        this.activeJobs.delete(context.slug);
+      }
+      releaseLock();
+    }
+  }
+
   async dispatch(
     mode: DispatchMode,
     context: ContextRecord,
@@ -162,27 +183,51 @@ export class Dispatcher {
       };
     }
 
-    await mkdir(this.config.logsDir, { recursive: true });
-    const logPath = resolve(this.config.logsDir, `${nowStamp()}-${context.slug}-${mode}.log`);
-
-    const savedContext = this.contexts.saveContext({
-      ...context,
-      latestRunLogPath: logPath,
-      lastRunAt: new Date().toISOString(),
-      lastError: null
+    let releaseLock: () => void = () => undefined;
+    const lock = new Promise<void>((resolve) => {
+      releaseLock = resolve;
     });
+    this.activeJobs.set(context.slug, lock);
 
-    const job = this.runJob(
-      mode,
-      savedContext,
-      trimmedInstruction,
-      replyTarget,
-      logPath,
-      options.telegramInput || null,
-      options
-    );
-    this.activeJobs.set(savedContext.slug, job);
-    void job.finally(() => this.activeJobs.delete(savedContext.slug));
+    let savedContext: ContextRecord;
+    let logPath: string;
+    try {
+      await mkdir(this.config.logsDir, { recursive: true });
+      logPath = resolve(this.config.logsDir, `${nowStamp()}-${context.slug}-${mode}.log`);
+
+      const currentBeforeAccept = this.db.getContextBySlug(context.slug) || context;
+      if (currentBeforeAccept.state === "archived") {
+        if (this.activeJobs.get(context.slug) === lock) {
+          this.activeJobs.delete(context.slug);
+        }
+        releaseLock();
+        return {
+          accepted: false,
+          message: `${context.slug} is archived. Rebind the topic or create a new context first.`
+        };
+      }
+
+      savedContext = this.contexts.saveContext({
+        ...currentBeforeAccept,
+        latestRunLogPath: logPath,
+        lastRunAt: new Date().toISOString(),
+        lastError: null
+      });
+    } catch (error) {
+      if (this.activeJobs.get(context.slug) === lock) {
+        this.activeJobs.delete(context.slug);
+      }
+      releaseLock();
+      throw error;
+    }
+
+    const job = this.runJob(mode, savedContext, trimmedInstruction, replyTarget, logPath, options.telegramInput || null, options);
+    void job.finally(() => {
+      if (this.activeJobs.get(savedContext.slug) === lock) {
+        this.activeJobs.delete(savedContext.slug);
+      }
+      releaseLock();
+    });
 
     return {
       accepted: true,
@@ -211,6 +256,10 @@ export class Dispatcher {
     try {
       const ensured = await this.workers.ensureContext(context);
       const freshContext = this.db.getContextBySlug(context.slug) || context;
+      if (freshContext.state === "archived") {
+        await this.telegram.sendText(replyTarget, `${freshContext.slug} was archived before the run started. No worker side effects were applied.`);
+        return;
+      }
 
       if (!ensured.ok) {
         const pendingOrError = this.contexts.saveContext({
@@ -240,8 +289,14 @@ export class Dispatcher {
         return;
       }
 
+      const currentBeforeReady = this.db.getContextBySlug(context.slug) || freshContext;
+      if (currentBeforeReady.state === "archived") {
+        await this.telegram.sendText(replyTarget, `${currentBeforeReady.slug} was archived before the run started. No worker side effects were applied.`);
+        return;
+      }
+
       const readyContext = this.contexts.saveContext({
-        ...freshContext,
+        ...currentBeforeReady,
         kind: ensured.kind,
         state: "active",
         transport: ensured.transport,
@@ -262,8 +317,16 @@ export class Dispatcher {
           preparedTelegramInput = await this.prepareTelegramInput(telegramInput);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          const currentAfterPreparationFailure = this.db.getContextBySlug(context.slug) || readyContext;
+          if (currentAfterPreparationFailure.state === "archived") {
+            await this.telegram.sendText(
+              replyTarget,
+              `${currentAfterPreparationFailure.slug} was archived while Telegram input was being prepared. No worker side effects were applied.`
+            );
+            return;
+          }
           this.contexts.saveContext({
-            ...readyContext,
+            ...currentAfterPreparationFailure,
             latestRunLogPath: logPath,
             lastRunAt: new Date().toISOString(),
             lastError: message
@@ -273,14 +336,23 @@ export class Dispatcher {
         }
       }
 
-      const prompt = buildPrompt(readyContext, mode, instruction, preparedTelegramInput?.promptSection || null);
-      const result = await this.workers.runCodex(readyContext, prompt, mode, logPath, {
+      const currentBeforeWorker = this.db.getContextBySlug(context.slug) || readyContext;
+      if (currentBeforeWorker.state === "archived") {
+        await this.telegram.sendText(replyTarget, `${currentBeforeWorker.slug} was archived before the worker started. No worker side effects were applied.`);
+        return;
+      }
+
+      const prompt = buildPrompt(currentBeforeWorker, mode, instruction, preparedTelegramInput?.promptSection || null);
+      const result = await this.workers.runCodex(currentBeforeWorker, prompt, mode, logPath, {
         workspaceFiles: preparedTelegramInput?.workspaceFiles,
         imagePaths: preparedTelegramInput?.imagePaths,
-        modelOverride: options.modelOverride ?? readyContext.modelOverride,
-        reasoningEffortOverride: options.reasoningEffortOverride ?? readyContext.reasoningEffortOverride,
+        modelOverride: options.modelOverride ?? currentBeforeWorker.modelOverride,
+        reasoningEffortOverride: options.reasoningEffortOverride ?? currentBeforeWorker.reasoningEffortOverride,
         onSessionId: async (sessionId) => {
-          const current = this.db.getContextBySlug(context.slug) || readyContext;
+          const current = this.db.getContextBySlug(context.slug) || currentBeforeWorker;
+          if (current.state === "archived") {
+            return;
+          }
           this.contexts.saveContext({
             ...current,
             codexSessionId: sessionId,
@@ -289,9 +361,16 @@ export class Dispatcher {
           });
         }
       });
-      const afterRunContext = this.db.getContextBySlug(context.slug) || readyContext;
+      const afterRunContext = this.db.getContextBySlug(context.slug) || currentBeforeWorker;
 
       if (result.ok) {
+        if (afterRunContext.state === "archived") {
+          await this.telegram.sendText(
+            replyTarget,
+            `${afterRunContext.slug} completed after it was archived. Completion side effects were skipped.`
+          );
+          return;
+        }
         const summary = await this.workers.readFactoryFile(afterRunContext, "SUMMARY.md");
         const artifacts = await this.workers.readFactoryFile(afterRunContext, "ARTIFACTS.md");
         const lastMessage = await this.workers.readWorkspaceFile(afterRunContext, ".factory/last-message.txt");
@@ -322,6 +401,14 @@ export class Dispatcher {
         await this.sendTelegramAttachments(saved, replyTarget, artifacts, attachmentManifest);
         await this.applyCronManifest(saved, replyTarget, cronManifest);
         await this.importRunNotesToBrain(saved, summary, artifacts);
+        return;
+      }
+
+      if (afterRunContext.state === "archived") {
+        await this.telegram.sendText(
+          replyTarget,
+          `${afterRunContext.slug} failed after it was archived. Context state was left archived.`
+        );
         return;
       }
 
@@ -457,7 +544,7 @@ export class Dispatcher {
         throw new Error(`Telegram did not return a downloadable path for ${attachment.kind}`);
       }
 
-      const bytes = await this.telegram.downloadFile(remoteFile.file_path);
+      const bytes = await this.telegram.downloadFile(remoteFile.file_path, TELEGRAM_MAX_INBOUND_FILE_BYTES);
       if (bytes.byteLength > TELEGRAM_MAX_INBOUND_FILE_BYTES) {
         throw new Error(`Downloaded Telegram file exceeds ${TELEGRAM_MAX_INBOUND_FILE_BYTES} bytes`);
       }

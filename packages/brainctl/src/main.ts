@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 type Profile = "single-node" | "control" | "worker" | "client-macos" | "private-journal";
+const SUPPORTED_PROFILES: Profile[] = ["single-node", "control", "worker", "client-macos"];
 type SeedMode = "empty-only" | "missing" | "force";
 type HarnessName = "codex" | "claude";
 type DestroyScope = "control" | "worker" | "client" | "all";
@@ -144,7 +145,7 @@ const ALLOWED_TOP_LEVEL_CONFIG_KEYS = new Set([
 function usage(): string {
   return `Usage:
   brainctl init --profile single-node|control|worker|client-macos --config brainstack.yaml [--dry-run] [--root /tmp/install-root] [--seed-missing|--force-seed]
-  brainctl provision --profile single-node|control|worker|client-macos [--out brainstack.yaml] [--harness codex|claude] [--enable-telemux] [--enroll-tailscale] [--tailscale-tag tag:brain] [--brain-base-url URL] [--brain-remote SSH_OR_PATH] [--test-bot]
+  brainctl provision --profile single-node|control|worker|client-macos [--out brainstack.yaml] [--harness codex|claude] [--harness-bin PATH_OR_NAME] [--enable-telemux] [--enroll-tailscale] [--tailscale-tag tag:brain] [--brain-base-url URL] [--brain-remote SSH_OR_PATH] [--test-bot]
   brainctl upgrade --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
   brainctl apply-runtime --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
   brainctl doctor --config brainstack.yaml [--profile ...] [--json] [--workers] [--deep]
@@ -546,6 +547,12 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
   validateRawConfig(raw);
   const schemaVersion = numberAt(raw, "schema_version", numberAt(raw, "config_version", CONFIG_SCHEMA_VERSION));
   const profile = (profileOverride || stringAt(raw, "profile", "single-node")) as Profile;
+  if (profile === "private-journal") {
+    throw new Error("Unsupported profile private-journal: first-class private journaling is not implemented yet. Use a separate explicit Brainstack install/config with separate repo paths and tokens.");
+  }
+  if (!SUPPORTED_PROFILES.includes(profile)) {
+    throw new Error(`Unsupported profile ${profile}; supported profiles are ${SUPPORTED_PROFILES.join("|")}`);
+  }
   const runtime = objectAt(raw, "runtime");
   const harness = objectAt(raw, "harness");
   const machine = objectAt(raw, "machine");
@@ -649,19 +656,22 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
   return cfg;
 }
 
-function run(args: string[], options: { cwd?: string; env?: Record<string, string>; check?: boolean } = {}) {
+function run(args: string[], options: { cwd?: string; env?: Record<string, string>; check?: boolean; timeoutMs?: number } = {}) {
   const proc = Bun.spawnSync(args, {
     cwd: options.cwd || process.cwd(),
     env: { ...process.env, ...(options.env || {}) },
     stdout: "pipe",
-    stderr: "pipe"
+    stderr: "pipe",
+    timeout: options.timeoutMs
   });
   const stdout = proc.stdout.toString();
-  const stderr = proc.stderr.toString();
-  if (options.check !== false && proc.exitCode !== 0) {
+  const timedOut = proc.exitCode === null;
+  const stderr = proc.stderr.toString() || (timedOut && options.timeoutMs ? `timed out after ${options.timeoutMs}ms` : "");
+  const code = timedOut ? 124 : proc.exitCode;
+  if (options.check !== false && code !== 0) {
     throw new Error(`${args.join(" ")} failed\n${stderr || stdout}`);
   }
-  return { code: proc.exitCode, stdout, stderr };
+  return { code, stdout, stderr, timedOut };
 }
 
 async function ensureDir(path: string): Promise<void> {
@@ -986,7 +996,7 @@ function defaultWorkers(cfg: BrainstackConfig): BrainstackWorkerConfig[] {
 }
 
 function runsBraind(cfg: BrainstackConfig): boolean {
-  return cfg.profile === "single-node" || cfg.profile === "control" || cfg.profile === "private-journal";
+  return cfg.profile === "single-node" || cfg.profile === "control";
 }
 
 function usesUserServices(cfg: BrainstackConfig): boolean {
@@ -1412,6 +1422,14 @@ function commandPath(name: string): string | null {
 
 let cachedUserShellPath: string | null | undefined;
 
+function userShellPathTimeoutMs(): number {
+  const raw = Number(process.env.BRAINSTACK_SHELL_PATH_TIMEOUT_MS || "");
+  if (Number.isFinite(raw) && raw > 0) {
+    return Math.min(raw, 30_000);
+  }
+  return 5_000;
+}
+
 function detectUserShellPath(): string | null {
   if (cachedUserShellPath !== undefined) return cachedUserShellPath;
   if (process.env.BRAINSTACK_SKIP_USER_PATH_RESOLVE) {
@@ -1427,17 +1445,16 @@ function detectUserShellPath(): string | null {
     cachedUserShellPath = null;
     return cachedUserShellPath;
   }
-  const script = [
-    "__brainstack_path=\"\"",
-    "if command -v timeout >/dev/null 2>&1; then",
-    `  __brainstack_path="$(timeout 5s ${shellSingleQuote(shell)} -lic 'printf "__BRAINSTACK_PATH__%s\\n" "$PATH"' 2>/dev/null | sed -n 's/.*__BRAINSTACK_PATH__//p' | tail -n 1)"`,
-    "else",
-    `  __brainstack_path="$(${shellSingleQuote(shell)} -lic 'printf "__BRAINSTACK_PATH__%s\\n" "$PATH"' 2>/dev/null | sed -n 's/.*__BRAINSTACK_PATH__//p' | tail -n 1)"`,
-    "fi",
-    "printf '%s\\n' \"$__brainstack_path\""
-  ].join("\n");
-  const proc = run(["bash", "-lc", script], { check: false });
-  cachedUserShellPath = proc.code === 0 && proc.stdout.trim() ? proc.stdout.trim().split(/\r?\n/).at(-1) || null : null;
+  const proc = run([shell, "-lic", 'printf "__BRAINSTACK_PATH__%s\\n" "$PATH"'], {
+    check: false,
+    timeoutMs: userShellPathTimeoutMs()
+  });
+  const marker = proc.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.includes("__BRAINSTACK_PATH__"))
+    .at(-1);
+  cachedUserShellPath = proc.code === 0 && marker ? marker.replace(/^.*__BRAINSTACK_PATH__/, "") || null : null;
   return cachedUserShellPath;
 }
 
@@ -1503,6 +1520,10 @@ function profileRequiresPasswordlessSudo(profile: Profile): boolean {
   return profile === "single-node" || profile === "control" || profile === "worker";
 }
 
+function provisionRequiresPasswordlessSudo(profile: Profile, args: ParsedArgs): boolean {
+  return profileRequiresPasswordlessSudo(profile) || hasFlag(args, "enroll-tailscale");
+}
+
 function ensureProvisionPrereqs(profile: Profile): Record<string, string> {
   const found: Record<string, string> = {};
   const missing: string[] = [];
@@ -1541,27 +1562,28 @@ async function promptHarnessChoice(codexPath: string, claudePath: string): Promi
 
 async function selectProvisionHarness(args: ParsedArgs): Promise<{ name: HarnessName; bin: string; discovered: Record<string, string | null> }> {
   const requested = flag(args, "harness");
+  const harnessBinOverride = flag(args, "harness-bin");
   const codexPath = whereisPath("codex");
   const claudePath = whereisPath("claude");
   const discovered = { codex: codexPath, claude: claudePath };
   if (requested) {
     const name = normalizeHarness(requested);
-    const bin = name === "codex" ? codexPath : claudePath;
+    const bin = harnessBinOverride || (name === "codex" ? codexPath : claudePath);
     if (!bin) {
       throw new Error(`provision blocked: requested harness ${name} is missing.\n${installHint(name)}`);
     }
     return { name, bin, discovered };
   }
   if (codexPath && !claudePath) {
-    return { name: "codex", bin: codexPath, discovered };
+    return { name: "codex", bin: harnessBinOverride || codexPath, discovered };
   }
   if (claudePath && !codexPath) {
-    return { name: "claude", bin: claudePath, discovered };
+    return { name: "claude", bin: harnessBinOverride || claudePath, discovered };
   }
   if (codexPath && claudePath) {
     if (process.stdin.isTTY && !hasFlag(args, "yes")) {
       const name = await promptHarnessChoice(codexPath, claudePath);
-      return { name, bin: name === "codex" ? codexPath : claudePath, discovered };
+      return { name, bin: harnessBinOverride || (name === "codex" ? codexPath : claudePath), discovered };
     }
     throw new Error("provision blocked: both Codex and Claude were found; pass --harness codex or --harness claude for non-interactive provisioning.");
   }
@@ -1673,8 +1695,9 @@ function discoveredMachineName(): string {
 }
 
 function buildProvisionConfig(profile: Profile, harness: { name: HarnessName; bin: string }, args: ParsedArgs): Record<string, unknown> {
+  const rootOverride = flag(args, "root") ? abs(flag(args, "root")!) : null;
   const user = process.env.USER || "operator";
-  const home = process.env.HOME || `/home/${user}`;
+  const home = rootOverride ? join(rootOverride, "home") : process.env.HOME || `/home/${user}`;
   const machineName = flag(args, "machine") || discoveredMachineName();
   const role = flag(args, "role") || profile;
   const publicBaseUrl = flag(args, "brain-base-url") || flag(args, "public-base-url") || "";
@@ -1692,9 +1715,12 @@ function buildProvisionConfig(profile: Profile, harness: { name: HarnessName; bi
     schema_version: CONFIG_SCHEMA_VERSION,
     profile,
     runtime: {
-      bunBin: whereisPath("bun") || "bun"
+      bunBin: flag(args, "bun-bin") || "bun"
     },
-    harness,
+    harness: {
+      name: harness.name,
+      bin: flag(args, "harness-bin") || harness.name
+    },
     machine: {
       name: machineName,
       user,
@@ -1705,11 +1731,11 @@ function buildProvisionConfig(profile: Profile, harness: { name: HarnessName; bi
     paths: {
       home,
       productRepo: "~/brainstack",
-      sharedBrainRoot: "~/shared-brain",
-      privateBrainRoot: "~/private-brain",
-      stateRoot: "~/.local/state/brainstack",
-      configRoot: "~/.config/brainstack",
-      systemdUserRoot: "~/.config/systemd/user"
+      sharedBrainRoot: rootOverride ? join(rootOverride, "shared-brain") : "~/shared-brain",
+      privateBrainRoot: rootOverride ? join(rootOverride, "private-brain") : "~/private-brain",
+      stateRoot: rootOverride ? join(rootOverride, "state") : "~/.local/state/brainstack",
+      configRoot: rootOverride ? join(rootOverride, "config") : "~/.config/brainstack",
+      systemdUserRoot: rootOverride ? join(rootOverride, "systemd-user") : "~/.config/systemd/user"
     },
     brain: {
       bind: "127.0.0.1",
@@ -1753,9 +1779,17 @@ async function commandProvision(args: ParsedArgs): Promise<void> {
   if (!["single-node", "control", "worker", "client-macos"].includes(profile)) {
     throw new Error("provision supports --profile single-node|control|worker|client-macos");
   }
+  if (flag(args, "config") && !flag(args, "out")) {
+    throw new Error("provision writes a new config with --out; --config is used by commands that read an existing config");
+  }
   const found = ensureProvisionPrereqs(profile);
   const selectedHarness = await selectProvisionHarness(args);
-  if (profileRequiresPasswordlessSudo(profile)) {
+  const enrollTailscale = hasFlag(args, "enroll-tailscale");
+  const authKeyEnv = flag(args, "tailscale-auth-key-env") || "TAILSCALE_AUTH_KEY";
+  if (enrollTailscale && !process.env[authKeyEnv]) {
+    throw new Error(`provision blocked: --enroll-tailscale requires ${authKeyEnv} in env`);
+  }
+  if (provisionRequiresPasswordlessSudo(profile, args)) {
     ensurePasswordlessSudo();
   }
   if (profileRequiresPasswordlessSudo(profile) && !hasFlag(args, "skip-harness-sudo-test")) {
@@ -1770,11 +1804,7 @@ async function commandProvision(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(out, profile);
   await ensureDir(cfg.paths.configRoot);
   await writeManagedManifest(cfg);
-  if (hasFlag(args, "enroll-tailscale")) {
-    const authKeyEnv = flag(args, "tailscale-auth-key-env") || "TAILSCALE_AUTH_KEY";
-    if (!process.env[authKeyEnv]) {
-      throw new Error(`provision blocked: --enroll-tailscale requires ${authKeyEnv} in env`);
-    }
+  if (enrollTailscale) {
     const tailscale = objectAt(config, "tailscale");
     const machine = objectAt(config, "machine");
     const paths = objectAt(config, "paths");
@@ -1784,8 +1814,8 @@ async function commandProvision(args: ParsedArgs): Promise<void> {
   }
   console.log(`provision config written: ${out}`);
   console.log(`ownership manifest written: ${managedManifestPath(cfg)}`);
-  console.log(`detected tools: ${Object.entries(found).map(([name, path]) => `${name}=${path}`).join(" ")}`);
-  console.log(`selected harness: ${selectedHarness.name} (${selectedHarness.bin})`);
+  console.log(`detected tools: ${Object.entries(found).map(([name]) => `${name}=present`).join(" ")}`);
+  console.log(`selected harness: ${selectedHarness.name} (config bin: ${flag(args, "harness-bin") || selectedHarness.name})`);
   console.log("next:");
   console.log(`  brainctl init --profile ${profile} --config ${out}`);
   if (profile === "single-node" || profile === "control") {
@@ -1978,26 +2008,58 @@ function commandOk(name: string): boolean {
   return commandPath(name) !== null;
 }
 
-function commandVersion(name: string): string {
+interface CommandProbe {
+  text: string;
+  code: number;
+  timedOut: boolean;
+}
+
+function firstProbeLine(stdout: string, stderr: string): string {
+  return (stdout || stderr).trim().split(/\r?\n/)[0] || "unknown";
+}
+
+function commandVersionProbe(name: string): CommandProbe {
   const executable = commandPath(name) || name;
   const proc =
     name === "ssh"
-      ? run([executable, "-V"], { check: false, env: userShellPathEnv() })
-      : run([executable, "--version"], { check: false, env: userShellPathEnv() });
-  return (proc.stdout || proc.stderr).trim().split(/\r?\n/)[0] || "unknown";
+      ? run([executable, "-V"], { check: false, env: userShellPathEnv(), timeoutMs: updateProbeTimeoutMs() })
+      : run([executable, "--version"], { check: false, env: userShellPathEnv(), timeoutMs: updateProbeTimeoutMs() });
+  return {
+    text: proc.timedOut ? proc.stderr || `timed out after ${updateProbeTimeoutMs()}ms` : firstProbeLine(proc.stdout, proc.stderr),
+    code: proc.code,
+    timedOut: proc.timedOut
+  };
 }
 
-function commandHelp(name: string, args: string[] = ["--help"]): string {
-  const proc = run([commandPath(name) || name, ...args], { check: false, env: userShellPathEnv() });
-  return `${proc.stdout}\n${proc.stderr}`;
+function commandVersion(name: string): string {
+  return commandVersionProbe(name).text;
 }
 
-function harnessCompatibility(name: HarnessName, bin: string): DoctorCheck {
+function commandHelpProbe(name: string, args: string[] = ["--help"]): CommandProbe {
+  const proc = run([commandPath(name) || name, ...args], { check: false, env: userShellPathEnv(), timeoutMs: updateProbeTimeoutMs() });
+  return {
+    text: `${proc.stdout}\n${proc.stderr}`,
+    code: proc.code,
+    timedOut: proc.timedOut
+  };
+}
+
+function harnessCompatibility(name: HarnessName, bin: string, options: { required?: boolean } = {}): DoctorCheck {
+  const requiredHarness = options.required ?? true;
+  const failureStatus: CheckStatus = requiredHarness ? "FAIL" : "WARN";
   if (!commandOk(bin)) {
-    return check("FAIL", "versions", `${name}-harness`, `${bin} not found in PATH`, installHint(name));
+    return check(failureStatus, "versions", `${name}-harness`, `${bin} not found in PATH`, requiredHarness ? installHint(name) : undefined);
   }
-  const version = commandVersion(bin);
-  const help = name === "codex" ? commandHelp(bin, ["exec", "--help"]) : commandHelp(bin, ["--help"]);
+  const versionProbe = commandVersionProbe(bin);
+  const helpProbe = name === "codex" ? commandHelpProbe(bin, ["exec", "--help"]) : commandHelpProbe(bin, ["--help"]);
+  const version = versionProbe.text;
+  if (versionProbe.timedOut || helpProbe.timedOut) {
+    return check(failureStatus, "versions", `${name}-harness`, `${version}; CLI compatibility probe timed out`, `Update ${name} manually, then rerun doctor. ${installHint(name)}`);
+  }
+  if (helpProbe.code !== 0) {
+    return check(failureStatus, "versions", `${name}-harness`, `${version}; CLI help probe exited ${helpProbe.code}`, `Update ${name} manually, then rerun doctor. ${installHint(name)}`);
+  }
+  const help = helpProbe.text;
   const required =
     name === "codex"
       ? ["--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"]
@@ -2005,7 +2067,7 @@ function harnessCompatibility(name: HarnessName, bin: string): DoctorCheck {
   const missing = required.filter((needle) => !help.includes(needle));
   if (missing.length) {
     return check(
-      "FAIL",
+      failureStatus,
       "versions",
       `${name}-harness`,
       `${version}; missing required CLI surface: ${missing.join(", ")}`,
@@ -2550,6 +2612,26 @@ function summarizeLines(text: string, maxLines = 40): string {
   return shown.join("\n");
 }
 
+function updateProbeTimeoutMs(): number {
+  const raw = Number(process.env.BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS || "");
+  if (Number.isFinite(raw) && raw > 0) {
+    return Math.min(raw, 120_000);
+  }
+  return 20_000;
+}
+
+function updateProbeAllowed(command: string): boolean {
+  const allowlist = process.env.BRAINSTACK_UPDATE_PROBE_COMMANDS?.trim();
+  if (!allowlist) {
+    return true;
+  }
+  return allowlist
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .includes(command);
+}
+
 function updateProbe(
   command: string,
   args: string[],
@@ -2557,15 +2639,15 @@ function updateProbe(
   envOverrides: Record<string, string> = {},
   label: string | null = null
 ): { label: string; code: number; output: string } | null {
+  if (!updateProbeAllowed(command)) {
+    return null;
+  }
   const executable = commandPath(command);
   if (!executable) {
     return null;
   }
-  const timeoutBin = commandPath("timeout");
   const env = { ...userShellPathEnv(), ...envOverrides };
-  const proc = timeoutBin
-    ? run([timeoutBin, "20s", executable, ...args], { check: false, env })
-    : run([executable, ...args], { check: false, env });
+  const proc = run([executable, ...args], { check: false, env, timeoutMs: updateProbeTimeoutMs() });
   const output = `${proc.stdout}${proc.stderr ? `\n${proc.stderr}` : ""}`.trim();
   const status = okCodes.includes(proc.code) ? "ok" : `exit-${proc.code}`;
   return {
@@ -2573,6 +2655,20 @@ function updateProbe(
     code: proc.code,
     output: `${status}\n${summarizeLines(output)}`
   };
+}
+
+function pacmanUpdateProbe(): { label: string; code: number; output: string } | null {
+  const probe = updateProbe("pacman", ["-Qu"], [0]);
+  if (!probe) {
+    return null;
+  }
+  if (probe.code === 1 && probe.output === "exit-1\n(none)") {
+    return {
+      ...probe,
+      output: "ok\n(none)"
+    };
+  }
+  return probe;
 }
 
 function collectOsUpdateProbes(): Array<{ label: string; code: number; output: string }> {
@@ -2594,28 +2690,36 @@ function collectOsUpdateProbes(): Array<{ label: string; code: number; output: s
       "brew outdated --quiet (HOMEBREW_NO_AUTO_UPDATE=1)"
     )
   );
-  add(updateProbe("pacman", ["-Qu"], [0, 1]));
+  add(pacmanUpdateProbe());
   add(updateProbe("checkupdates", []));
   add(updateProbe("apt", ["list", "--upgradable"]));
+  // dnf exits 100 when updates are available; that is a successful read-only probe.
   add(updateProbe("dnf", ["--cacheonly", "check-update", "--quiet"], [0, 100]));
   add(updateProbe("zypper", ["--no-refresh", "list-updates"]));
   return probes;
 }
 
+function gitUpdateProbe(args: string[]): ReturnType<typeof run> {
+  return run(["git", ...args], { cwd: PRODUCT_ROOT, check: false, timeoutMs: updateProbeTimeoutMs() });
+}
+
 async function commandUpdates(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
-  const branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd: PRODUCT_ROOT, check: false }).stdout.trim() || "unknown";
-  const head = run(["git", "rev-parse", "HEAD"], { cwd: PRODUCT_ROOT, check: false }).stdout.trim() || "unknown";
+  const branch = gitUpdateProbe(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.trim() || "unknown";
+  const head = gitUpdateProbe(["rev-parse", "HEAD"]).stdout.trim() || "unknown";
   const remoteCandidates = ["origin/main", "refs/remotes/https-main"];
   const remoteRef =
-    remoteCandidates.find((candidate) => run(["git", "rev-parse", "--verify", candidate], { cwd: PRODUCT_ROOT, check: false }).code === 0) || null;
-  const origin = remoteRef ? run(["git", "rev-parse", "--verify", remoteRef], { cwd: PRODUCT_ROOT, check: false }).stdout.trim() : "";
+    remoteCandidates.find((candidate) => gitUpdateProbe(["rev-parse", "--verify", candidate]).code === 0) || null;
+  const origin = remoteRef ? gitUpdateProbe(["rev-parse", "--verify", remoteRef]).stdout.trim() : "";
   const aheadBehind = remoteRef
-    ? run(["git", "rev-list", "--left-right", "--count", `HEAD...${remoteRef}`], { cwd: PRODUCT_ROOT, check: false }).stdout.trim()
+    ? gitUpdateProbe(["rev-list", "--left-right", "--count", `HEAD...${remoteRef}`]).stdout.trim()
     : "unknown";
   const codex = commandOk("codex") ? commandVersion("codex") : "missing";
   const claude = commandOk("claude") ? commandVersion("claude") : "missing";
-  const compat = [harnessCompatibility("codex", "codex"), harnessCompatibility("claude", "claude")];
+  const compat = [
+    harnessCompatibility("codex", "codex", { required: cfg.harness.name === "codex" }),
+    harnessCompatibility("claude", "claude", { required: cfg.harness.name === "claude" })
+  ];
   console.log(`brainstack_branch=${branch}`);
   console.log(`brainstack_head=${head}`);
   console.log(`origin_main=${origin || "unavailable"}`);
@@ -2809,11 +2913,12 @@ async function commandDestroy(args: ParsedArgs): Promise<void> {
   const removed: string[] = [];
   const skipped: string[] = [];
   const manual: string[] = [];
+  const hasOwnershipManifest = existsSync(managedManifestPath(cfg));
   const manifest = await loadManagedManifest(cfg);
   const bootstrapRoot = join(cfg.paths.configRoot, "client-bootstrap");
   const bootstrapFiles = clientBootstrapFiles(cfg);
 
-  if ((scope === "all" || scope === "control") && !dryRun && commandPath("systemctl")) {
+  if (hasOwnershipManifest && (scope === "all" || scope === "control") && !dryRun && commandPath("systemctl")) {
     if (runsBraind(cfg)) {
       run(["systemctl", "--user", "disable", "--now", "braind.service"], { check: false });
     }
@@ -2860,6 +2965,10 @@ async function commandDestroy(args: ParsedArgs): Promise<void> {
 
   for (const artifact of artifacts) {
     if (artifact.kind === "tailscale-serve") {
+      continue;
+    }
+    if (!hasOwnershipManifest) {
+      skipped.push(`${artifact.path} (ownership manifest missing; inferred artifact not removed)`);
       continue;
     }
     await removePath(artifact.path, dryRun, removed);

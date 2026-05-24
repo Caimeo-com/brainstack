@@ -1,8 +1,8 @@
 # Provenance
 
-`apps/braind/src/server.ts` was copied from the customer-zero shared-brain app during the initial productization pass.
+`apps/braind/src/server.ts` was copied from an earlier shared-brain codebase during the initial productization pass.
 
-`apps/braind/src/brain-lib.ts` was copied from the customer-zero shared-brain tool library.
+`apps/braind/src/brain-lib.ts` was copied from the original shared-brain tool library.
 
 Product changes after copy:
 

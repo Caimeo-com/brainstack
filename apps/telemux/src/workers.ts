@@ -3,7 +3,7 @@ import { dirname } from "node:path";
 import type { CodexReasoningEffort } from "./codex-runtime";
 import { FactoryConfig, FactoryWorkerConfig, HarnessName } from "./config";
 import { ContextKind, ContextRecord, ContextState, FactoryDb, WorkerRecord } from "./db";
-import { TELEGRAM_ATTACHMENTS_WORKSPACE_PATH } from "./telegram-attachments";
+import { isProtectedArtifactPath, TELEGRAM_ATTACHMENTS_WORKSPACE_PATH } from "./telegram-attachments";
 
 export interface WorkerExecResult {
   ok: boolean;
@@ -176,8 +176,7 @@ function buildWorkspaceSeedScript(files: WorkspaceSeedFile[]): string {
       const marker = `__CODEX_WORKSPACE_FILE_${index}__`;
 
       return [
-        `mkdir -p ${quoteSh(dirname(safePath))}`,
-        `cat <<'${marker}' | brainstack_base64_decode > ${quoteSh(safePath)}`,
+        `cat <<'${marker}' | brainstack_base64_decode | brainstack_safe_write_file ${quoteSh(safePath)}`,
         encoded,
         marker
       ].join("\n");
@@ -378,9 +377,10 @@ prompt_b64=${quoteSh(promptBase64)}
 resume_session=${quoteSh(resumeSessionId)}
 harness=${quoteSh(harness.family)}
 harness_bin=${quoteSh(harness.bin)}
+max_runtime_seconds=${quoteSh(String(this.config.workerRunTimeoutSeconds))}
 ${worker.transport === "local" ? workerUserPathPrelude() : ""}
 worktree="$(expand_home_path "$worktree_raw")"
-launcher_dir="$(mktemp -d "\${TMPDIR:-/tmp}/clawdex-run.XXXXXX")"
+launcher_dir="$(mktemp -d "\${TMPDIR:-/tmp}/brainstack-run.XXXXXX")"
 prompt_file="$launcher_dir/control-plane.prompt.md"
 runner_file="$launcher_dir/run-harness.sh"
 
@@ -388,18 +388,39 @@ cleanup() {
   rm -rf "$launcher_dir"
 }
 
+kill_process_tree() {
+  target_pid="$1"
+  target_signal="$2"
+  if command -v pgrep >/dev/null 2>&1; then
+    for child_pid in $(pgrep -P "$target_pid" 2>/dev/null || true); do
+      kill_process_tree "$child_pid" "$target_signal"
+    done
+  fi
+  kill "-$target_signal" "$target_pid" 2>/dev/null || true
+}
+
 terminate_harness_run() {
+  if [ -z "\${harness_pid:-}" ]; then
+    return
+  fi
   if [ -n "\${harness_pgid:-}" ]; then
     kill -TERM -- "-$harness_pgid" 2>/dev/null || true
   fi
+  kill_process_tree "$harness_pid" TERM
   if command -v pkill >/dev/null 2>&1; then
     pkill -TERM -P "$harness_pid" 2>/dev/null || true
   fi
   kill "$harness_pid" 2>/dev/null || true
-  sleep 1
+  for _brainstack_wait in 1 2; do
+    if ! kill -0 "$harness_pid" 2>/dev/null; then
+      return
+    fi
+    sleep 1
+  done
   if [ -n "\${harness_pgid:-}" ] && kill -0 -- "-$harness_pgid" 2>/dev/null; then
     kill -KILL -- "-$harness_pgid" 2>/dev/null || true
   fi
+  kill_process_tree "$harness_pid" KILL
   if command -v pkill >/dev/null 2>&1; then
     pkill -KILL -P "$harness_pid" 2>/dev/null || true
   fi
@@ -408,7 +429,14 @@ terminate_harness_run() {
   fi
 }
 
+handle_wrapper_signal() {
+  terminate_harness_run
+  cleanup
+  exit 124
+}
+
 trap cleanup EXIT
+trap handle_wrapper_signal TERM INT HUP
 
 if ! command -v "$harness_bin" >/dev/null 2>&1; then
   echo "$harness binary not found on worker: $harness_bin" >&2
@@ -416,27 +444,73 @@ if ! command -v "$harness_bin" >/dev/null 2>&1; then
 fi
 
 printf '%s' "$prompt_b64" | brainstack_base64_decode > "$prompt_file"
-cat > "$runner_file" <<'__CLAWDEX_RUNNER__'
+cat > "$runner_file" <<'__BRAINSTACK_RUNNER__'
 set -euo pipefail
 ${base64DecodeShellFunction()}
 ${codexModelArgScript}
 ${claudeArgScript}
 image_args=()
 cd "$worktree"
+worktree_real="$(pwd -P)"
+
+brainstack_safe_parent_real() {
+  safe_path="$1"
+  target_path="$worktree_real/$safe_path"
+  target_parent="$(dirname "$target_path")"
+  mkdir -p "$target_parent"
+  parent_real="$(cd "$target_parent" && pwd -P)"
+  case "$parent_real/" in
+    "$worktree_real"/*) printf '%s\\n' "$parent_real" ;;
+    *) echo "workspace path escaped worktree: $safe_path" >&2; return 1 ;;
+  esac
+}
+
+brainstack_safe_write_file() {
+  safe_path="$1"
+  parent_real="$(brainstack_safe_parent_real "$safe_path")"
+  target_path="$worktree_real/$safe_path"
+  if [ -L "$target_path" ]; then
+    echo "workspace write refused symlink target: $safe_path" >&2
+    return 1
+  fi
+  tmp_file="$(mktemp "$parent_real/.brainstack-write.XXXXXX")"
+  trap 'rm -f "$tmp_file"' RETURN
+  cat > "$tmp_file"
+  mv -f "$tmp_file" "$target_path"
+  trap - RETURN
+}
+
+brainstack_safe_remove_file() {
+  safe_path="$1"
+  parent_real="$(brainstack_safe_parent_real "$safe_path")"
+  target_path="$worktree_real/$safe_path"
+  case "$target_path" in
+    "$parent_real"/*) rm -f -- "$target_path" ;;
+    *) echo "workspace remove escaped worktree: $safe_path" >&2; return 1 ;;
+  esac
+}
+
 mkdir -p .factory
-rm -f ${quoteSh(TELEGRAM_ATTACHMENTS_WORKSPACE_PATH)}
-cp "$prompt_file" .factory/control-plane.prompt.md
+brainstack_safe_remove_file ${quoteSh(TELEGRAM_ATTACHMENTS_WORKSPACE_PATH)}
+brainstack_safe_write_file .factory/control-plane.prompt.md < "$prompt_file"
 ${workspaceSeedScript}
 ${codexImageArgScript}
 
+last_message_tmp="$(mktemp "\${TMPDIR:-/tmp}/brainstack-last-message.XXXXXX")"
+trap 'rm -f "$last_message_tmp"' EXIT
 if [ "$harness" = "claude" ]; then
-  exec "$harness_bin" "\${claude_args[@]}" < "$prompt_file" | tee .factory/last-message.txt
+  set +e
+  "$harness_bin" "\${claude_args[@]}" < "$prompt_file" | tee "$last_message_tmp"
+  status=\${PIPESTATUS[0]}
+  set -e
+  brainstack_safe_write_file .factory/last-message.txt < "$last_message_tmp"
+  exit "$status"
 else
   codex_args=("$harness_bin" exec)
   if ${shouldResume ? "true" : "false"}; then
     codex_args+=(resume)
   fi
-  codex_args+=(--json --output-last-message .factory/last-message.txt --dangerously-bypass-approvals-and-sandbox)
+  codex_args+=(--json --output-last-message "$last_message_tmp" --dangerously-bypass-approvals-and-sandbox)
   if ((\${#model_args[@]})); then
     codex_args+=("\${model_args[@]}")
   fi
@@ -447,9 +521,16 @@ else
     codex_args+=("$resume_session")
   fi
   codex_args+=(-)
-  exec "\${codex_args[@]}" < "$prompt_file"
+  set +e
+  "\${codex_args[@]}" < "$prompt_file"
+  status=$?
+  set -e
+  if [ -s "$last_message_tmp" ]; then
+    brainstack_safe_write_file .factory/last-message.txt < "$last_message_tmp"
+  fi
+  exit "$status"
 fi
-__CLAWDEX_RUNNER__
+__BRAINSTACK_RUNNER__
 chmod +x "$runner_file"
 export worktree prompt_file resume_session harness harness_bin
 
@@ -463,11 +544,20 @@ else
   harness_pgid=""
 fi
 
+run_started_at="$(date +%s)"
 while kill -0 "$harness_pid" 2>/dev/null; do
+  if [ "$max_runtime_seconds" -gt 0 ]; then
+    now_seconds="$(date +%s)"
+    if [ $((now_seconds - run_started_at)) -ge "$max_runtime_seconds" ]; then
+      echo "harness run timed out after \${max_runtime_seconds}s" >&2
+      terminate_harness_run
+      exit 124
+    fi
+  fi
+
   if [ ! -d "$worktree" ]; then
     echo "worktree disappeared during harness run: $worktree" >&2
     terminate_harness_run
-    wait "$harness_pid" || true
     exit 88
   fi
 
@@ -477,9 +567,23 @@ done
 wait "$harness_pid"
 `;
 
+    const currentBeforeLaunch = this.db.getContextBySlug(context.slug);
+    if (currentBeforeLaunch?.state === "archived") {
+      return {
+        ok: false,
+        host: worker.name,
+        transport: worker.transport,
+        exitCode: 89,
+        stdout: "",
+        stderr: `context archived before harness launch: ${context.slug}`,
+        durationMs: 0,
+        commandLabel: harness.family
+      };
+    }
+
     let stdoutBuffer = "";
     let seenSessionId: string | null = null;
-    const result = await this.runWorkerScript(worker, script, logPath, undefined, async (chunk) => {
+    const result = await this.runWorkerScript(worker, script, logPath, this.config.workerRunTimeoutSeconds, async (chunk) => {
       stdoutBuffer += chunk;
       const detected = parseSessionId(stdoutBuffer);
       if (detected && detected !== seenSessionId) {
@@ -491,6 +595,165 @@ wait "$harness_pid"
     return {
       ...result,
       sessionId: seenSessionId || parseSessionId(result.stdout) || context.codexSessionId || null
+    };
+  }
+
+  async runUpdateCheck(context: ContextRecord, logPath?: string): Promise<WorkerExecResult & { reportPath: string | null }> {
+    const worker = this.requireWorker(context.machine);
+    const productRoot = worker.localExecution ? this.config.projectRoot : "~/brainstack";
+    const script = `
+set -euo pipefail
+expand_home_path() {
+  case "$1" in
+    "~") printf '%s\\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
+    *) printf '%s\\n' "$1" ;;
+  esac
+}
+
+run_readonly() {
+  per_command_timeout="\${BRAINSTACK_UPDATE_PROBE_TIMEOUT_SECONDS:-20}"
+  printf '\\n$ %s\\n' "$*"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$per_command_timeout" "$@" 2>&1 || printf 'exit=%s\\n' "$?"
+    return
+  fi
+  "$@" > >(cat) 2> >(cat >&2) &
+  probe_pid=$!
+  elapsed=0
+  while kill -0 "$probe_pid" 2>/dev/null; do
+    if [ "$elapsed" -ge "$per_command_timeout" ]; then
+      kill "$probe_pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$probe_pid" 2>/dev/null || true
+      wait "$probe_pid" 2>/dev/null || true
+      printf 'exit=124\\n'
+      return
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  wait "$probe_pid" 2>&1 || printf 'exit=%s\\n' "$?"
+}
+
+worktree="$(expand_home_path ${quoteSh(context.worktreePath)})"
+product_root="$(expand_home_path ${quoteSh(productRoot)})"
+config_path="$(expand_home_path ~/.config/brainstack/brainstack.yaml)"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+report=".factory/reports/update-check-$stamp.md"
+cd "$worktree"
+worktree_real="$(pwd -P)"
+if [ -L .factory ]; then
+  echo "refusing symlinked .factory directory" >&2
+  exit 46
+fi
+mkdir -p .factory
+factory_real="$(cd .factory && pwd -P)"
+case "$factory_real" in
+  "$worktree_real/.factory") ;;
+  *) echo ".factory escapes worktree" >&2; exit 46 ;;
+esac
+if [ -L .factory/reports ]; then
+  echo "refusing symlinked .factory/reports directory" >&2
+  exit 46
+fi
+mkdir -p .factory/reports
+reports_real="$(cd .factory/reports && pwd -P)"
+case "$reports_real" in
+  "$factory_real/reports") ;;
+  *) echo ".factory/reports escapes worktree" >&2; exit 46 ;;
+esac
+report_path="$reports_real/update-check-$stamp.md"
+tmp_report="$(mktemp "$reports_real/.update-check.XXXXXX")"
+cleanup_update_check() {
+  rm -f "$tmp_report"
+  if [ -n "\${artifact_lock_dir:-}" ] && [ -d "$artifact_lock_dir" ]; then
+    rmdir "$artifact_lock_dir" 2>/dev/null || true
+  fi
+}
+trap cleanup_update_check EXIT
+
+{
+  printf '# Update Check\\n\\n'
+  printf -- '- machine: %s\\n' "$(hostname 2>/dev/null || printf unknown)"
+  printf -- '- generated_at: %s\\n\\n' "$stamp"
+  if [ -f "$product_root/packages/brainctl/src/main.ts" ] && command -v bun >/dev/null 2>&1 && [ -f "$config_path" ]; then
+    printf '## brainctl updates\\n'
+    (cd "$product_root" && BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS="\${BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS:-20000}" bun run packages/brainctl/src/main.ts updates --config "$config_path") 2>&1 || printf 'brainctl updates failed with exit=%s\\n' "$?"
+  else
+    printf '## fallback checks\\n'
+    run_readonly uname -a
+    if command -v codex >/dev/null 2>&1; then run_readonly codex --version; else printf '\\ncodex: missing\\n'; fi
+    if command -v claude >/dev/null 2>&1; then run_readonly claude --version; else printf '\\nclaude: missing\\n'; fi
+    if command -v brew >/dev/null 2>&1; then HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 run_readonly brew outdated --quiet; fi
+    if command -v pacman >/dev/null 2>&1; then run_readonly pacman -Qu; fi
+    if command -v checkupdates >/dev/null 2>&1; then run_readonly checkupdates; fi
+    if command -v apt >/dev/null 2>&1; then run_readonly apt list --upgradable; fi
+    if command -v dnf >/dev/null 2>&1; then run_readonly dnf --cacheonly check-update --quiet; fi
+    if command -v zypper >/dev/null 2>&1; then run_readonly zypper --no-refresh list-updates; fi
+  fi
+  printf '\\nNo packages or services were changed by this deterministic update check.\\n'
+} > "$tmp_report"
+mv -f "$tmp_report" "$report_path"
+
+artifacts_path="$factory_real/ARTIFACTS.md"
+if [ -L "$artifacts_path" ]; then
+  echo "refusing symlinked .factory/ARTIFACTS.md" >&2
+  exit 46
+fi
+if [ -e "$artifacts_path" ] && [ ! -f "$artifacts_path" ]; then
+  echo "refusing non-file .factory/ARTIFACTS.md" >&2
+  exit 46
+fi
+artifact_lock_dir="$factory_real/.artifacts.lock"
+artifact_lock_acquired=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if mkdir "$artifact_lock_dir" 2>/dev/null; then
+    artifact_lock_acquired=1
+    break
+  fi
+  sleep 0.2
+done
+if [ "$artifact_lock_acquired" != "1" ]; then
+  echo "timed out waiting for artifact metadata lock" >&2
+  exit 75
+fi
+if [ ! -f "$artifacts_path" ]; then
+  tmp_artifacts="$(mktemp "$factory_real/.artifacts.XXXXXX")"
+  printf '# Artifacts\\n' > "$tmp_artifacts"
+  mv -f "$tmp_artifacts" "$artifacts_path"
+fi
+if ! grep -F "$report" "$artifacts_path" >/dev/null 2>&1; then
+  tmp_artifacts="$(mktemp "$factory_real/.artifacts.XXXXXX")"
+  cat "$artifacts_path" > "$tmp_artifacts"
+  printf '\\n- \`%s\` - read-only OS, Brainstack, Codex, and Claude update report\\n' "$report" >> "$tmp_artifacts"
+  mv -f "$tmp_artifacts" "$artifacts_path"
+fi
+
+printf 'BRAINSTACK_UPDATE_REPORT=%s\\n' "$report"
+cat "$report_path"
+	`;
+
+    const currentBeforeLaunch = this.db.getContextBySlug(context.slug);
+    if (currentBeforeLaunch?.state === "archived") {
+      return {
+        ok: false,
+        host: worker.name,
+        transport: worker.transport,
+        exitCode: 89,
+        stdout: "",
+        stderr: `context archived before update-check launch: ${context.slug}`,
+        durationMs: 0,
+        commandLabel: "update-check",
+        reportPath: null
+      };
+    }
+
+    const result = await this.runWorkerScript(worker, script, logPath, 120);
+    const reportPath = result.stdout.match(/^BRAINSTACK_UPDATE_REPORT=(.+)$/m)?.[1]?.trim() || null;
+    return {
+      ...result,
+      reportPath
     };
   }
 
@@ -512,8 +775,27 @@ expand_home_path() {
 }
 
 cd "$(expand_home_path ${quoteSh(context.worktreePath)})"
-if [ -f ${quoteSh(safePath)} ]; then
-  cat ${quoteSh(safePath)}
+worktree_real="$(pwd -P)"
+safe_path=${quoteSh(safePath)}
+target_path="$worktree_real/$safe_path"
+if [ -L "$target_path" ]; then
+  echo "workspace read refused symlink target: $safe_path" >&2
+  exit 1
+fi
+resolved_real="$(realpath "$target_path" 2>/dev/null || true)"
+if [ -n "$resolved_real" ]; then
+  case "$resolved_real" in
+    "$worktree_real"|"$worktree_real"/*) ;;
+    *) echo "workspace read escaped worktree: $safe_path" >&2; exit 1 ;;
+  esac
+fi
+if [ -f "$resolved_real" ]; then
+  size="$(wc -c < "$resolved_real" | tr -d '[:space:]')"
+  if [ "$size" -gt 1048576 ]; then
+    echo "workspace read refused oversized file: $safe_path" >&2
+    exit 1
+  fi
+  cat "$resolved_real"
 fi
 `;
 
@@ -522,7 +804,7 @@ fi
       return null;
     }
 
-    return result.stdout.trim() || null;
+    return result.stdout || null;
   }
 
   async writeWorkspaceFile(context: ContextRecord, relativePath: string, content: string): Promise<void> {
@@ -541,11 +823,28 @@ expand_home_path() {
 }
 
 cd "$(expand_home_path ${quoteSh(context.worktreePath)})"
-mkdir -p ${quoteSh(dirname(safePath))}
+worktree_real="$(pwd -P)"
+safe_path=${quoteSh(safePath)}
+target_path="$worktree_real/$safe_path"
+target_parent="$(dirname "$target_path")"
+mkdir -p "$target_parent"
+parent_real="$(cd "$target_parent" && pwd -P)"
+case "$parent_real/" in
+  "$worktree_real"/*) ;;
+  *) echo "workspace write escaped worktree: $safe_path" >&2; exit 1 ;;
+esac
+if [ -L "$target_path" ]; then
+  echo "workspace write refused symlink target: $safe_path" >&2
+  exit 1
+fi
+tmp_file="$(mktemp "$parent_real/.brainstack-write.XXXXXX")"
+trap 'rm -f "$tmp_file"' EXIT
 ${base64DecodeShellFunction()}
-cat <<'${marker}' | brainstack_base64_decode > ${quoteSh(safePath)}
+cat <<'${marker}' | brainstack_base64_decode > "$tmp_file"
 ${encoded}
 ${marker}
+mv -f "$tmp_file" "$target_path"
+trap - EXIT
 `;
 
     const result = await this.runWorkerScript(worker, script, undefined, 10);
@@ -554,9 +853,107 @@ ${marker}
     }
   }
 
+  async writeWorkspaceFileIfUnchanged(
+    context: ContextRecord,
+    relativePath: string,
+    expectedContent: string | null,
+    content: string
+  ): Promise<boolean> {
+    const worker = this.requireWorker(context.machine);
+    const safePath = cleanRelativePath(relativePath);
+    const expectedEncoded = expectedContent === null ? "" : Buffer.from(expectedContent, "utf8").toString("base64");
+    const contentEncoded = Buffer.from(content, "utf8").toString("base64");
+    const expectedMarker = "__EXPECTED_WORKSPACE_FILE_CONTENT__";
+    const contentMarker = "__NEXT_WORKSPACE_FILE_CONTENT__";
+    const script = `
+set -euo pipefail
+expand_home_path() {
+  case "$1" in
+    "~") printf '%s\\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
+    *) printf '%s\\n' "$1" ;;
+  esac
+}
+
+cd "$(expand_home_path ${quoteSh(context.worktreePath)})"
+worktree_real="$(pwd -P)"
+safe_path=${quoteSh(safePath)}
+target_path="$worktree_real/$safe_path"
+target_parent="$(dirname "$target_path")"
+mkdir -p "$target_parent"
+parent_real="$(cd "$target_parent" && pwd -P)"
+case "$parent_real/" in
+  "$worktree_real"/*) ;;
+  *) echo "workspace write escaped worktree: $safe_path" >&2; exit 1 ;;
+esac
+if [ -L "$target_path" ]; then
+  echo "workspace write refused symlink target: $safe_path" >&2
+  exit 1
+fi
+${base64DecodeShellFunction()}
+expected_mode=${expectedContent === null ? quoteSh("absent") : quoteSh("content")}
+expected_file="$(mktemp "$parent_real/.brainstack-expected.XXXXXX")"
+tmp_file="$(mktemp "$parent_real/.brainstack-write.XXXXXX")"
+lock_dir=""
+if [ "$safe_path" = ".factory/ARTIFACTS.md" ]; then
+  lock_dir="$parent_real/.artifacts.lock"
+  lock_acquired=0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if mkdir "$lock_dir" 2>/dev/null; then
+      lock_acquired=1
+      break
+    fi
+    sleep 0.2
+  done
+  if [ "$lock_acquired" != "1" ]; then
+    echo "timed out waiting for artifact metadata lock" >&2
+    exit 75
+  fi
+fi
+cleanup_compare_write() {
+  rm -f "$expected_file" "$tmp_file"
+  if [ -n "$lock_dir" ] && [ -d "$lock_dir" ]; then
+    rmdir "$lock_dir" 2>/dev/null || true
+  fi
+}
+trap cleanup_compare_write EXIT
+if [ "$expected_mode" = "content" ]; then
+  cat <<'${expectedMarker}' | brainstack_base64_decode > "$expected_file"
+${expectedEncoded}
+${expectedMarker}
+  if [ ! -f "$target_path" ] || ! cmp -s "$target_path" "$expected_file"; then
+    echo "workspace file changed: $safe_path" >&2
+    exit 75
+  fi
+elif [ -e "$target_path" ]; then
+  echo "workspace file appeared: $safe_path" >&2
+  exit 75
+fi
+cat <<'${contentMarker}' | brainstack_base64_decode > "$tmp_file"
+${contentEncoded}
+${contentMarker}
+mv -f "$tmp_file" "$target_path"
+trap - EXIT
+cleanup_compare_write
+`;
+
+    const result = await this.runWorkerScript(worker, script, undefined, 10);
+    if (result.exitCode === 75) {
+      return false;
+    }
+    if (!result.ok) {
+      throw new Error(result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`);
+    }
+
+    return true;
+  }
+
   async readArtifactFile(context: ContextRecord, filePath: string, maxBytes = 45 * 1024 * 1024): Promise<WorkspaceArtifactFile> {
     if (!this.config.allowAbsoluteArtifactPaths && (filePath.startsWith("/") || filePath === "~" || filePath.startsWith("~/"))) {
       throw new Error("absolute artifact paths are disabled; record a relative path inside the workspace");
+    }
+    if (!filePath.startsWith("/") && !filePath.startsWith("~/") && isProtectedArtifactPath(filePath)) {
+      throw new Error(`protected artifact path cannot be sent: ${filePath}`);
     }
 
     const worker = this.requireWorker(context.machine);
@@ -575,6 +972,39 @@ requested_raw=${quoteSh(filePath)}
 max_bytes=${quoteSh(String(maxBytes))}
 allow_absolute=${quoteSh(this.config.allowAbsoluteArtifactPaths ? "1" : "0")}
 worktree="$(expand_home_path "$worktree_raw")"
+
+brainstack_protected_artifact_path() {
+  normalized="$1"
+  while [ "\${normalized#./}" != "$normalized" ]; do
+    normalized="\${normalized#./}"
+  done
+  lower="$(printf '%s' "$normalized" | tr '[:upper:]' '[:lower:]')"
+  case "$normalized" in
+    ""|../*|*/../*|*/..|.git|.git/*)
+      return 0
+      ;;
+    .factory|.factory/*)
+      case "$normalized" in
+        .factory/reports/*)
+          case "$normalized" in
+            */.*) return 0 ;;
+            *) return 1 ;;
+          esac
+          ;;
+        *) return 0 ;;
+      esac
+      ;;
+    .*|*/.*)
+      return 0
+      ;;
+  esac
+  case "$lower" in
+    .env|*.env|*.pem|*.key|*id_rsa*|*id_ed25519*|*authorized_keys*|*known_hosts*|*token*|*secret*|*passwd*|*shadow*|*keyring*)
+      return 0
+      ;;
+  esac
+  return 1
+}
 
 case "$requested_raw" in
   "~"|~/*)
@@ -597,6 +1027,10 @@ case "$requested_raw" in
 esac
 
 worktree_real="$(realpath "$worktree")"
+if [ -L "$resolved" ]; then
+  echo "artifact path is a symlink: $requested_raw" >&2
+  exit 46
+fi
 resolved_real="$(realpath "$resolved" 2>/dev/null || true)"
 if [ -z "$resolved_real" ]; then
   echo "missing file: $resolved" >&2
@@ -611,6 +1045,11 @@ if [ "$allow_absolute" != "1" ]; then
       exit 45
       ;;
   esac
+  resolved_relative="\${resolved_real#$worktree_real/}"
+  if brainstack_protected_artifact_path "$resolved_relative"; then
+    echo "protected artifact path cannot be sent: $resolved_relative" >&2
+    exit 46
+  fi
 fi
 
 resolved="$resolved_real"
@@ -700,6 +1139,9 @@ fi
   async deleteArtifactFile(context: ContextRecord, filePath: string): Promise<WorkspaceArtifactDeleteResult> {
     const worker = this.requireWorker(context.machine);
     const safePath = cleanArtifactDeletePath(filePath);
+    if (isProtectedArtifactPath(safePath)) {
+      throw new Error(`protected artifact path cannot be deleted: ${filePath}`);
+    }
     const script = `
 set -euo pipefail
 expand_home_path() {
@@ -733,6 +1175,15 @@ case "$parent_real" in
     ;;
 esac
 
+if [ -L "$resolved" ]; then
+  rm -f -- "$resolved"
+  echo "STATUS=deleted"
+  echo "REQUESTED_PATH=$requested_raw"
+  echo "RESOLVED_PATH=$parent_real/$(basename "$resolved")"
+  echo "FILE_NAME=$(basename "$requested_raw")"
+  exit 0
+fi
+
 if [ ! -e "$resolved" ]; then
   echo "STATUS=missing"
   echo "REQUESTED_PATH=$requested_raw"
@@ -755,7 +1206,7 @@ if [ ! -f "$resolved_real" ]; then
   exit 42
 fi
 
-rm -f -- "$resolved_real"
+rm -f -- "$resolved"
 echo "STATUS=deleted"
 echo "REQUESTED_PATH=$requested_raw"
 echo "RESOLVED_PATH=$resolved_real"
@@ -883,9 +1334,23 @@ current_branch() {
 
 ensure_factory_files() {
   workspace="$1"
+  workspace_real="$(cd "$workspace" && pwd -P)"
+  if [ -L "$workspace/.factory" ]; then
+    echo "refusing symlinked .factory directory" >&2
+    exit 46
+  fi
   mkdir -p "$workspace/.factory"
+  factory_real="$(cd "$workspace/.factory" && pwd -P)"
+  case "$factory_real" in
+    "$workspace_real/.factory") ;;
+    *) echo ".factory escapes workspace" >&2; exit 46 ;;
+  esac
 
   if [ ! -f "$workspace/.factory/SUMMARY.md" ]; then
+    if [ -L "$workspace/.factory/SUMMARY.md" ]; then
+      echo "refusing symlinked .factory/SUMMARY.md" >&2
+      exit 46
+    fi
     cat > "$workspace/.factory/SUMMARY.md" <<'EOF'
 # Summary
 
@@ -894,6 +1359,10 @@ EOF
   fi
 
   if [ ! -f "$workspace/.factory/TODO.md" ]; then
+    if [ -L "$workspace/.factory/TODO.md" ]; then
+      echo "refusing symlinked .factory/TODO.md" >&2
+      exit 46
+    fi
     cat > "$workspace/.factory/TODO.md" <<'EOF'
 # TODO
 
@@ -902,6 +1371,10 @@ EOF
   fi
 
   if [ ! -f "$workspace/.factory/ARTIFACTS.md" ]; then
+    if [ -L "$workspace/.factory/ARTIFACTS.md" ]; then
+      echo "refusing symlinked .factory/ARTIFACTS.md" >&2
+      exit 46
+    fi
     cat > "$workspace/.factory/ARTIFACTS.md" <<'EOF'
 # Artifacts
 
@@ -919,7 +1392,7 @@ ensure_initial_commit() {
   fi
 
   if ! git -C "$workspace" config user.name >/dev/null 2>&1; then
-    git -C "$workspace" config user.name "Private Dev Factory"
+    git -C "$workspace" config user.name "Brainstack Factory"
   fi
 
   if ! git -C "$workspace" config user.email >/dev/null 2>&1; then
@@ -936,7 +1409,13 @@ write_state_file() {
   worktree_path="$3"
   branch_name="$4"
   state_name="$5"
-  cat > "$workspace/.factory/STATE.json" <<EOF
+  state_path="$workspace/.factory/STATE.json"
+  if [ -L "$state_path" ]; then
+    echo "refusing symlinked .factory/STATE.json" >&2
+    exit 46
+  fi
+  tmp_state="$(mktemp "$workspace/.factory/.state.XXXXXX")"
+  cat > "$tmp_state" <<EOF
 {
   "slug": ${JSON.stringify(request.slug)},
   "machine": ${JSON.stringify(request.machine)},
@@ -951,6 +1430,7 @@ write_state_file() {
   "updatedAt": ${JSON.stringify(nowIso())}
 }
 EOF
+  mv -f "$tmp_state" "$state_path"
 }
 `;
 
@@ -1130,8 +1610,7 @@ printf 'BRANCH=%s\\n' "$branch_name"
     onStdoutChunk?: (chunk: string) => Promise<void> | void
   ): Promise<WorkerExecResult> {
     const startedAt = Date.now();
-    const timeoutBin = timeoutSeconds && timeoutSeconds > 0 ? Bun.which("timeout") : null;
-    const fullArgs = timeoutBin ? [timeoutBin, `${timeoutSeconds}s`, ...args] : args;
+    const fullArgs = args;
 
     const proc = Bun.spawn(fullArgs, {
       stdin: "pipe",
@@ -1139,6 +1618,18 @@ printf 'BRANCH=%s\\n' "$branch_name"
       stderr: "pipe",
       env: process.env
     });
+    let timedOut = false;
+    let killTimer: Timer | null = null;
+    let forceKillTimer: Timer | null = null;
+    if (timeoutSeconds && timeoutSeconds > 0) {
+      killTimer = setTimeout(() => {
+        timedOut = true;
+        proc.kill("SIGTERM");
+        forceKillTimer = setTimeout(() => {
+          proc.kill("SIGKILL");
+        }, 1_000);
+      }, timeoutSeconds * 1000);
+    }
 
     proc.stdin.write(script);
     proc.stdin.end();
@@ -1146,16 +1637,27 @@ printf 'BRANCH=%s\\n' "$branch_name"
     const stdoutPromise = this.collectStream(proc.stdout, logPath, "", onStdoutChunk);
     const stderrPromise = this.collectStream(proc.stderr, logPath, "[stderr] ");
 
-    const exitCode = await proc.exited;
+    const rawExitCode = await proc.exited;
+    if (killTimer) {
+      clearTimeout(killTimer);
+    }
+    if (forceKillTimer) {
+      clearTimeout(forceKillTimer);
+    }
     const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+    const exitCode = timedOut ? 124 : rawExitCode;
+    const finalStderr =
+      timedOut && timeoutSeconds
+        ? `${stderr}${stderr ? "\n" : ""}worker command timed out after ${timeoutSeconds}s`
+        : stderr;
 
     return {
-      ok: exitCode === 0,
+      ok: exitCode === 0 && !timedOut,
       host,
       transport,
       exitCode,
       stdout,
-      stderr,
+      stderr: finalStderr,
       durationMs: Date.now() - startedAt,
       commandLabel: fullArgs.join(" ")
     };

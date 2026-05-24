@@ -9,7 +9,7 @@ usage() {
   cat <<'EOF'
 Usage: ./scripts/bootstrap-codex.sh [--force] [--codex-home PATH]
 
-Installs the tracked Clawdex Codex templates into the target Codex home.
+Installs the tracked Brainstack Codex templates into the target Codex home.
 By default it will not overwrite existing files.
 EOF
 }

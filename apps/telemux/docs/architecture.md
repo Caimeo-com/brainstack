@@ -1,6 +1,6 @@
 # Architecture
 
-Brainstack product note: fresh installs use home-directory state roots by default. Original `/srv/telemux` and `/srv/factory` paths in this vendored document describe the legacy valkyrie deployment unless overridden by `FACTORY_CONTROL_ROOT` and `FACTORY_FACTORY_ROOT`.
+Brainstack product note: fresh installs use home-directory state roots by default. Original `/srv/telemux` and `/srv/factory` paths in this vendored document describe a legacy deployment unless overridden by `FACTORY_CONTROL_ROOT` and `FACTORY_FACTORY_ROOT`.
 
 ## Purpose
 

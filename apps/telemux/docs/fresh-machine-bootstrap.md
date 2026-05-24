@@ -1,6 +1,16 @@
-# Fresh Machine Bootstrap
+# Legacy Telemux Bootstrap
 
-This document is the reproducible bootstrap path for a clean machine. It is written so a human or another LLM can rebuild the current Clawdex setup without needing hidden local memory.
+This document records the old direct telemux bootstrap path. It is useful for migrating or understanding legacy `/srv/telemux` and `/srv/factory` installations, but it is not the preferred fresh Brainstack install path.
+
+For a new machine, use the repo-level Brainstack flow instead:
+
+```bash
+brainctl provision --profile control --out ~/.config/brainstack/brainstack.yaml
+brainctl init --profile control --config ~/.config/brainstack/brainstack.yaml
+brainctl doctor --config ~/.config/brainstack/brainstack.yaml --workers
+```
+
+That path records ownership manifests, uses home-directory state defaults, and keeps `destroy`/reprovision behavior predictable.
 
 Use it together with:
 
@@ -48,7 +58,7 @@ Create a passwordless sudo rule:
 
 ```bash
 sudo install -d -m 0750 /etc/sudoers.d
-sudo cp /path/to/clawdex/templates/sudoers/factory-nopasswd /etc/sudoers.d/factory-nopasswd
+sudo cp /path/to/brainstack/apps/telemux/templates/sudoers/factory-nopasswd /etc/sudoers.d/factory-nopasswd
 sudo chmod 0440 /etc/sudoers.d/factory-nopasswd
 sudo visudo -cf /etc/sudoers.d/factory-nopasswd
 ```
@@ -116,7 +126,7 @@ model_reasoning_effort = "xhigh"
 Run the one-shot bootstrap for the tracked Codex templates:
 
 ```bash
-cd ~/clawdex
+cd ~/brainstack/apps/telemux
 ./scripts/bootstrap-codex.sh
 ```
 
@@ -127,14 +137,14 @@ The tracked AGENTS template currently uses:
 ```md
 # Machine Guidance
 
-- This machine is the Clawdex control plane.
+- This machine is the Brainstack telemux control plane.
 - Prefer Bun and simple shell scripts over heavier runtimes.
 - Prefer inspectable files over hidden state.
 - Avoid Docker unless absolutely necessary.
 - Any repo-bound task should use per-context worktrees.
 - Global durable machine guidance belongs in `~/.codex/AGENTS.md`.
 - Context and task state belongs in `.factory/` files inside each worktree, not in global memory.
-- When working on `~/clawdex`, keep docs current with reality.
+- When working on `~/brainstack`, keep docs current with reality.
 ```
 
 ## 6. Clone and configure the repo
@@ -142,8 +152,8 @@ The tracked AGENTS template currently uses:
 As the control user:
 
 ```bash
-git clone git@github.com:swader/clawdex.git ~/clawdex
-cd ~/clawdex
+git clone git@github.com:example/brainstack.git ~/brainstack
+cd ~/brainstack/apps/telemux
 cp .env.example .env
 cp workers.example.json workers.json
 ```
@@ -166,7 +176,7 @@ Edit `workers.json`:
 As the control user:
 
 ```bash
-cd ~/clawdex
+cd ~/brainstack/apps/telemux
 ./scripts/install.sh
 ./scripts/doctor.sh
 ```
@@ -227,12 +237,12 @@ Then bind it in Telegram:
 
 If it is still unreachable, the context should remain `pending` instead of crashing the control plane.
 
-## 10. Reboot test
+## 10. Boot validation
 
-Because the service is a user unit with linger enabled, test a clean boot:
+Because the service is a user unit with linger enabled, validate boot behavior only when someone is physically present or there is a reliable remote-unlock path. Do not remotely reboot encrypted hosts.
 
-1. reboot the control host
-2. do not log in locally first
+1. arrange a local/on-prem boot validation window
+2. boot the control host without logging in locally first
 3. from Telegram only, try:
 
 ```text
@@ -263,5 +273,5 @@ Then add these machine-local files, which are not tracked in git:
 
 - `~/.codex/config.toml`
 - `~/.codex/AGENTS.md`
-- `~/clawdex/.env`
-- `~/clawdex/workers.json`
+- `~/.config/brainstack/telemux.env`
+- `~/.config/brainstack/workers.json`

@@ -49,7 +49,7 @@ mkdir -p \
 
 cat > "$SERVICE_DST" <<EOF
 [Unit]
-Description=Clawdex control plane
+Description=Brainstack telemux control plane
 After=network-online.target
 Wants=network-online.target
 
@@ -71,4 +71,4 @@ sudo loginctl enable-linger "$OWNER_USER"
 systemctl --user daemon-reload
 systemctl --user enable --now telemux.service
 
-echo "Installed and started telemux.service for Clawdex"
+echo "Installed and started telemux.service for Brainstack"

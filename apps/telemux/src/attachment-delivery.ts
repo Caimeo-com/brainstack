@@ -16,6 +16,8 @@ export async function deliverAttachmentRequests(
   target: TelegramTarget,
   requests: TelegramAttachmentRequest[]
 ): Promise<AttachmentDeliveryResult> {
+  const maxTotalBytes = 90 * 1024 * 1024;
+  let totalBytes = 0;
   const result: AttachmentDeliveryResult = {
     sent: [],
     skipped: [],
@@ -25,6 +27,11 @@ export async function deliverAttachmentRequests(
   for (const request of requests) {
     try {
       const file = await workers.readArtifactFile(context, request.path);
+      if (totalBytes + file.sizeBytes > maxTotalBytes) {
+        result.skipped.push(`Skipped ${request.path}: attachment batch would exceed ${maxTotalBytes} bytes.`);
+        continue;
+      }
+      totalBytes += file.sizeBytes;
       await telegram.sendAttachment(target, {
         kind: preferredAttachmentKind(file.path, request.type),
         fileName: file.fileName,

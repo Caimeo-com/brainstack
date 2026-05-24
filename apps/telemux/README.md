@@ -2,7 +2,7 @@
 
 Telegram-driven harness control plane for one control host, with optional remote workers.
 
-Brainstack product note: this app is vendored under `apps/telemux`. Fresh brainstack installs default mutable state to `~/.local/state/brainstack/telemux` and factory workspaces to `~/.local/state/brainstack/factory`. Older `/srv/telemux` and `/srv/factory` paths below describe the original valkyrie deployment and remain relevant only for compatibility migration.
+Brainstack product note: this app is vendored under `apps/telemux`. Fresh brainstack installs default mutable state to `~/.local/state/brainstack/telemux` and factory workspaces to `~/.local/state/brainstack/factory`. Older `/srv/telemux` and `/srv/factory` paths below describe a legacy deployment and remain relevant only for compatibility migration.
 
 Security note: telemux is not a sandbox. It accepts Telegram messages from the configured allowed user and passes work into the configured harness process, Codex CLI or Claude Code. If that harness is configured for bypass/yolo mode and the Unix user has passwordless sudo, telemux is effectively a remote command path into that authority.
 

@@ -30,6 +30,8 @@ interface JobScope {
   target: TelegramTarget | null;
 }
 
+const MIN_CODEX_INTERVAL_MINUTES = 15;
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -79,6 +81,12 @@ function effectiveRuntime(
     modelOverride: job.modelOverride || context?.modelOverride || null,
     reasoningEffortOverride: job.reasoningEffortOverride || context?.reasoningEffortOverride || null
   };
+}
+
+function assertCronSchedulePolicy(job: Pick<CronJobRecord, "kind" | "schedule">): void {
+  if (job.kind === "codex" && job.schedule.type === "interval" && job.schedule.everyMinutes < MIN_CODEX_INTERVAL_MINUTES) {
+    throw new Error(`Codex interval jobs must run at least every ${MIN_CODEX_INTERVAL_MINUTES} minutes.`);
+  }
 }
 
 export class CronManager {
@@ -147,11 +155,13 @@ export class CronManager {
     if (draft.kind === "codex" && executionContextSlug) {
       this.requireContextReference(executionContextSlug);
     }
+    assertCronSchedulePolicy({ kind: draft.kind, schedule: draft.schedule });
 
     const job: CronJobRecord = {
       id: createCronJobId(draft.label, createdAt),
       label: draft.label,
       kind: draft.kind,
+      runner: draft.runner || null,
       enabled: draft.enabled ?? true,
       schedule: draft.schedule,
       nextRunAt: draft.enabled === false ? null : nextCronRunAt(draft.schedule, createdAt),
@@ -182,6 +192,10 @@ export class CronManager {
 
     if (changes.label !== undefined && changes.label) {
       next.label = changes.label;
+    }
+
+    if (changes.runner !== undefined) {
+      next.runner = changes.runner;
     }
 
     if (changes.executionContextSlug !== undefined) {
@@ -234,6 +248,7 @@ export class CronManager {
     if (next.kind === "codex" && next.executionContextSlug) {
       this.requireContextReference(next.executionContextSlug);
     }
+    assertCronSchedulePolicy(next);
 
     if (next.kind === "reminder" && !next.reminderText) {
       throw new Error(`Reminder cron ${next.id} is missing reminder text`);
@@ -264,6 +279,7 @@ export class CronManager {
   }
 
   async resumeJob(job: CronJobRecord): Promise<CronJobRecord> {
+    assertCronSchedulePolicy(job);
     return this.saveJob({
       ...job,
       enabled: true,
@@ -281,16 +297,16 @@ export class CronManager {
   }
 
   resolveJob(selector: CronJobSelector, scope: JobScope): CronJobRecord {
+    const scoped = this.listRelevantJobs(scope.context, scope.target);
     if (selector.id) {
-      const job = this.db.getCronJob(selector.id);
+      const job = scoped.find((candidate) => candidate.id === selector.id);
       if (!job) {
-        throw new Error(`Unknown cron job: ${selector.id}`);
+        throw new Error(`Unknown cron job in this topic/context: ${selector.id}`);
       }
 
       return job;
     }
 
-    const scoped = this.listRelevantJobs(scope.context, scope.target);
     const matches = scoped.filter((job) => matchesSelector(job, selector));
     if (!matches.length) {
       throw new Error(`No cron job matched label: ${selector.label}`);
@@ -426,6 +442,9 @@ export class CronManager {
   private async applyManifestAction(action: CronManifestAction, defaults: ManifestDefaults): Promise<string | null> {
     switch (action.type) {
       case "create": {
+        if (action.job.executionContextSlug || action.job.targetChatId !== undefined || action.job.targetThreadId !== undefined) {
+          throw new Error("Cron manifest create actions cannot set target/context fields");
+        }
         const job = await this.createJob(action.job, defaults);
         return `Cron created: ${job.id} (${job.label}) next=${job.nextRunAt || "none"}`;
       }

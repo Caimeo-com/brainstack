@@ -145,6 +145,7 @@ function rowToCronJob(row: Record<string, unknown>): CronJobRecord {
     id: String(row.id),
     label: String(row.label),
     kind: String(row.kind) === "codex" ? "codex" : "reminder",
+    runner: readNullableString(row, "runner") === "deterministic-update-check" ? "deterministic-update-check" : null,
     enabled: Boolean(Number(row.enabled ?? 1)),
     schedule: normalizeCronSchedule(JSON.parse(scheduleText)),
     nextRunAt: readNullableString(row, "next_run_at"),
@@ -266,6 +267,7 @@ export class FactoryDb {
         id TEXT PRIMARY KEY,
         label TEXT NOT NULL,
         kind TEXT NOT NULL,
+        runner TEXT,
         enabled INTEGER NOT NULL DEFAULT 1,
         schedule_json TEXT NOT NULL,
         next_run_at TEXT,
@@ -330,6 +332,7 @@ export class FactoryDb {
     this.ensureColumn("workers", "ssh_target", "ssh_target TEXT");
     this.ensureColumn("workers", "ssh_user", "ssh_user TEXT");
     this.ensureColumn("workers", "last_seen_at", "last_seen_at TEXT");
+    this.ensureColumn("cron_jobs", "runner", "runner TEXT");
   }
 
   saveContext(context: ContextRecord): ContextRecord {
@@ -535,13 +538,14 @@ export class FactoryDb {
     this.db
       .query(`
         INSERT INTO cron_jobs (
-          id, label, kind, enabled, schedule_json, next_run_at, pending_run_at, last_run_at, last_scheduled_for,
+          id, label, kind, runner, enabled, schedule_json, next_run_at, pending_run_at, last_run_at, last_scheduled_for,
           execution_context_slug, target_chat_id, target_thread_id, instruction, reminder_text,
           codex_model_override, codex_reasoning_effort, last_result, last_error, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           label = excluded.label,
           kind = excluded.kind,
+          runner = excluded.runner,
           enabled = excluded.enabled,
           schedule_json = excluded.schedule_json,
           next_run_at = excluded.next_run_at,
@@ -563,6 +567,7 @@ export class FactoryDb {
         updated.id,
         updated.label,
         updated.kind,
+        updated.runner,
         updated.enabled ? 1 : 0,
         JSON.stringify(updated.schedule),
         updated.nextRunAt,
@@ -583,6 +588,77 @@ export class FactoryDb {
       );
 
     return updated;
+  }
+
+  updateCronJobIfUnchanged(job: CronJobRecord, expectedUpdatedAt: string): CronJobRecord | null {
+    const updated = {
+      ...job,
+      createdAt: job.createdAt || nowIso(),
+      updatedAt: job.updatedAt || nowIso()
+    };
+
+    const result = this.db
+      .query(`
+        UPDATE cron_jobs SET
+          label = ?,
+          kind = ?,
+          runner = ?,
+          enabled = ?,
+          schedule_json = ?,
+          next_run_at = ?,
+          pending_run_at = ?,
+          last_run_at = ?,
+          last_scheduled_for = ?,
+          execution_context_slug = ?,
+          target_chat_id = ?,
+          target_thread_id = ?,
+          instruction = ?,
+          reminder_text = ?,
+          codex_model_override = ?,
+          codex_reasoning_effort = ?,
+          last_result = ?,
+          last_error = ?,
+          updated_at = ?
+        WHERE id = ? AND updated_at = ?
+      `)
+      .run(
+        updated.label,
+        updated.kind,
+        updated.runner,
+        updated.enabled ? 1 : 0,
+        JSON.stringify(updated.schedule),
+        updated.nextRunAt,
+        updated.pendingRunAt,
+        updated.lastRunAt,
+        updated.lastScheduledFor,
+        updated.executionContextSlug,
+        updated.targetChatId,
+        updated.targetThreadId,
+        updated.instruction,
+        updated.reminderText,
+        updated.modelOverride,
+        updated.reasoningEffortOverride,
+        updated.lastResult,
+        updated.lastError,
+        updated.updatedAt,
+        updated.id,
+        expectedUpdatedAt
+      ) as { changes?: number };
+
+    return result.changes ? updated : null;
+  }
+
+  claimCronJobSlotIfUnchanged(job: CronJobRecord, expectedUpdatedAt: string, claimRun: CronRunRecord): CronJobRecord | null {
+    const claim = this.db.transaction(() => {
+      const updated = this.updateCronJobIfUnchanged(job, expectedUpdatedAt);
+      if (!updated) {
+        return null;
+      }
+      this.saveCronRun(claimRun);
+      return updated;
+    });
+
+    return claim();
   }
 
   getCronJob(id: string): CronJobRecord | null {
@@ -650,6 +726,13 @@ export class FactoryDb {
     const rows = this.db
       .query("SELECT * FROM cron_runs WHERE job_id = ? ORDER BY started_at DESC LIMIT ?")
       .all(jobId, limit) as Record<string, unknown>[];
+    return rows.map(rowToCronRun);
+  }
+
+  listClaimedCronRunsBefore(beforeIso: string): CronRunRecord[] {
+    const rows = this.db
+      .query("SELECT * FROM cron_runs WHERE status = 'claimed' AND finished_at IS NULL AND started_at < ? ORDER BY started_at ASC")
+      .all(beforeIso) as Record<string, unknown>[];
     return rows.map(rowToCronRun);
   }
 

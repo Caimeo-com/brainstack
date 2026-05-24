@@ -1,8 +1,8 @@
 # Provenance
 
-`apps/telemux` was copied from `/home/swader/private-dev-factory` during the valkyrie productization pass.
+`apps/telemux` was copied from an earlier telemux codebase during the initial productization pass.
 
-The original upstream remote at migration time was `git@github.com:swader/clawdex.git` on branch `master`.
+The original upstream remote at migration time was a private development repo on branch `master`.
 
 Product changes after copy:
 
@@ -11,4 +11,3 @@ Product changes after copy:
 - Telegram network/fetch errors redact bot-token-shaped strings before logging.
 
 The copied app is first-class but optional. `single-node` and `control` profiles enable it by default; `worker` and `client-macos` do not run Telegram polling.
-

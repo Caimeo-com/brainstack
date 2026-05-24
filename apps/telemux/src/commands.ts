@@ -32,7 +32,7 @@ import { WorkerService } from "./workers";
 import type { FactoryConfig } from "./config";
 import type { TelegramBot, TelegramBotCommandScope, TelegramCommandSyncResult, TelegramMessage, TelegramTarget } from "./telegram";
 
-function parseCommand(text: string): { command: string; rest: string } | null {
+function parseCommand(text: string): { command: string; rest: string; mention: string | null } | null {
   const trimmed = text.trim();
   if (!trimmed.startsWith("/")) {
     return null;
@@ -41,9 +41,11 @@ function parseCommand(text: string): { command: string; rest: string } | null {
   const firstSpace = trimmed.indexOf(" ");
   const head = firstSpace === -1 ? trimmed : trimmed.slice(0, firstSpace);
   const rest = firstSpace === -1 ? "" : trimmed.slice(firstSpace + 1).trim();
+  const mention = head.match(/@([^@\s]+)$/)?.[1]?.toLowerCase() || null;
   return {
     command: head.replace(/@[^@\s]+$/, "").toLowerCase(),
-    rest
+    rest,
+    mention
   };
 }
 
@@ -94,15 +96,17 @@ function artifactSendIntentFromText(text: string): ArtifactSendIntent | null {
     return { filterText: pathLike[1], latestOnly: false };
   }
 
-  if (/\b(?:artifact|artifacts|attachment|attachments|file|files|document|documents|report|reports)\b/i.test(normalized)) {
-    return { filterText: null, latestOnly: true };
-  }
-
-  if (/\b(?:this|that|the|latest|last|current)\s+(?:file|files|document|documents|report|reports)\b/i.test(normalized)) {
-    return { filterText: null, latestOnly: true };
-  }
-
-  if (/\b(?:send|attach|upload)(?:\s+me)?\s+(?:it|this|that)\b/i.test(normalized)) {
+  const object = "(?:artifact|artifacts|attachment|attachments|file|files|document|documents|report|reports|it|this|that)";
+  const qualifier = "(?:(?:the\\s+)?(?:latest|last|current)|the|this|that)";
+  const directRequest = new RegExp(
+    `^(?:please\\s+)?(?:send|attach|upload)(?:\\s+me)?(?:\\s+${qualifier})?\\s+${object}(?:\\s+please)?[.!?]*$`,
+    "i"
+  );
+  const politeRequest = new RegExp(
+    `^(?:can|could|would)\\s+you\\s+(?:please\\s+)?(?:send|attach|upload)(?:\\s+me)?(?:\\s+${qualifier})?\\s+${object}(?:\\s+please)?[.!?]*$`,
+    "i"
+  );
+  if (directRequest.test(normalized) || politeRequest.test(normalized)) {
     return { filterText: null, latestOnly: true };
   }
 
@@ -173,6 +177,27 @@ interface PendingTextPrompt {
   createdAt: number;
 }
 
+interface CronShortcutSnapshot {
+  targetKey: string;
+  jobIds: string[];
+  createdAt: number;
+}
+
+interface ArtifactShortcutSnapshot {
+  targetKey: string;
+  contextSlug: string;
+  paths: string[];
+  createdAt: number;
+}
+
+const CRON_SHORTCUT_TTL_MS = 15 * 60 * 1000;
+const CRON_SHORTCUT_MAX_SNAPSHOTS = 50;
+const ARTIFACT_SHORTCUT_TTL_MS = 15 * 60 * 1000;
+const ARTIFACT_SHORTCUT_MAX_SNAPSHOTS = 50;
+const TEXT_COALESCE_MAX_PARTS = 25;
+const TEXT_COALESCE_MAX_CHARS = 120_000;
+const TEXT_COALESCE_MAX_PENDING = 100;
+
 function audioNotSupportedText(): string {
   return "Audio and voice Telegram messages are not forwarded to Codex yet. Phase 2 will transcribe them first.";
 }
@@ -205,6 +230,10 @@ function codexModeSummary(context: ContextRecord): string {
 interface ParsedScheduleArgs {
   schedule: CronSchedule;
   consumed: number;
+}
+
+function isIsoTimestamp(value: string | undefined): value is string {
+  return Boolean(value && !Number.isNaN(Date.parse(value)));
 }
 
 function cronCommandUsage(): string {
@@ -289,13 +318,14 @@ function parseScheduleArgs(parts: string[], offset = 0): ParsedScheduleArgs {
     if (!everyMinutes) {
       throw new Error("Interval schedules require <minutes>.");
     }
+    const anchorAt = isIsoTimestamp(parts[offset + 2]) ? parts[offset + 2] : null;
     return {
       schedule: normalizeCronSchedule({
         type: "interval",
         everyMinutes,
-        anchorAt: parts[offset + 2] || new Date().toISOString()
+        anchorAt: anchorAt || new Date().toISOString()
       }),
-      consumed: parts[offset + 2] ? 3 : 2
+      consumed: anchorAt ? 3 : 2
     };
   }
 
@@ -315,6 +345,10 @@ function cronSelectorForShortcut(selector: string, jobs: CronJobRecord[]): CronJ
   return jobs[index] || null;
 }
 
+function telegramTargetKey(target: TelegramTarget): string {
+  return `${target.chatId}:${target.threadId ?? "none"}`;
+}
+
 function commandTimezone(): string {
   try {
     return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -323,8 +357,99 @@ function commandTimezone(): string {
   }
 }
 
+async function runBoundedCommand(args: string[], options: { cwd?: string; timeoutMs?: number } = {}): Promise<string> {
+  const timeoutMs = options.timeoutMs ?? 5000;
+  const proc = Bun.spawn(
+    [
+      "bash",
+      "-lc",
+      [
+        "if command -v setsid >/dev/null 2>&1; then exec setsid \"$@\"; fi",
+        "brainstack_kill_descendants() {",
+        "  if ! command -v pgrep >/dev/null 2>&1; then return; fi",
+        "  for child in $(pgrep -P \"$1\" 2>/dev/null || true); do",
+        "    brainstack_kill_descendants \"$child\" \"$2\"",
+        "    kill \"-$2\" \"$child\" 2>/dev/null || true",
+        "  done",
+        "}",
+        "\"$@\" &",
+        "child_pid=$!",
+        "brainstack_stop_child() {",
+        "  brainstack_kill_descendants \"$child_pid\" TERM",
+        "  kill -TERM \"$child_pid\" 2>/dev/null || true",
+        "  sleep 0.2",
+        "  brainstack_kill_descendants \"$child_pid\" KILL",
+        "  kill -KILL \"$child_pid\" 2>/dev/null || true",
+        "}",
+        "trap brainstack_stop_child TERM INT HUP",
+        "wait \"$child_pid\""
+      ].join("\n"),
+      "brainstack-probe",
+      ...args
+    ],
+    {
+      cwd: options.cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: process.env
+    }
+  );
+  const killProbe = (signal: "TERM" | "KILL") => {
+    proc.kill(`SIG${signal}`);
+    if (proc.pid) {
+      void Bun.spawn(["bash", "-lc", `kill -${signal} -- -"$1" 2>/dev/null || true`, "brainstack-probe-kill", String(proc.pid)]).exited;
+    }
+  };
+  const collect = (async () => {
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text().catch(() => ""),
+      new Response(proc.stderr).text().catch(() => ""),
+      proc.exited.catch(() => 124)
+    ]);
+    const output = (stdout || stderr).trim();
+    return exitCode === 0 ? output : output || `exit=${exitCode}`;
+  })();
+
+  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  let forceKillTimer: ReturnType<typeof setTimeout> | null = null;
+  let timedOut = false;
+  const timeout = new Promise<string>((resolve) => {
+    timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      killProbe("TERM");
+      forceKillTimer = setTimeout(() => killProbe("KILL"), 500);
+      resolve(`timeout after ${timeoutMs}ms`);
+    }, timeoutMs);
+    void collect.finally(() => {
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+      }
+      if (forceKillTimer && !timedOut) {
+        clearTimeout(forceKillTimer);
+      }
+    });
+  });
+
+  try {
+    return await Promise.race([collect, timeout]);
+  } finally {
+    if (timeoutTimer) {
+      clearTimeout(timeoutTimer);
+    }
+    if (forceKillTimer && !timedOut) {
+      clearTimeout(forceKillTimer);
+    }
+  }
+}
+
+function firstLine(value: string): string {
+  return value.split(/\r?\n/)[0]?.trim() || "missing";
+}
+
 export class CommandHandler {
   private readonly pendingText = new Map<string, PendingTextPrompt>();
+  private readonly cronShortcutSnapshots = new Map<string, CronShortcutSnapshot>();
+  private readonly artifactShortcutSnapshots = new Map<string, ArtifactShortcutSnapshot>();
 
   constructor(
     private readonly config: FactoryConfig,
@@ -348,6 +473,9 @@ export class CommandHandler {
 
     const target = messageTarget(message);
     const parsed = parseCommand(text);
+    if (parsed?.mention && this.config.telegramBotUsername && parsed.mention !== this.config.telegramBotUsername) {
+      return;
+    }
     const hasAttachments = Boolean(rawTelegramInput?.attachments.length);
     if (parsed || hasAttachments) {
       await this.flushPendingText(target, message.from?.id ?? null);
@@ -393,12 +521,12 @@ export class CommandHandler {
           return;
         }
 
-        if (!hasAttachments && (await this.maybeSendArtifactsFromPlainText(boundContext, text, target))) {
+        if (!hasAttachments && this.config.textCoalesceMs > 0) {
+          this.enqueuePendingText(boundContext, text, target, message.from?.id ?? null);
           return;
         }
 
-        if (!hasAttachments && this.config.textCoalesceMs > 0) {
-          this.enqueuePendingText(boundContext, text, target, message.from?.id ?? null);
+        if (!hasAttachments && (await this.maybeSendArtifactsFromPlainText(boundContext, text, target))) {
           return;
         }
 
@@ -411,7 +539,45 @@ export class CommandHandler {
         return;
       }
 
-      const artifactShortcut = parsed.command.match(/^\/artifact_?(\d+|latest|last)(?:_(senddel|del|shred))?$/);
+      const artifactSnapshotShortcut = parsed.command.match(/^\/artifact_([a-z0-9]{6,10})_(\d+)(?:_(senddel|del|shred))?$/);
+      if (artifactSnapshotShortcut) {
+        if (!boundContext) {
+          await this.telegram.sendText(target, "This topic is not bound.");
+          return;
+        }
+
+        const artifacts = await this.workers.readFactoryFile(boundContext, "ARTIFACTS.md");
+        const entry = this.resolveArtifactSnapshotShortcut(
+          artifactSnapshotShortcut[1] || "",
+          artifactSnapshotShortcut[2] || "",
+          boundContext,
+          target,
+          artifacts
+        );
+        if (!entry) {
+          await this.telegram.sendText(target, "That artifact shortcut expired or the artifact changed. Use /artifacts to refresh the list.");
+          return;
+        }
+
+        const action = artifactSnapshotShortcut[3] || "send";
+        if (action === "del" || action === "shred") {
+          await this.shredArtifactEntries(boundContext, target, artifacts, [entry], "Deleted");
+        } else {
+          const delivery = await this.deliverArtifactEntries(boundContext, target, [entry]);
+          if (action === "senddel" && delivery.sent.length) {
+            await this.shredArtifactEntries(boundContext, target, artifacts, [entry], "Sent and deleted");
+          }
+        }
+        return;
+      }
+
+      const artifactLegacyShortcut = parsed.command.match(/^\/artifact_?(\d+)(?:_(senddel|del|shred))?$/);
+      if (artifactLegacyShortcut) {
+        await this.telegram.sendText(target, "Numeric artifact shortcuts expire when the artifact list changes. Use /artifacts to refresh the list.");
+        return;
+      }
+
+      const artifactShortcut = parsed.command.match(/^\/artifact_?(latest|last)(?:_(senddel|del|shred))?$/);
       if (artifactShortcut) {
         if (!boundContext) {
           await this.telegram.sendText(target, "This topic is not bound.");
@@ -428,7 +594,36 @@ export class CommandHandler {
         return;
       }
 
-      const shredShortcut = parsed.command.match(/^\/shred_?(\d+|latest|last)$/);
+      const shredSnapshotShortcut = parsed.command.match(/^\/shred_([a-z0-9]{6,10})_(\d+)$/);
+      if (shredSnapshotShortcut) {
+        if (!boundContext) {
+          await this.telegram.sendText(target, "This topic is not bound.");
+          return;
+        }
+
+        const artifacts = await this.workers.readFactoryFile(boundContext, "ARTIFACTS.md");
+        const entry = this.resolveArtifactSnapshotShortcut(
+          shredSnapshotShortcut[1] || "",
+          shredSnapshotShortcut[2] || "",
+          boundContext,
+          target,
+          artifacts
+        );
+        if (!entry) {
+          await this.telegram.sendText(target, "That artifact shortcut expired or the artifact changed. Use /artifacts to refresh the list.");
+          return;
+        }
+        await this.shredArtifactEntries(boundContext, target, artifacts, [entry], "Deleted");
+        return;
+      }
+
+      const shredLegacyShortcut = parsed.command.match(/^\/shred_?(\d+)$/);
+      if (shredLegacyShortcut) {
+        await this.telegram.sendText(target, "Numeric artifact shortcuts expire when the artifact list changes. Use /artifacts to refresh the list.");
+        return;
+      }
+
+      const shredShortcut = parsed.command.match(/^\/shred_?(latest|last)$/);
       if (shredShortcut) {
         if (!boundContext) {
           await this.telegram.sendText(target, "This topic is not bound.");
@@ -440,15 +635,32 @@ export class CommandHandler {
         return;
       }
 
-      const cronShortcut = parsed.command.match(/^\/cron_(show|run|pause|resume)_?(\d+|latest|last)$/);
-      if (cronShortcut) {
+      const cronSnapshotShortcut = parsed.command.match(/^\/cron_(show|run|pause|resume)_([a-z0-9]{6,10})_(\d+)$/);
+      if (cronSnapshotShortcut) {
+        const job = this.resolveCronSnapshotShortcut(cronSnapshotShortcut[2] || "", cronSnapshotShortcut[3] || "", target);
+        if (!job) {
+          await this.telegram.sendText(target, "That scheduled-job shortcut expired or the job was deleted. Use /crons to refresh the list.");
+          return;
+        }
+        await this.handleCronJobAction(cronSnapshotShortcut[1] || "", job, target);
+        return;
+      }
+
+      const legacyCronShortcut = parsed.command.match(/^\/cron_(show|run|pause|resume)_?(\d+)$/);
+      if (legacyCronShortcut) {
+        await this.telegram.sendText(target, "Numeric cron shortcuts expire when the job list changes. Use /crons to refresh the list.");
+        return;
+      }
+
+      const cronLatestShortcut = parsed.command.match(/^\/cron_(show|run|pause|resume)_?(latest|last)$/);
+      if (cronLatestShortcut) {
         const jobs = this.cronManager.listRelevantJobs(boundContext, target);
-        const job = cronSelectorForShortcut(cronShortcut[2] || "", jobs);
+        const job = cronSelectorForShortcut(cronLatestShortcut[2] || "", jobs);
         if (!job) {
           await this.telegram.sendText(target, "No scheduled job matched that shortcut. Use /crons to refresh the list.");
           return;
         }
-        await this.handleCronJobAction(cronShortcut[1] || "", job, target);
+        await this.handleCronJobAction(cronLatestShortcut[1] || "", job, target);
         return;
       }
 
@@ -495,15 +707,14 @@ export class CommandHandler {
               "/detach",
               "/tail",
               "/artifacts",
-              "/artifact_latest",
-              "/artifact_N",
-              "/shred",
-              "/shred_N",
+        "/artifact_latest",
+        "/shred",
+        "/shred_latest",
               "/usage",
               "",
               "In a bound topic, plain text starts or resumes the stored Codex session.",
-              "Use /artifacts to list sendable artifact shortcuts. Generic requests such as \"send it\" send the latest artifact.",
-              "Use /shred to list artifact cleanup shortcuts.",
+              "Use /artifacts to list tokenized send/send+del shortcuts. Generic requests such as \"send it\" send the latest artifact.",
+              "Use /shred to list tokenized cleanup shortcuts.",
               "Use /mode, /model, and /effort to change Codex runtime behavior for this topic without rebinding it.",
               "Use /crons to inspect scheduled jobs linked to this topic/context. Use /cron install update-check, brain-curator, or daily-checkin to add built-in routines.",
               "Use /cron_run <id|label> or the shortcuts from /crons to test a scheduled job immediately."
@@ -583,30 +794,20 @@ export class CommandHandler {
 
         case "/updates": {
           const productRoot = resolve(this.config.projectRoot, "..", "..");
-          const head = Bun.spawnSync(["git", "-C", productRoot, "rev-parse", "--short", "HEAD"], {
-            stdout: "pipe",
-            stderr: "pipe"
-          }).stdout.toString().trim() || "unknown";
-          const branch = Bun.spawnSync(["git", "-C", productRoot, "rev-parse", "--abbrev-ref", "HEAD"], {
-            stdout: "pipe",
-            stderr: "pipe"
-          }).stdout.toString().trim() || "unknown";
-          const codex = Bun.spawnSync(["bash", "-lc", "command -v codex >/dev/null && codex --version || true"], {
-            stdout: "pipe",
-            stderr: "pipe"
-          }).stdout.toString().trim() || "missing";
-          const claude = Bun.spawnSync(["bash", "-lc", "command -v claude >/dev/null && claude --version || true"], {
-            stdout: "pipe",
-            stderr: "pipe"
-          }).stdout.toString().trim() || "missing";
+          const [head, branch, codex, claude] = await Promise.all([
+            runBoundedCommand(["git", "rev-parse", "--short", "HEAD"], { cwd: productRoot }),
+            runBoundedCommand(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd: productRoot }),
+            runBoundedCommand(["bash", "-lc", "command -v codex >/dev/null && codex --version || true"]),
+            runBoundedCommand(["bash", "-lc", "command -v claude >/dev/null && claude --version || true"])
+          ]);
           await this.telegram.sendText(
             target,
             [
               "Updates are manual/read-only.",
-              `brainstack=${branch}@${head}`,
+              `brainstack=${firstLine(branch)}@${firstLine(head)}`,
               `selected_harness=${this.config.harness}`,
-              `codex=${codex.split(/\r?\n/)[0]}`,
-              `claude=${claude.split(/\r?\n/)[0]}`,
+              `codex=${firstLine(codex)}`,
+              `claude=${firstLine(claude)}`,
               "Run on control host: brainctl updates --config ~/.config/brainstack/brainstack.yaml"
             ].join("\n")
           );
@@ -1044,7 +1245,9 @@ export class CommandHandler {
           if (!parsed.rest) {
             await this.telegram.sendText(
               target,
-              artifacts ? this.formatArtifactsList(artifacts) : `No artifact file available. Cached snippet: ${boundContext.lastArtifacts || "n/a"}`
+              artifacts
+                ? this.formatArtifactsList(artifacts, boundContext, target)
+                : `No artifact file available. Cached snippet: ${boundContext.lastArtifacts || "n/a"}`
             );
             return;
           }
@@ -1067,7 +1270,7 @@ export class CommandHandler {
           }
 
           const artifacts = await this.workers.readFactoryFile(boundContext, "ARTIFACTS.md");
-          await this.telegram.sendText(target, this.formatShredList(artifacts, parsed.rest || null));
+          await this.telegram.sendText(target, this.formatShredList(artifacts, parsed.rest || null, boundContext, target));
           return;
         }
 
@@ -1099,14 +1302,19 @@ export class CommandHandler {
     const key = this.pendingKey(target, userId);
     const existing = this.pendingText.get(key);
     if (existing && existing.contextSlug === context.slug) {
-      clearTimeout(existing.timer);
-      existing.parts.push(text);
-      existing.timer = setTimeout(() => void this.flushPendingText(target, userId), this.config.textCoalesceMs);
-      return;
-    }
-    if (existing) {
+      const nextChars = existing.parts.reduce((total, part) => total + part.length, 0) + text.length;
+      if (existing.parts.length >= TEXT_COALESCE_MAX_PARTS || nextChars > TEXT_COALESCE_MAX_CHARS) {
+        void this.flushPendingText(target, userId);
+      } else {
+        clearTimeout(existing.timer);
+        existing.parts.push(text);
+        existing.timer = setTimeout(() => void this.flushPendingText(target, userId), this.config.textCoalesceMs);
+        return;
+      }
+    } else if (existing) {
       void this.flushPendingText(target, userId);
     }
+    this.flushOldestPendingTextIfNeeded(key);
     const pending: PendingTextPrompt = {
       key,
       target,
@@ -1117,6 +1325,17 @@ export class CommandHandler {
       timer: setTimeout(() => void this.flushPendingText(target, userId), this.config.textCoalesceMs)
     };
     this.pendingText.set(key, pending);
+  }
+
+  private flushOldestPendingTextIfNeeded(nextKey: string): void {
+    if (this.pendingText.size < TEXT_COALESCE_MAX_PENDING || this.pendingText.has(nextKey)) {
+      return;
+    }
+
+    const oldest = [...this.pendingText.values()].sort((a, b) => a.createdAt - b.createdAt)[0];
+    if (oldest) {
+      void this.flushPendingText(oldest.target, oldest.userId);
+    }
   }
 
   private async flushPendingText(target: TelegramTarget, userId: number | null): Promise<void> {
@@ -1285,6 +1504,7 @@ export class CommandHandler {
 
   private formatCronOverview(context: ContextRecord | null, target: TelegramTarget): string {
     const jobs = this.cronManager.listRelevantJobs(context, target);
+    const shortcutToken = jobs.length ? this.createCronShortcutSnapshot(jobs, target) : null;
     const timezone = commandTimezone();
     const lines = [
       "# Scheduled Jobs",
@@ -1311,14 +1531,67 @@ export class CommandHandler {
       lines.push(`- ${number}. ${job.label} (${job.kind}, ${job.enabled ? "enabled" : "paused"})`);
       lines.push(`  next: ${job.nextRunAt || "none"}`);
       lines.push(`  schedule: ${scheduleSummary(job.schedule)}`);
-      lines.push(`  show: /cron_show_${number}`);
-      lines.push(`  run now: /cron_run_${number}`);
-      lines.push(`  pause: /cron_pause_${number}`);
-      lines.push(`  resume: /cron_resume_${number}`);
+      lines.push(`  show: /cron_show_${shortcutToken}_${number}`);
+      lines.push(`  run now: /cron_run_${shortcutToken}_${number}`);
+      lines.push(`  pause: /cron_pause_${shortcutToken}_${number}`);
+      lines.push(`  resume: /cron_resume_${shortcutToken}_${number}`);
       lines.push(`  id: ${job.id}`);
     });
 
     return lines.join("\n");
+  }
+
+  private createCronShortcutSnapshot(jobs: CronJobRecord[], target: TelegramTarget): string {
+    this.pruneCronShortcutSnapshots();
+    let token = "";
+    do {
+      token = Math.random().toString(36).slice(2, 8).padEnd(6, "0");
+    } while (this.cronShortcutSnapshots.has(token));
+
+    this.cronShortcutSnapshots.set(token, {
+      targetKey: telegramTargetKey(target),
+      jobIds: jobs.map((job) => job.id),
+      createdAt: Date.now()
+    });
+    return token;
+  }
+
+  private resolveCronSnapshotShortcut(token: string, selector: string, target: TelegramTarget): CronJobRecord | null {
+    this.pruneCronShortcutSnapshots();
+    const snapshot = this.cronShortcutSnapshots.get(token);
+    if (!snapshot || snapshot.targetKey !== telegramTargetKey(target)) {
+      return null;
+    }
+
+    const index = Number(selector) - 1;
+    if (!Number.isInteger(index) || index < 0 || index >= snapshot.jobIds.length) {
+      return null;
+    }
+
+    const job = this.db.getCronJob(snapshot.jobIds[index] || "");
+    if (!job) {
+      return null;
+    }
+    const currentContext = this.contexts.getContextByTopic(target.chatId, target.threadId);
+    const stillRelevant = this.cronManager.listRelevantJobs(currentContext, target).some((candidate) => candidate.id === job.id);
+    return stillRelevant ? job : null;
+  }
+
+  private pruneCronShortcutSnapshots(): void {
+    const now = Date.now();
+    for (const [token, snapshot] of this.cronShortcutSnapshots) {
+      if (now - snapshot.createdAt > CRON_SHORTCUT_TTL_MS) {
+        this.cronShortcutSnapshots.delete(token);
+      }
+    }
+
+    while (this.cronShortcutSnapshots.size > CRON_SHORTCUT_MAX_SNAPSHOTS) {
+      const oldest = [...this.cronShortcutSnapshots.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0]?.[0];
+      if (!oldest) {
+        break;
+      }
+      this.cronShortcutSnapshots.delete(oldest);
+    }
   }
 
   private formatBuiltinRoutineList(): string {
@@ -1385,12 +1658,21 @@ export class CommandHandler {
   }
 
   private resolveCronJobFromText(selectorText: string, context: ContextRecord | null, target: TelegramTarget): CronJobRecord {
-    const byId = this.db.getCronJob(selectorText);
+    const scoped = this.cronManager.listRelevantJobs(context, target);
+    const byId = scoped.find((job) => job.id === selectorText);
     if (byId) {
       return byId;
     }
 
-    return this.cronManager.resolveJob({ label: selectorText }, { context, target });
+    const byLabel = scoped.filter((job) => job.label.toLowerCase() === selectorText.trim().toLowerCase());
+    if (byLabel.length === 1) {
+      return byLabel[0];
+    }
+    if (byLabel.length > 1) {
+      throw new Error(`Cron label is ambiguous in this topic/context: ${selectorText}`);
+    }
+
+    throw new Error(`No cron job matched in this topic/context: ${selectorText}`);
   }
 
   private async installBuiltinRoutine(
@@ -1439,6 +1721,7 @@ export class CommandHandler {
         targetThreadId: target.threadId,
         instruction: draft.instruction || null,
         reminderText: draft.reminderText || null,
+        runner: draft.runner || null,
         enabled: true
       });
       await this.telegram.sendText(target, `Built-in routine updated: ${updated.id} (${updated.label}) next=${updated.nextRunAt || "none"}`);
@@ -1509,11 +1792,12 @@ export class CommandHandler {
       .join("\n");
   }
 
-  private formatArtifactsList(artifacts: string): string {
+  private formatArtifactsList(artifacts: string, context: ContextRecord, target: TelegramTarget): string {
     const entries = parseArtifactEntries(artifacts);
     if (!entries.length) {
-      return `${artifacts}\n\nNo sendable artifact paths were found. Record artifacts as file paths, for example: - \`report.md\``;
+      return "No sendable artifact paths were found. Record artifacts as file paths, for example: - `report.md`";
     }
+    const shortcutToken = this.createArtifactShortcutSnapshot(entries, context, target);
 
     const lines = [
       "# Artifacts",
@@ -1527,16 +1811,21 @@ export class CommandHandler {
     entries.forEach((entry, index) => {
       const number = index + 1;
       lines.push(`- ${entry.fileName}`);
-      lines.push(`  send: /artifact_${number}`);
-      lines.push(`  send + del: /artifact_${number}_senddel`);
-      lines.push(`  del: /shred_${number}`);
+      lines.push(`  send: /artifact_${shortcutToken}_${number}`);
+      lines.push(`  send + del: /artifact_${shortcutToken}_${number}_senddel`);
+      lines.push(`  del: /shred_${shortcutToken}_${number}`);
       lines.push(`  path: ${entry.path}`);
     });
 
     return lines.join("\n");
   }
 
-  private formatShredList(artifacts: string | null, filterText: string | null): string {
+  private formatShredList(
+    artifacts: string | null,
+    filterText: string | null,
+    context: ContextRecord,
+    target: TelegramTarget
+  ): string {
     const filter = filterText?.trim().toLowerCase() || "";
     const entries = parseArtifactEntries(artifacts)
       .map((entry, index) => ({ entry, index }))
@@ -1552,6 +1841,7 @@ export class CommandHandler {
         ? `No artifact file paths matched for shredding: ${filterText.trim()}`
         : "No artifact file paths were found in .factory/ARTIFACTS.md.";
     }
+    const shortcutToken = this.createArtifactShortcutSnapshot(entries.map(({ entry }) => entry), context, target);
 
     const lines = [
       "# Shred Artifacts",
@@ -1560,12 +1850,67 @@ export class CommandHandler {
       "- /shred_latest"
     ];
 
-    entries.forEach(({ entry, index }) => {
-      lines.push(`- /shred_${index + 1} ${entry.fileName}`);
+    entries.forEach(({ entry }, index) => {
+      lines.push(`- /shred_${shortcutToken}_${index + 1} ${entry.fileName}`);
       lines.push(`  path: ${entry.path}`);
     });
 
     return lines.join("\n");
+  }
+
+  private createArtifactShortcutSnapshot(entries: ArtifactEntry[], context: ContextRecord, target: TelegramTarget): string {
+    this.pruneArtifactShortcutSnapshots();
+    let token = "";
+    do {
+      token = Math.random().toString(36).slice(2, 8).padEnd(6, "0");
+    } while (this.artifactShortcutSnapshots.has(token));
+
+    this.artifactShortcutSnapshots.set(token, {
+      targetKey: telegramTargetKey(target),
+      contextSlug: context.slug,
+      paths: entries.map((entry) => entry.path),
+      createdAt: Date.now()
+    });
+    return token;
+  }
+
+  private resolveArtifactSnapshotShortcut(
+    token: string,
+    selector: string,
+    context: ContextRecord,
+    target: TelegramTarget,
+    artifacts: string | null
+  ): ArtifactEntry | null {
+    this.pruneArtifactShortcutSnapshots();
+    const snapshot = this.artifactShortcutSnapshots.get(token);
+    if (!snapshot || snapshot.targetKey !== telegramTargetKey(target) || snapshot.contextSlug !== context.slug) {
+      return null;
+    }
+
+    const index = Number(selector) - 1;
+    if (!Number.isInteger(index) || index < 0 || index >= snapshot.paths.length) {
+      return null;
+    }
+
+    const path = snapshot.paths[index];
+    return parseArtifactEntries(artifacts).find((entry) => entry.path === path) || null;
+  }
+
+  private pruneArtifactShortcutSnapshots(): void {
+    const now = Date.now();
+    for (const [token, snapshot] of this.artifactShortcutSnapshots) {
+      if (now - snapshot.createdAt > ARTIFACT_SHORTCUT_TTL_MS) {
+        this.artifactShortcutSnapshots.delete(token);
+      }
+    }
+
+    while (this.artifactShortcutSnapshots.size > ARTIFACT_SHORTCUT_MAX_SNAPSHOTS) {
+      const oldest = [...this.artifactShortcutSnapshots.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0]?.[0];
+      if (!oldest) {
+        break;
+      }
+      this.artifactShortcutSnapshots.delete(oldest);
+    }
   }
 
   private artifactEntriesForSend(artifacts: string | null, filterText: string | null, latestOnly: boolean): ArtifactEntry[] {
@@ -1696,6 +2041,11 @@ export class CommandHandler {
     entries: ArtifactEntry[],
     verb: string
   ): Promise<void> {
+    if (this.dispatcher.isActive(context.slug)) {
+      await this.telegram.sendText(target, `${context.slug} has an active job. Artifact deletion is disabled until the run finishes.`);
+      return;
+    }
+
     const removedPaths: string[] = [];
     const deleted: string[] = [];
     const missing: string[] = [];
@@ -1716,12 +2066,30 @@ export class CommandHandler {
     }
 
     if (removedPaths.length) {
-      const updatedArtifacts = removeArtifactEntriesFromMarkdown(artifacts, removedPaths);
-      await this.workers.writeWorkspaceFile(context, ".factory/ARTIFACTS.md", updatedArtifacts);
-      this.contexts.saveContext({
-        ...context,
-        lastArtifacts: snippet(updatedArtifacts)
-      });
+      let updatedArtifacts: string | null = null;
+      let wroteArtifacts = false;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const latestArtifacts = await this.workers.readFactoryFile(context, "ARTIFACTS.md");
+        updatedArtifacts = removeArtifactEntriesFromMarkdown(latestArtifacts ?? artifacts, removedPaths);
+        wroteArtifacts = await this.workers.writeWorkspaceFileIfUnchanged(
+          context,
+          ".factory/ARTIFACTS.md",
+          latestArtifacts,
+          updatedArtifacts
+        );
+        if (wroteArtifacts) {
+          break;
+        }
+      }
+
+      if (wroteArtifacts && updatedArtifacts !== null) {
+        this.contexts.saveContext({
+          ...context,
+          lastArtifacts: snippet(updatedArtifacts)
+        });
+      } else {
+        failed.push(".factory/ARTIFACTS.md changed during cleanup; deleted files were not removed from metadata. Retry /shred.");
+      }
     }
 
     const lines = [`${verb} ${deleted.length + missing.length} artifact(s).`];

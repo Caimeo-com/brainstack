@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { CommandHandler } from "../src/commands";
@@ -9,7 +9,12 @@ import { CronScheduler } from "../src/cron-scheduler";
 import { ContextService } from "../src/contexts";
 import { FactoryDb } from "../src/db";
 import { Dispatcher } from "../src/dispatcher";
-import { parseArtifactEntries, resolveManifestRequests, type TelegramAttachmentKind } from "../src/telegram-attachments";
+import {
+  parseArtifactEntries,
+  removeArtifactEntriesFromMarkdown,
+  resolveManifestRequests,
+  type TelegramAttachmentKind
+} from "../src/telegram-attachments";
 import type { TelegramMessage, TelegramTarget } from "../src/telegram";
 import { WorkerService } from "../src/workers";
 
@@ -75,10 +80,13 @@ class FakeTelegram {
     };
   }
 
-  async downloadFile(filePath: string): Promise<Uint8Array> {
+  async downloadFile(filePath: string, maxBytes?: number): Promise<Uint8Array> {
     const file = [...this.remoteFiles.values()].find((entry) => entry.filePath === filePath);
     if (!file) {
       throw new Error(`Missing fake Telegram file path: ${filePath}`);
+    }
+    if (maxBytes !== undefined && file.bytes.byteLength > maxBytes) {
+      throw new Error(`Fake Telegram file exceeds ${maxBytes} bytes`);
     }
 
     return file.bytes;
@@ -482,7 +490,7 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
   const telegram = new FakeTelegram();
   const cronManager = new CronManager(config, db, workers);
   const dispatcher = new Dispatcher(config, db, contexts, workers, telegram as never, cronManager);
-  const cronScheduler = new CronScheduler(config, db, cronManager, dispatcher, telegram as never);
+  const cronScheduler = new CronScheduler(config, db, cronManager, dispatcher, workers, telegram as never);
   const commands = new CommandHandler(config, db, telegram as never, contexts, workers, dispatcher, cronManager, cronScheduler);
 
   return {
@@ -513,6 +521,8 @@ test("phase 1 workflow covers local host/scratch and pending remote behavior", a
     expect(helpText).toContain("A context is the durable Codex workspace and session binding for one Telegram topic.");
     expect(helpText).toContain("/newctx is usually run once per reusable Telegram topic");
     expect(helpText).toContain("/bind is for repointing the current topic");
+    expect(helpText).not.toContain("/artifact_N");
+    expect(helpText).not.toContain("/shred_N");
     expect(helpText).toContain("Old Telegram messages remain in Telegram");
     expect(helpText).toContain("/mode [fast|normal|max|clear]");
     expect(helpText).toContain("/model [model-id|clear]");
@@ -635,7 +645,30 @@ test("phase 1 workflow covers local host/scratch and pending remote behavior", a
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }
-}, 15_000);
+}, 30_000);
+
+test("addressed commands for other bots are ignored and updates probes are bounded", async () => {
+  const fixture = await createFixture({ FACTORY_TELEGRAM_BOT_USERNAME: "brainstackbot" });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/help@otherbot", 10));
+    expect(fixture.telegram.sent).toHaveLength(0);
+
+    await makeExecutable(
+      fixture.fakeCodex,
+      `#!/usr/bin/env bash
+exec sleep 30
+`
+    );
+    const startedAt = Date.now();
+    await fixture.commands.handleMessage(telegramMessage("/updates@brainstackbot", 10));
+    expect(Date.now() - startedAt).toBeLessThan(7000);
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("codex=timeout after");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
 
 test("cron jobs can be created from a normal Codex turn, tuned later, mirrored into the workspace, and dispatched by the scheduler", async () => {
   const fixture = await createFixture();
@@ -661,7 +694,7 @@ test("cron jobs can be created from a normal Codex turn, tuned later, mirrored i
 
     await fixture.commands.handleMessage(telegramMessage("/crons", 80));
     expect(fixture.telegram.sent.at(-1)?.text).toContain("stripe-reminder");
-    expect(fixture.telegram.sent.at(-1)?.text).toContain("/cron_run_1");
+    expect(fixture.telegram.sent.at(-1)?.text || "").toMatch(/\/cron_run_[a-z0-9]{6,10}_1/);
     expect(fixture.telegram.sent.at(-1)?.text).toContain("/cron_install_update_check");
 
     await fixture.commands.handleMessage(telegramMessage("Change mode to fast for stripe cron.", 80));
@@ -730,11 +763,252 @@ test("cron jobs can be created from a normal Codex turn, tuned later, mirrored i
   }
 }, 20_000);
 
+test("dispatcher reserves context locks before asynchronous setup can race", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx lockrace control scratch", 82));
+    const context = fixture.db.getContextBySlug("lockrace");
+    expect(context).toBeTruthy();
+
+    const first = await fixture.dispatcher.dispatch(
+      "resume",
+      context!,
+      "slow live session from first dispatch",
+      { chatId: 4242, threadId: 82 },
+      { notifyAccepted: false }
+    );
+    const second = await fixture.dispatcher.dispatch(
+      "resume",
+      context!,
+      "second dispatch should not start",
+      { chatId: 4242, threadId: 82 },
+      { notifyAccepted: false }
+    );
+
+    expect(first.accepted).toBe(true);
+    expect(second.accepted).toBe(false);
+    expect(second.message).toContain("already has an active job");
+    await waitFor(() => !fixture.dispatcher.isActive("lockrace"));
+    expect(await readFile(join(context!.worktreePath, ".factory", "fake-turn-count"), "utf8")).toBe("1");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("archiving an active context prevents completion side effects from reactivating it", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx archive-race control scratch", 83));
+    await fixture.commands.handleMessage(telegramMessage("slow live session", 83));
+    await fixture.commands.handleMessage(telegramMessage("/archive", 83));
+    await waitFor(() => !fixture.dispatcher.isActive("archive-race"));
+    expect(fixture.db.getContextBySlug("archive-race")?.state).toBe("archived");
+    expect(fixture.db.getContextBySlug("archive-race")?.telegramThreadId).toBeNull();
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("archived contexts stop pre-worker dispatch and pause linked cron slots", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx archive-preworker control scratch", 85));
+    const context = fixture.db.getContextBySlug("archive-preworker");
+    expect(context?.worktreePath).toBeTruthy();
+
+    fixture.telegram.registerRemoteFile("archive-photo", "photos/archive.jpg", "archive image");
+    const originalDownloadFile = fixture.telegram.downloadFile.bind(fixture.telegram);
+    fixture.telegram.downloadFile = async (...args) => {
+      const current = fixture.db.getContextBySlug("archive-preworker");
+      fixture.contexts.saveContext({
+        ...current!,
+        state: "archived",
+        telegramChatId: null,
+        telegramThreadId: null
+      });
+      return originalDownloadFile(...args);
+    };
+    await fixture.commands.handleMessage(telegramPhotoMessage("Archive during prep.", 85, "archive-photo"));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("was archived before the worker started")));
+    fixture.telegram.downloadFile = originalDownloadFile;
+    expect(await Bun.file(join(context!.worktreePath, ".factory", "fake-turn-count")).exists()).toBe(false);
+    expect(fixture.db.getContextBySlug("archive-preworker")?.state).toBe("archived");
+    const guardedRun = await fixture.workers.runCodex(
+      context!,
+      "This should not reach the harness.",
+      "run",
+      join(fixture.controlRoot, "logs", "archive-preworker.log")
+    );
+    expect(guardedRun.ok).toBe(false);
+    expect(guardedRun.exitCode).toBe(89);
+    expect(guardedRun.stderr).toContain("context archived before harness launch");
+    expect(await Bun.file(join(context!.worktreePath, ".factory", "fake-turn-count")).exists()).toBe(false);
+    const guardedUpdateCheck = await fixture.workers.runUpdateCheck(context!);
+    expect(guardedUpdateCheck.ok).toBe(false);
+    expect(guardedUpdateCheck.exitCode).toBe(89);
+    expect(guardedUpdateCheck.stderr).toContain("context archived before update-check launch");
+
+    const codex = await fixture.cronManager.createJob(
+      {
+        label: "paused-archived-codex",
+        kind: "codex",
+        schedule: { type: "once", at: "2999-04-01T07:00:00.000Z" },
+        executionContextSlug: "archive-preworker",
+        targetChatId: 4242,
+        targetThreadId: 85,
+        instruction: "Should not run."
+      },
+      { context: fixture.db.getContextBySlug("archive-preworker"), target: { chatId: 4242, threadId: 85 } }
+    );
+    await fixture.cronScheduler.runDueJobs("2999-04-01T08:00:00.000Z");
+    const pausedCodex = fixture.db.getCronJob(codex.id);
+    expect(pausedCodex?.enabled).toBe(false);
+    expect(pausedCodex?.pendingRunAt).toBe("2999-04-01T07:00:00.000Z");
+    expect(pausedCodex?.lastError).toContain("is archived");
+
+    const updateCheck = await fixture.cronManager.createJob(
+      {
+        label: "paused-archived-update-check",
+        kind: "codex",
+        runner: "deterministic-update-check",
+        schedule: { type: "once", at: "2999-04-02T07:00:00.000Z" },
+        executionContextSlug: "archive-preworker",
+        targetChatId: 4242,
+        targetThreadId: 85,
+        instruction: "Run update check."
+      },
+      { context: fixture.db.getContextBySlug("archive-preworker"), target: { chatId: 4242, threadId: 85 } }
+    );
+    await fixture.cronScheduler.runDueJobs("2999-04-02T08:00:00.000Z");
+    const pausedUpdateCheck = fixture.db.getCronJob(updateCheck.id);
+    expect(pausedUpdateCheck?.enabled).toBe(false);
+    expect(pausedUpdateCheck?.pendingRunAt).toBe("2999-04-02T07:00:00.000Z");
+    expect(pausedUpdateCheck?.lastError).toContain("is archived");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("cron outcome saves do not resurrect jobs deleted after claim", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx claim-races control scratch", 84));
+    const reminder = await fixture.cronManager.createJob(
+      {
+        label: "delete-reminder-after-claim",
+        kind: "reminder",
+        schedule: { type: "once", at: "2999-03-01T07:00:00.000Z" },
+        executionContextSlug: "claim-races",
+        targetChatId: 4242,
+        targetThreadId: 84,
+        reminderText: "Delete me during send."
+      },
+      { context: fixture.db.getContextBySlug("claim-races"), target: { chatId: 4242, threadId: 84 } }
+    );
+    const originalSendText = fixture.telegram.sendText.bind(fixture.telegram);
+    fixture.telegram.sendText = async (target, text) => {
+      if (text === "Delete me during send.") {
+        fixture.db.deleteCronJob(reminder.id);
+      }
+      await originalSendText(target, text);
+    };
+    await fixture.cronScheduler.runDueJobs("2999-03-01T08:00:00.000Z");
+    fixture.telegram.sendText = originalSendText;
+    expect(fixture.db.getCronJob(reminder.id)).toBeNull();
+
+    const codex = await fixture.cronManager.createJob(
+      {
+        label: "delete-codex-after-claim",
+        kind: "codex",
+        schedule: { type: "once", at: "2999-03-02T07:00:00.000Z" },
+        executionContextSlug: "claim-races",
+        targetChatId: 4242,
+        targetThreadId: 84,
+        instruction: "Delete me during dispatch."
+      },
+      { context: fixture.db.getContextBySlug("claim-races"), target: { chatId: 4242, threadId: 84 } }
+    );
+    const originalDispatch = fixture.dispatcher.dispatch.bind(fixture.dispatcher);
+    fixture.dispatcher.dispatch = async () => {
+      fixture.db.deleteCronJob(codex.id);
+      return { accepted: true, message: "" };
+    };
+    await fixture.cronScheduler.runDueJobs("2999-03-02T08:00:00.000Z");
+    fixture.dispatcher.dispatch = originalDispatch;
+    expect(fixture.db.getCronJob(codex.id)).toBeNull();
+
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("scheduler startup recovers unfinished claimed cron slots for operator review", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx recover-claims control scratch", 86));
+    const recover = await fixture.cronManager.createJob(
+      {
+        label: "recover-claimed-slot",
+        kind: "reminder",
+        schedule: { type: "once", at: "2999-03-03T07:00:00.000Z" },
+        executionContextSlug: "recover-claims",
+        targetChatId: 4242,
+        targetThreadId: 86,
+        reminderText: "Recover me."
+      },
+      { context: fixture.db.getContextBySlug("recover-claims"), target: { chatId: 4242, threadId: 86 } }
+    );
+    const scheduledFor = "2999-03-03T07:00:00.000Z";
+    await fixture.cronManager.saveJob({
+      ...recover,
+      enabled: false,
+      nextRunAt: null,
+      pendingRunAt: null,
+      lastRunAt: scheduledFor,
+      lastScheduledFor: scheduledFor,
+      updatedAt: "2999-03-03T07:01:00.000Z"
+    });
+    fixture.db.saveCronRun({
+      id: `cron-claim-${recover.id}-${scheduledFor.replace(/[^0-9]/g, "")}`,
+      jobId: recover.id,
+      scheduledFor,
+      startedAt: "2999-03-03T07:01:00.000Z",
+      finishedAt: null,
+      status: "claimed",
+      note: "Claimed before simulated crash"
+    });
+
+    await fixture.cronScheduler.runDueJobs("2999-03-03T08:00:00.000Z");
+    const recovered = fixture.db.getCronJob(recover.id);
+    expect(recovered?.enabled).toBe(false);
+    expect(recovered?.pendingRunAt).toBe(scheduledFor);
+    expect(recovered?.lastError).toContain("Recovered unfinished claimed run");
+    expect(fixture.db.listCronRuns(recover.id).find((run) => run.id.startsWith("cron-claim-"))?.status).toBe("failed");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
 test("deterministic cron commands install built-ins and run jobs immediately", async () => {
   const fixture = await createFixture();
 
   try {
     await fixture.commands.handleMessage(telegramMessage("/newctx routines control scratch", 81));
+
+    await fixture.commands.handleMessage(
+      telegramMessage("/cron create codex too-fast interval 1 Sweep the repo too often.", 81)
+    );
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Codex interval jobs must run at least every 15 minutes");
 
     await fixture.commands.handleMessage(
       telegramMessage("/cron create reminder water daily 09:00 Europe/Zagreb Drink water.", 81)
@@ -747,13 +1021,290 @@ test("deterministic cron commands install built-ins and run jobs immediately", a
     expect(fixture.telegram.sent.at(-2)?.text).toBe("Drink water.");
     expect(fixture.telegram.sent.at(-1)?.text).toContain("Cron run sent:");
 
+    await fixture.cronManager.saveJob({
+      ...water!,
+      nextRunAt: "2999-01-01T09:00:00.000Z",
+      pendingRunAt: null,
+      updatedAt: "2999-01-01T09:00:00.000Z"
+    });
+    const dueWater = fixture.db.getCronJob(water!.id)!;
+    const drinkCountBefore = fixture.telegram.sent.filter((entry) => entry.text === "Drink water.").length;
+    await fixture.cronScheduler.runJobNow(dueWater, "2999-01-02T10:00:00.000Z");
+    const manuallyClaimedWater = fixture.db.getCronJob(water!.id)!;
+    expect(manuallyClaimedWater.pendingRunAt).toBeNull();
+    expect(manuallyClaimedWater.nextRunAt && manuallyClaimedWater.nextRunAt > "2999-01-02T10:00:00.000Z").toBe(true);
+    await fixture.cronScheduler.runDueJobs("2999-01-02T10:00:00.000Z");
+    expect(fixture.telegram.sent.filter((entry) => entry.text === "Drink water.")).toHaveLength(drinkCountBefore + 1);
+
+    await fixture.commands.handleMessage(
+      telegramMessage("/cron create reminder race once 2999-01-03T09:00:00.000Z Race reminder.", 81)
+    );
+    const race = fixture.db.listCronJobs().find((job) => job.label === "race")!;
+    const originalSendText = fixture.telegram.sendText.bind(fixture.telegram);
+    let racedScheduler = false;
+    fixture.telegram.sendText = async (target, text) => {
+      if (text === "Race reminder." && !racedScheduler) {
+        racedScheduler = true;
+        const schedulerRun = fixture.cronScheduler.runDueJobs("2999-01-03T10:00:00.000Z");
+        await Bun.sleep(10);
+        await originalSendText(target, text);
+        await schedulerRun;
+        return;
+      }
+      await originalSendText(target, text);
+    };
+    await fixture.cronScheduler.runJobNow(race, "2999-01-03T10:00:00.000Z");
+    fixture.telegram.sendText = originalSendText;
+    expect(fixture.telegram.sent.filter((entry) => entry.text === "Race reminder.")).toHaveLength(1);
+
+    const legacyUpdateCheck = await fixture.cronManager.createJob(
+      {
+        label: "update-check",
+        kind: "codex",
+        schedule: {
+          type: "interval",
+          everyMinutes: 60,
+          anchorAt: "2026-04-08T06:00:00.000Z"
+        },
+        executionContextSlug: "routines",
+        targetChatId: 4242,
+        targetThreadId: 81,
+        instruction: "Legacy yolo update check.",
+        enabled: false
+      },
+      {
+        context: fixture.db.getContextBySlug("routines"),
+        target: { chatId: 4242, threadId: 81 }
+      }
+    );
+    expect(legacyUpdateCheck.runner).toBeNull();
     await fixture.commands.handleMessage(telegramMessage("/cron install update-check daily 08:00 Europe/Zagreb", 81));
-    const updateCheck = fixture.db.listCronJobs().find((job) => job.label === "update-check");
+    const updateCheck = fixture.db.getCronJob(legacyUpdateCheck.id);
     expect(updateCheck?.kind).toBe("codex");
+    expect(updateCheck?.runner).toBe("deterministic-update-check");
     expect(updateCheck?.executionContextSlug).toBe("routines");
-    expect(updateCheck?.instruction).toContain("read-only update check");
-    expect(updateCheck?.instruction).toContain("pacman -Qu");
-    expect(updateCheck?.instruction).toContain("Do not install, upgrade, remove, reboot, restart");
+    expect(updateCheck?.instruction).toContain("deterministic built-in update check");
+    expect(updateCheck?.instruction).toContain("not by an LLM harness");
+
+    await fixture.cronManager.updateJob(updateCheck!, { label: "weekly-updates" });
+    await fixture.commands.handleMessage(telegramMessage("/cron_run weekly-updates", 81));
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("Update check complete."))).toBe(true);
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Cron run completed:");
+    const routinesRoot = join(fixture.factoryRoot, "scratch", "routines");
+    expect(await Bun.file(join(routinesRoot, ".factory", "fake-codex-turn-count")).exists()).toBe(false);
+    expect(await readFile(join(routinesRoot, ".factory", "ARTIFACTS.md"), "utf8")).toContain(
+      ".factory/reports/update-check-"
+    );
+
+    const customUpdateCheck = await fixture.cronManager.createJob(
+      {
+        label: "update-check",
+        kind: "codex",
+        schedule: {
+          type: "interval",
+          everyMinutes: 60,
+          anchorAt: "2026-04-08T06:00:00.000Z"
+        },
+        executionContextSlug: "routines",
+        targetChatId: 4242,
+        targetThreadId: 81,
+        instruction: "Run a custom update-check-labeled Codex job."
+      },
+      {
+        context: fixture.db.getContextBySlug("routines"),
+        target: { chatId: 4242, threadId: 81 }
+      }
+    );
+    expect(customUpdateCheck.runner).toBeNull();
+    let customUsedDeterministicRunner = false;
+    const originalRunUpdateCheck = fixture.workers.runUpdateCheck.bind(fixture.workers);
+    fixture.workers.runUpdateCheck = async (...args) => {
+      customUsedDeterministicRunner = true;
+      return originalRunUpdateCheck(...args);
+    };
+    const customRunMessageStart = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage(`/cron_run ${customUpdateCheck.id}`, 81));
+    expect(fixture.telegram.sent.slice(customRunMessageStart).some((entry) => entry.text.includes("Cron run dispatched:"))).toBe(true);
+    expect(customUsedDeterministicRunner).toBe(false);
+    await waitFor(() => !fixture.dispatcher.isActive("routines"));
+    fixture.workers.runUpdateCheck = originalRunUpdateCheck;
+
+    let archivedDuringClaim = false;
+    let staleContextRan = false;
+    const originalSaveJob = fixture.cronManager.saveJob.bind(fixture.cronManager);
+    fixture.cronManager.saveJob = async (job) => {
+      const saved = await originalSaveJob(job);
+      if (
+        saved.id === updateCheck!.id &&
+        saved.lastResult?.startsWith("Deterministic update check started") &&
+        !archivedDuringClaim
+      ) {
+        archivedDuringClaim = true;
+        fixture.contexts.updateState(fixture.db.getContextBySlug("routines")!, "archived");
+      }
+      return saved;
+    };
+    fixture.workers.runUpdateCheck = async (...args) => {
+      staleContextRan = true;
+      return originalRunUpdateCheck(...args);
+    };
+    await fixture.commands.handleMessage(telegramMessage("/cron_run weekly-updates", 81));
+    expect(staleContextRan).toBe(false);
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("context routines is no longer active");
+    fixture.cronManager.saveJob = originalSaveJob;
+    fixture.workers.runUpdateCheck = originalRunUpdateCheck;
+    fixture.contexts.updateState(fixture.db.getContextBySlug("routines")!, "active");
+    await fixture.cronManager.pauseJob(fixture.db.getCronJob(updateCheck!.id)!);
+    await fixture.cronManager.pauseJob(fixture.db.getCronJob(customUpdateCheck.id)!);
+
+    const staleFastJob = fixture.db.saveCronJob({
+      id: "legacy-fast-codex",
+      label: "legacy-fast",
+      kind: "codex",
+      runner: null,
+      enabled: false,
+      schedule: {
+        type: "interval",
+        everyMinutes: 1,
+        anchorAt: "2026-04-08T06:00:00.000Z"
+      },
+      nextRunAt: null,
+      pendingRunAt: null,
+      lastRunAt: null,
+      lastScheduledFor: null,
+      executionContextSlug: "routines",
+      targetChatId: 4242,
+      targetThreadId: 81,
+      instruction: "Legacy high-frequency job.",
+      reminderText: null,
+      modelOverride: null,
+      reasoningEffortOverride: null,
+      lastResult: null,
+      lastError: null,
+      createdAt: "2026-04-08T06:00:00.000Z",
+      updatedAt: "2026-04-08T06:00:00.000Z"
+    });
+    await expect(fixture.cronManager.resumeJob(staleFastJob)).rejects.toThrow("Codex interval jobs must run at least every 15 minutes");
+
+    const postClaimBusyCodex = await fixture.cronManager.createJob(
+      {
+        label: "post-claim-busy-codex",
+        kind: "codex",
+        schedule: {
+          type: "once",
+          at: "2999-01-31T07:00:00.000Z"
+        },
+        executionContextSlug: "routines",
+        targetChatId: 4242,
+        targetThreadId: 81,
+        instruction: "Race normal dispatch."
+      },
+      {
+        context: fixture.db.getContextBySlug("routines"),
+        target: { chatId: 4242, threadId: 81 }
+      }
+    );
+    const originalDispatch = fixture.dispatcher.dispatch.bind(fixture.dispatcher);
+    fixture.dispatcher.dispatch = async () => ({
+      accepted: false,
+      message: "routines already has an active job. Use /topicinfo or /tail."
+    });
+    await fixture.cronScheduler.runDueJobs("2999-01-31T08:00:00.000Z");
+    fixture.dispatcher.dispatch = originalDispatch;
+    const queuedCodex = fixture.db.getCronJob(postClaimBusyCodex.id);
+    expect(queuedCodex?.enabled).toBe(true);
+    expect(queuedCodex?.pendingRunAt).toBe("2999-01-31T07:00:00.000Z");
+    expect(fixture.db.listCronRuns(postClaimBusyCodex.id)[0]?.status).toBe("queued");
+    await fixture.cronManager.pauseJob(queuedCodex!);
+
+    const raceUpdateCheck = await fixture.cronManager.createJob(
+      {
+        label: "update-check-race",
+        kind: "codex",
+        runner: "deterministic-update-check",
+        schedule: {
+          type: "once",
+          at: "2999-02-01T07:00:00.000Z"
+        },
+        executionContextSlug: "routines",
+        targetChatId: 4242,
+        targetThreadId: 81,
+        instruction: "Race update check."
+      },
+      {
+        context: fixture.db.getContextBySlug("routines"),
+        target: { chatId: 4242, threadId: 81 }
+      }
+    );
+    fixture.workers.runUpdateCheck = async (...args) => {
+      fixture.db.deleteCronJob(raceUpdateCheck.id);
+      return originalRunUpdateCheck(...args);
+    };
+    await fixture.cronScheduler.runDueJobs("2999-02-01T08:00:00.000Z");
+    expect(fixture.db.getCronJob(raceUpdateCheck.id)).toBeNull();
+    expect(fixture.db.listCronRuns(raceUpdateCheck.id)).toEqual([]);
+    fixture.workers.runUpdateCheck = originalRunUpdateCheck;
+
+    const busyUpdateCheck = await fixture.cronManager.createJob(
+      {
+        label: "update-check-busy-after-claim",
+        kind: "codex",
+        runner: "deterministic-update-check",
+        schedule: {
+          type: "once",
+          at: "2999-02-01T09:00:00.000Z"
+        },
+        executionContextSlug: "routines",
+        targetChatId: 4242,
+        targetThreadId: 81,
+        instruction: "Busy update check."
+      },
+      {
+        context: fixture.db.getContextBySlug("routines"),
+        target: { chatId: 4242, threadId: 81 }
+      }
+    );
+    const originalWithContextLock = fixture.dispatcher.withContextLock.bind(fixture.dispatcher);
+    fixture.dispatcher.withContextLock = async () => {
+      throw new Error("routines already has an active job. Use /topicinfo or /tail.");
+    };
+    await fixture.cronScheduler.runDueJobs("2999-02-01T10:00:00.000Z");
+    fixture.dispatcher.withContextLock = originalWithContextLock;
+    const queuedUpdateCheck = fixture.db.getCronJob(busyUpdateCheck.id);
+    expect(queuedUpdateCheck?.enabled).toBe(true);
+    expect(queuedUpdateCheck?.pendingRunAt).toBe("2999-02-01T09:00:00.000Z");
+    expect(fixture.db.listCronRuns(busyUpdateCheck.id)[0]?.status).toBe("queued");
+    await fixture.cronManager.pauseJob(queuedUpdateCheck!);
+
+    const failingUpdateCheck = await fixture.cronManager.createJob(
+      {
+        label: "update-check-fails",
+        kind: "codex",
+        runner: "deterministic-update-check",
+        schedule: {
+          type: "once",
+          at: "2999-02-02T07:00:00.000Z"
+        },
+        executionContextSlug: "routines",
+        targetChatId: 4242,
+        targetThreadId: 81,
+        instruction: "Failing update check."
+      },
+      {
+        context: fixture.db.getContextBySlug("routines"),
+        target: { chatId: 4242, threadId: 81 }
+      }
+    );
+    await fixture.commands.handleMessage(
+      telegramMessage("/cron create reminder after-failure once 2999-02-02T07:00:00.000Z After failure.", 81)
+    );
+    fixture.workers.runUpdateCheck = async () => {
+      throw new Error("synthetic update-check failure");
+    };
+    await fixture.cronScheduler.runDueJobs("2999-02-02T08:00:00.000Z");
+    expect(fixture.db.getCronJob(failingUpdateCheck.id)?.lastError).toContain("synthetic update-check failure");
+    expect(fixture.telegram.sent.some((entry) => entry.text === "After failure.")).toBe(true);
+    fixture.workers.runUpdateCheck = originalRunUpdateCheck;
 
     await fixture.commands.handleMessage(telegramMessage("/cron_install_daily_checkin", 81));
     const checkin = fixture.db.listCronJobs().find((job) => job.label === "daily-checkin");
@@ -769,8 +1320,81 @@ test("deterministic cron commands install built-ins and run jobs immediately", a
     await fixture.commands.handleMessage(telegramMessage("/crons", 81));
     const overview = fixture.telegram.sent.at(-1)?.text || "";
     expect(overview).toContain("/cron_install_brain_curator");
-    expect(overview).toContain("/cron_run_");
+    expect(overview).toMatch(/\/cron_run_[a-z0-9]{6,10}_\d+/);
     expect(overview).toContain("daily-checkin");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("cron shortcuts use stable scoped snapshots and cron ids cannot cross topics", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx topic-a control scratch", 82));
+    await fixture.commands.handleMessage(
+      telegramMessage("/cron create reminder alpha daily 09:00 Europe/Zagreb Alpha reminder.", 82)
+    );
+    const alpha = fixture.db.listCronJobs().find((job) => job.label === "alpha")!;
+
+    await fixture.commands.handleMessage(telegramMessage("/newctx topic-b control scratch", 83));
+    await fixture.commands.handleMessage(
+      telegramMessage("/cron create reminder beta daily 09:00 Europe/Zagreb Beta reminder.", 83)
+    );
+    const beta = fixture.db.listCronJobs().find((job) => job.label === "beta")!;
+
+    await fixture.commands.handleMessage(telegramMessage("/crons", 82));
+    const overview = fixture.telegram.sent.at(-1)?.text || "";
+    const runShortcut = overview.match(/\/cron_run_[a-z0-9]{6,10}_1/)?.[0];
+    expect(runShortcut).toBeTruthy();
+
+    await fixture.commands.handleMessage(
+      telegramMessage("/cron create reminder newest daily 09:05 Europe/Zagreb Newest reminder.", 82)
+    );
+    await fixture.commands.handleMessage(telegramMessage(runShortcut!, 82));
+    expect(fixture.telegram.sent.at(-2)?.text).toBe("Alpha reminder.");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Cron run sent:");
+
+    const topicBContext = fixture.db.getContextBySlug("topic-b")!;
+    const crossDeleteNotes = await fixture.cronManager.applyManifest(
+      JSON.stringify({ actions: [{ type: "delete", selector: { id: alpha.id } }] }),
+      { context: topicBContext, target: { chatId: 4242, threadId: 83 } }
+    );
+    expect(crossDeleteNotes.join("\n")).toContain("Unknown cron job in this topic/context");
+    expect(fixture.db.getCronJob(alpha.id)).not.toBeNull();
+
+    const scopedCreateNotes = await fixture.cronManager.applyManifest(
+      JSON.stringify({
+        actions: [
+          {
+            type: "create",
+            job: {
+              label: "cross-create",
+              kind: "reminder",
+              schedule: { type: "daily", time: "09:00", timezone: "Europe/Zagreb" },
+              targetThreadId: 82,
+              reminderText: "should not cross"
+            }
+          }
+        ]
+      }),
+      { context: topicBContext, target: { chatId: 4242, threadId: 83 } }
+    );
+    expect(scopedCreateNotes.join("\n")).toContain("Cron manifest create actions cannot set scoped fields");
+    expect(fixture.db.listCronJobs().some((job) => job.label === "cross-create")).toBe(false);
+
+    await fixture.cronManager.updateJob(alpha, { executionContextSlug: "topic-b", targetThreadId: 83 });
+    await fixture.commands.handleMessage(telegramMessage(runShortcut!, 82));
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("shortcut expired or the job was deleted");
+
+    await fixture.commands.handleMessage(telegramMessage("/cron_run_1", 82));
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Numeric cron shortcuts expire");
+
+    await fixture.commands.handleMessage(telegramMessage(`/cron show ${beta.id}`, 82));
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Error: No cron job matched in this topic/context");
+    await fixture.commands.handleMessage(telegramMessage(`/cron_run ${beta.id}`, 82));
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Error: No cron job matched in this topic/context");
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
@@ -840,7 +1464,11 @@ test("artifact delivery rejects absolute paths recorded in ARTIFACTS by default"
     expect(fixture.telegram.attachments).toHaveLength(0);
     expect(fixture.telegram.sent.at(-1)?.text).toContain("absolute artifact paths are disabled");
 
-    await fixture.commands.handleMessage(telegramMessage("/shred_1", 66));
+    await fixture.commands.handleMessage(telegramMessage("/shred", 66));
+    const shredList = fixture.telegram.sent.at(-1)?.text || "";
+    const shredShortcut = shredList.match(/\/shred_[a-z0-9]{6,10}_1/)?.[0] || "";
+    expect(shredShortcut).not.toBe("");
+    await fixture.commands.handleMessage(telegramMessage(shredShortcut, 66));
     expect(fixture.telegram.sent.at(-1)?.text).toContain("Not deleted:");
     expect(fixture.telegram.sent.at(-1)?.text).toContain("Unsafe artifact delete path");
     expect(parseArtifactEntries(await readFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), "utf8"))).toHaveLength(1);
@@ -861,45 +1489,94 @@ test("artifact delivery supports backticked bare relative filenames", async () =
     const artifactMarkdown = [
       "# Artifacts",
       "",
-      "- `yoda-openclaw-audit.md` - read-only audit report on `yoda`",
+      "- `worker-openclaw-audit.md` - read-only audit report on `worker-host`",
       "- `openclaw-retirement-phase1.md` - phase 1 cleanup report"
     ].join("\n");
-    await writeFile(join(context!.worktreePath, "yoda-openclaw-audit.md"), "audit contents");
+    await writeFile(join(context!.worktreePath, "worker-openclaw-audit.md"), "audit contents");
     await writeFile(join(context!.worktreePath, "openclaw-retirement-phase1.md"), "phase 1 contents");
     await writeFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), artifactMarkdown);
 
     expect(parseArtifactEntries(artifactMarkdown).map((entry) => entry.path)).toEqual([
-      "yoda-openclaw-audit.md",
+      "worker-openclaw-audit.md",
       "openclaw-retirement-phase1.md"
     ]);
     expect(
+      parseArtifactEntries("# Artifacts\n\n- `.factory/STATE.json`\n- `.git/config`\n- `.factory/reports/update-check.md`\n").map(
+        (entry) => entry.path
+      )
+    ).toEqual([".factory/reports/update-check.md"]);
+    const splitLineArtifacts = removeArtifactEntriesFromMarkdown(
+      "# Artifacts\n\n- `one.md` and `two.md`\n",
+      ["one.md"]
+    );
+    expect(parseArtifactEntries(splitLineArtifacts).map((entry) => entry.path)).toEqual(["two.md"]);
+    expect(
       resolveManifestRequests(
-        '{"attachments":[{"path":"yoda-openclaw-audit.md","type":"document"}]}',
+        '{"attachments":[{"path":"worker-openclaw-audit.md","type":"document"}]}',
         artifactMarkdown
       ).requests.map((request) => request.path)
-    ).toEqual(["yoda-openclaw-audit.md"]);
+    ).toEqual(["worker-openclaw-audit.md"]);
+    const manyAttachments = resolveManifestRequests(
+      JSON.stringify({
+        attachments: Array.from({ length: 12 }, (_, index) => ({ path: `artifact-${index}.md`, type: "document" }))
+      }),
+      Array.from({ length: 12 }, (_, index) => `- \`artifact-${index}.md\``).join("\n")
+    );
+    expect(manyAttachments.requests).toHaveLength(10);
+    expect(manyAttachments.skipped.join("\n")).toContain("file limit");
 
-    await fixture.commands.handleMessage(telegramMessage("/artifacts send yoda-openclaw-audit.md", 67));
-    await waitFor(() => fixture.telegram.attachments.some((entry) => entry.fileName === "yoda-openclaw-audit.md"));
+    await fixture.commands.handleMessage(telegramMessage("/artifacts send worker-openclaw-audit.md", 67));
+    await waitFor(() => fixture.telegram.attachments.some((entry) => entry.fileName === "worker-openclaw-audit.md"));
 
-    const sent = fixture.telegram.attachments.find((entry) => entry.fileName === "yoda-openclaw-audit.md");
+    const sent = fixture.telegram.attachments.find((entry) => entry.fileName === "worker-openclaw-audit.md");
     expect(sent?.text).toBe("audit contents");
     expect(fixture.telegram.sent.some((entry) => entry.text.includes("No artifact file paths matched"))).toBe(false);
 
+    await symlink(join(context!.worktreePath, ".factory", "STATE.json"), join(context!.worktreePath, "safe-report.md"));
+    await symlink(join(context!.worktreePath, ".factory"), join(context!.worktreePath, "reports-link"));
+    await writeFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), "# Artifacts\n\n- `safe-report.md`\n- `reports-link/STATE.json`\n");
+    const symlinkSendCount = fixture.telegram.attachments.length;
+    await fixture.commands.handleMessage(telegramMessage("/artifacts send safe-report.md", 67));
+    expect(fixture.telegram.attachments).toHaveLength(symlinkSendCount);
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("artifact path is a symlink");
+    await fixture.commands.handleMessage(telegramMessage("/artifacts send reports-link/STATE.json", 67));
+    expect(fixture.telegram.attachments).toHaveLength(symlinkSendCount);
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("protected artifact path cannot be sent");
+    await writeFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), artifactMarkdown);
+
     await fixture.commands.handleMessage(telegramMessage("/artifacts", 67));
-    expect(fixture.telegram.sent.at(-1)?.text).toContain("send: /artifact_1");
-    expect(fixture.telegram.sent.at(-1)?.text).toContain("send + del: /artifact_2_senddel");
-    expect(fixture.telegram.sent.at(-1)?.text).toContain("del: /shred_1");
+    const artifactListText = fixture.telegram.sent.at(-1)?.text || "";
+    const firstSendShortcut = artifactListText.match(/\/artifact_[a-z0-9]{6,10}_1/)?.[0];
+    const firstShredShortcut = artifactListText.match(/\/shred_[a-z0-9]{6,10}_1/)?.[0];
+    expect(firstSendShortcut).toBeTruthy();
+    expect(artifactListText).toMatch(/send \+ del: \/artifact_[a-z0-9]{6,10}_2_senddel/);
+    expect(firstShredShortcut).toBeTruthy();
     expect(fixture.telegram.sent.at(-1)?.text).toContain("/artifact_latest");
 
+    await fixture.commands.handleMessage(telegramMessage(firstSendShortcut!, 67));
+    await waitFor(() => fixture.telegram.attachments.filter((entry) => entry.fileName === "worker-openclaw-audit.md").length >= 2);
+
     await fixture.commands.handleMessage(telegramMessage("/artifact_1", 67));
-    await waitFor(() => fixture.telegram.attachments.filter((entry) => entry.fileName === "yoda-openclaw-audit.md").length >= 2);
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Numeric artifact shortcuts expire");
+
+    const splitSendCount = fixture.telegram.attachments.length;
+    await fixture.commands.handleMessage(telegramMessage("Send me this", 67));
+    await fixture.commands.handleMessage(telegramMessage("worker-openclaw-audit.md", 67));
+    await waitFor(() => fixture.telegram.attachments.length > splitSendCount);
+    expect(fixture.telegram.attachments.at(-1)?.fileName).toBe("worker-openclaw-audit.md");
 
     await fixture.commands.handleMessage(telegramMessage("Send me this artifact", 67));
     await waitFor(() => fixture.telegram.attachments.some((entry) => entry.fileName === "openclaw-retirement-phase1.md"));
     expect(fixture.telegram.attachments.at(-1)?.fileName).toBe("openclaw-retirement-phase1.md");
     expect(fixture.telegram.attachments.at(-1)?.text).toBe("phase 1 contents");
     expect(fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn"))).toBe(false);
+
+    const broadTaskAttachmentCount = fixture.telegram.attachments.length;
+    await fixture.commands.handleMessage(telegramMessage("Generate a report about the workspace and send it to me.", 67));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for bareartifact.")));
+    await waitFor(() => !fixture.dispatcher.isActive("bareartifact"));
+    expect(fixture.telegram.attachments).toHaveLength(broadTaskAttachmentCount);
+    await writeFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), artifactMarkdown);
 
     const attachmentCount = fixture.telegram.attachments.length;
     await fixture.commands.handleMessage(telegramMessage("Send file", 67));
@@ -912,16 +1589,25 @@ test("artifact delivery supports backticked bare relative filenames", async () =
     expect(fixture.telegram.attachments.at(-1)?.fileName).toBe("openclaw-retirement-phase1.md");
 
     await fixture.commands.handleMessage(telegramMessage("/shred", 67));
-    expect(fixture.telegram.sent.at(-1)?.text).toContain("/shred_1 yoda-openclaw-audit.md");
-    expect(fixture.telegram.sent.at(-1)?.text).toContain("/shred_2 openclaw-retirement-phase1.md");
+    const shredListText = fixture.telegram.sent.at(-1)?.text || "";
+    const currentFirstShredShortcut = shredListText.match(/\/shred_[a-z0-9]{6,10}_1/)?.[0];
+    expect(currentFirstShredShortcut).toBeTruthy();
+    expect(shredListText).toMatch(/\/shred_[a-z0-9]{6,10}_2 openclaw-retirement-phase1\.md/);
     expect(fixture.telegram.sent.at(-1)?.text).toContain("/shred_latest");
 
-    await fixture.commands.handleMessage(telegramMessage("/shred_1", 67));
-    expect(await Bun.file(join(context!.worktreePath, "yoda-openclaw-audit.md")).exists()).toBe(false);
+    await writeFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), "# Artifacts\n\n- `openclaw-retirement-phase1.md`\n");
+    await fixture.commands.handleMessage(telegramMessage(currentFirstShredShortcut!, 67));
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("artifact shortcut expired or the artifact changed");
+    await writeFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), artifactMarkdown);
+
+    await fixture.commands.handleMessage(telegramMessage("/shred", 67));
+    const refreshedShredShortcut = (fixture.telegram.sent.at(-1)?.text || "").match(/\/shred_[a-z0-9]{6,10}_1/)?.[0];
+    await fixture.commands.handleMessage(telegramMessage(refreshedShredShortcut!, 67));
+    expect(await Bun.file(join(context!.worktreePath, "worker-openclaw-audit.md")).exists()).toBe(false);
     const afterFirstShred = await readFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), "utf8");
     expect(parseArtifactEntries(afterFirstShred).map((entry) => entry.path)).toEqual(["openclaw-retirement-phase1.md"]);
     expect(fixture.db.getContextBySlug("bareartifact")?.lastArtifacts).toContain("openclaw-retirement-phase1.md");
-    expect(fixture.db.getContextBySlug("bareartifact")?.lastArtifacts).not.toContain("yoda-openclaw-audit.md");
+    expect(fixture.db.getContextBySlug("bareartifact")?.lastArtifacts).not.toContain("worker-openclaw-audit.md");
 
     const sendDeleteCount = fixture.telegram.attachments.length;
     await fixture.commands.handleMessage(telegramMessage("/artifact_latest_senddel", 67));
@@ -930,6 +1616,96 @@ test("artifact delivery supports backticked bare relative filenames", async () =
     expect(await Bun.file(join(context!.worktreePath, "openclaw-retirement-phase1.md")).exists()).toBe(false);
     const afterSendDel = await readFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), "utf8");
     expect(parseArtifactEntries(afterSendDel)).toHaveLength(0);
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("artifact cleanup preserves concurrent manifest additions and rejects symlinked metadata writes", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx artifact-races control scratch", 68));
+    const context = fixture.db.getContextBySlug("artifact-races");
+    expect(context?.worktreePath).toBeTruthy();
+
+    const artifactPath = join(context!.worktreePath, ".factory", "ARTIFACTS.md");
+    await writeFile(join(context!.worktreePath, "old.md"), "old");
+    await writeFile(join(context!.worktreePath, "survivor.md"), "survivor");
+    await writeFile(artifactPath, "# Artifacts\n\n- `old.md`\n- `survivor.md`\n");
+
+    await fixture.commands.handleMessage(telegramMessage("/shred", 68));
+    const shredShortcut = (fixture.telegram.sent.at(-1)?.text || "").match(/\/shred_[a-z0-9]{6,10}_1/)?.[0];
+    expect(shredShortcut).toBeTruthy();
+
+    const originalDeleteArtifactFile = fixture.workers.deleteArtifactFile.bind(fixture.workers);
+    let appended = false;
+    fixture.workers.deleteArtifactFile = async (...args) => {
+      const result = await originalDeleteArtifactFile(...args);
+      if (!appended) {
+        appended = true;
+        await writeFile(join(context!.worktreePath, "late.md"), "late");
+        await writeFile(artifactPath, "# Artifacts\n\n- `old.md`\n- `survivor.md`\n- `late.md`\n");
+      }
+      return result;
+    };
+    await fixture.commands.handleMessage(telegramMessage(shredShortcut!, 68));
+    fixture.workers.deleteArtifactFile = originalDeleteArtifactFile;
+    expect(parseArtifactEntries(await readFile(artifactPath, "utf8")).map((entry) => entry.path)).toEqual([
+      "survivor.md",
+      "late.md"
+    ]);
+
+    await writeFile(join(context!.worktreePath, "old-after-read.md"), "old");
+    await writeFile(join(context!.worktreePath, "survivor-after-read.md"), "survivor");
+    await writeFile(artifactPath, "# Artifacts\n\n- `old-after-read.md`\n- `survivor-after-read.md`\n");
+    await fixture.commands.handleMessage(telegramMessage("/shred", 68));
+    const retryShredShortcut = (fixture.telegram.sent.at(-1)?.text || "").match(/\/shred_[a-z0-9]{6,10}_1/)?.[0];
+    const originalWriteIfUnchanged = fixture.workers.writeWorkspaceFileIfUnchanged.bind(fixture.workers);
+    let forcedManifestDrift = false;
+    fixture.workers.writeWorkspaceFileIfUnchanged = async (...args) => {
+      if (!forcedManifestDrift) {
+        forcedManifestDrift = true;
+        await writeFile(join(context!.worktreePath, "late-after-read.md"), "late");
+        await writeFile(
+          artifactPath,
+          "# Artifacts\n\n- `old-after-read.md`\n- `survivor-after-read.md`\n- `late-after-read.md`\n"
+        );
+        return false;
+      }
+      return originalWriteIfUnchanged(...args);
+    };
+    await fixture.commands.handleMessage(telegramMessage(retryShredShortcut!, 68));
+    fixture.workers.writeWorkspaceFileIfUnchanged = originalWriteIfUnchanged;
+    expect(parseArtifactEntries(await readFile(artifactPath, "utf8")).map((entry) => entry.path)).toEqual([
+      "survivor-after-read.md",
+      "late-after-read.md"
+    ]);
+
+    await rm(artifactPath, { force: true });
+    const outside = join(fixture.root, "outside-artifacts.md");
+    await writeFile(outside, "outside");
+    await symlink(outside, artifactPath);
+    expect(await fixture.workers.readFactoryFile(context!, "ARTIFACTS.md")).toBeNull();
+    await expect(fixture.workers.writeWorkspaceFile(context!, ".factory/ARTIFACTS.md", "# Artifacts\n")).rejects.toThrow(
+      "workspace write refused symlink target"
+    );
+    expect(await readFile(outside, "utf8")).toBe("outside");
+
+    const updateCheck = await fixture.workers.runUpdateCheck(context!);
+    expect(updateCheck.ok).toBe(false);
+    expect(updateCheck.stderr).toContain("refusing symlinked .factory/ARTIFACTS.md");
+    expect(await readFile(outside, "utf8")).toBe("outside");
+
+    await rm(artifactPath, { force: true });
+    await writeFile(artifactPath, "# Artifacts\n");
+    await writeFile(join(context!.worktreePath, "important.md"), "important");
+    await symlink(join(context!.worktreePath, "important.md"), join(context!.worktreePath, "artifact-link.md"));
+    const deleteLink = await fixture.workers.deleteArtifactFile(context!, "artifact-link.md");
+    expect(deleteLink.status).toBe("deleted");
+    expect(await Bun.file(join(context!.worktreePath, "artifact-link.md")).exists()).toBe(false);
+    expect(await readFile(join(context!.worktreePath, "important.md"), "utf8")).toBe("important");
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
@@ -1072,6 +1848,65 @@ test("Telegram text coalescing merges quick text and commands flush pending text
     await fixture.commands.handleMessage(telegramMessage("/topicinfo", 71));
     await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 2 for coalesce.")));
     expect(fixture.telegram.sent.some((entry) => entry.text.includes("Context: coalesce"))).toBe(true);
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("Telegram text coalescing flushes before buffers grow without bound", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "5000"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx coalesce-cap control scratch", 73));
+    for (let index = 0; index < 26; index += 1) {
+      await fixture.commands.handleMessage(telegramMessage(`part ${index}`, 73));
+    }
+
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for coalesce-cap.")));
+    const prompt = await readFile(
+      join(fixture.factoryRoot, "scratch", "coalesce-cap", ".factory", "control-plane.prompt.md"),
+      "utf8"
+    );
+    expect(prompt).toContain("part 0");
+    expect(prompt).toContain("part 24");
+    expect(prompt).not.toContain("part 25");
+
+    const pendingText = (fixture.commands as unknown as { pendingText: Map<string, { parts: string[] }> }).pendingText;
+    expect([...pendingText.values()][0]?.parts).toEqual(["part 25"]);
+
+    await fixture.commands.handleMessage(telegramMessage("/topicinfo", 73));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 2 for coalesce-cap.")));
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("Telegram text coalescing caps the number of pending buffers", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "5000"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx coalesce-map-cap control scratch", 74));
+    const context = fixture.db.getContextBySlug("coalesce-map-cap")!;
+    const enqueue = (fixture.commands as unknown as {
+      enqueuePendingText: (context: typeof context, text: string, target: TelegramTarget, userId: number | null) => void;
+    }).enqueuePendingText.bind(fixture.commands);
+    for (let index = 0; index < 101; index += 1) {
+      enqueue(context, `pending ${index}`, { chatId: 4242, threadId: 10_000 + index }, TEST_ALLOWED_TELEGRAM_USER_ID);
+    }
+
+    const pendingText = (fixture.commands as unknown as { pendingText: Map<string, { timer: Timer }> }).pendingText;
+    expect(pendingText.size).toBeLessThanOrEqual(100);
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for coalesce-map-cap.")));
+    for (const pending of pendingText.values()) {
+      clearTimeout(pending.timer);
+    }
+    pendingText.clear();
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });

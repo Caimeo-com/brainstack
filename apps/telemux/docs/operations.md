@@ -1,23 +1,19 @@
 # Operations
 
-Brainstack product note: fresh installs should use `~/.config/brainstack/telemux.env` and `~/.local/state/brainstack/...` paths. Original `/srv` paths in this vendored document are legacy valkyrie compatibility paths.
+Brainstack product note: fresh installs should use `~/.config/brainstack/telemux.env` and `~/.local/state/brainstack/...` paths. Original `/srv` paths in this vendored document are legacy compatibility paths.
 
 ## Install or refresh
 
-If you are starting from a blank machine, read [docs/fresh-machine-bootstrap.md](./fresh-machine-bootstrap.md) first. That document includes the OS user, passwordless sudo, Codex config, and Telegram onboarding steps needed to reproduce the current control-plane setup.
+If you are starting from a blank machine, use `brainctl` from the repo root. The direct `apps/telemux/scripts/install.sh` path is retained only for legacy compatibility notes in [docs/fresh-machine-bootstrap.md](./fresh-machine-bootstrap.md).
 
 ```bash
-cd ~/clawdex
-cp -n .env.example .env
-cp -n workers.example.json workers.json
-$EDITOR .env workers.json
-./scripts/install.sh
-./scripts/doctor.sh
+cd ~/brainstack
+bun run packages/brainctl/src/main.ts provision --profile control --out ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts init --profile control --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts doctor --config ~/.config/brainstack/brainstack.yaml --workers
 ```
 
-Run both scripts as your normal user. `install.sh` prompts for `sudo` internally when it needs to create or repair `/srv/telemux` and `/srv/factory`, but all Bun and `systemctl --user` work stays under your user account.
-
-The loader defaults to `./workers.json`. Set `FACTORY_WORKERS_FILE` in `.env` only if you want a different path.
+Provision checks prerequisites and writes generated runtime files; it does not install Bun, Git, OpenSSH, Tailscale, Codex, or Claude for you. `init` creates Brainstack-owned artifacts and records them for later `destroy`.
 
 If you want startup-time `chat_member` command registration for the control supergroup, set `FACTORY_TELEGRAM_CONTROL_CHAT_ID` in `.env` to that supergroup chat id.
 
@@ -30,19 +26,19 @@ Recommended worker config for phase 1:
 
 If you want this checkout to push to a dedicated GitHub repository without changing the identity used by other repos on the machine, create a dedicated deploy key and SSH host alias for this repo only.
 
-- private key: `~/.ssh/clawdex_github_deploy`
-- public key: `~/.ssh/clawdex_github_deploy.pub`
-- SSH host alias: `github.com-clawdex`
+- private key: `~/.ssh/brainstack_github_deploy`
+- public key: `~/.ssh/brainstack_github_deploy.pub`
+- SSH host alias: `github.com-brainstack`
 
 With this setup, the repo remote can be:
 
 ```bash
-git@github.com-clawdex:swader/clawdex.git
+git@github.com-brainstack:example/brainstack.git
 ```
 
 Paste the public key into the GitHub repo at:
 
-- `swader/clawdex` -> `Settings` -> `Deploy keys`
+- `example/brainstack` -> `Settings` -> `Deploy keys`
 
 Enable write access if the key should be allowed to push.
 
@@ -243,16 +239,15 @@ systemctl --user restart telemux.service
 journalctl --user -u telemux.service -f
 ```
 
-After changing the control plane source under `~/clawdex/src`, restart `telemux.service` because the unit runs directly from `bun run src/main.ts`.
+After changing the control plane source under `~/brainstack/apps/telemux/src`, restart `telemux.service` because the unit runs directly from `bun run src/main.ts`.
 
 The internal scheduler lives in the same service. There is no separate OS cron or timer to restart.
 
 ## Boot readiness
 
 - The user systemd service must be enabled: `systemctl --user enable --now telemux.service`
-- `loginctl enable-linger <user>` is required if the service should start after reboot without login
-- Recommended reboot test:
-  reboot the machine, do not log in locally first, then verify from Telegram only with `/whoami`, `/workers`, and plain text in an already bound topic
+- `loginctl enable-linger <user>` is required if the service should start after boot without login
+- Boot validation is local/on-prem only for encrypted hosts. Do not remotely reboot them. During a planned local validation window, boot the machine, do not log in locally first, then verify from Telegram with `/whoami`, `/workers`, and plain text in an already bound topic.
 
 ## Worker troubleshooting
 
