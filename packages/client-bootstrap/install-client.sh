@@ -50,6 +50,16 @@ read_import_token() {
       echo "BRAIN_IMPORT_TOKEN_FILE does not exist: $BRAIN_IMPORT_TOKEN_FILE" >&2
       exit 2
     fi
+    if [ -L "$BRAIN_IMPORT_TOKEN_FILE" ]; then
+      echo "BRAIN_IMPORT_TOKEN_FILE must not be a symlink: $BRAIN_IMPORT_TOKEN_FILE" >&2
+      exit 2
+    fi
+    local mode
+    mode="$(stat -f '%Lp' "$BRAIN_IMPORT_TOKEN_FILE" 2>/dev/null || stat -c '%a' "$BRAIN_IMPORT_TOKEN_FILE" 2>/dev/null || true)"
+    if [ -n "$mode" ] && (( (8#$mode) & 077 )); then
+      echo "BRAIN_IMPORT_TOKEN_FILE must not be group/world accessible; run: chmod 600 '$BRAIN_IMPORT_TOKEN_FILE'" >&2
+      exit 2
+    fi
     sed -n '1p' "$BRAIN_IMPORT_TOKEN_FILE" | tr -d '\r\n'
     return
   fi

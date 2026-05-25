@@ -37,7 +37,7 @@ Prefer this order:
 2. Check normal OpenSSH over Tailscale: `ssh -o BatchMode=yes -o ConnectTimeout=8 <user>@<host> true`.
 3. On the control host, run `brainctl doctor --config "$BRAINSTACK_CONFIG" --workers`; use `--deep` only when intentionally proving yolo/bypass sudo through the harness.
 4. Check services: `systemctl --user status braind.service telemux.service --no-pager`, `journalctl --user -u telemux.service -n 200 --no-pager`, and `journalctl --user -u braind.service -n 200 --no-pager`.
-5. Check local health endpoints on the host: `curl -fsS http://127.0.0.1:8080/health` for braind and `curl -fsS http://127.0.0.1:8787/healthz` for telemux.
+5. Check local health endpoints on the host: `curl -fsS http://127.0.0.1:8080/healthz` for public braind liveness, `curl -H "Authorization: Bearer $BRAIN_ADMIN_TOKEN" http://127.0.0.1:8080/admin/health` for deep braind diagnostics, and `curl -fsS http://127.0.0.1:8787/healthz` for telemux.
 6. Check stack update visibility with `/updates` in Telegram or `brainctl updates --config "$BRAINSTACK_CONFIG"` on a host. Do not auto-apply updates.
 7. Use `brainctl doctor --workers --config "$BRAINSTACK_CONFIG"` to verify each worker's shell PATH exposes Bun, Git, SSH, Tailscale, and the configured harness.
 8. On installed client/worker profiles, use `brainctl doctor --write-smoke --config "$BRAINSTACK_CONFIG"` only when explicitly proving import/propose pushback; it posts a small import artifact.
@@ -77,7 +77,7 @@ The required grant shape is directional: operator to control/worker, control to 
 - Write continuity comes from `POST /api/import` and `POST /api/propose`, or `brainctl import-text` and `brainctl propose`.
 - If a write reports idempotency `review_required`, inspect the matching record under `derived/idempotency/` and repo state before retrying with a new key; do not force replay an ambiguous side effect.
 - Client bootstrap can receive `BRAIN_IMPORT_TOKEN` or `BRAIN_IMPORT_TOKEN_FILE`; it fills the local token slot only when blank and never prints the value.
-- If the brain is unreachable, use `brainctl outbox status|list|flush|purge`. Outbox files may contain sensitive note text and should stay in private local state.
+- If the brain is unreachable, use `brainctl outbox status|list|flush|purge|purge-corrupt`. Outbox files may contain sensitive note text and should stay in private local state.
 - Keep `BRAIN_ADMIN_TOKEN` on organizer/control hosts only. Clients and workers should use import/propose scope.
 
 ## Repo Lock Recovery

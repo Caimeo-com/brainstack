@@ -78,6 +78,10 @@ export interface CreateImportResult {
   summary: string;
 }
 
+export interface MutationHooks {
+  beforeMutation?: () => Promise<void>;
+}
+
 export interface IngestResult {
   artifactIds: string[];
   touchedFiles: string[];
@@ -908,7 +912,8 @@ export async function appendLogEntry(
 
 export async function createImportedArtifact(
   repoRoot: string,
-  input: ImportArtifactInput
+  input: ImportArtifactInput,
+  hooks: MutationHooks = {}
 ): Promise<CreateImportResult> {
   if (!input.source_harness || !input.source_machine || !input.source_type) {
     throw new Error("source_harness, source_machine, and source_type are required");
@@ -924,7 +929,16 @@ export async function createImportedArtifact(
         })());
   const sha256 = await hashBytes(bytes);
   const duplicate = await findSourceManifestBySha(paths, sha256);
+  let mutationHookCalled = false;
+  const beforeMutation = async (): Promise<void> => {
+    if (mutationHookCalled) {
+      return;
+    }
+    mutationHookCalled = true;
+    await hooks.beforeMutation?.();
+  };
   if (duplicate) {
+    await beforeMutation();
     const logPath = await appendLogEntry(repoRoot, "import", duplicate.id, title, [
       `operation: import`,
       `inputs: duplicate sha256=${sha256}; source_machine=${input.source_machine}; source_harness=${input.source_harness}; source_type=${input.source_type}`,
@@ -957,6 +971,7 @@ export async function createImportedArtifact(
     const blobExtension = extname(fileName) || ".bin";
     externalBlobRelativePath = join(sha256.slice(0, 2), `${sha256}${blobExtension}`).split(sep).join("/");
     normalizationInputPath = join(blobStoreRoot(), externalBlobRelativePath);
+    await beforeMutation();
     await ensureDir(dirname(normalizationInputPath));
     if (!existsSync(normalizationInputPath)) {
       await Bun.write(normalizationInputPath, bytes);
@@ -980,6 +995,7 @@ export async function createImportedArtifact(
       ].join("\n")
     );
   } else {
+    await beforeMutation();
     await ensureDir(dirname(rawAbsolutePath));
     await Bun.write(rawAbsolutePath, bytes);
   }
@@ -1644,7 +1660,8 @@ export async function createProposal(
     source_machine: string;
     target_page?: string;
     tags?: string[];
-  }
+  },
+  hooks: MutationHooks = {}
 ): Promise<{ proposalPath: string; touchedFiles: string[] }> {
   if (!input.title.trim() || !input.body.trim()) {
     throw new Error("Proposal title and body are required");
@@ -1676,6 +1693,7 @@ export async function createProposal(
   ]
     .filter(Boolean)
     .join("\n");
+  await hooks.beforeMutation?.();
   await writeText(absolutePath, stringifyFrontmatter(frontmatter, body));
   const proposalPath = toRepoRelative(repoRoot, absolutePath);
   const logPath = await appendLogEntry(repoRoot, "propose", proposalPath, input.title.trim(), [

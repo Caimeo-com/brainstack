@@ -19,6 +19,7 @@ const FORBIDDEN_PUBLIC_PATTERNS: Array<{ label: string; pattern: RegExp }> = [
   { label: "old telemux product name", pattern: new RegExp("claw" + "dex", "i") },
   { label: "old private source name", pattern: new RegExp("private-dev" + "-factory", "i") },
   { label: "old private source env var", pattern: new RegExp("PRIVATE_DEV" + "_FACTORY_ROOT") },
+  { label: "local/customer project marker", pattern: new RegExp("bit" + "falls", "i") },
   { label: "old factory phrase spaced", pattern: new RegExp("private\\s+dev\\s+factory", "i") },
   { label: "old factory phrase", pattern: new RegExp("private\\s+factory", "i") },
   { label: "c0 marker", pattern: new RegExp("customer" + "-zero", "i") },
@@ -1035,6 +1036,7 @@ describe("braind write safety", () => {
       expect(html).not.toContain("Shared-Brain-v1.md");
 
       const serveRoot = join(root, "shared-brain", "serve", "shared-brain");
+      expect(html).not.toContain(serveRoot);
       const pageLinks = [...html.matchAll(/href="\/page\/([^"]+)"/g)].map((match) => decodeURIComponent(match[1]));
       expect(pageLinks.length).toBeGreaterThan(0);
       const deadLinks = pageLinks.filter((repoPath) => !existsSync(join(serveRoot, repoPath)));
@@ -1077,6 +1079,351 @@ describe("braind write safety", () => {
     });
     expect(padded.code).not.toBe(0);
     expect(padded.stderr).toContain("BRAIN_IMPORT_TOKEN must not contain leading or trailing whitespace");
+  });
+
+  test("braind enforces local security posture at startup", async () => {
+    const blocked = runCommand(["bun", "run", SERVER], {
+      env: {
+        BRAIN_IMPORT_TOKEN: "import-test-token",
+        BRAIN_ADMIN_TOKEN: "admin-test-token",
+        BRAIN_SECURITY_POSTURE: "local",
+        BRAIN_BIND: "0.0.0.0"
+      }
+    });
+    expect(blocked.code).not.toBe(0);
+    expect(blocked.stderr).toContain("BRAIN_SECURITY_POSTURE=local requires BRAIN_BIND to be loopback");
+  });
+
+  test("pre-mutation idempotent import failures can be retried with the same key", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-idempotency-preflight-"));
+    const port = 44_000 + Math.floor(Math.random() * 1_000);
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const root = await createSingleNodeInstall(dir);
+      proc = await startBraind(root, port);
+      const staging = join(root, "shared-brain", "staging", "shared-brain");
+      const dirtyPath = join(staging, "wiki", "Home.md");
+      const cleanHome = await readFile(dirtyPath, "utf8");
+      await writeFile(dirtyPath, `${cleanHome}\nDirty preflight marker.\n`);
+      const payload = {
+        title: "Preflight retry",
+        text: "preflight retry body",
+        source_harness: "codex",
+        source_machine: "client",
+        source_type: "note",
+        tags: [] as string[]
+      };
+      const first = await fetch(`http://127.0.0.1:${port}/api/import`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "preflight-retry"
+        },
+        body: JSON.stringify(payload)
+      });
+      expect(first.status).toBe(500);
+      await writeFile(dirtyPath, cleanHome);
+      const second = await fetch(`http://127.0.0.1:${port}/api/import`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "preflight-retry"
+        },
+        body: JSON.stringify(payload)
+      });
+      expect(second.status).toBe(200);
+      const body = (await second.json()) as Record<string, unknown>;
+      expect(typeof body.artifact_id).toBe("string");
+      expect(body.idempotent_replay).toBeUndefined();
+    } finally {
+      await stopBraind(proc);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("expired pre-mutation idempotency locks with unreadable owners require review", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-idempotency-unreadable-owner-"));
+    const port = 44_000 + Math.floor(Math.random() * 1_000);
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const root = await createSingleNodeInstall(dir);
+      proc = await startBraind(root, port, {
+        BRAIN_IDEMPOTENCY_LOCK_WAIT_MS: "100",
+        BRAIN_IDEMPOTENCY_CLAIM_LEASE_MS: "100"
+      });
+      const payload = {
+        title: "Unreadable Owner",
+        text: "This request has a corrupted pre-mutation lock owner.",
+        source_harness: "codex",
+        source_machine: "client",
+        source_type: "note",
+        tags: [] as string[]
+      };
+      const textBytes = new TextEncoder().encode(payload.text);
+      const input = {
+        title: payload.title,
+        text: payload.text,
+        bytes: textBytes,
+        fileName: "unreadable-owner.md",
+        contentType: "text/markdown",
+        source_harness: payload.source_harness,
+        source_machine: payload.source_machine,
+        source_type: payload.source_type,
+        related_project: undefined,
+        related_repo: undefined,
+        conversation_id: undefined,
+        tags: payload.tags,
+        ingest_now: false
+      };
+      const key = "unreadable-owner-key";
+      const keyHash = sha256Text(key);
+      const requestHash = sha256Text(canonicalJson({ endpoint: "import", input }));
+      const writeRoot = join(root, "shared-brain", "staging", "shared-brain");
+      const recordPath = join(writeRoot, "derived", "idempotency", "import", `${keyHash}.json`);
+      const lockDir = `${recordPath}.lock`;
+      const ownerId = "00000000-0000-0000-0000-000000000050";
+      const old = new Date(Date.now() - 60_000).toISOString();
+      await mkdir(lockDir, { recursive: true });
+      await writeFile(join(lockDir, `owner-${ownerId}.json`), "{");
+      await writeFile(join(lockDir, `release-${ownerId}`), ownerId);
+      await writeFile(
+        recordPath,
+        `${JSON.stringify(
+          {
+            endpoint: "import",
+            key_hash: keyHash,
+            request_hash: requestHash,
+            status: "claimed",
+            created_at: old,
+            updated_at: old,
+            lease_until: old
+          },
+          null,
+          2
+        )}\n`
+      );
+
+      const response = await fetch(`http://127.0.0.1:${port}/api/import`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": key
+        },
+        body: JSON.stringify(payload)
+      });
+      expect(response.status).toBe(409);
+      const record = JSON.parse(await readFile(recordPath, "utf8")) as { status?: string; error?: string };
+      expect(record.status).toBe("review_required");
+      expect(record.error || "").toContain("could not be proven safe to clear");
+      expect(existsSync(lockDir)).toBe(true);
+    } finally {
+      await stopBraind(proc);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("completed idempotent import replays bypass the new-write rate limiter", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-idempotency-rate-"));
+    const port = 44_000 + Math.floor(Math.random() * 1_000);
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const root = await createSingleNodeInstall(dir);
+      proc = await startBraind(root, port, { BRAIN_WRITE_RATE_LIMIT_PER_MINUTE: "1" });
+      const payload = {
+        title: "Rate replay",
+        text: "rate replay body",
+        source_harness: "codex",
+        source_machine: "client",
+        source_type: "note",
+        tags: [] as string[]
+      };
+      const first = await fetch(`http://127.0.0.1:${port}/api/import`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "rate-replay"
+        },
+        body: JSON.stringify(payload)
+      });
+      expect(first.status).toBe(200);
+      const replay = await fetch(`http://127.0.0.1:${port}/api/import`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "rate-replay"
+        },
+        body: JSON.stringify(payload)
+      });
+      expect(replay.status).toBe(200);
+      const body = (await replay.json()) as Record<string, unknown>;
+      expect(body.idempotent_replay).toBe(true);
+    } finally {
+      await stopBraind(proc);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("braind queues concurrent mutations instead of rejecting ready writes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-mutation-queue-"));
+    const port = 44_000 + Math.floor(Math.random() * 1_000);
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const root = await createSingleNodeInstall(dir);
+      proc = await startBraind(root, port, { BRAIN_WRITE_CONCURRENCY: "1", BRAIN_WRITE_QUEUE_WAIT_MS: "5000" });
+      const staging = join(root, "shared-brain", "staging", "shared-brain");
+      const lockDir = join(staging, ".shared-brain.lock");
+      await mkdir(lockDir);
+      setTimeout(() => {
+        void rm(lockDir, { recursive: true, force: true });
+      }, 300);
+
+      const makePayload = (index: number) => ({
+        title: `Queued mutation ${index}`,
+        text: `queued mutation body ${index}`,
+        source_harness: "codex",
+        source_machine: `client-${index}`,
+        source_type: "note",
+        tags: [] as string[]
+      });
+      const send = (index: number) =>
+        fetch(`http://127.0.0.1:${port}/api/import`, {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer import-test-token",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(makePayload(index))
+        });
+
+      const [first, second] = await Promise.all([send(1), send(2)]);
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      const firstBody = (await first.json()) as Record<string, unknown>;
+      const secondBody = (await second.json()) as Record<string, unknown>;
+      expect(typeof firstBody.artifact_id).toBe("string");
+      expect(typeof secondBody.artifact_id).toBe("string");
+      expect(secondBody.artifact_id).not.toBe(firstBody.artifact_id);
+    } finally {
+      await stopBraind(proc);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("write-rate source cache is bounded while preserving per-source quotas", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-rate-cache-"));
+    const port = 44_000 + Math.floor(Math.random() * 1_000);
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const root = await createSingleNodeInstall(dir);
+      proc = await startBraind(root, port, {
+        BRAIN_WRITE_RATE_LIMIT_PER_MINUTE: "1",
+        BRAIN_WRITE_RATE_LIMIT_MAX_KEYS: "2"
+      });
+      const send = async (source: string, suffix: string) =>
+        await fetch(`http://127.0.0.1:${port}/api/import`, {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer import-test-token",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            title: `Rate cache ${source} ${suffix}`,
+            text: `rate cache body ${source} ${suffix}`,
+            source_harness: "codex",
+            source_machine: source,
+            source_type: "note",
+            tags: [] as string[]
+          })
+        });
+
+      expect((await send("source-a", "1")).status).toBe(200);
+      expect((await send("source-b", "1")).status).toBe(200);
+      expect((await send("source-c", "1")).status).toBe(200);
+      expect((await send("source-a", "2")).status).toBe(200);
+      expect((await send("source-c", "2")).status).toBe(429);
+    } finally {
+      await stopBraind(proc);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("write-rate limiting has a token-level quota across rotated sources", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-rate-token-"));
+    const port = 44_000 + Math.floor(Math.random() * 1_000);
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const root = await createSingleNodeInstall(dir);
+      proc = await startBraind(root, port, {
+        BRAIN_WRITE_RATE_LIMIT_PER_MINUTE: "10",
+        BRAIN_WRITE_TOKEN_RATE_LIMIT_PER_MINUTE: "2"
+      });
+      const send = async (source: string) =>
+        await fetch(`http://127.0.0.1:${port}/api/import`, {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer import-test-token",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            title: `Token quota ${source}`,
+            text: `token quota body ${source}`,
+            source_harness: "codex",
+            source_machine: source,
+            source_type: "note",
+            tags: [] as string[]
+          })
+        });
+
+      expect((await send("source-a")).status).toBe(200);
+      expect((await send("source-b")).status).toBe(200);
+      expect((await send("source-c")).status).toBe(429);
+    } finally {
+      await stopBraind(proc);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("pre-body token quota rejects import floods before request parsing", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-prebody-rate-"));
+    const port = 44_000 + Math.floor(Math.random() * 1_000);
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const root = await createSingleNodeInstall(dir);
+      proc = await startBraind(root, port, {
+        BRAIN_WRITE_TOKEN_RATE_LIMIT_PER_MINUTE: "1",
+        BRAIN_WRITE_RATE_LIMIT_PER_MINUTE: "100"
+      });
+      const send = (title: string) =>
+        fetch(`http://127.0.0.1:${port}/api/import`, {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer import-test-token",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            title,
+            text: `body ${title}`,
+            source_harness: "codex",
+            source_machine: "client",
+            source_type: "note",
+            tags: [] as string[]
+          })
+        });
+
+      expect((await send("prebody-one")).status).toBe(200);
+      const rejected = await send("prebody-two");
+      expect(rejected.status).toBe(429);
+      const body = (await rejected.json()) as { error?: string };
+      expect(body.error || "").toContain("pre-body write rate limit");
+    } finally {
+      await stopBraind(proc);
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   test("braind converts expired running idempotency records with persisted locks into operator review", async () => {
@@ -1217,13 +1564,32 @@ describe("braind write safety", () => {
       expect(replayed.artifact_id).toBe(imported.artifact_id);
       expect(replayed.idempotent_replay).toBe(true);
 
-      const healthResponse = await fetch(`http://127.0.0.1:${port}/health`);
+      const healthResponse = await fetch(`http://127.0.0.1:${port}/healthz`);
       expect(healthResponse.status).toBe(200);
       const health = (await healthResponse.json()) as Record<string, unknown>;
-      expect(health.write_repo_root).toBe(join(root, "shared-brain", "staging", "shared-brain"));
-      expect((health.write_repo_lock as { present?: boolean }).present).toBe(false);
-      expect(Array.isArray(health.idempotency_locks)).toBe(true);
-      expect(typeof (health.pending_reindex as { present?: boolean }).present).toBe("boolean");
+      expect(health).toEqual({ ok: true, service: "braind", version: "0.1.0" });
+      const adminHealthResponse = await fetch(`http://127.0.0.1:${port}/admin/health`, {
+        headers: { Authorization: "Bearer admin-test-token" }
+      });
+      expect(adminHealthResponse.status).toBe(200);
+      const adminHealth = (await adminHealthResponse.json()) as Record<string, unknown>;
+      expect(adminHealth.write_repo_root).toBe(join(root, "shared-brain", "staging", "shared-brain"));
+      expect((adminHealth.write_repo_lock as { present?: boolean }).present).toBe(false);
+      expect(Array.isArray(adminHealth.idempotency_locks)).toBe(true);
+      expect(typeof (adminHealth.pending_reindex as { present?: boolean }).present).toBe("boolean");
+      const pendingReindexPath = join(root, "shared-brain", "serve", "shared-brain", "derived", "search-reindex-needed.json");
+      await mkdir(dirname(pendingReindexPath), { recursive: true });
+      await writeFile(
+        pendingReindexPath,
+        `${JSON.stringify({ commit: "abc123", error: `private path ${join(root, "secret")}`, updated_at: new Date().toISOString() })}\n`
+      );
+      const publicSearch = await fetch(`http://127.0.0.1:${port}/search?format=json&q=Needle`);
+      expect(publicSearch.status).toBe(200);
+      const publicSearchText = await publicSearch.text();
+      expect(publicSearchText).toContain('"search_freshness"');
+      expect(publicSearchText).toContain('"present": true');
+      expect(publicSearchText).not.toContain(pendingReindexPath);
+      expect(publicSearchText).not.toContain("private path");
 
       const conflictResponse = await fetch(`http://127.0.0.1:${port}/api/import`, {
         method: "POST",
@@ -1787,6 +2153,7 @@ describe("public release hygiene", () => {
       );
 
       await writeFile(tokenFile, "first-token\n");
+      await chmod(tokenFile, 0o600);
       const install = runCommand(["bash", join(out, "install-client.sh")], {
         cwd: out,
         env: {
@@ -1828,6 +2195,21 @@ describe("public release hygiene", () => {
       });
       expect(missing.code).toBe(2);
       expect(missing.stderr).toContain("BRAIN_IMPORT_TOKEN_FILE does not exist");
+
+      const looseTokenFile = join(dir, "loose-token.txt");
+      await writeFile(looseTokenFile, "loose-token\n");
+      await chmod(looseTokenFile, 0o644);
+      const loose = runCommand(["bash", join(out, "install-client.sh")], {
+        cwd: out,
+        env: {
+          HOME: join(dir, "loose-home"),
+          BRAIN_GIT_REMOTE: bare,
+          BRAIN_IMPORT_TOKEN_FILE: looseTokenFile,
+          PATH: process.env.PATH || ""
+        }
+      });
+      expect(loose.code).toBe(2);
+      expect(loose.stderr).toContain("must not be group/world accessible");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -2011,6 +2393,10 @@ describe("public release hygiene", () => {
       await writeFile(join(symlinkTarget, `owner-${symlinkLockId}.json`), `${JSON.stringify({ token: symlinkLockId, pid: 999999, hostname: hostname() })}\n`);
       await writeFile(join(symlinkTarget, `release-${symlinkLockId}`), symlinkLockId);
       await symlink(symlinkTarget, lockPath);
+      const symlinkStatus = runBrainctl(["repo-lock", "status", "--config", configPath]);
+      expectSuccess(symlinkStatus);
+      expect(symlinkStatus.stdout).toContain("lock path is a symlink");
+      expect(symlinkStatus.stdout).not.toContain(symlinkLockId);
       const symlinkRefused = runBrainctl(["repo-lock", "clear", "--config", configPath, "--yes", "--force", "--token", symlinkLockId, "--min-age-ms", "0"]);
       expect(symlinkRefused.code).not.toBe(0);
       expect(symlinkRefused.stderr).toContain("non-directory or symlink repo lock");
@@ -2163,6 +2549,343 @@ describe("public release hygiene", () => {
     }
   });
 
+  test("expose tailscale refuses placeholder hosts and stale exposure metadata", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-expose-tailscale-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: brain-control",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          "brain:",
+          "  publicBaseUrl: https://brain-control.example.ts.net",
+          "security:",
+          "  posture: trusted-tailnet",
+          "  bindHost: 127.0.0.1",
+          "  trustedExposure: none",
+          "tailscale:",
+          "  tailnetHost: brain-control.example.ts.net",
+          ""
+        ].join("\n")
+      );
+      const placeholder = runBrainctl(["expose", "tailscale", "--config", configPath, "--dry-run"]);
+      expect(placeholder.code).not.toBe(0);
+      expect(placeholder.stderr).toContain("requires a real tailscale.tailnetHost");
+
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: brain-control",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          "brain:",
+          "  publicBaseUrl: https://brain-control.tailnet.invalid",
+          "security:",
+          "  posture: trusted-tailnet",
+          "  bindHost: 127.0.0.1",
+          "  trustedExposure: none",
+          "tailscale:",
+          "  tailnetHost: brain-control.tailnet.invalid",
+          ""
+        ].join("\n")
+      );
+      const staleExposure = runBrainctl(["expose", "tailscale", "--config", configPath, "--apply"]);
+      expect(staleExposure.code).not.toBe(0);
+      expect(staleExposure.stderr).toContain("requires security.trustedExposure: tailscale-serve");
+
+      await writeFile(
+        configPath,
+        (await readFile(configPath, "utf8")).replace("trustedExposure: none", "trustedExposure: tailscale-serve")
+      );
+      const dryRun = runBrainctl(["expose", "tailscale", "--config", configPath, "--dry-run"]);
+      expectSuccess(dryRun);
+      expect(dryRun.stdout).toContain("brain-control.tailnet.invalid:443");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("project context blocks personal brains until allowed and search labels sources", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainstack-project-context-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      await writeFixtureConfig(configPath);
+      const root = join(dir, "install");
+      const workBrain = join(dir, "work-brain");
+      const personalBrain = join(dir, "personal-brain");
+      for (const brain of [workBrain, personalBrain]) {
+        await mkdir(join(brain, "wiki"), { recursive: true });
+        git(["init"], brain);
+      }
+      await writeFile(join(workBrain, "wiki", "Runbook.md"), "deploy checklist and owner notes\n");
+      await writeFile(join(personalBrain, "wiki", "Journal.md"), "private deploy memory\n");
+      const repo = join(dir, "project");
+      await mkdir(repo, { recursive: true });
+      await writeFile(
+        join(repo, ".brainstack.yaml"),
+        [
+          "defaultBrain: work",
+          "writeDefault: work",
+          "brains:",
+          "  - id: work",
+          `    localPath: ${workBrain}`,
+          "    sections:",
+          "      - wiki",
+          "  - id: personal",
+          `    localPath: ${personalBrain}`,
+          "    sections:",
+          "      - wiki",
+          ""
+        ].join("\n")
+      );
+
+      const beforeAllow = runBrainctl(["context", "--repo", repo, "--config", configPath, "--root", root]);
+      expectSuccess(beforeAllow);
+      expect(beforeAllow.stdout).toContain("[allowed] work");
+      expect(beforeAllow.stdout).toContain("[blocked] personal");
+      expect(beforeAllow.stdout).toContain("brainctl allow repo");
+
+      const searchBefore = runBrainctl(["search", "--repo", repo, "--config", configPath, "--root", root, "deploy"]);
+      expectSuccess(searchBefore);
+      expect(searchBefore.stdout).toContain("[work / wiki/Runbook.md:1]");
+      expect(searchBefore.stdout).not.toContain("personal");
+
+      const allow = runBrainctl(["allow", "repo", "--repo", repo, "--brain", "personal", "--always", "--config", configPath, "--root", root]);
+      expectSuccess(allow);
+      const rulesPath = join(root, "config", "allow-rules.json");
+      expect((await stat(rulesPath)).mode & 0o777).toBe(0o600);
+
+      const searchAfter = runBrainctl(["search", "--repo", repo, "--config", configPath, "--root", root, "deploy"]);
+      expectSuccess(searchAfter);
+      expect(searchAfter.stdout).toContain("[work / wiki/Runbook.md:1]");
+      expect(searchAfter.stdout).toContain("[personal / wiki/Journal.md:1]");
+
+      const personalReadOnlyConfig = await readFile(join(repo, ".brainstack.yaml"), "utf8");
+      await writeFile(join(repo, ".brainstack.yaml"), `${personalReadOnlyConfig}    write: false\n`);
+      const rememberPersonal = runBrainctl(["remember", "--repo", repo, "--target", "personal", "--summary", "private note", "--config", configPath, "--root", root]);
+      expect(rememberPersonal.code).not.toBe(0);
+      expect(rememberPersonal.stderr).toContain("target brain personal is read-only");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("project allow rules scope sections, consume once, and target outbox keeps credential affinity", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainstack-project-target-outbox-"));
+    const servers: Array<ReturnType<typeof Bun.spawn>> = [];
+    try {
+      const configPath = join(dir, "config.yaml");
+      const stateRoot = join(dir, "state");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  stateRoot: ${stateRoot}`,
+          "client:",
+          "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+      const workBrain = join(dir, "work-brain");
+      const personalBrain = join(dir, "personal-brain");
+      for (const brain of [workBrain, personalBrain]) {
+        await mkdir(join(brain, "wiki"), { recursive: true });
+        await mkdir(join(brain, "raw"), { recursive: true });
+        git(["init"], brain);
+      }
+      await writeFile(join(workBrain, "wiki", "Runbook.md"), "alpha work note\n");
+      await writeFile(join(personalBrain, "wiki", "Journal.md"), "alpha personal wiki\n");
+      await writeFile(join(personalBrain, "raw", "Dump.md"), "alpha personal raw\n");
+      const repo = join(dir, "project");
+      await mkdir(repo, { recursive: true });
+      const portA = 42_000 + Math.floor(Math.random() * 1_000);
+      const portB = 43_000 + Math.floor(Math.random() * 1_000);
+      await writeFile(
+        join(repo, ".brainstack.yaml"),
+        [
+          "defaultBrain: work",
+          "writeDefault: work",
+          "brains:",
+          "  - id: work",
+          "    label: Work brain",
+          `    localPath: ${workBrain}`,
+          `    baseUrl: http://127.0.0.1:${portA}`,
+          "    importTokenEnv: BRAIN_A_TOKEN",
+          "    classification: work",
+          "    sections: [wiki]",
+          "    write: true",
+          "  - id: p1",
+          "    label: Personal brain",
+          `    localPath: ${personalBrain}`,
+          `    baseUrl: http://127.0.0.1:${portB}`,
+          "    importTokenEnv: BRAIN_B_TOKEN",
+          "    classification: personal",
+          "    sections: [wiki, raw]",
+          "    write: true",
+          ""
+        ].join("\n")
+      );
+
+      expectSuccess(runBrainctl(["allow", "repo", "--repo", repo, "--brain", "p1", "--sections", "wiki", "--once", "--config", configPath]));
+      const typoAllow = runBrainctl(["allow", "repo", "--repo", repo, "--brain", "p1", "--sections", "typo", "--once", "--config", configPath]);
+      expect(typoAllow.code).not.toBe(0);
+      expect(typoAllow.stderr).toContain("unknown section(s) for brain p1: typo");
+      const scoped = runBrainctl(["search", "--repo", repo, "--config", configPath, "--no-sync", "--query", "alpha"]);
+      expectSuccess(scoped);
+      expect(scoped.stdout).toContain("[work / wiki/Runbook.md:1]");
+      expect(scoped.stdout).toContain("[p1 / wiki/Journal.md:1]");
+      expect(scoped.stdout).not.toContain("Dump.md");
+      const afterOnce = runBrainctl(["search", "--repo", repo, "--config", configPath, "--no-sync", "--query", "alpha"]);
+      expectSuccess(afterOnce);
+      expect(afterOnce.stdout).not.toContain("[p1 /");
+
+      const malformedRepo = join(dir, "malformed-project");
+      await mkdir(malformedRepo, { recursive: true });
+      await writeFile(
+        join(malformedRepo, ".brainstack.yaml"),
+        [
+          "brains:",
+          "  - id: p1",
+          "    label: Personal brain",
+          `    localPath: ${personalBrain}`,
+          "    classification: personal",
+          "    section: [wiki]",
+          ""
+        ].join("\n")
+      );
+      const singularSection = runBrainctl(["context", "--repo", malformedRepo, "--config", configPath]);
+      expect(singularSection.code).not.toBe(0);
+      expect(singularSection.stderr).toContain("use `sections`, not `section`");
+      await writeFile(
+        join(malformedRepo, ".brainstack.yaml"),
+        [
+          "brains:",
+          "  - id: p1",
+          "    label: Personal brain",
+          `    localPath: ${personalBrain}`,
+          "    classification: personal",
+          "    sections: wiki",
+          ""
+        ].join("\n")
+      );
+      const scalarSections = runBrainctl(["context", "--repo", malformedRepo, "--config", configPath]);
+      expect(scalarSections.code).not.toBe(0);
+      expect(scalarSections.stderr).toContain("sections must be a YAML list");
+      await writeFile(
+        join(malformedRepo, ".brainstack.yaml"),
+        [
+          "brains:",
+          "  - id: p1",
+          "    label: Personal brain",
+          `    localPath: ${personalBrain}`,
+          "    classification: personal",
+          "    sections: [typo]",
+          ""
+        ].join("\n")
+      );
+      const unknownSection = runBrainctl(["context", "--repo", malformedRepo, "--config", configPath]);
+      expect(unknownSection.code).not.toBe(0);
+      expect(unknownSection.stderr).toContain("unknown section(s) typo");
+
+      const clientEnvPath = join(dir, ".config", "shared-brain.env");
+      await mkdir(dirname(clientEnvPath), { recursive: true });
+      await writeFile(clientEnvPath, "BRAIN_A_TOKEN=token-a\nBRAIN_B_TOKEN=token-b\n");
+
+      const queueWork = runBrainctl(["remember", "--repo", repo, "--target", "work", "--summary", "work memory", "--config", configPath]);
+      expectSuccess(queueWork);
+      const allowPersonal = runBrainctl(["allow", "repo", "--repo", repo, "--brain", "p1", "--always", "--config", configPath]);
+      expectSuccess(allowPersonal);
+      const queuePersonal = runBrainctl(["remember", "--repo", repo, "--target", "p1", "--summary", "personal memory", "--config", configPath]);
+      expectSuccess(queuePersonal);
+      const list = runBrainctl(["outbox", "list", "--config", configPath]);
+      expectSuccess(list);
+      expect(list.stdout).toContain("brain=work");
+      expect(list.stdout).toContain("token_env=BRAIN_A_TOKEN");
+      expect(list.stdout).toContain("brain=p1");
+      expect(list.stdout).toContain("token_env=BRAIN_B_TOKEN");
+
+      const receivedPaths: string[] = [];
+      for (const port of [portA, portB]) {
+        const receivedPath = join(dir, `received-${port}.jsonl`);
+        const serverScript = join(dir, `target-${port}.ts`);
+        receivedPaths.push(receivedPath);
+        await writeFile(
+          serverScript,
+          [
+            `const port = ${port};`,
+            `const receivedPath = ${JSON.stringify(receivedPath)};`,
+            "Bun.serve({",
+            "  hostname: '127.0.0.1',",
+            "  port,",
+            "  async fetch(req) {",
+            "    const existing = await Bun.file(receivedPath).exists() ? await Bun.file(receivedPath).text() : '';",
+            "    await Bun.write(receivedPath, `${existing}${JSON.stringify({ auth: req.headers.get('authorization'), path: new URL(req.url).pathname })}\\n`);",
+            "    await req.text();",
+            "    return Response.json({ ok: true });",
+            "  }",
+            "});",
+            "await new Promise(() => {});",
+            ""
+          ].join("\n")
+        );
+        servers.push(Bun.spawn(["bun", "run", serverScript], { stdout: "pipe", stderr: "pipe" }));
+      }
+      for (const port of [portA, portB]) {
+        await waitForCondition(
+          async () => {
+            try {
+              const response = await fetch(`http://127.0.0.1:${port}/health`);
+              return response.ok;
+            } catch {
+              return false;
+            }
+          },
+          `target brain test server ${port}`,
+          20
+        );
+      }
+      const flush = runBrainctl(["outbox", "flush", "--config", configPath]);
+      expectSuccess(flush);
+      expect(flush.stdout).toContain("flushed=2 kept=0 terminal_failures=0 corrupt=0");
+      const received = (
+        await Promise.all(
+          receivedPaths.map(async (path, index) => {
+            const text = await readFile(path, "utf8");
+            return text
+              .trim()
+              .split(/\r?\n/)
+              .filter(Boolean)
+              .map((line) => ({ port: index === 0 ? portA : portB, ...(JSON.parse(line) as { auth: string | null; path: string }) }));
+          })
+        )
+      ).flat();
+      expect(received).toContainEqual({ port: portA, auth: "Bearer token-a", path: "/api/import" });
+      expect(received).toContainEqual({ port: portB, auth: "Bearer token-b", path: "/api/import" });
+    } finally {
+      for (const server of servers) {
+        server.kill();
+        await server.exited;
+      }
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("outbox queues unreachable writes and flushes later", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-outbox-"));
     const port = 41_000 + Math.floor(Math.random() * 5_000);
@@ -2229,8 +2952,11 @@ describe("public release hygiene", () => {
       const statusBefore = runBrainctl(["outbox", "status", "--config", configPath], env);
       expectSuccess(statusBefore);
       expect(statusBefore.stdout).toContain("queued=1");
-      const outboxRootLine = statusBefore.stdout.split(/\r?\n/).find((line) => line.startsWith("outbox="));
-      const outboxPath = outboxRootLine?.slice("outbox=".length);
+      const queuedPathLine = `${queued.stdout}\n${queued.stderr}`
+        .split(/\r?\n/)
+        .find((line) => line.includes("shared-brain write queued:"));
+      const queuedItemPath = queuedPathLine?.replace(/^.*shared-brain write queued:\s*/, "").trim();
+      const outboxPath = queuedItemPath ? dirname(queuedItemPath) : undefined;
       expect(typeof outboxPath).toBe("string");
       await writeFile(
         join(outboxPath!, "legacy-timestamp-id.json"),
@@ -2575,6 +3301,210 @@ describe("public release hygiene", () => {
         terminalServer.kill();
         await terminalServer.exited;
       }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("outbox flush refuses corrupt entries before coalescing valid queued files", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-outbox-corrupt-before-coalesce-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      const stateRoot = join(dir, "state");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  stateRoot: ${stateRoot}`,
+          "client:",
+          "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+      const status = runBrainctl(["outbox", "status", "--config", configPath]);
+      expectSuccess(status);
+      const outboxPath = status.stdout.split(/\r?\n/).find((line) => line.startsWith("outbox="))?.slice("outbox=".length);
+      expect(typeof outboxPath).toBe("string");
+      await mkdir(outboxPath!, { recursive: true });
+      const payload = {
+        title: "Valid queued note",
+        text: "valid body",
+        source_harness: "codex",
+        source_machine: "client",
+        source_type: "note",
+        tags: []
+      };
+      const valid = {
+        endpoint: "import",
+        url: "http://127.0.0.1:1",
+        payload,
+        created_at: "2026-01-01T00:00:00.000Z",
+        source_machine: "client",
+        source_harness: "codex",
+        retry_count: 0,
+        idempotency_key: "same-valid-key",
+        last_error: null
+      };
+      await writeFile(join(outboxPath!, "import-valid-a.json"), `${JSON.stringify({ id: "import-valid-a", ...valid }, null, 2)}\n`);
+      await writeFile(join(outboxPath!, "import-valid-b.json"), `${JSON.stringify({ id: "import-valid-b", ...valid }, null, 2)}\n`);
+      await writeFile(
+        join(outboxPath!, "import-corrupt-json.json"),
+        `${JSON.stringify(
+          {
+            id: "import-corrupt-json",
+            endpoint: "import",
+            url: "http://127.0.0.1:1",
+            payload_storage: {
+              encoding: "json",
+              data: { ...payload, text: "mutated body" },
+              uncompressed_bytes: new TextEncoder().encode(JSON.stringify(payload)).byteLength,
+              stored_bytes: new TextEncoder().encode(JSON.stringify(payload)).byteLength,
+              sha256: sha256Text(JSON.stringify(payload))
+            },
+            created_at: "2026-01-01T00:00:00.000Z",
+            source_machine: "client",
+            source_harness: "codex",
+            retry_count: 0,
+            idempotency_key: "corrupt-json-key",
+            last_error: null
+          },
+          null,
+          2
+        )}\n`
+      );
+
+      const flush = runBrainctl(["outbox", "flush", "--config", configPath], {
+        BRAIN_BASE_URL: "http://127.0.0.1:1",
+        BRAIN_IMPORT_TOKEN: "token"
+      });
+      expect(flush.code).not.toBe(0);
+      expect(flush.stdout).toContain("flushed=0 kept=2 terminal_failures=0 corrupt=1");
+      expect(await Bun.file(join(outboxPath!, "import-valid-a.json")).exists()).toBe(true);
+      expect(await Bun.file(join(outboxPath!, "import-valid-b.json")).exists()).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("outbox surfaces corrupt json payloads, oversize legacy entries, and stale temp files", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-outbox-corrupt-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      const stateRoot = join(dir, "state");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  stateRoot: ${stateRoot}`,
+          "client:",
+          "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+      const status = runBrainctl(["outbox", "status", "--config", configPath]);
+      expectSuccess(status);
+      const outboxPath = status.stdout.split(/\r?\n/).find((line) => line.startsWith("outbox="))?.slice("outbox=".length);
+      expect(typeof outboxPath).toBe("string");
+      await mkdir(outboxPath!, { recursive: true });
+
+      const payload = {
+        title: "Corrupt note",
+        text: "original body",
+        source_harness: "codex",
+        source_machine: "client",
+        source_type: "note",
+        tags: []
+      };
+      await writeFile(
+        join(outboxPath!, "import-corrupt-json.json"),
+        `${JSON.stringify(
+          {
+            id: "import-corrupt-json",
+            endpoint: "import",
+            url: "http://127.0.0.1:1",
+            payload_storage: {
+              encoding: "json",
+              data: { ...payload, text: "mutated body" },
+              uncompressed_bytes: new TextEncoder().encode(JSON.stringify(payload)).byteLength,
+              stored_bytes: new TextEncoder().encode(JSON.stringify(payload)).byteLength,
+              sha256: sha256Text(JSON.stringify(payload))
+            },
+            created_at: "2026-01-01T00:00:00.000Z",
+            source_machine: "client",
+            source_harness: "codex",
+            retry_count: 0,
+            idempotency_key: "corrupt-json-key",
+            last_error: null
+          },
+          null,
+          2
+        )}\n`
+      );
+      await writeFile(
+        join(outboxPath!, "legacy-oversize.json"),
+        `${JSON.stringify({
+          id: "legacy-oversize",
+          endpoint: "import",
+          url: "http://127.0.0.1:1",
+          payload: {
+            ...payload,
+            title: "Oversize note",
+            text: "x".repeat(256)
+          },
+          created_at: "2026-01-01T00:00:00.000Z",
+          source_machine: "client",
+          source_harness: "codex",
+          retry_count: 0,
+          idempotency_key: "legacy-oversize-key",
+          last_error: null
+        })}\n`
+      );
+      await writeFile(join(outboxPath!, ".import-partial.json.123.tmp"), "partial sensitive payload");
+
+      const env = { BRAINSTACK_OUTBOX_HARD_MAX_BYTES: "128" };
+      const corruptStatus = runBrainctl(["outbox", "status", "--config", configPath], env);
+      expectSuccess(corruptStatus);
+      expect(corruptStatus.stdout).toContain("queued=0");
+      expect(corruptStatus.stdout).toContain("corrupt=3");
+      const corruptList = runBrainctl(["outbox", "list", "--config", configPath], env);
+      expectSuccess(corruptList);
+      expect(corruptList.stdout).toContain("CORRUPT import-corrupt-json.json");
+      expect(corruptList.stdout).toContain("json payload");
+      expect(corruptList.stdout).toContain("CORRUPT legacy-oversize.json");
+      expect(corruptList.stdout).toContain("exceeds hard cap 128");
+      expect(corruptList.stdout).toContain("CORRUPT .import-partial.json.123.tmp");
+      const flush = runBrainctl(["outbox", "flush", "--config", configPath], env);
+      expect(flush.code).not.toBe(0);
+      expect(flush.stdout).toContain("flushed=0 kept=0 terminal_failures=0 corrupt=3");
+      expect(flush.stderr).toContain("corrupt/unsafe entries");
+      const doctor = runBrainctl(["doctor", "--config", configPath], env);
+      expect(doctor.code).not.toBe(0);
+      expect(doctor.stdout).toContain("FAIL [outbox] corrupt-items: 3 corrupt/unsafe item(s)");
+      const purge = runBrainctl(["outbox", "purge-corrupt", "--yes", "--config", configPath], env);
+      expectSuccess(purge);
+      expect(purge.stdout).toContain("purged_corrupt=3");
+      expect(await Bun.file(join(outboxPath!, ".import-partial.json.123.tmp")).exists()).toBe(false);
+      const otherOutboxPath = join(dirname(outboxPath!), "target-specific-queue");
+      await mkdir(otherOutboxPath, { recursive: true });
+      await writeFile(join(outboxPath!, "default-leftover.json"), "{}\n");
+      await writeFile(join(otherOutboxPath, "target-leftover.json"), "{}\n");
+      const purgeAll = runBrainctl(["outbox", "purge", "--yes", "--config", configPath], env);
+      expectSuccess(purgeAll);
+      expect(purgeAll.stdout).toContain("purged=2");
+      expect(await Bun.file(outboxPath!).exists()).toBe(false);
+      expect(await Bun.file(otherOutboxPath).exists()).toBe(false);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

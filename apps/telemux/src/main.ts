@@ -34,6 +34,8 @@ setInterval(() => {
 }, 60_000);
 
 if (telegram.isConfigured()) {
+  dispatcher.recoverQueuedTurns();
+  commands.recoverPendingText();
   void ensureBasicLoops(config, contexts, workers, cronManager)
     .then((result) => {
       console.log(`basic loops: ${result}`);

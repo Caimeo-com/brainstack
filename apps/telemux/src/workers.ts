@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
-import { appendFile, mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { dirname, join } from "node:path";
 import type { CodexReasoningEffort } from "./codex-runtime";
 import { loadWorkerConfigsFromPath, type FactoryConfig, type FactoryWorkerConfig, type HarnessName } from "./config";
 import { ContextKind, ContextRecord, ContextState, FactoryDb, WorkerRecord } from "./db";
@@ -86,6 +87,52 @@ function nowIso(): string {
 
 function quoteSh(value: string): string {
   return `'${value.replaceAll("'", `'\"'\"'`)}'`;
+}
+
+interface WorkerEnvCacheRecord {
+  worker: string;
+  fingerprint: string;
+  path: string;
+  harness: string;
+  harnessBin: string;
+  harnessVersion: string;
+  detectedAt: string;
+}
+
+function cacheSha(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function workerEnvCachePath(config: FactoryConfig): string {
+  return join(config.stateRoot, "worker-env-cache.json");
+}
+
+async function readWorkerEnvCache(config: FactoryConfig): Promise<Record<string, WorkerEnvCacheRecord>> {
+  const path = workerEnvCachePath(config);
+  if (!existsSync(path)) {
+    return {};
+  }
+  try {
+    return JSON.parse(await readFile(path, "utf8")) as Record<string, WorkerEnvCacheRecord>;
+  } catch {
+    return {};
+  }
+}
+
+async function writeWorkerEnvCache(config: FactoryConfig, cache: Record<string, WorkerEnvCacheRecord>): Promise<void> {
+  await mkdir(dirname(workerEnvCachePath(config)), { recursive: true });
+  await writeFile(workerEnvCachePath(config), `${JSON.stringify(cache, null, 2)}\n`, { mode: 0o600 });
+}
+
+function workerEnvFingerprint(worker: FactoryWorkerConfig, harness: { family: HarnessName; bin: string }): string {
+  return cacheSha({
+    worker: worker.name,
+    transport: worker.transport,
+    sshTarget: worker.sshTarget || null,
+    sshUser: worker.sshUser || null,
+    harness: harness.family,
+    harnessBin: harness.bin
+  });
 }
 
 function workerUserPathPrelude(): string {
@@ -332,6 +379,37 @@ export class WorkerService {
     return this.configuredWorkers().find((worker) => worker.name === machine) || null;
   }
 
+  private async cachedWorkerPath(worker: FactoryWorkerConfig, harness: { family: HarnessName; bin: string }): Promise<string | null> {
+    const cache = await readWorkerEnvCache(this.config);
+    const record = cache[worker.name];
+    if (!record || record.fingerprint !== workerEnvFingerprint(worker, harness) || !record.path.trim()) {
+      return null;
+    }
+    const detectedAt = Date.parse(record.detectedAt);
+    if (!Number.isFinite(detectedAt) || Date.now() - detectedAt > 7 * 24 * 60 * 60 * 1000) {
+      return null;
+    }
+    return record.path;
+  }
+
+  private async saveWorkerPathCache(worker: FactoryWorkerConfig, harness: { family: HarnessName; bin: string }, details: string): Promise<void> {
+    const pathValue = probeField(details, "path");
+    if (!pathValue) {
+      return;
+    }
+    const cache = await readWorkerEnvCache(this.config);
+    cache[worker.name] = {
+      worker: worker.name,
+      fingerprint: workerEnvFingerprint(worker, harness),
+      path: pathValue,
+      harness: harness.family,
+      harnessBin: probeField(details, "harness_bin") || harness.bin,
+      harnessVersion: probeField(details, "harness_version") || "",
+      detectedAt: new Date().toISOString()
+    };
+    await writeWorkerEnvCache(this.config, cache);
+  }
+
   async refreshWorkers(): Promise<WorkerRecord[]> {
     const workers = await Promise.all(this.knownHosts().map((host) => this.probeWorker(host)));
     if (this.workerConfigError) {
@@ -416,6 +494,7 @@ export class WorkerService {
         `harness=${quoteSh(harness.family)}`,
         `harness_bin=${quoteSh(harness.bin)}`,
         ...(worker.transport === "local" ? [workerUserPathPrelude()] : []),
+        "printf 'path=%s\\n' \"$PATH\"",
         "brainstack_config_value() { key=\"$1\"; file=\"$2\"; [ -f \"$file\" ] || return 0; awk -v key=\"$key\" 'BEGIN { in_section=0 } /^[[:space:]]*\\[/ { in_section=1 } in_section == 0 { pattern=\"^[[:space:]]*\" key \"[[:space:]]*=\"; if ($0 ~ pattern) { sub(/^[^=]*=[[:space:]]*/, \"\"); sub(/[[:space:]]*#.*/, \"\"); gsub(/^[[:space:]\"]+|[[:space:]\"]+$/, \"\"); print; exit } }' \"$file\" || true; }",
         "printf 'harness=%s\\n' \"$harness\"",
         "if command -v \"$harness_bin\" >/dev/null 2>&1; then printf 'harness_bin=1\\n'; else printf 'harness_bin=0\\n'; fi",
@@ -427,11 +506,19 @@ export class WorkerService {
         "printf 'home=%s\\n' \"$HOME\""
       ].join("\n"),
       undefined,
-      8
+      8,
+      undefined,
+      undefined,
+      false
     );
 
     const existing = this.db.getWorker(host);
     const details = result.ok ? result.stdout.trim() : "";
+    if (result.ok) {
+      await this.saveWorkerPathCache(worker, harness, details).catch((error) => {
+        console.warn(`worker path cache update failed for ${worker.name}`, error);
+      });
+    }
     const probeIssues: string[] = [];
     if (result.ok) {
       if (probeField(details, "harness_bin") !== "1") {
@@ -1857,9 +1944,14 @@ printf 'BRANCH=%s\\n' "$branch_name"
     logPath?: string,
     timeoutSeconds?: number,
     onStdoutChunk?: (chunk: string) => Promise<void> | void,
-    captureMaxBytes = this.config.workerCaptureMaxBytes
+    captureMaxBytes = this.config.workerCaptureMaxBytes,
+    usePathCache = true
   ): Promise<WorkerExecResult> {
-    const scriptToRun = worker.transport === "local" ? script : `${workerUserPathPrelude()}\n${script}`;
+    const harness = this.resolveHarness(worker);
+    const cachedPath = usePathCache && worker.transport !== "local" ? await this.cachedWorkerPath(worker, harness) : null;
+    const cachePrelude = cachedPath ? `BRAINSTACK_WORKER_PATH=${quoteSh(cachedPath)}\nexport BRAINSTACK_WORKER_PATH\n` : "";
+    const uncachedPrelude = usePathCache ? "" : "unset BRAINSTACK_WORKER_PATH\n";
+    const scriptToRun = worker.transport === "local" ? script : `${uncachedPrelude}${cachePrelude}${workerUserPathPrelude()}\n${script}`;
     switch (worker.transport) {
       case "local":
         return this.spawnAndCapture(

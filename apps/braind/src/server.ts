@@ -5,6 +5,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { createHash, randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import {
   backlinksForPath,
@@ -87,6 +88,8 @@ const importToken = readTokenEnv("BRAIN_IMPORT_TOKEN");
 const adminToken = readTokenEnv("BRAIN_ADMIN_TOKEN");
 const host = process.env.BRAIN_BIND || "127.0.0.1";
 const port = Number(process.env.BRAIN_PORT || 8080);
+const securityPosture = process.env.BRAIN_SECURITY_POSTURE || "trusted-tailnet";
+const trustedExposure = process.env.BRAIN_TRUSTED_EXPOSURE || "none";
 const configuredMaxImportBytes = Number(process.env.BRAIN_MAX_IMPORT_BYTES || "");
 const maxImportBytes =
   Number.isFinite(configuredMaxImportBytes) && configuredMaxImportBytes > 0
@@ -116,6 +119,24 @@ const writeRateLimitPerMinute =
   Number.isFinite(configuredRateLimit) && configuredRateLimit > 0
     ? Math.trunc(configuredRateLimit)
     : 60;
+const configuredTokenRateLimit = Number(process.env.BRAIN_WRITE_TOKEN_RATE_LIMIT_PER_MINUTE || "");
+const writeTokenRateLimitPerMinute =
+  Number.isFinite(configuredTokenRateLimit) && configuredTokenRateLimit > 0
+    ? Math.trunc(configuredTokenRateLimit)
+    : writeRateLimitPerMinute * 5;
+const configuredRateLimitMaxKeys = Number(process.env.BRAIN_WRITE_RATE_LIMIT_MAX_KEYS || "");
+const writeRateLimitMaxKeys =
+  Number.isFinite(configuredRateLimitMaxKeys) && configuredRateLimitMaxKeys > 0
+    ? Math.trunc(configuredRateLimitMaxKeys)
+    : 10_000;
+const trustProxyHeaders = ["1", "true", "yes", "on"].includes(
+  (process.env.BRAIN_TRUST_PROXY_HEADERS || "").toLowerCase()
+);
+const configuredMutationWaitMs = Number(process.env.BRAIN_WRITE_QUEUE_WAIT_MS || process.env.BRAIN_REPO_LOCK_WAIT_MS || "");
+const mutationQueueWaitMs =
+  Number.isFinite(configuredMutationWaitMs) && configuredMutationWaitMs > 0
+    ? Math.trunc(configuredMutationWaitMs)
+    : 30_000;
 const configuredReindexTimeoutMs = Number(process.env.BRAIN_REINDEX_TIMEOUT_MS || "");
 const reindexTimeoutMs =
   Number.isFinite(configuredReindexTimeoutMs) && configuredReindexTimeoutMs > 0
@@ -147,7 +168,10 @@ const pendingReindexPath = join(repoRoot, "derived", "search-reindex-needed.json
 let searchRefreshPromise: Promise<void> | null = null;
 let searchRefreshRequestedCommit: string | null = null;
 let activeWriteRequests = 0;
+let activeImportPreparations = 0;
 const writeRateEvents = new Map<string, number[]>();
+const writeTokenRateEvents = new Map<string, number[]>();
+const writePreBodyRateEvents = new Map<string, number[]>();
 
 if (legacyWriteToken || (rawLegacyWriteToken && rawLegacyWriteToken !== legacyWriteToken)) {
   throw new Error("BRAIN_WRITE_TOKEN is no longer accepted by braind; set distinct BRAIN_IMPORT_TOKEN and BRAIN_ADMIN_TOKEN.");
@@ -157,6 +181,9 @@ if (!importToken || !adminToken) {
 }
 if (importToken === adminToken) {
   throw new Error("BRAIN_IMPORT_TOKEN and BRAIN_ADMIN_TOKEN must be distinct.");
+}
+if (securityPosture === "local" && !["127.0.0.1", "::1", "localhost"].includes(host)) {
+  throw new Error(`BRAIN_SECURITY_POSTURE=local requires BRAIN_BIND to be loopback; got ${host}`);
 }
 
 async function currentRepoCommit(root: string): Promise<string | null> {
@@ -369,7 +396,7 @@ function renderMarkdown(markdown: string, currentPath: string): string {
   return html;
 }
 
-function layout(title: string, body: string): Response {
+function layout(title: string, body: string, status = 200): Response {
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -470,6 +497,14 @@ function layout(title: string, body: string): Response {
       margin-right: 0.35rem;
       margin-bottom: 0.35rem;
     }
+    .notice {
+      padding: 0.8rem 1rem;
+      border: 1px solid #b98521;
+      border-radius: 0.75rem;
+      background: #fff2ce;
+      color: #5b3a00;
+      margin-top: 1rem;
+    }
     .crumbs {
       color: var(--muted);
       font-size: 0.95rem;
@@ -490,7 +525,7 @@ function layout(title: string, body: string): Response {
   </main>
 </body>
 </html>`;
-  return new Response(html, { headers: securityHeaders("text/html; charset=utf-8") });
+  return new Response(html, { status, headers: securityHeaders("text/html; charset=utf-8") });
 }
 
 function json(data: unknown, status = 200): Response {
@@ -505,11 +540,11 @@ function textResponse(body: string, status = 200): Response {
 }
 
 function errorResponse(status: number, message: string): Response {
-  return layout(`Error ${status}`, `<div class="masthead"><h1>Error ${status}</h1><p>${htmlEscape(message)}</p></div>`);
+  return layout(`Error ${status}`, `<div class="masthead"><h1>Error ${status}</h1><p>${htmlEscape(message)}</p></div>`, status);
 }
 
 function wantsJson(request: Request, url: URL): boolean {
-  return url.searchParams.get("format") === "json" || request.headers.get("accept")?.includes("application/json") === true;
+  return url.pathname.startsWith("/api/") || url.searchParams.get("format") === "json" || request.headers.get("accept")?.includes("application/json") === true;
 }
 
 function reject(status: number, message: string, code?: string): never {
@@ -569,17 +604,47 @@ async function pendingReindexStatus(): Promise<Record<string, unknown>> {
   };
 }
 
+async function publicPendingReindexStatus(): Promise<Record<string, unknown>> {
+  if (!existsSync(pendingReindexPath)) {
+    return { present: false };
+  }
+  const info = await stat(pendingReindexPath);
+  return {
+    present: true,
+    age_ms: Math.max(0, Date.now() - info.mtime.getTime())
+  };
+}
+
 async function operationalHealth(): Promise<Record<string, unknown>> {
   const readPaths = getRepoPaths(repoRoot);
   const writePaths = getRepoPaths(writeRepoRoot);
   return {
     ...(await getHealth(repoRoot)),
+    security_posture: securityPosture,
+    trusted_exposure: trustedExposure,
+    bind_host: host,
     write_repo_root: writeRepoRoot,
     repo_lock: await lockStatus(readPaths.lockDir),
     write_repo_lock: await lockStatus(writePaths.lockDir),
     idempotency_locks: await idempotencyLockStatuses(writePaths.idempotencyDir),
     pending_reindex: await pendingReindexStatus()
   };
+}
+
+function minimalHealth(): Record<string, unknown> {
+  return {
+    ok: true,
+    service: "braind",
+    version: "0.1.0"
+  };
+}
+
+function staleSearchNotice(status: Record<string, unknown>): string {
+  if (!status.present) {
+    return "";
+  }
+  const age = typeof status.age_ms === "number" ? ` age_ms=${Math.trunc(status.age_ms)}` : "";
+  return `<div class="notice">Search/backlink index refresh is pending; results may be stale.${htmlEscape(age)}</div>`;
 }
 
 function sha256Text(value: string): string {
@@ -664,6 +729,60 @@ async function idempotencyLockDetails(lockDir: string): Promise<string> {
   }
 }
 
+function pidAppearsAlive(pid: unknown): boolean {
+  if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pidIsDefinitelyDead(pid: unknown): boolean {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code) : "";
+    return code === "ESRCH";
+  }
+}
+
+function isIdempotencyLockEntry(entry: string): boolean {
+  return /^owner-[A-Fa-f0-9-]+\.json$/.test(entry) || /^release-[A-Fa-f0-9-]+$/.test(entry);
+}
+
+async function clearPreMutationIdempotencyLock(lockDir: string): Promise<boolean> {
+  try {
+    const entries = await readdir(lockDir);
+    if (!entries.length || entries.some((entry) => !isIdempotencyLockEntry(entry))) {
+      return false;
+    }
+    const ownerEntries = entries.filter((entry) => entry.startsWith("owner-") && entry.endsWith(".json"));
+    if (ownerEntries.length !== 1) {
+      return false;
+    }
+    const owner = await readJsonFile<{ pid?: number; hostname?: string }>(join(lockDir, ownerEntries[0]));
+    if (!owner || owner.hostname !== hostname() || !pidIsDefinitelyDead(owner.pid)) {
+      return false;
+    }
+    console.warn(`clearing expired pre-mutation idempotency lock for dead pid=${owner.pid} lock=${lockDir}`);
+    for (const entry of entries) {
+      await rm(join(lockDir, entry), { force: true });
+    }
+    await rmdir(lockDir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function withIdempotency(
   request: Request,
   endpoint: "import" | "propose",
@@ -692,7 +811,7 @@ async function withIdempotency(
     try {
       await mkdir(lockDir);
       try {
-        await writeJsonFile(lockOwnerPath, { token: lockToken, pid: process.pid, created_at: isoNow() }, { createOnly: true });
+        await writeJsonFile(lockOwnerPath, { token: lockToken, pid: process.pid, hostname: hostname(), created_at: isoNow() }, { createOnly: true });
         await writeFile(lockTokenPath, lockToken, { encoding: "utf8", flag: "wx" });
       } catch (error) {
         await rm(lockTokenPath, { force: true }).catch(() => undefined);
@@ -710,6 +829,22 @@ async function withIdempotency(
         if (existing?.endpoint === endpoint && existing.request_hash === requestHash) {
           if (existing.status === "complete" && existing.response_body) {
             return { ...existing.response_body, idempotent_replay: true };
+          }
+          if (existing.status === "claimed" && isLeaseExpired(existing) && !existing.side_effect_started_at) {
+            if (await clearPreMutationIdempotencyLock(lockDir)) {
+              continue;
+            }
+            const reviewRecord: IdempotencyRecord = {
+              ...existing,
+              status: "review_required",
+              updated_at: isoNow(),
+              review_required_at: isoNow(),
+              error:
+                existing.error ||
+                `Idempotent request preflight lock could not be proven safe to clear; inspect ${relativeRecordPath} and ${lockDir} before retrying with a new key.`
+            };
+            await writeJsonFile(recordPath, reviewRecord).catch(() => undefined);
+            reject(409, "Idempotent request preflight requires operator review before retry", "IDEMPOTENCY_REVIEW_REQUIRED");
           }
           if ((existing.status === "claimed" || existing.status === "running") && isLeaseExpired(existing)) {
             const reviewRecord: IdempotencyRecord = {
@@ -866,6 +1001,33 @@ async function withIdempotency(
       await rmdir(lockDir).catch(() => undefined);
     }
   }
+}
+
+async function completedIdempotencyReplay(
+  request: Request,
+  endpoint: "import" | "propose",
+  requestHash: string
+): Promise<Record<string, unknown> | null> {
+  const rawKey = request.headers.get("idempotency-key")?.trim();
+  if (!rawKey) {
+    return null;
+  }
+  if (rawKey.length > 200) {
+    reject(400, "Idempotency-Key is too long");
+  }
+  const paths = getRepoPaths(writeRepoRoot);
+  const recordPath = join(paths.idempotencyDir, endpoint, `${sha256Text(rawKey)}.json`);
+  const existing = await readJsonFile<IdempotencyRecord>(recordPath);
+  if (!existing) {
+    return null;
+  }
+  if (existing.endpoint !== endpoint || existing.request_hash !== requestHash) {
+    reject(409, "Idempotency-Key was already used for a different request");
+  }
+  if (existing.status === "complete" && existing.response_body) {
+    return { ...existing.response_body, idempotent_replay: true };
+  }
+  return null;
 }
 
 function assertImportSize(size: number, label: string): void {
@@ -1193,26 +1355,119 @@ function assertAdminAuth(request: Request): void {
   }
 }
 
-async function withWriteGate<T>(request: Request, scope: AuthScope, run: () => Promise<T>): Promise<T> {
-  const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || scope;
-  const tokenKey = sha256Text(token).slice(0, 16);
-  const now = Date.now();
-  const windowStart = now - 60_000;
-  const recent = (writeRateEvents.get(tokenKey) || []).filter((timestamp) => timestamp >= windowStart);
-  if (recent.length >= writeRateLimitPerMinute) {
-    reject(429, `write rate limit exceeded for this token; limit=${writeRateLimitPerMinute}/minute`);
-  }
-  if (activeWriteRequests >= writeConcurrencyLimit) {
-    reject(503, `write concurrency limit exceeded; limit=${writeConcurrencyLimit}`);
-  }
+function normalizeRateSource(value: string | null | undefined): string {
+  const normalized = String(value || "")
+    .trim()
+    .replace(/[^\x20-\x7e]/g, "?")
+    .slice(0, 200);
+  return normalized || "unknown-source";
+}
 
+function writeRateSource(request: Request, sourceMachine?: string | null): string {
+  if (sourceMachine) {
+    return normalizeRateSource(sourceMachine);
+  }
+  const brainstackSource = request.headers.get("x-brainstack-source-machine");
+  if (brainstackSource) {
+    return normalizeRateSource(brainstackSource);
+  }
+  if (trustProxyHeaders) {
+    return normalizeRateSource(request.headers.get("x-real-ip") || request.headers.get("x-forwarded-for"));
+  }
+  return "unknown-source";
+}
+
+function pruneRateMap(map: Map<string, number[]>, now: number): void {
+  const windowStart = now - 60_000;
+  const entries: Array<{ key: string; newest: number }> = [];
+  for (const [key, timestamps] of map) {
+    const recent = timestamps.filter((timestamp) => timestamp >= windowStart);
+    if (!recent.length) {
+      map.delete(key);
+      continue;
+    }
+    map.set(key, recent);
+    entries.push({ key, newest: Math.max(...recent) });
+  }
+  if (map.size <= writeRateLimitMaxKeys) {
+    return;
+  }
+  for (const entry of entries.sort((a, b) => a.newest - b.newest)) {
+    if (map.size <= writeRateLimitMaxKeys) {
+      break;
+    }
+    map.delete(entry.key);
+  }
+}
+
+function assertWriteRateLimit(request: Request, scope: AuthScope, endpoint: string, sourceMachine?: string | null): void {
+  const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || scope;
+  const source = writeRateSource(request, sourceMachine);
+  const tokenHash = sha256Text(token).slice(0, 16);
+  const globalTokenKey = `${tokenHash}|${endpoint}`;
+  const sourceTokenKey = `${tokenHash}|${sha256Text(source).slice(0, 16)}|${endpoint}`;
+  const now = Date.now();
+  pruneRateMap(writeTokenRateEvents, now);
+  pruneRateMap(writeRateEvents, now);
+  const windowStart = now - 60_000;
+  const globalRecent = (writeTokenRateEvents.get(globalTokenKey) || []).filter((timestamp) => timestamp >= windowStart);
+  if (globalRecent.length >= writeTokenRateLimitPerMinute) {
+    reject(429, `write rate limit exceeded for this token/endpoint; limit=${writeTokenRateLimitPerMinute}/minute`);
+  }
+  const recent = (writeRateEvents.get(sourceTokenKey) || []).filter((timestamp) => timestamp >= windowStart);
+  if (recent.length >= writeRateLimitPerMinute) {
+    reject(429, `write rate limit exceeded for this token/source/endpoint; limit=${writeRateLimitPerMinute}/minute`);
+  }
+  globalRecent.push(now);
+  writeTokenRateEvents.set(globalTokenKey, globalRecent);
   recent.push(now);
-  writeRateEvents.set(tokenKey, recent);
+  writeRateEvents.set(sourceTokenKey, recent);
+}
+
+function assertPreBodyWriteRateLimit(request: Request, scope: AuthScope, endpoint: string): void {
+  const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || scope;
+  const tokenHash = sha256Text(token).slice(0, 16);
+  const key = `${tokenHash}|pre-body|${endpoint}`;
+  const now = Date.now();
+  pruneRateMap(writePreBodyRateEvents, now);
+  const windowStart = now - 60_000;
+  const recent = (writePreBodyRateEvents.get(key) || []).filter((timestamp) => timestamp >= windowStart);
+  if (recent.length >= writeTokenRateLimitPerMinute) {
+    reject(429, `pre-body write rate limit exceeded for this token/endpoint; limit=${writeTokenRateLimitPerMinute}/minute`);
+  }
+  recent.push(now);
+  writePreBodyRateEvents.set(key, recent);
+}
+
+async function withMutationGate<T>(run: () => Promise<T>): Promise<T> {
+  const startedAt = Date.now();
+  while (activeWriteRequests >= writeConcurrencyLimit) {
+    if (Date.now() - startedAt > mutationQueueWaitMs) {
+      reject(503, `write queue timed out after ${mutationQueueWaitMs}ms; limit=${writeConcurrencyLimit}`);
+    }
+    await Bun.sleep(50);
+  }
   activeWriteRequests += 1;
   try {
     return await run();
   } finally {
     activeWriteRequests = Math.max(0, activeWriteRequests - 1);
+  }
+}
+
+async function withImportPreparationGate<T>(run: () => Promise<T>): Promise<T> {
+  const startedAt = Date.now();
+  while (activeImportPreparations >= writeConcurrencyLimit) {
+    if (Date.now() - startedAt > mutationQueueWaitMs) {
+      reject(503, `import preparation queue timed out after ${mutationQueueWaitMs}ms; limit=${writeConcurrencyLimit}`);
+    }
+    await Bun.sleep(50);
+  }
+  activeImportPreparations += 1;
+  try {
+    return await run();
+  } finally {
+    activeImportPreparations = Math.max(0, activeImportPreparations - 1);
   }
 }
 
@@ -1371,29 +1626,34 @@ if (typeof searchRefreshRetryTimer === "object" && searchRefreshRetryTimer && "u
 }
 void retryPendingSearchRefresh().catch(() => undefined);
 
-async function writeImport(input: Parameters<typeof createImportedArtifact>[1]): Promise<Record<string, unknown>> {
-  return await withRepoLock(writeRepoRoot, async () => {
-    await syncWritableRepoAsync(writeRepoRoot);
-    const imported = await createImportedArtifact(writeRepoRoot, input);
-    let touchedFiles = [...imported.touchedFiles];
-    if (input.ingest_now) {
-      const ingest = await ingestArtifacts(writeRepoRoot, [imported.artifactId]);
-      touchedFiles = [...touchedFiles, ...ingest.touchedFiles];
-    }
-    const commit = await gitCommitAndPush(
-      writeRepoRoot,
-      touchedFiles,
-      input.ingest_now ? `brain: import+ingest ${imported.artifactId}` : `brain: import ${imported.artifactId}`
-    );
-    return {
-      ok: true,
-      artifact_id: imported.artifactId,
-      deduplicated: imported.deduplicated,
-      commit,
-      touched_files: touchedFiles,
-      search_index: await refreshSearchAfterWrite(commit)
-    };
-  });
+async function writeImport(
+  input: Parameters<typeof createImportedArtifact>[1],
+  beforeMutation?: () => Promise<void>
+): Promise<Record<string, unknown>> {
+  return await withMutationGate(async () =>
+    await withRepoLock(writeRepoRoot, async () => {
+      await syncWritableRepoAsync(writeRepoRoot);
+      const imported = await createImportedArtifact(writeRepoRoot, input, { beforeMutation });
+      let touchedFiles = [...imported.touchedFiles];
+      if (input.ingest_now) {
+        const ingest = await ingestArtifacts(writeRepoRoot, [imported.artifactId]);
+        touchedFiles = [...touchedFiles, ...ingest.touchedFiles];
+      }
+      const commit = await gitCommitAndPush(
+        writeRepoRoot,
+        touchedFiles,
+        input.ingest_now ? `brain: import+ingest ${imported.artifactId}` : `brain: import ${imported.artifactId}`
+      );
+      return {
+        ok: true,
+        artifact_id: imported.artifactId,
+        deduplicated: imported.deduplicated,
+        commit,
+        touched_files: touchedFiles,
+        search_index: await refreshSearchAfterWrite(commit)
+      };
+    })
+  );
 }
 
 async function importFromRequest(request: Request, authScope: AuthScope): Promise<Record<string, unknown>> {
@@ -1426,9 +1686,14 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
     if (input.ingest_now && authScope !== "admin") {
       throw new Error("Forbidden: ingest_now requires the admin token");
     }
-    return await withIdempotency(request, "import", requestHashFor({ endpoint: "import", input }), async (markSideEffectStarted) => {
-      await markSideEffectStarted();
-      return await writeImport(input);
+    const requestHash = requestHashFor({ endpoint: "import", input });
+    const replay = await completedIdempotencyReplay(request, "import", requestHash);
+    if (replay) {
+      return replay;
+    }
+    assertWriteRateLimit(request, authScope, "import", input.source_machine);
+    return await withIdempotency(request, "import", requestHash, async (markSideEffectStarted) => {
+      return await writeImport(input, markSideEffectStarted);
     });
   }
 
@@ -1456,9 +1721,14 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
     if (input.ingest_now && authScope !== "admin") {
       throw new Error("Forbidden: ingest_now requires the admin token");
     }
-    return await withIdempotency(request, "import", requestHashFor({ endpoint: "import", input }), async (markSideEffectStarted) => {
-      await markSideEffectStarted();
-      return await writeImport(input);
+    const requestHash = requestHashFor({ endpoint: "import", input });
+    const replay = await completedIdempotencyReplay(request, "import", requestHash);
+    if (replay) {
+      return replay;
+    }
+    assertWriteRateLimit(request, authScope, "import", input.source_machine);
+    return await withIdempotency(request, "import", requestHash, async (markSideEffectStarted) => {
+      return await writeImport(input, markSideEffectStarted);
     });
   }
 
@@ -1480,27 +1750,32 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
     if (requestShape.ingest_now && authScope !== "admin") {
       throw new Error("Forbidden: ingest_now requires the admin token");
     }
-    return await withIdempotency(request, "import", requestHashFor({ endpoint: "import-url", request: requestShape }), async (markSideEffectStarted) => {
+    const requestHash = requestHashFor({ endpoint: "import-url", request: requestShape });
+    const replay = await completedIdempotencyReplay(request, "import", requestHash);
+    if (replay) {
+      return replay;
+    }
+    assertWriteRateLimit(request, authScope, "import", requestShape.source_machine);
+    return await withIdempotency(request, "import", requestHash, async (markSideEffectStarted) => {
       const upstream = await safeFetchImportUrl(sourceUrl);
       if (!upstream.ok) {
         reject(400, `URL fetch failed: ${upstream.status} ${upstream.statusText}`);
       }
       const upstreamType = upstream.headers.get("content-type")?.split(";")[0];
       const bytes = await readResponseBytesCapped(upstream, "URL import response");
-      await markSideEffectStarted();
       return await writeImport({
         ...requestShape,
         bytes,
         fileName: fileNameForUrl(sourceUrl, upstreamType, title),
         contentType: upstreamType
-      });
+      }, markSideEffectStarted);
     });
   }
 
   throw new Error("Import request must include text, url, or multipart file");
 }
 
-async function proposeFromRequest(request: Request): Promise<Record<string, unknown>> {
+async function proposeFromRequest(request: Request, authScope: AuthScope): Promise<Record<string, unknown>> {
   const body = await readJsonBody(request);
   const input = {
     title: String(body.title || ""),
@@ -1510,24 +1785,31 @@ async function proposeFromRequest(request: Request): Promise<Record<string, unkn
     target_page: typeof body.target_page === "string" ? body.target_page : undefined,
     tags: Array.isArray(body.tags) ? body.tags.map(String) : []
   };
-  return await withIdempotency(request, "propose", requestHashFor({ endpoint: "propose", input }), async (markSideEffectStarted) => {
-    await markSideEffectStarted();
-    return await withRepoLock(writeRepoRoot, async () => {
-      await syncWritableRepoAsync(writeRepoRoot);
-      const proposal = await createProposal(writeRepoRoot, input);
-      const commit = await gitCommitAndPush(
-        writeRepoRoot,
-        proposal.touchedFiles,
-        `brain: propose ${input.title || "proposal"}`
-      );
-      return {
-        ok: true,
-        proposal_path: proposal.proposalPath,
-        commit,
-        touched_files: proposal.touchedFiles,
-        search_index: await refreshSearchAfterWrite(commit)
-      };
-    });
+  const requestHash = requestHashFor({ endpoint: "propose", input });
+  const replay = await completedIdempotencyReplay(request, "propose", requestHash);
+  if (replay) {
+    return replay;
+  }
+  assertWriteRateLimit(request, authScope, "propose", input.source_machine);
+  return await withIdempotency(request, "propose", requestHash, async (markSideEffectStarted) => {
+    return await withMutationGate(async () =>
+      await withRepoLock(writeRepoRoot, async () => {
+        await syncWritableRepoAsync(writeRepoRoot);
+        const proposal = await createProposal(writeRepoRoot, input, { beforeMutation: markSideEffectStarted });
+        const commit = await gitCommitAndPush(
+          writeRepoRoot,
+          proposal.touchedFiles,
+          `brain: propose ${input.title || "proposal"}`
+        );
+        return {
+          ok: true,
+          proposal_path: proposal.proposalPath,
+          commit,
+          touched_files: proposal.touchedFiles,
+          search_index: await refreshSearchAfterWrite(commit)
+        };
+      })
+    );
   });
 }
 
@@ -1574,7 +1856,7 @@ async function renderHome(): Promise<Response> {
           <div>Commit: <code>${htmlEscape(health.commit || "(none)")}</code></div>
           <div>Indexed docs: <code>${String(health.indexed_docs)}</code></div>
           <div>Last reindex: <code>${htmlEscape(health.last_reindex_at || "(none)")}</code></div>
-          <div>Repo root: <code>${htmlEscape(repoRoot)}</code></div>
+          <div>Storage: <code>local shared-brain repo</code></div>
         </div>
       </aside>
     </div>
@@ -1645,6 +1927,7 @@ async function discoverHomeSections(): Promise<Array<{ label: string; path: stri
 async function renderPage(repoPath: string): Promise<Response> {
   assertPublicPagePath(repoPath);
   const page = await readPage(repoRoot, repoPath);
+  const freshness = await pendingReindexStatus();
   const backlinks = existsSync(join(repoRoot, "derived", "search.sqlite"))
     ? await backlinksForPath(repoRoot, repoPath)
     : [];
@@ -1676,6 +1959,7 @@ async function renderPage(repoPath: string): Promise<Response> {
       <h1>${htmlEscape(page.title)}</h1>
       <p>Rendered from <code>${htmlEscape(repoPath)}</code></p>
     </section>
+    ${staleSearchNotice(freshness)}
     <div class="grid cols">
       <article class="card content">
         ${renderMarkdown(page.body, repoPath)}
@@ -1738,8 +2022,9 @@ async function renderSearch(request: Request, url: URL): Promise<Response> {
   const rawLimit = Number(url.searchParams.get("limit") || 10);
   const limit = Math.min(Math.max(Math.trunc(rawLimit) || 10, 1), maxSearchLimit);
   const results = query ? await searchIndex(repoRoot, query, scope, limit) : [];
+  const freshness = await pendingReindexStatus();
   if (wantsJson(request, url)) {
-    return json({ query, scope, limit, results });
+    return json({ query, scope, limit, search_freshness: await publicPendingReindexStatus(), results });
   }
   return layout(
     `Search: ${query || "shared brain"}`,
@@ -1755,6 +2040,7 @@ async function renderSearch(request: Request, url: URL): Promise<Response> {
         <button type="submit">Search</button>
       </form>
     </section>
+    ${staleSearchNotice(freshness)}
     <section class="card">
       <h2>${results.length} results</h2>
       <ul>
@@ -1775,7 +2061,11 @@ const server = Bun.serve({
   async fetch(request) {
     const url = new URL(request.url);
     try {
-      if (request.method === "GET" && url.pathname === "/health") {
+      if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
+        return json(minimalHealth());
+      }
+      if (request.method === "GET" && (url.pathname === "/admin/health" || url.pathname === "/health/deep")) {
+        assertAdminAuth(request);
         return json(await operationalHealth());
       }
       if (request.method === "GET" && url.pathname === "/") {
@@ -1792,21 +2082,23 @@ const server = Bun.serve({
       }
       if (request.method === "POST" && url.pathname === "/api/import") {
         const authScope = assertImportAuth(request);
-        return json(await withWriteGate(request, authScope, () => importFromRequest(request, authScope)));
+        assertPreBodyWriteRateLimit(request, authScope, "import");
+        return json(await withImportPreparationGate(async () => await importFromRequest(request, authScope)));
       }
       if (request.method === "POST" && url.pathname === "/api/ingest") {
         assertAdminAuth(request);
+        assertWriteRateLimit(request, "admin", "ingest", null);
+        const body = await readJsonBody(request);
+        const artifactIds = Array.isArray(body.artifact_ids)
+          ? body.artifact_ids.map(String)
+          : body.artifact_id
+            ? [String(body.artifact_id)]
+            : [];
+        if (!artifactIds.length) {
+          reject(400, "artifact_id or artifact_ids is required");
+        }
         return json(
-          await withWriteGate(request, "admin", async () => {
-            const body = await readJsonBody(request);
-            const artifactIds = Array.isArray(body.artifact_ids)
-              ? body.artifact_ids.map(String)
-              : body.artifact_id
-                ? [String(body.artifact_id)]
-                : [];
-            if (!artifactIds.length) {
-              reject(400, "artifact_id or artifact_ids is required");
-            }
+          await withMutationGate(async () => {
             return await withRepoLock(writeRepoRoot, async () => {
               await syncWritableRepoAsync(writeRepoRoot);
               const ingest = await ingestArtifacts(writeRepoRoot, artifactIds);
@@ -1824,13 +2116,15 @@ const server = Bun.serve({
       }
       if (request.method === "POST" && url.pathname === "/api/propose") {
         const authScope = assertImportAuth(request);
-        return json(await withWriteGate(request, authScope, () => proposeFromRequest(request)));
+        assertPreBodyWriteRateLimit(request, authScope, "propose");
+        return json(await proposeFromRequest(request, authScope));
       }
       if (request.method === "POST" && url.pathname === "/api/lint") {
         assertAdminAuth(request);
+        assertWriteRateLimit(request, "admin", "lint", null);
+        assertContentLength(request, maxJsonBytes, "Lint request body");
         return json(
-          await withWriteGate(request, "admin", async () => {
-            assertContentLength(request, maxJsonBytes, "Lint request body");
+          await withMutationGate(async () => {
             const result = await withRepoLock(writeRepoRoot, async () => {
               await syncWritableRepoAsync(writeRepoRoot);
               const lint = await lintWiki(writeRepoRoot);

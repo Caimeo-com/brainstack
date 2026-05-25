@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
 import type { CodexReasoningEffort } from "./codex-runtime";
 import { CronJobRecord, CronRunRecord, normalizeCronSchedule } from "./cron-jobs";
 
@@ -45,6 +46,38 @@ export interface WorkerRecord {
   lastSeenAt: string | null;
   lastError: string | null;
   details: string | null;
+  updatedAt: string;
+}
+
+export type QueuedTurnStatus = "queued" | "running" | "finished" | "failed" | "abandoned" | "skipped";
+
+export interface QueuedTurnRecord {
+  id: string;
+  contextSlug: string;
+  mode: string;
+  instruction: string;
+  chatId: number;
+  threadId: number | null;
+  userId: number | null;
+  optionsJson: string;
+  status: QueuedTurnStatus;
+  activeJobId: string | null;
+  attempts: number;
+  receivedAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  updatedAt: string;
+  lastError: string | null;
+}
+
+export interface PendingTextRecord {
+  key: string;
+  contextSlug: string;
+  chatId: number;
+  threadId: number | null;
+  userId: number | null;
+  partsJson: string;
+  createdAt: string;
   updatedAt: string;
 }
 
@@ -132,6 +165,27 @@ function rowToWorker(row: Record<string, unknown>): WorkerRecord {
     lastError: readNullableString(row, "last_error"),
     details: readNullableString(row, "details"),
     updatedAt: String(row.updated_at)
+  };
+}
+
+function rowToQueuedTurn(row: Record<string, unknown>): QueuedTurnRecord {
+  return {
+    id: String(row.id),
+    contextSlug: String(row.context_slug),
+    mode: String(row.mode),
+    instruction: String(row.instruction),
+    chatId: Number(row.chat_id),
+    threadId: readNullableNumber(row, "thread_id"),
+    userId: readNullableNumber(row, "user_id"),
+    optionsJson: String(row.options_json || "{}"),
+    status: String(row.status || "queued") as QueuedTurnStatus,
+    activeJobId: readNullableString(row, "active_job_id"),
+    attempts: Number(row.attempts || 0),
+    receivedAt: String(row.received_at),
+    startedAt: readNullableString(row, "started_at"),
+    finishedAt: readNullableString(row, "finished_at"),
+    updatedAt: String(row.updated_at),
+    lastError: readNullableString(row, "last_error")
   };
 }
 
@@ -309,6 +363,42 @@ export class FactoryDb {
 
       CREATE INDEX IF NOT EXISTS cron_runs_job_idx
       ON cron_runs(job_id, started_at DESC);
+
+      CREATE TABLE IF NOT EXISTS queued_turns (
+        id TEXT PRIMARY KEY,
+        context_slug TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        instruction TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        thread_id INTEGER,
+        user_id INTEGER,
+        options_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        active_job_id TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        received_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT,
+        updated_at TEXT NOT NULL,
+        last_error TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS queued_turns_context_status_idx
+      ON queued_turns(context_slug, status, received_at);
+
+      CREATE INDEX IF NOT EXISTS queued_turns_status_idx
+      ON queued_turns(status, received_at);
+
+      CREATE TABLE IF NOT EXISTS pending_text_prompts (
+        key TEXT PRIMARY KEY,
+        context_slug TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        thread_id INTEGER,
+        user_id INTEGER,
+        parts_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
     `);
 
     this.ensureColumn("contexts", "machine", "machine TEXT");
@@ -333,6 +423,173 @@ export class FactoryDb {
     this.ensureColumn("workers", "ssh_user", "ssh_user TEXT");
     this.ensureColumn("workers", "last_seen_at", "last_seen_at TEXT");
     this.ensureColumn("cron_jobs", "runner", "runner TEXT");
+  }
+
+  countQueuedContexts(): number {
+    const row = this.db.query("SELECT COUNT(DISTINCT context_slug) AS count FROM queued_turns WHERE status = 'queued'").get() as { count?: number };
+    return Number(row?.count || 0);
+  }
+
+  queuedTurnStatusCounts(): Record<QueuedTurnStatus, number> {
+    const counts: Record<QueuedTurnStatus, number> = {
+      queued: 0,
+      running: 0,
+      finished: 0,
+      failed: 0,
+      abandoned: 0,
+      skipped: 0
+    };
+    const rows = this.db.query("SELECT status, COUNT(*) AS count FROM queued_turns GROUP BY status").all() as Array<{ status?: string; count?: number }>;
+    for (const row of rows) {
+      const status = String(row.status || "") as QueuedTurnStatus;
+      if (status in counts) {
+        counts[status] = Number(row.count || 0);
+      }
+    }
+    return counts;
+  }
+
+  pendingTextStats(): { count: number; oldestAgeMs: number | null } {
+    const row = this.db.query("SELECT COUNT(*) AS count, MIN(created_at) AS oldest FROM pending_text_prompts").get() as { count?: number; oldest?: string | null };
+    const count = Number(row?.count || 0);
+    const oldest = row?.oldest ? Date.parse(String(row.oldest)) : NaN;
+    return {
+      count,
+      oldestAgeMs: count > 0 && Number.isFinite(oldest) ? Math.max(0, Date.now() - oldest) : null
+    };
+  }
+
+  upsertPendingText(input: {
+    key: string;
+    contextSlug: string;
+    chatId: number;
+    threadId: number | null;
+    userId: number | null;
+    partsJson: string;
+  }): void {
+    const now = nowIso();
+    this.db
+      .query(`
+        INSERT INTO pending_text_prompts (key, context_slug, chat_id, thread_id, user_id, parts_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+          context_slug = excluded.context_slug,
+          chat_id = excluded.chat_id,
+          thread_id = excluded.thread_id,
+          user_id = excluded.user_id,
+          parts_json = excluded.parts_json,
+          updated_at = excluded.updated_at
+      `)
+      .run(input.key, input.contextSlug, input.chatId, input.threadId, input.userId, input.partsJson, now, now);
+  }
+
+  getPendingText(key: string): PendingTextRecord | null {
+    const row = this.db.query("SELECT * FROM pending_text_prompts WHERE key = ?").get(key) as Record<string, unknown> | null;
+    return row
+      ? {
+          key: String(row.key),
+          contextSlug: String(row.context_slug),
+          chatId: Number(row.chat_id),
+          threadId: row.thread_id === null || row.thread_id === undefined ? null : Number(row.thread_id),
+          userId: row.user_id === null || row.user_id === undefined ? null : Number(row.user_id),
+          partsJson: String(row.parts_json || "[]"),
+          createdAt: String(row.created_at),
+          updatedAt: String(row.updated_at)
+        }
+      : null;
+  }
+
+  listPendingText(): PendingTextRecord[] {
+    const rows = this.db.query("SELECT * FROM pending_text_prompts ORDER BY created_at").all() as Array<Record<string, unknown>>;
+    return rows
+      .map((row) => this.getPendingText(String(row.key)))
+      .filter((row): row is PendingTextRecord => Boolean(row));
+  }
+
+  deletePendingText(key: string): void {
+    this.db.query("DELETE FROM pending_text_prompts WHERE key = ?").run(key);
+  }
+
+  countQueuedTurnsForContext(contextSlug: string): number {
+    const row = this.db.query("SELECT COUNT(*) AS count FROM queued_turns WHERE context_slug = ? AND status = 'queued'").get(contextSlug) as { count?: number };
+    return Number(row?.count || 0);
+  }
+
+  enqueueQueuedTurn(input: {
+    contextSlug: string;
+    mode: string;
+    instruction: string;
+    chatId: number;
+    threadId: number | null;
+    userId?: number | null;
+    optionsJson: string;
+  }): QueuedTurnRecord {
+    const now = nowIso();
+    const id = randomUUID();
+    this.db
+      .query(`
+        INSERT INTO queued_turns (
+          id, context_slug, mode, instruction, chat_id, thread_id, user_id, options_json,
+          status, attempts, received_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)
+      `)
+      .run(id, input.contextSlug, input.mode, input.instruction, input.chatId, input.threadId, input.userId || null, input.optionsJson, now, now);
+    return this.getQueuedTurn(id)!;
+  }
+
+  getQueuedTurn(id: string): QueuedTurnRecord | null {
+    const row = this.db.query("SELECT * FROM queued_turns WHERE id = ?").get(id) as Record<string, unknown> | null;
+    return row ? rowToQueuedTurn(row) : null;
+  }
+
+  queuedContextSlugs(): string[] {
+    const rows = this.db
+      .query("SELECT context_slug FROM queued_turns WHERE status = 'queued' GROUP BY context_slug ORDER BY MIN(received_at)")
+      .all() as Array<{ context_slug: string }>;
+    return rows.map((row) => String(row.context_slug));
+  }
+
+  claimNextQueuedTurn(contextSlug: string): QueuedTurnRecord | null {
+    const now = nowIso();
+    const activeJobId = randomUUID();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.db
+        .query("SELECT * FROM queued_turns WHERE context_slug = ? AND status = 'queued' ORDER BY received_at ASC LIMIT 1")
+        .get(contextSlug) as Record<string, unknown> | null;
+      if (!row) {
+        this.db.exec("COMMIT");
+        return null;
+      }
+      this.db
+        .query("UPDATE queued_turns SET status = 'running', active_job_id = ?, attempts = attempts + 1, started_at = ?, updated_at = ? WHERE id = ?")
+        .run(activeJobId, now, now, String(row.id));
+      this.db.exec("COMMIT");
+      return this.getQueuedTurn(String(row.id));
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  finishQueuedTurn(id: string, status: Exclude<QueuedTurnStatus, "queued" | "running">, lastError: string | null = null): void {
+    const now = nowIso();
+    this.db
+      .query("UPDATE queued_turns SET status = ?, finished_at = ?, updated_at = ?, last_error = ? WHERE id = ?")
+      .run(status, now, now, lastError, id);
+  }
+
+  markRunningQueuedTurnsAbandoned(): QueuedTurnRecord[] {
+    const rows = this.db.query("SELECT * FROM queued_turns WHERE status = 'running' ORDER BY started_at").all() as Array<Record<string, unknown>>;
+    const running = rows.map(rowToQueuedTurn);
+    if (!running.length) {
+      return [];
+    }
+    const now = nowIso();
+    this.db
+      .query("UPDATE queued_turns SET status = 'abandoned', finished_at = ?, updated_at = ?, last_error = COALESCE(last_error, 'telemux restarted while this queued turn was starting') WHERE status = 'running'")
+      .run(now, now);
+    return running;
   }
 
   saveContext(context: ContextRecord): ContextRecord {

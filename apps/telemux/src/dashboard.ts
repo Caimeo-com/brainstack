@@ -43,16 +43,24 @@ export function startDashboard(config: FactoryConfig, db: FactoryDb, workers: Wo
 
       if (url.pathname === "/healthz") {
         const cronRows = db.listCronJobs();
+        const workerRows = db.listWorkers();
+        const queuedTurns = db.queuedTurnStatusCounts();
+        const pendingText = db.pendingTextStats();
         const now = new Date().toISOString();
         const cronDue = cronRows.filter(
           (job) => job.enabled && (job.pendingRunAt || (job.nextRunAt && job.nextRunAt <= now))
         ).length;
+        const degradedWorkers = workerRows.filter((worker) => worker.status !== "healthy").length;
         return Response.json({
           ok: true,
           dashboard: `${config.dashboardHost}:${config.dashboardPort}`,
           telegramConfigured: Boolean(config.telegramBotToken),
           workers: workers.knownHosts().length,
+          workerHealthRows: workerRows.length,
+          workerDegraded: degradedWorkers,
           contexts: db.listContexts().length,
+          queuedTurns,
+          pendingText,
           crons: cronRows.length,
           cronEnabled: cronRows.filter((job) => job.enabled).length,
           cronPending: cronRows.filter((job) => job.pendingRunAt).length,

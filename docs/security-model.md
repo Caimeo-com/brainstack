@@ -111,4 +111,4 @@ Personal/private journaling should use a separate repo/service/token boundary:
 
 Do not co-mingle private journaling secrets or content into the shared dev brain.
 
-Automatic multi-brain routing and a first-class `private-journal` provisioning profile are not implemented yet. Until that exists, run private journaling through an explicit separate Brainstack install/config and keep its tokens, repo paths, and Telegram topics separate from the shared dev brain.
+Local project context can include multiple explicitly configured brains for search and `remember`, but it is an operator convenience layer, not a hard private-journal security boundary. Automatic private-journal provisioning and policy routing are not implemented yet. Until that exists, run private journaling through an explicit separate Brainstack install/config and keep its tokens, repo paths, and Telegram topics separate from the shared dev brain.

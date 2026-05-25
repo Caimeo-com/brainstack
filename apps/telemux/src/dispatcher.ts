@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { deliverAttachmentRequests, formatAttachmentDeliveryIssues } from "./attachment-delivery";
 import { CronManager } from "./cron-manager";
 import { CONTEXT_CRONS_FILE_NAME, CONTEXT_CRONS_WORKSPACE_PATH, CRON_REQUESTS_FILE_NAME, CRON_REQUESTS_WORKSPACE_PATH } from "./cron-jobs";
-import { ContextRecord, FactoryDb } from "./db";
+import { ContextRecord, FactoryDb, type QueuedTurnStatus } from "./db";
 import { ContextService } from "./contexts";
 import { resolveManifestRequests, TELEGRAM_ATTACHMENTS_FILE_NAME, TELEGRAM_ATTACHMENTS_WORKSPACE_PATH } from "./telegram-attachments";
 import {
@@ -41,6 +41,7 @@ export interface DispatchOptions {
   modelOverride?: string | null;
   reasoningEffortOverride?: ContextRecord["reasoningEffortOverride"];
   sourceLabel?: string | null;
+  queuedTurnId?: string | null;
 }
 
 function nowStamp(): string {
@@ -195,7 +196,6 @@ interface QueuedTurn {
 
 export class Dispatcher {
   private readonly activeJobs = new Map<string, Promise<void>>();
-  private readonly queuedTurns = new Map<string, QueuedTurn[]>();
 
   constructor(
     private readonly config: FactoryConfig,
@@ -211,57 +211,88 @@ export class Dispatcher {
   }
 
   private queueTurn(turn: QueuedTurn): boolean {
-    const existing = this.queuedTurns.get(turn.contextSlug) || [];
-    if (!existing.length && this.queuedTurns.size >= MAX_QUEUED_CONTEXTS) {
+    const existingCount = this.db.countQueuedTurnsForContext(turn.contextSlug);
+    if (!existingCount && this.db.countQueuedContexts() >= MAX_QUEUED_CONTEXTS) {
       return false;
     }
-    if (existing.length >= 5) {
+    if (existingCount >= 5) {
       return false;
     }
-    existing.push(turn);
-    this.queuedTurns.set(turn.contextSlug, existing);
+    this.db.enqueueQueuedTurn({
+      contextSlug: turn.contextSlug,
+      mode: turn.mode,
+      instruction: turn.instruction,
+      chatId: turn.replyTarget.chatId,
+      threadId: turn.replyTarget.threadId,
+      optionsJson: JSON.stringify(turn.options)
+    });
     return true;
   }
 
   private startNextQueuedTurn(slug: string): void {
     try {
-      const queue = this.queuedTurns.get(slug);
-      const next = queue?.shift();
+      const next = this.db.claimNextQueuedTurn(slug);
       if (!next) {
-        this.queuedTurns.delete(slug);
         return;
-      }
-      if (queue && queue.length > 0) {
-        this.queuedTurns.set(slug, queue);
-      } else {
-        this.queuedTurns.delete(slug);
       }
 
       const context = this.db.getContextBySlug(next.contextSlug);
+      const replyTarget: TelegramTarget = { chatId: next.chatId, threadId: next.threadId };
       if (!context || context.state === "archived") {
-        void this.telegram.sendText(next.replyTarget, `${next.contextSlug} queued turn was skipped because the context is no longer active.`);
+        this.db.finishQueuedTurn(next.id, "skipped", "context is no longer active");
+        void this.telegram.sendText(replyTarget, `${next.contextSlug} queued turn was skipped because the context is no longer active.`);
+        this.startNextQueuedTurn(slug);
+        return;
+      }
+      if (context.telegramChatId !== next.chatId || context.telegramThreadId !== next.threadId) {
+        this.db.finishQueuedTurn(next.id, "skipped", "context Telegram binding changed before queued turn could run");
+        void this.telegram.sendText(replyTarget, `${next.contextSlug} queued turn was skipped because the topic binding changed.`);
         this.startNextQueuedTurn(slug);
         return;
       }
 
-      void this.dispatch(next.mode, context, next.instruction, next.replyTarget, {
-        ...next.options,
-        notifyAccepted: false
+      const options = (parseJsonObject(next.optionsJson) || {}) as DispatchOptions;
+      void this.dispatch(next.mode as DispatchMode, context, next.instruction, replyTarget, {
+        ...options,
+        notifyAccepted: false,
+        queuedTurnId: next.id
       })
         .then((response) => {
+          if (!response.accepted) {
+            this.db.finishQueuedTurn(next.id, "failed", response.message);
+          }
           if (!response.accepted && response.message) {
-            return this.telegram.sendText(next.replyTarget, response.message);
+            return this.telegram.sendText(replyTarget, response.message);
           }
         })
         .catch((error) => {
           console.error(`queued turn failed to start for ${next.contextSlug}`, error);
+          this.db.finishQueuedTurn(next.id, "failed", error instanceof Error ? error.message : String(error));
           void this.telegram.sendText(
-            next.replyTarget,
+            replyTarget,
             `${next.contextSlug} queued turn failed to start: ${error instanceof Error ? error.message : String(error)}`
           );
         });
     } catch (error) {
       console.error(`queued turn failed to start for ${slug}`, error);
+    }
+  }
+
+  recoverQueuedTurns(): void {
+    const abandoned = this.db.markRunningQueuedTurnsAbandoned();
+    if (abandoned.length > 0) {
+      console.warn(`queued turns abandoned after restart: ${abandoned.length}`);
+      for (const turn of abandoned) {
+        void this.telegram.sendText(
+          { chatId: turn.chatId, threadId: turn.threadId },
+          `${turn.contextSlug} had a queued turn interrupted by a telemux restart. It was marked for operator review instead of replayed automatically.`
+        );
+      }
+    }
+    for (const slug of this.db.queuedContextSlugs()) {
+      if (!this.activeJobs.has(slug)) {
+        this.startNextQueuedTurn(slug);
+      }
     }
   }
 
@@ -326,7 +357,7 @@ export class Dispatcher {
       return {
         accepted: queued,
         message: queued
-          ? `${context.slug} is busy; queued this turn in memory for after the current run.`
+          ? `${context.slug} is busy; queued this turn for after the current run.`
           : `${context.slug} already has an active job and its turn queue is full. Use /topicinfo or /tail.`
       };
     }
@@ -370,6 +401,15 @@ export class Dispatcher {
     }
 
     const job = this.runJob(mode, savedContext, trimmedInstruction, replyTarget, logPath, options.telegramInput || null, options);
+    if (options.queuedTurnId) {
+      void job
+        .then((status) => {
+          this.db.finishQueuedTurn(options.queuedTurnId!, status, status === "finished" ? null : "queued worker run did not complete successfully");
+        })
+        .catch((error) => {
+          this.db.finishQueuedTurn(options.queuedTurnId!, "failed", error instanceof Error ? error.message : String(error));
+        });
+    }
     void job.finally(() => {
       if (this.activeJobs.get(savedContext.slug) === lock) {
         this.activeJobs.delete(savedContext.slug);
@@ -392,7 +432,7 @@ export class Dispatcher {
     logPath: string,
     telegramInput: TelegramInboundMessageInput | null,
     options: DispatchOptions
-  ): Promise<void> {
+  ): Promise<Exclude<QueuedTurnStatus, "queued" | "running" | "abandoned">> {
     const stopHeartbeat = this.startTypingHeartbeat(replyTarget);
 
     try {
@@ -400,7 +440,7 @@ export class Dispatcher {
       const freshContext = this.db.getContextBySlug(context.slug) || context;
       if (freshContext.state === "archived") {
         await this.telegram.sendText(replyTarget, `${freshContext.slug} was archived before the run started. No worker side effects were applied.`);
-        return;
+        return "skipped";
       }
 
       if (!ensured.ok) {
@@ -428,13 +468,13 @@ export class Dispatcher {
             pendingOrError.lastError || "unknown error"
           ].join("\n")
         );
-        return;
+        return "failed";
       }
 
       const currentBeforeReady = this.db.getContextBySlug(context.slug) || freshContext;
       if (currentBeforeReady.state === "archived") {
         await this.telegram.sendText(replyTarget, `${currentBeforeReady.slug} was archived before the run started. No worker side effects were applied.`);
-        return;
+        return "skipped";
       }
 
       const readyContext = this.contexts.saveContext({
@@ -465,7 +505,7 @@ export class Dispatcher {
               replyTarget,
               `${currentAfterPreparationFailure.slug} was archived while Telegram input was being prepared. No worker side effects were applied.`
             );
-            return;
+            return "skipped";
           }
           this.contexts.saveContext({
             ...currentAfterPreparationFailure,
@@ -474,14 +514,14 @@ export class Dispatcher {
             lastError: message
           });
           await this.telegram.sendText(replyTarget, `Failed to prepare Telegram input: ${message}`);
-          return;
+          return "failed";
         }
       }
 
       const currentBeforeWorker = this.db.getContextBySlug(context.slug) || readyContext;
       if (currentBeforeWorker.state === "archived") {
         await this.telegram.sendText(replyTarget, `${currentBeforeWorker.slug} was archived before the worker started. No worker side effects were applied.`);
-        return;
+        return "skipped";
       }
 
       const prompt = options.rawPrompt ? instruction : buildPrompt(currentBeforeWorker, mode, instruction, preparedTelegramInput?.promptSection || null);
@@ -520,7 +560,7 @@ export class Dispatcher {
             replyTarget,
             `${afterRunContext.slug} completed after it was archived. Completion side effects were skipped.`
           );
-          return;
+          return "skipped";
         }
         const summary = await this.workers.readFactoryFile(afterRunContext, "SUMMARY.md");
         const artifacts = await this.workers.readFactoryFile(afterRunContext, "ARTIFACTS.md");
@@ -552,7 +592,7 @@ export class Dispatcher {
         await this.sendTelegramAttachments(saved, replyTarget, artifacts, attachmentManifest);
         await this.applyCronManifest(saved, replyTarget, cronManifest);
         await this.importRunNotesToBrain(saved, summary, artifacts);
-        return;
+        return "finished";
       }
 
       if (afterRunContext.state === "archived") {
@@ -560,7 +600,7 @@ export class Dispatcher {
           replyTarget,
           `${afterRunContext.slug} failed after it was archived. Context state was left archived.`
         );
-        return;
+        return "skipped";
       }
 
       const failureOutput = [result.stderr.trim(), result.stdout.trim()].filter(Boolean).join("\n");
@@ -580,6 +620,7 @@ export class Dispatcher {
           formatRunFailureForTelegram(saved.lastError, logPath, Boolean(options.rawPrompt && instruction.trim() === "/compact"))
         ].join("\n")
       );
+      return "failed";
     } finally {
       stopHeartbeat();
     }
@@ -657,13 +698,23 @@ export class Dispatcher {
 
   private startTypingHeartbeat(replyTarget: TelegramTarget): () => void {
     let stopped = false;
+    let lastLoggedAt = 0;
+    let suppressed = 0;
 
     void (async () => {
       while (!stopped) {
         try {
           await this.telegram.sendChatAction(replyTarget, "typing");
         } catch (error) {
-          console.error("telegram typing heartbeat failed", error);
+          const now = Date.now();
+          if (now - lastLoggedAt > 60_000) {
+            const suffix = suppressed > 0 ? `; suppressed ${suppressed} repeated heartbeat failure(s)` : "";
+            console.error(`telegram typing heartbeat failed${suffix}`, error);
+            lastLoggedAt = now;
+            suppressed = 0;
+          } else {
+            suppressed += 1;
+          }
         }
 
         if (stopped) {

@@ -1,54 +1,22 @@
-import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
-import { dirname, resolve } from "node:path";
+import { rm } from "node:fs/promises";
+import { resolve } from "node:path";
 import type { FactoryConfig } from "./config";
-
-type BrainEndpoint = "import" | "propose";
-
-interface QueuedBrainWrite {
-  id: string;
-  endpoint: BrainEndpoint;
-  url: string;
-  payload: Record<string, unknown>;
-  created_at: string;
-  source_machine: string;
-  source_harness: string;
-  retry_count: number;
-  idempotency_key: string;
-  last_error: string | null;
-  terminal_error?: string | null;
-}
-
-function sha256(text: string): string {
-  return createHash("sha256").update(text).digest("hex");
-}
-
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
-  }
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-    .join(",")}}`;
-}
+import {
+  buildOutboxItem,
+  ensurePrivateOutboxDir,
+  normalizeOutboxItem,
+  outboxItemKey,
+  sanitizedHttpError,
+  scanOutbox,
+  sha256Hex,
+  writeOutboxItem,
+  type BrainEndpoint,
+  type OutboxEntry,
+  type OutboxItem as QueuedBrainWrite
+} from "../../../packages/outbox/src/outbox";
 
 function idempotencyKeyFor(endpoint: BrainEndpoint, payload: Record<string, unknown>): string {
-  return sha256(canonicalJson({ endpoint, payload }));
-}
-
-function normalizeQueuedWrite(item: QueuedBrainWrite): QueuedBrainWrite {
-  const idempotencyKey = idempotencyKeyFor(item.endpoint, item.payload);
-  return {
-    ...item,
-    id: `${item.endpoint}-${idempotencyKey.slice(0, 32)}`,
-    idempotency_key: idempotencyKey
-  };
+  return outboxItemKey(endpoint, payload);
 }
 
 function isRetryableBrainWriteStatus(status: number): boolean {
@@ -68,39 +36,22 @@ function idempotencyPendingTerminalError(item: QueuedBrainWrite, status: number,
   if ((item.retry_count || 0) < retryLimit) {
     return null;
   }
-  return `HTTP 425 persisted after ${item.retry_count} flush attempt(s); operator review required before replaying this idempotent write. ${responseText.slice(0, 240)}`;
+  return `HTTP 425 persisted after ${item.retry_count} flush attempt(s); operator review required before replaying this idempotent write. ${sanitizedHttpError(status, responseText)}`;
 }
 
 function outboxRoot(config: FactoryConfig): string {
-  const brainId = sha256(config.brainBaseUrl || "unconfigured-brain").slice(0, 16);
+  const brainId = sha256Hex(config.brainBaseUrl || "unconfigured-brain").slice(0, 16);
   return resolve(config.stateRoot, "outbox", brainId);
 }
 
-async function writeText(path: string, text: string): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, text, "utf8");
-}
-
-async function readQueuedWrite(path: string): Promise<QueuedBrainWrite | null> {
-  try {
-    return JSON.parse(await readFile(path, "utf8")) as QueuedBrainWrite;
-  } catch {
-    return null;
-  }
-}
-
 async function findMatchingQueuedWrite(root: string, endpoint: BrainEndpoint, idempotencyKey: string): Promise<{ path: string; item: QueuedBrainWrite } | null> {
-  if (!existsSync(root)) {
-    return null;
-  }
-  for (const name of (await readdir(root)).filter((entry) => entry.endsWith(".json")).sort()) {
-    const path = resolve(root, name);
-    const item = await readQueuedWrite(path);
-    if (!item || item.endpoint !== endpoint) {
+  const scan = await scanOutbox(root);
+  for (const entry of scan.items) {
+    if (entry.item.endpoint !== endpoint) {
       continue;
     }
-    if (idempotencyKeyFor(item.endpoint, item.payload) === idempotencyKey || item.idempotency_key === idempotencyKey) {
-      return { path, item };
+    if (entry.idempotencyKey === idempotencyKey || entry.item.idempotency_key === idempotencyKey) {
+      return { path: entry.path, item: entry.item };
     }
   }
   return null;
@@ -111,16 +62,15 @@ async function queueBrainWrite(config: FactoryConfig, endpoint: BrainEndpoint, p
   const created = new Date().toISOString();
   const id = `${endpoint}-${idempotencyKey.slice(0, 32)}`;
   const root = outboxRoot(config);
-  await mkdir(root, { recursive: true });
+  await ensurePrivateOutboxDir(root);
   const stablePath = resolve(root, `${id}.json`);
   const matched = await findMatchingQueuedWrite(root, endpoint, idempotencyKey);
   const path = matched?.path || stablePath;
-  const existing = matched?.item || (existsSync(stablePath) ? await readQueuedWrite(stablePath) : null);
-  await writeText(
+  const existing = matched?.item || null;
+  await writeOutboxItem(
     path,
-    `${JSON.stringify(
+    buildOutboxItem(
       {
-        id,
         endpoint,
         url: config.brainBaseUrl,
         payload,
@@ -130,10 +80,10 @@ async function queueBrainWrite(config: FactoryConfig, endpoint: BrainEndpoint, p
         retry_count: existing?.retry_count || 0,
         idempotency_key: idempotencyKey,
         last_error: error
-      } satisfies QueuedBrainWrite,
-      null,
-      2
-    )}\n`
+      },
+      error,
+      existing
+    )
   );
   return path;
 }
@@ -159,9 +109,10 @@ export async function postBrainImportOrQueue(config: FactoryConfig, payload: Rec
 
     if (!response.ok) {
       const text = await response.text();
-      console.error(`shared brain import failed: ${response.status} ${text.slice(0, 500)}`);
+      const sanitized = sanitizedHttpError(response.status, text);
+      console.error(`shared brain import failed: ${sanitized}`);
       if (isRetryableBrainWriteStatus(response.status)) {
-        const queuedPath = await queueBrainWrite(config, endpoint, payload, `HTTP ${response.status}: ${text.slice(0, 500)}`);
+        const queuedPath = await queueBrainWrite(config, endpoint, payload, sanitized);
         console.warn(`shared brain import queued: ${queuedPath}`);
         return "queued";
       }
@@ -177,48 +128,45 @@ export async function postBrainImportOrQueue(config: FactoryConfig, payload: Rec
 
 export async function flushBrainOutbox(config: FactoryConfig): Promise<{ flushed: number; kept: number }> {
   const root = outboxRoot(config);
-  if (!existsSync(root) || !config.brainImportToken) {
+  if (!config.brainImportToken) {
     return { flushed: 0, kept: 0 };
   }
-  const seen = new Map<string, { path: string; item: QueuedBrainWrite }>();
-  for (const name of (await readdir(root)).filter((entry) => entry.endsWith(".json")).sort()) {
-    const path = resolve(root, name);
-    const item = await readQueuedWrite(path);
-    if (!item) {
-      continue;
-    }
-    const normalized = normalizeQueuedWrite(item);
+  const seen = new Map<string, OutboxEntry>();
+  const firstScan = await scanOutbox(root);
+  if (firstScan.corrupt.length) {
+    throw new Error(`brain outbox contains ${firstScan.corrupt.length} corrupt/unsafe item(s); inspect and purge before flushing`);
+  }
+  for (const entry of firstScan.items) {
+    const path = entry.path;
+    const normalized = normalizeOutboxItem(entry.item);
     const key = normalized.idempotency_key;
     const prior = seen.get(key);
     if (!prior) {
-      await writeText(path, `${JSON.stringify(normalized, null, 2)}\n`);
-      seen.set(key, { path, item: normalized });
+      await writeOutboxItem(path, normalized);
+      seen.set(key, { ...entry, item: normalized });
       continue;
     }
-    const keep = prior.path.endsWith(`${normalized.endpoint}-${key.slice(0, 32)}.json`) ? prior : { path, item: normalized };
-    const drop = keep.path === prior.path ? { path, item: normalized } : prior;
+    const keep = prior.path.endsWith(`${normalized.endpoint}-${key.slice(0, 32)}.json`) ? prior : { ...entry, item: normalized };
+    const drop = keep.path === prior.path ? { ...entry, item: normalized } : prior;
     keep.item.retry_count = Math.max(keep.item.retry_count || 0, drop.item.retry_count || 0);
     keep.item.created_at = [keep.item.created_at, drop.item.created_at].filter(Boolean).sort()[0] || keep.item.created_at;
     keep.item.idempotency_key = key;
     keep.item.last_error = keep.item.last_error || drop.item.last_error || null;
     keep.item.terminal_error = keep.item.terminal_error || drop.item.terminal_error || null;
-    await writeText(keep.path, `${JSON.stringify(keep.item, null, 2)}\n`);
+    await writeOutboxItem(keep.path, keep.item);
     await rm(drop.path, { force: true });
     seen.set(key, keep);
   }
-  const names = (await readdir(root)).filter((name) => name.endsWith(".json")).sort();
   let flushed = 0;
   let kept = 0;
-  for (const name of names) {
-    const path = resolve(root, name);
-    const item = await readQueuedWrite(path);
-    if (!item) {
-      kept += 1;
-      continue;
-    }
-    const normalized = normalizeQueuedWrite(item);
+  const secondScan = await scanOutbox(root);
+  if (secondScan.corrupt.length) {
+    throw new Error(`brain outbox contains ${secondScan.corrupt.length} corrupt/unsafe item(s); inspect and purge before flushing`);
+  }
+  for (const { path, item, payload } of secondScan.items) {
+    const normalized = normalizeOutboxItem(item);
     if (normalized.id !== item.id || normalized.idempotency_key !== item.idempotency_key) {
-      await writeText(path, `${JSON.stringify(normalized, null, 2)}\n`);
+      await writeOutboxItem(path, normalized);
     }
     if (normalized.terminal_error) {
       kept += 1;
@@ -232,7 +180,7 @@ export async function flushBrainOutbox(config: FactoryConfig): Promise<{ flushed
           "Content-Type": "application/json",
           "Idempotency-Key": normalized.idempotency_key
         },
-        body: JSON.stringify(normalized.payload),
+        body: JSON.stringify(payload),
         signal: AbortSignal.timeout(15_000)
       });
       if (response.ok) {
@@ -241,20 +189,20 @@ export async function flushBrainOutbox(config: FactoryConfig): Promise<{ flushed
       } else {
         const responseText = await response.text();
         normalized.retry_count += 1;
-        normalized.last_error = `HTTP ${response.status}: ${responseText.slice(0, 300)}`;
+        normalized.last_error = sanitizedHttpError(response.status, responseText);
         const pendingTerminalError = idempotencyPendingTerminalError(normalized, response.status, responseText);
         if (pendingTerminalError) {
           normalized.terminal_error = pendingTerminalError;
         } else if (!isRetryableBrainWriteStatus(response.status)) {
           normalized.terminal_error = normalized.last_error;
         }
-        await writeText(path, `${JSON.stringify(normalized, null, 2)}\n`);
+        await writeOutboxItem(path, normalized);
         kept += 1;
       }
     } catch (error) {
       normalized.retry_count += 1;
       normalized.last_error = error instanceof Error ? error.message : String(error);
-      await writeText(path, `${JSON.stringify(normalized, null, 2)}\n`);
+      await writeOutboxItem(path, normalized);
       kept += 1;
     }
   }

@@ -1328,7 +1328,15 @@ export class CommandHandler {
       } else {
         clearTimeout(existing.timer);
         existing.parts.push(text);
-        existing.timer = setTimeout(() => void this.flushPendingText(target, userId), this.config.textCoalesceMs);
+        this.db.upsertPendingText({
+          key,
+          contextSlug: existing.contextSlug,
+          chatId: existing.target.chatId,
+          threadId: existing.target.threadId,
+          userId: existing.userId,
+          partsJson: JSON.stringify(existing.parts)
+        });
+        existing.timer = setTimeout(() => void this.flushPendingText(target, userId).catch((error) => this.reportPendingTextFlushError(target, error)), this.config.textCoalesceMs);
         return;
       }
     } else if (existing) {
@@ -1342,9 +1350,17 @@ export class CommandHandler {
       contextSlug: context.slug,
       parts: [text],
       createdAt: Date.now(),
-      timer: setTimeout(() => void this.flushPendingText(target, userId), this.config.textCoalesceMs)
+      timer: setTimeout(() => void this.flushPendingText(target, userId).catch((error) => this.reportPendingTextFlushError(target, error)), this.config.textCoalesceMs)
     };
     this.pendingText.set(key, pending);
+    this.db.upsertPendingText({
+      key,
+      contextSlug: context.slug,
+      chatId: target.chatId,
+      threadId: target.threadId,
+      userId,
+      partsJson: JSON.stringify(pending.parts)
+    });
   }
 
   private flushOldestPendingTextIfNeeded(nextKey: string): void {
@@ -1360,7 +1376,28 @@ export class CommandHandler {
 
   private async flushPendingText(target: TelegramTarget, userId: number | null): Promise<void> {
     const key = this.pendingKey(target, userId);
-    const pending = this.pendingText.get(key);
+    let pending = this.pendingText.get(key);
+    if (!pending) {
+      const stored = this.db.getPendingText(key);
+      if (stored) {
+        let parts: string[] = [];
+        try {
+          const parsed = JSON.parse(stored.partsJson) as unknown;
+          parts = Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+        } catch {
+          parts = [];
+        }
+        pending = {
+          key,
+          target: { chatId: stored.chatId, threadId: stored.threadId },
+          userId: stored.userId,
+          contextSlug: stored.contextSlug,
+          parts,
+          createdAt: Date.parse(stored.createdAt) || Date.now(),
+          timer: setTimeout(() => undefined, 0)
+        };
+      }
+    }
     if (!pending) {
       return;
     }
@@ -1368,6 +1405,7 @@ export class CommandHandler {
     this.pendingText.delete(key);
     const context = this.contexts.getContextBySlug(pending.contextSlug);
     if (!context || context.state === "archived") {
+      this.db.deletePendingText(key);
       return;
     }
     const prompt = pending.parts.join("\n\n");
@@ -1375,13 +1413,60 @@ export class CommandHandler {
       console.log(`coalesced ${pending.parts.length} Telegram text messages for ${context.slug}`);
     }
     if (await this.maybeSendArtifactsFromPlainText(context, prompt, pending.target)) {
+      this.db.deletePendingText(key);
       return;
     }
-    const response = await this.dispatcher.dispatch("resume", context, prompt, pending.target, {
-      telegramInput: null
-    });
-    if (response.message) {
-      await this.telegram.sendText(pending.target, response.message);
+    try {
+      const response = await this.dispatcher.dispatch("resume", context, prompt, pending.target, {
+        telegramInput: null
+      });
+      if (response.accepted) {
+        this.db.deletePendingText(key);
+      } else {
+        this.pendingText.set(key, pending);
+      }
+      if (response.message) {
+        await this.telegram.sendText(pending.target, response.message);
+      }
+    } catch (error) {
+      this.pendingText.set(key, pending);
+      await this.reportPendingTextFlushError(pending.target, error);
+    }
+  }
+
+  private async reportPendingTextFlushError(target: TelegramTarget, error: unknown): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("pending Telegram text flush failed", error);
+    await this.telegram.sendText(target, `Pending Telegram text was not dispatched and remains queued for retry: ${message}`);
+  }
+
+  recoverPendingText(): void {
+    for (const stored of this.db.listPendingText()) {
+      if (this.pendingText.has(stored.key)) {
+        continue;
+      }
+      let parts: string[] = [];
+      try {
+        const parsed = JSON.parse(stored.partsJson) as unknown;
+        parts = Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+      } catch {
+        this.db.deletePendingText(stored.key);
+        continue;
+      }
+      if (!parts.length) {
+        this.db.deletePendingText(stored.key);
+        continue;
+      }
+      const target = { chatId: stored.chatId, threadId: stored.threadId };
+      this.pendingText.set(stored.key, {
+        key: stored.key,
+        target,
+        userId: stored.userId,
+        contextSlug: stored.contextSlug,
+        parts,
+        createdAt: Date.parse(stored.createdAt) || Date.now(),
+        timer: setTimeout(() => void this.flushPendingText(target, stored.userId).catch((error) => this.reportPendingTextFlushError(target, error)), Math.max(1, this.config.textCoalesceMs))
+      });
     }
   }
 

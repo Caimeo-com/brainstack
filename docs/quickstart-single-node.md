@@ -83,10 +83,12 @@ BRAIN_PORT=8080
 Expose it privately to the tailnet with:
 
 ```bash
-tailscale serve get-config --all > ~/.config/brainstack/tailscale-serve.before.json
-tailscale serve set-config --all ~/.local/state/brainstack/rendered/tailscale/serve-config.json
+brainctl expose tailscale --config ~/.config/brainstack/brainstack.yaml --dry-run
+brainctl expose tailscale --config ~/.config/brainstack/brainstack.yaml --apply
 tailscale serve status
 ```
+
+`--apply` replaces the whole Tailscale Serve config, refuses placeholder hosts, and requires `security.trustedExposure: tailscale-serve` so `braind` health metadata matches reality. Save a manual backup first with `tailscale serve get-config --all > ~/.config/brainstack/tailscale-serve.before.json` if the node already serves other apps.
 
 Do not enable Funnel for the shared brain unless you explicitly intend public internet exposure.
 
@@ -95,8 +97,8 @@ Do not enable Funnel for the shared brain unless you explicitly intend public in
 ```bash
 bun run packages/brainctl/src/main.ts doctor --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts updates --config ~/.config/brainstack/brainstack.yaml
-curl -fsS http://127.0.0.1:8080/health
-curl -fsS https://brain-control.example.ts.net/health
+curl -fsS http://127.0.0.1:8080/healthz
+curl -fsS https://brain-control.example.ts.net/healthz
 systemctl --user status braind.service --no-pager
 journalctl --user -u braind.service -n 100 --no-pager
 ```

@@ -978,13 +978,77 @@ test("dispatcher drains queued turns after lock-only jobs finish", async () => {
         { notifyAccepted: false }
       );
       expect(queued.accepted).toBe(true);
-      expect(queued.message).toContain("queued this turn in memory");
+      expect(queued.message).toContain("queued this turn for after the current run");
       await Bun.sleep(100);
     });
 
     await lockDone;
     await waitFor(() => !fixture.dispatcher.isActive("lockqueue"));
     await waitFor(async () => (await readFile(join(context!.worktreePath, ".factory", "fake-turn-count"), "utf8")) === "1");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("dispatcher skips queued turns when Telegram topic binding changes before drain", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx bindingqueue control scratch", 84));
+    const context = fixture.db.getContextBySlug("bindingqueue");
+    expect(context).toBeTruthy();
+
+    const first = await fixture.dispatcher.dispatch(
+      "resume",
+      context!,
+      "slow live session from first dispatch",
+      { chatId: 4242, threadId: 84 },
+      { notifyAccepted: false }
+    );
+    expect(first.accepted).toBe(true);
+    const queued = await fixture.dispatcher.dispatch(
+      "resume",
+      context!,
+      "queued turn should be skipped after detach",
+      { chatId: 4242, threadId: 84 },
+      { notifyAccepted: false }
+    );
+    expect(queued.accepted).toBe(true);
+    await fixture.commands.handleMessage(telegramMessage("/detach", 84));
+    await waitFor(() => !fixture.dispatcher.isActive("bindingqueue"));
+    await waitFor(async () => (await readFile(join(context!.worktreePath, ".factory", "fake-turn-count"), "utf8")) === "1");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("dispatcher reports running queued turns abandoned after restart", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx recoverqueue control scratch", 85));
+    const context = fixture.db.getContextBySlug("recoverqueue");
+    expect(context).toBeTruthy();
+    const queued = fixture.db.enqueueQueuedTurn({
+      contextSlug: "recoverqueue",
+      mode: "resume",
+      instruction: "queued before restart",
+      chatId: 4242,
+      threadId: 85,
+      userId: TEST_ALLOWED_TELEGRAM_USER_ID,
+      optionsJson: "{}"
+    });
+    const claimed = fixture.db.claimNextQueuedTurn("recoverqueue");
+    expect(claimed?.id).toBe(queued.id);
+
+    fixture.dispatcher.recoverQueuedTurns();
+
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("interrupted by a telemux restart")));
+    expect(fixture.db.getQueuedTurn(queued.id)?.status).toBe("abandoned");
+    const counts = fixture.db.queuedTurnStatusCounts();
+    expect(counts.abandoned).toBeGreaterThanOrEqual(1);
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
@@ -2609,8 +2673,11 @@ test("Telegram text coalescing merges quick text and commands flush pending text
   try {
     await fixture.commands.handleMessage(telegramMessage("/newctx coalesce control scratch", 71));
     await fixture.commands.handleMessage(telegramMessage("First part", 71));
+    expect(fixture.db.listPendingText()).toHaveLength(1);
     await fixture.commands.handleMessage(telegramMessage("Second part", 71));
+    expect(fixture.db.listPendingText()[0]?.partsJson).toContain("Second part");
     await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for coalesce.")));
+    expect(fixture.db.listPendingText()).toHaveLength(0);
     const prompt = await readFile(join(fixture.factoryRoot, "scratch", "coalesce", ".factory", "control-plane.prompt.md"), "utf8");
     expect(prompt).toContain("First part\n\nSecond part");
 
@@ -2623,6 +2690,77 @@ test("Telegram text coalescing merges quick text and commands flush pending text
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 15_000);
+
+test("Telegram text coalescing keeps pending text durable when dispatch setup fails", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "30"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx coalescefail control scratch", 70));
+    const originalDispatcher = (fixture.commands as unknown as { dispatcher: unknown }).dispatcher;
+    (fixture.commands as unknown as { dispatcher: { dispatch: () => Promise<never> } }).dispatcher = {
+      dispatch: async () => {
+        throw new Error("setup exploded before dispatch acceptance");
+      }
+    };
+
+    await fixture.commands.handleMessage(telegramMessage("This should remain durable", 70));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("remains queued")));
+    expect(fixture.db.listPendingText()).toHaveLength(1);
+    expect(fixture.db.pendingTextStats().count).toBe(1);
+    (fixture.commands as unknown as { dispatcher: unknown }).dispatcher = originalDispatcher;
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("Telegram text coalescing keeps pending text durable when dispatch refuses the turn", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "30"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx coalescerefuse control scratch", 69));
+    const context = fixture.db.getContextBySlug("coalescerefuse");
+    expect(context).toBeTruthy();
+    let unlock: (() => void) | null = null;
+    const releaseLock = fixture.dispatcher.withContextLock(
+      context!,
+      async () =>
+        await new Promise<void>((resolve) => {
+          unlock = resolve;
+        })
+    );
+    const seededIds: string[] = [];
+    for (let index = 0; index < 5; index += 1) {
+      const row = fixture.db.enqueueQueuedTurn({
+        contextSlug: "coalescerefuse",
+        mode: "resume",
+        instruction: `already queued ${index}`,
+        chatId: 4242,
+        threadId: 69,
+        userId: TEST_ALLOWED_TELEGRAM_USER_ID,
+        optionsJson: "{}"
+      });
+      seededIds.push(row.id);
+    }
+
+    await fixture.commands.handleMessage(telegramMessage("This should survive refusal", 69));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("turn queue is full")));
+    expect(fixture.db.listPendingText()).toHaveLength(1);
+    expect(fixture.db.listPendingText()[0]?.partsJson).toContain("This should survive refusal");
+    for (const id of seededIds) {
+      fixture.db.finishQueuedTurn(id, "skipped", "test cleanup");
+    }
+    unlock?.();
+    await releaseLock;
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
 
 test("Telegram text coalescing flushes before buffers grow without bound", async () => {
   const fixture = await createFixture({

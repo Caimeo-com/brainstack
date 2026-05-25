@@ -82,13 +82,13 @@ That creates:
 ### Existing repo path
 
 ```text
-/newctx bitfalls-dashboard control /absolute/path/to/repo
+/newctx ops-dashboard control /absolute/path/to/repo
 ```
 
 ### Managed clone from a git URL
 
 ```text
-/newctx bitfalls-dashboard worker1 https://github.com/example/project.git master
+/newctx ops-dashboard worker1 https://github.com/example/project.git master
 ```
 
 If the remote worker is unavailable, the context is still created and stored as `pending`.

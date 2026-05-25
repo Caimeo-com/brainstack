@@ -1,9 +1,22 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve, sep } from "node:path";
 import { hostname, tmpdir } from "node:os";
+import {
+  buildOutboxItem,
+  decodeOutboxPayload,
+  ensurePrivateOutboxDir,
+  normalizeOutboxItem as normalizeSharedOutboxItem,
+  outboxItemKey as sharedOutboxItemKey,
+  purgeCorruptOutboxEntries,
+  sanitizedHttpError,
+  scanOutbox,
+  writeOutboxItem,
+  type OutboxEntry,
+  type OutboxItem as SharedOutboxItem
+} from "../../outbox/src/outbox";
 
 type Profile = "single-node" | "control" | "worker" | "client-macos" | "private-journal";
 const SUPPORTED_PROFILES: Profile[] = ["single-node", "control", "worker", "client-macos"];
@@ -12,6 +25,8 @@ type HarnessName = "codex" | "claude";
 type DestroyScope = "control" | "worker" | "client" | "all";
 type CheckStatus = "PASS" | "WARN" | "FAIL";
 type WorkerSshTrustMode = "pinned" | "accept-new";
+type SecurityPosture = "local" | "trusted-tailnet" | "guarded";
+type TrustedExposure = "none" | "tailscale-serve" | "public";
 
 const CONFIG_SCHEMA_VERSION = 1;
 const MIN_BUN_VERSION = "1.3.10";
@@ -92,6 +107,11 @@ interface BrainstackConfig {
     configRoot: string;
     systemdUserRoot: string;
   };
+  security: {
+    posture: SecurityPosture;
+    bindHost: string;
+    trustedExposure: TrustedExposure;
+  };
   brain: {
     bind: string;
     port: number;
@@ -138,6 +158,7 @@ const ALLOWED_TOP_LEVEL_CONFIG_KEYS = new Set([
   "harness",
   "machine",
   "paths",
+  "security",
   "brain",
   "repos",
   "telemux",
@@ -153,18 +174,24 @@ function usage(): string {
   brainctl apply-runtime --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
   brainctl doctor --config brainstack.yaml [--profile ...] [--json] [--workers] [--deep] [--write-smoke]
   brainctl updates --config brainstack.yaml [--profile ...]
+  brainctl expose tailscale --config brainstack.yaml --dry-run|--apply
   brainctl backup --config brainstack.yaml [--out DIR] [--pause-telemux]
   brainctl restore --backup DIR_OR_TGZ --target DIR [--apply]
   brainctl render --config brainstack.yaml --profile ... --out DIR
   brainctl bootstrap-client --profile client-macos --config brainstack.yaml --out DIR
   brainctl join-worker --config brainstack.yaml --worker WORKER_HOST [--ssh-user USER] [--out DIR]
   brainctl trust-worker --config brainstack.yaml --worker WORKER_NAME [--host HOST] [--dry-run]
+  brainctl worker-cache status|clear --config brainstack.yaml [worker|--all]
   brainctl repo-lock status|clear --config brainstack.yaml [--repo write|serve] [--path LOCK_DIR] [--yes] [--token LOCK_TOKEN] [--force] [--min-age-ms MS]
   brainctl locks status|clear --config brainstack.yaml [--repo write|serve] [--path LOCK_DIR] [--yes] [--token LOCK_TOKEN] [--force] [--min-age-ms MS]
   brainctl rotate-token --kind import|admin|telegram-placeholder --config brainstack.yaml [--env FILE]
   brainctl import-text --config brainstack.yaml --title TITLE --text TEXT --source-harness HARNESS --source-machine MACHINE [--source-type note]
   brainctl propose --config brainstack.yaml --title TITLE --body BODY
-  brainctl outbox status|list|flush|purge --config brainstack.yaml [--yes]
+  brainctl context --repo PATH [--config brainstack.yaml] [--json] [--sync|--no-sync]
+  brainctl search --repo PATH "query" [--config brainstack.yaml] [--json] [--wait-fresh]
+  brainctl remember --repo PATH --summary TEXT [--target BRAIN_ID] [--confirm-cross-brain]
+  brainctl allow repo --repo PATH --brain BRAIN_ID [--sections a,b] --always|--once|--deny
+  brainctl outbox status|list|flush|purge|purge-corrupt --config brainstack.yaml [--yes]
   brainctl destroy --config brainstack.yaml [--profile ...] --dry-run|--yes [--scope control|worker|client|all] [--remove-shared-brain] [--remove-private-brain] [--remove-tailscale-serve]
   brainctl migrate-current-install [--out FILE]
   brainctl smoke --profile single-node|control|worker|client-macos --config brainstack.yaml`;
@@ -283,6 +310,22 @@ function normalizeWorkerSshTrustMode(value: string | null | undefined, transport
     return "accept-new";
   }
   return "pinned";
+}
+
+function normalizeSecurityPosture(value: string | null | undefined): SecurityPosture {
+  const normalized = (value || "trusted-tailnet").trim().toLowerCase();
+  if (normalized === "local" || normalized === "trusted-tailnet" || normalized === "guarded") {
+    return normalized;
+  }
+  throw new Error(`Unsupported security posture: ${value}. Expected local, trusted-tailnet, or guarded.`);
+}
+
+function normalizeTrustedExposure(value: string | null | undefined): TrustedExposure {
+  const normalized = (value || "none").trim().toLowerCase();
+  if (normalized === "none" || normalized === "tailscale-serve" || normalized === "public") {
+    return normalized;
+  }
+  throw new Error(`Unsupported trusted exposure: ${value}. Expected none, tailscale-serve, or public.`);
 }
 
 function splitKeyValue(text: string): [string, string] {
@@ -576,6 +619,7 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
   const harness = objectAt(raw, "harness");
   const machine = objectAt(raw, "machine");
   const paths = objectAt(raw, "paths");
+  const security = objectAt(raw, "security");
   const brain = objectAt(raw, "brain");
   const telemux = objectAt(raw, "telemux");
   const tailscale = objectAt(raw, "tailscale");
@@ -604,6 +648,9 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
           ? []
           : [controlTag];
   const publicBaseUrl = stringAt(brain, "publicBaseUrl", "");
+  const securityPosture = normalizeSecurityPosture(optionalStringAt(security, "posture"));
+  const securityBindHost = stringAt(security, "bindHost", stringAt(brain, "bind", "127.0.0.1"));
+  const trustedExposure = normalizeTrustedExposure(optionalStringAt(security, "trustedExposure"));
   const workerInputs = arrayAt(telemux, "workers") as Array<Record<string, unknown>>;
   const remoteSsh = `${machineUser}@${machineName}:${join(sharedBrainRoot, "bare", "shared-brain.git")}`;
   const harnessName = normalizeHarness(stringAt(harness, "name", stringAt(telemux, "harness", "codex")));
@@ -635,8 +682,13 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
       configRoot,
       systemdUserRoot
     },
+    security: {
+      posture: securityPosture,
+      bindHost: securityBindHost,
+      trustedExposure
+    },
     brain: {
-      bind: stringAt(brain, "bind", "127.0.0.1"),
+      bind: securityBindHost,
       port: numberAt(brain, "port", 8080),
       publicBaseUrl,
       largeFileThresholdBytes: numberAt(brain, "largeFileThresholdBytes", 10 * 1024 * 1024),
@@ -716,7 +768,15 @@ async function writeIfMissing(path: string, text: string, mode?: number): Promis
 async function readEnvSecretOrFile(envName: string, fileEnvName: string): Promise<string> {
   const filePath = process.env[fileEnvName]?.trim();
   if (filePath) {
-    return (await readFile(abs(filePath), "utf8")).split(/\r?\n/)[0]?.trim() || "";
+    const absolute = abs(filePath);
+    const info = await lstat(absolute);
+    if (info.isSymbolicLink() || !info.isFile()) {
+      throw new Error(`${fileEnvName} must point to a regular non-symlink file: ${absolute}`);
+    }
+    if ((info.mode & 0o077) !== 0) {
+      throw new Error(`${fileEnvName} must not be group/world accessible; run chmod 600 ${shellSingleQuote(absolute)}`);
+    }
+    return (await readFile(absolute, "utf8")).split(/\r?\n/)[0]?.trim() || "";
   }
   return process.env[envName]?.trim() || "";
 }
@@ -880,7 +940,8 @@ function sharedBrainSeedFiles(cfg: BrainstackConfig): Record<string, string> {
     "docs/API.md": [
       "# API",
       "",
-      "- `GET /health`",
+      "- `GET /healthz`",
+      "- `GET /admin/health` requires admin bearer token.",
       "- `GET /`",
       "- `GET /page/*path`",
       "- `GET /raw/*path`",
@@ -965,8 +1026,10 @@ function sharedBrainSeedFiles(cfg: BrainstackConfig): Record<string, string> {
 
 function braindRuntimeEnv(cfg: BrainstackConfig): string {
   return [
-    `BRAIN_BIND=${cfg.brain.bind}`,
+    `BRAIN_BIND=${cfg.security.bindHost}`,
     `BRAIN_PORT=${cfg.brain.port}`,
+    `BRAIN_SECURITY_POSTURE=${cfg.security.posture}`,
+    `BRAIN_TRUSTED_EXPOSURE=${cfg.security.trustedExposure}`,
     `SHARED_BRAIN_REPO_ROOT=${cfg.repos.serve}`,
     `SHARED_BRAIN_WRITE_REPO_ROOT=${cfg.repos.staging}`,
     `BRAIN_BLOB_STORE=${cfg.repos.blobs}`,
@@ -1184,7 +1247,7 @@ tailscale serve status
 }
 
 function tailscaleServeConfig(cfg: BrainstackConfig): string {
-  const host = cfg.tailscale.tailnetHost || "brain-control.example.ts.net";
+  const host = cfg.tailscale.tailnetHost;
   return `${JSON.stringify(
     {
       TCP: {
@@ -1251,6 +1314,38 @@ function tailscalePolicyFragment(cfg: BrainstackConfig): string {
   return `${JSON.stringify(fragment, null, 2)}\n`;
 }
 
+async function commandExpose(args: ParsedArgs): Promise<void> {
+  const sub = args.positional[0] || "";
+  if (sub !== "tailscale") {
+    throw new Error("expose supports only: tailscale");
+  }
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const configPath = join(cfg.paths.configRoot, "tailscale-serve.json");
+  const tailnetHost = cfg.tailscale.tailnetHost.trim();
+  if (!tailnetHost || tailnetHost === "brain-control.example.ts.net" || tailnetHost.endsWith(".example.ts.net")) {
+    throw new Error("expose tailscale requires a real tailscale.tailnetHost; set --tailnet-host during provision or edit brainstack.yaml.");
+  }
+  if (hasFlag(args, "apply") && cfg.security.trustedExposure !== "tailscale-serve") {
+    throw new Error("expose tailscale --apply requires security.trustedExposure: tailscale-serve so runtime health metadata matches exposure.");
+  }
+  const rendered = tailscaleServeConfig(cfg);
+  const command = `tailscale serve set-config --all ${shellSingleQuote(configPath)}`;
+  if (hasFlag(args, "dry-run") || !hasFlag(args, "apply")) {
+    console.log("# Tailscale Serve config");
+    console.log(rendered.trimEnd());
+    console.log("# Apply command");
+    console.log(command);
+    return;
+  }
+  const tailscaleBin = commandPath("tailscale");
+  if (!tailscaleBin) {
+    throw new Error(`tailscale binary missing; install Tailscale and retry, or run manually later:\n${command}`);
+  }
+  await writeText(configPath, rendered, 0o644);
+  run([tailscaleBin, "serve", "set-config", "--all", configPath]);
+  console.log(`applied Tailscale Serve config from ${configPath}`);
+}
+
 function clientBootstrapFiles(cfg: BrainstackConfig): Record<string, string> {
   const clientPath = cfg.client.localPath;
   const replacements = {
@@ -1283,6 +1378,7 @@ function renderFiles(cfg: BrainstackConfig): Record<string, string> {
       harness: cfg.harness,
       machine: cfg.machine,
       paths: cfg.paths,
+      security: cfg.security,
       brain: cfg.brain,
       repos: cfg.repos,
       telemux: { ...cfg.telemux, workers: defaultWorkers(cfg) },
@@ -1305,6 +1401,7 @@ function renderFiles(cfg: BrainstackConfig): Record<string, string> {
       `Staging clone: \`${cfg.repos.staging}\``,
       `Serve clone: \`${cfg.repos.serve}\``,
       `Public URL: \`${cfg.brain.publicBaseUrl || "(none)"}\``,
+      `Security posture: \`${cfg.security.posture}\` (${cfg.security.trustedExposure}, bind ${cfg.security.bindHost})`,
       "",
       "Use these rendered files as inspectable install artifacts. Real secret values belong in local env files only.",
       ""
@@ -1817,6 +1914,7 @@ function buildProvisionConfig(profile: Profile, harness: { name: HarnessName; bi
   const publicBaseUrl = flag(args, "brain-base-url") || flag(args, "public-base-url") || "";
   const tailnetHost = flag(args, "tailnet-host") || publicBaseUrl.replace(/^https?:\/\//, "");
   const telemuxEnabled = hasFlag(args, "enable-telemux");
+  const bindHost = flag(args, "brain-bind") || flag(args, "bind-host") || "127.0.0.1";
   const sharedBrainRemote =
     flag(args, "brain-remote") || flag(args, "shared-brain-remote") || `${user}@${machineName}:${join(home, "shared-brain", "bare", "shared-brain.git")}`;
   const localPath = flag(args, "client-local-path") || "~/shared-brain";
@@ -1851,8 +1949,13 @@ function buildProvisionConfig(profile: Profile, harness: { name: HarnessName; bi
       configRoot: rootOverride ? join(rootOverride, "config") : "~/.config/brainstack",
       systemdUserRoot: rootOverride ? join(rootOverride, "systemd-user") : "~/.config/systemd/user"
     },
+    security: {
+      posture: flag(args, "security-posture") || "trusted-tailnet",
+      bindHost,
+      trustedExposure: flag(args, "trusted-exposure") || "none"
+    },
     brain: {
-      bind: "127.0.0.1",
+      bind: bindHost,
       port: Number(flag(args, "brain-port") || "8080"),
       publicBaseUrl,
       largeFileThresholdBytes: 10 * 1024 * 1024,
@@ -2230,21 +2333,26 @@ function pendingReindexPathFor(cfg: BrainstackConfig): string {
   return join(cfg.repos.serve, "derived", "search-reindex-needed.json");
 }
 
+function outboxParentRoot(cfg: BrainstackConfig): string {
+  return join(cfg.paths.stateRoot, "outbox");
+}
+
 function outboxRoot(cfg: BrainstackConfig): string {
-  return join(cfg.paths.stateRoot, "outbox", brainInstanceId(cfg));
+  return join(outboxParentRoot(cfg), brainInstanceId(cfg));
+}
+
+function outboxRootForDestination(cfg: BrainstackConfig, destination: { brainId?: string; baseUrl?: string }): string {
+  const base = destination.brainId || destination.baseUrl || cfg.brain.publicBaseUrl || cfg.client.remoteSsh || cfg.client.localPath;
+  return join(outboxParentRoot(cfg), sha256Hex(base).slice(0, 32));
 }
 
 function brainInstanceId(cfg: BrainstackConfig): string {
   const base = cfg.brain.publicBaseUrl || cfg.client.remoteSsh || cfg.client.localPath;
-  return sha256Hex(base).slice(0, 16);
+  return sha256Hex(base).slice(0, 32);
 }
 
 async function countOutboxItems(cfg: BrainstackConfig): Promise<number> {
-  const root = outboxRoot(cfg);
-  if (!existsSync(root)) {
-    return 0;
-  }
-  return (await readdir(root)).filter((name) => name.endsWith(".json")).length;
+  return (await scanOutbox(outboxRoot(cfg))).items.length;
 }
 
 async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Promise<DoctorCheck[]> {
@@ -2275,6 +2383,23 @@ async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Pro
   checks.push(existsSync(cfg.paths.configRoot) ? check("PASS", "config", "config-root", cfg.paths.configRoot) : check("WARN", "config", "config-root", `${cfg.paths.configRoot} missing`, "Run brainctl init/apply-runtime after provisioning."));
   checks.push(existsSync(cfg.paths.stateRoot) ? check("PASS", "config", "state-root", cfg.paths.stateRoot) : check("WARN", "config", "state-root", `${cfg.paths.stateRoot} missing`, "Run brainctl init/apply-runtime after provisioning."));
   checks.push(existsSync(managedManifestPath(cfg)) ? check("PASS", "config", "ownership-manifest", managedManifestPath(cfg)) : check("WARN", "config", "ownership-manifest", "missing", "Run brainctl init/apply-runtime so destroy has a deterministic manifest."));
+  const loopbackBind = cfg.security.bindHost === "127.0.0.1" || cfg.security.bindHost === "::1" || cfg.security.bindHost === "localhost";
+  const wildcardBind = cfg.security.bindHost === "0.0.0.0" || cfg.security.bindHost === "::";
+  if (cfg.security.posture === "local") {
+    checks.push(
+      loopbackBind
+        ? check("PASS", "security", "posture", `local bind=${cfg.security.bindHost}`)
+        : check("FAIL", "security", "posture", `local posture must bind loopback, got ${cfg.security.bindHost}`, "Set security.bindHost to 127.0.0.1 or change the posture deliberately.")
+    );
+  } else if (cfg.security.posture === "trusted-tailnet") {
+    checks.push(
+      wildcardBind
+        ? check("WARN", "security", "posture", `trusted-tailnet bind=${cfg.security.bindHost}; exposure=${cfg.security.trustedExposure}`, "Prefer loopback bind plus `brainctl expose tailscale`; never expose this service directly to the public internet.")
+        : check("PASS", "security", "posture", `trusted-tailnet bind=${cfg.security.bindHost}; exposure=${cfg.security.trustedExposure}`)
+    );
+  } else {
+    checks.push(check("WARN", "security", "posture", "guarded posture is reserved; no first-class read-token/IAM enforcement is implemented yet", "Use trusted-tailnet for the current product stance, or add guarded controls before broader exposure."));
+  }
 
   if (runsBraind(cfg)) {
     checks.push(existsSync(join(cfg.paths.configRoot, "braind.runtime.env")) ? check("PASS", "secrets", "braind-runtime-env", "present") : check("WARN", "secrets", "braind-runtime-env", "missing"));
@@ -2291,10 +2416,24 @@ async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Pro
         : check("PASS", "locks", "pending-reindex", "absent")
     );
     try {
-      const response = await fetch(`http://${cfg.brain.bind}:${cfg.brain.port}/health`, { signal: AbortSignal.timeout(2000) });
-      checks.push(response.ok ? check("PASS", "health", "braind-health", `HTTP ${response.status}`) : check("WARN", "health", "braind-health", `HTTP ${response.status}`));
+      const response = await fetch(`http://${cfg.security.bindHost}:${cfg.brain.port}/healthz`, { signal: AbortSignal.timeout(2000) });
+      checks.push(response.ok ? check("PASS", "health", "braind-healthz", `HTTP ${response.status}`) : check("WARN", "health", "braind-healthz", `HTTP ${response.status}`));
     } catch (error) {
-      checks.push(check("WARN", "health", "braind-health", error instanceof Error ? error.message : String(error), "Start braind or ignore before runtime is installed."));
+      checks.push(check("WARN", "health", "braind-healthz", error instanceof Error ? error.message : String(error), "Start braind or ignore before runtime is installed."));
+    }
+    const adminToken = process.env.BRAIN_ADMIN_TOKEN || readEnvFile(join(cfg.paths.configRoot, "braind.secrets.env")).BRAIN_ADMIN_TOKEN || "";
+    if (adminToken) {
+      try {
+        const response = await fetch(`http://${cfg.security.bindHost}:${cfg.brain.port}/admin/health`, {
+          headers: { Authorization: `Bearer ${adminToken}` },
+          signal: AbortSignal.timeout(2000)
+        });
+        checks.push(response.ok ? check("PASS", "health", "braind-admin-health", `HTTP ${response.status}`) : check("WARN", "health", "braind-admin-health", `HTTP ${response.status}`));
+      } catch (error) {
+        checks.push(check("WARN", "health", "braind-admin-health", error instanceof Error ? error.message : String(error)));
+      }
+    } else {
+      checks.push(check("WARN", "health", "braind-admin-health", "admin token not available locally; skipped deep health"));
     }
   }
 
@@ -2314,10 +2453,27 @@ async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Pro
         const enabled = Number(body.cronEnabled ?? 0);
         const pending = Number(body.cronPending ?? 0);
         const due = Number(body.cronDue ?? 0);
+        const queuedTurns = body.queuedTurns && typeof body.queuedTurns === "object" ? (body.queuedTurns as Record<string, unknown>) : {};
+        const runningTurns = Number(queuedTurns.running ?? 0);
+        const abandonedTurns = Number(queuedTurns.abandoned ?? 0);
+        const pendingText = body.pendingText && typeof body.pendingText === "object" ? (body.pendingText as Record<string, unknown>) : {};
+        const pendingTextCount = Number(pendingText.count ?? 0);
+        const pendingTextOldestAgeMs = pendingText.oldestAgeMs === null || pendingText.oldestAgeMs === undefined ? 0 : Number(pendingText.oldestAgeMs);
+        const workerDegraded = Number(body.workerDegraded ?? 0);
         checks.push(
           due > 0 || pending > 0
             ? check("WARN", "health", "telemux-crons", `total=${crons} enabled=${enabled} due=${due} pending=${pending}`, "Inspect /crons and telemux logs if due or pending jobs do not clear after the scheduler interval.")
             : check("PASS", "health", "telemux-crons", `total=${crons} enabled=${enabled} due=${due} pending=${pending}`)
+        );
+        checks.push(
+          runningTurns > 0 || abandonedTurns > 0 || pendingTextOldestAgeMs > 5 * 60_000
+            ? check("WARN", "health", "telemux-durable-work", `queued_running=${runningTurns} abandoned=${abandonedTurns} pending_text=${pendingTextCount} oldest_pending_text_ms=${pendingTextOldestAgeMs}`, "Inspect telemux logs and Telegram topics for interrupted queued turns or stale coalesced input.")
+            : check("PASS", "health", "telemux-durable-work", `queued_running=${runningTurns} abandoned=${abandonedTurns} pending_text=${pendingTextCount}`)
+        );
+        checks.push(
+          workerDegraded > 0
+            ? check("WARN", "health", "telemux-worker-health", `degraded=${workerDegraded}`, "Run /health or brainctl doctor --workers for worker details.")
+            : check("PASS", "health", "telemux-worker-health", "degraded=0")
         );
       } else {
         checks.push(check("WARN", "health", "telemux-crons", `healthz HTTP ${response.status}`));
@@ -2344,7 +2500,40 @@ async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Pro
     checks.push(serve.code === 0 ? check("PASS", "tailscale", "serve", "serve status available") : check("WARN", "tailscale", "serve", (serve.stderr || serve.stdout).trim()));
   }
 
-  checks.push(check("PASS", "outbox", "queued-items", `${await countOutboxItems(cfg)} queued item(s)`));
+  const outboxScans = await scanAllOutboxes(cfg);
+  const outboxItems = outboxScans.flatMap((scan) => scan.items);
+  const outboxCorrupt = outboxScans.flatMap((scan) => scan.corrupt);
+  checks.push(check("PASS", "outbox", "queued-items", `${outboxItems.length} queued item(s)`));
+  checks.push(
+    outboxCorrupt.length
+      ? check("FAIL", "outbox", "corrupt-items", `${outboxCorrupt.length} corrupt/unsafe item(s)`, "Run `brainctl outbox list` and then `brainctl outbox purge-corrupt --yes` only if those drafts are unrecoverable.")
+      : check("PASS", "outbox", "corrupt-items", "none")
+  );
+  if (existsSync(outboxRoot(cfg))) {
+    const mode = (await stat(outboxRoot(cfg))).mode & 0o777;
+    checks.push(
+      (mode & 0o077) === 0
+        ? check("PASS", "outbox", "permissions", `dir mode=${mode.toString(8)}`)
+        : check("FAIL", "outbox", "permissions", `dir mode=${mode.toString(8)}; expected 0700`, `chmod 700 ${outboxRoot(cfg)}`)
+    );
+    const unsafeFiles = [];
+    for (const entry of outboxItems) {
+      const fileMode = (await stat(entry.path)).mode & 0o777;
+      if ((fileMode & 0o077) !== 0) {
+        unsafeFiles.push(`${entry.item.id}:${fileMode.toString(8)}`);
+      }
+    }
+    checks.push(
+      unsafeFiles.length
+        ? check("FAIL", "outbox", "file-permissions", unsafeFiles.join(", "), "Run `chmod 600 ~/.local/state/brainstack/outbox/*/*.json` or purge stale legacy entries after review.")
+        : check("PASS", "outbox", "file-permissions", "queued item files are private")
+    );
+  }
+  checks.push(
+    outboxItems.length
+      ? check("WARN", "outbox", "plaintext-posture", "queued payloads are stored locally and protected by filesystem permissions, not encrypted by brainstack", "Use disk encryption and keep the state root private; see docs/outbox-security.md.")
+      : check("PASS", "outbox", "plaintext-posture", "no queued payloads")
+  );
 
   if (cfg.profile === "worker" || cfg.profile === "client-macos") {
     const localClone = clientLocalPathAbs(cfg);
@@ -2387,6 +2576,60 @@ function formatDoctorChecks(checks: DoctorCheck[]): string {
   return checks
     .map((item) => `${item.status} [${item.section}] ${item.name}: ${item.detail}${item.remediation ? `\n  remediation: ${item.remediation}` : ""}`)
     .join("\n");
+}
+
+interface WorkerEnvCacheRecord {
+  worker: string;
+  fingerprint: string;
+  path: string;
+  harness: string;
+  harnessBin: string;
+  harnessVersion: string;
+  detectedAt: string;
+}
+
+function workerEnvCachePath(cfg: BrainstackConfig): string {
+  return join(cfg.paths.stateRoot, "worker-env-cache.json");
+}
+
+function workerEnvFingerprint(cfg: BrainstackConfig, worker: BrainstackWorkerConfig): string {
+  return sha256Hex(canonicalJson({
+    worker: worker.name,
+    transport: worker.transport,
+    sshTarget: worker.sshTarget || null,
+    sshUser: worker.sshUser || null,
+    harness: worker.harness || cfg.harness.name,
+    harnessBin: worker.harnessBin || null
+  }));
+}
+
+function readWorkerEnvCache(cfg: BrainstackConfig): Record<string, WorkerEnvCacheRecord> {
+  const path = workerEnvCachePath(cfg);
+  if (!existsSync(path)) {
+    return {};
+  }
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as Record<string, WorkerEnvCacheRecord>;
+  } catch {
+    return {};
+  }
+}
+
+async function writeWorkerEnvCache(cfg: BrainstackConfig, cache: Record<string, WorkerEnvCacheRecord>): Promise<void> {
+  await ensureDir(dirname(workerEnvCachePath(cfg)));
+  await writeText(workerEnvCachePath(cfg), `${JSON.stringify(cache, null, 2)}\n`, 0o600);
+}
+
+function cachedWorkerPath(cfg: BrainstackConfig, worker: BrainstackWorkerConfig): string | null {
+  const record = readWorkerEnvCache(cfg)[worker.name];
+  if (!record || record.fingerprint !== workerEnvFingerprint(cfg, worker) || !record.path.trim()) {
+    return null;
+  }
+  const detectedAt = Date.parse(record.detectedAt);
+  if (!Number.isFinite(detectedAt) || Date.now() - detectedAt > 7 * 24 * 60 * 60 * 1000) {
+    return null;
+  }
+  return record.path;
 }
 
 function workerHarnessFamily(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, contextOverride?: HarnessName | null): HarnessName {
@@ -2494,8 +2737,11 @@ fi
 `.trim();
 }
 
-function runWorkerShell(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, script: string, timeoutSeconds = 10) {
-  const wrappedScript = `${workerUserPathPrelude()}\n${script}`;
+function runWorkerShell(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, script: string, timeoutSeconds = 10, usePathCache = true) {
+  const cachedPath = usePathCache ? cachedWorkerPath(cfg, worker) : null;
+  const cachePrelude = cachedPath ? `BRAINSTACK_WORKER_PATH=${quoteForBash(cachedPath)}\nexport BRAINSTACK_WORKER_PATH\n` : "";
+  const uncachedPrelude = usePathCache ? "" : "unset BRAINSTACK_WORKER_PATH\n";
+  const wrappedScript = `${uncachedPrelude}${cachePrelude}${workerUserPathPrelude()}\n${script}`;
   if (worker.transport === "local") {
     return run(["bash", "-lc", wrappedScript], { check: false });
   }
@@ -2605,6 +2851,7 @@ async function workerDoctorChecks(cfg: BrainstackConfig, deep: boolean): Promise
       `harness_bin=${quoteForBash(bin)}`,
       `harness_family=${quoteForBash(family)}`,
       "printf 'worker=%s\\n' \"$(hostname)\"",
+      "printf 'path=%s\\n' \"$PATH\"",
       "if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then printf 'sudo=ok\\n'; else printf 'sudo=fail\\n'; fi",
       "probe_command() {",
       "  name=\"$1\"",
@@ -2638,13 +2885,27 @@ async function workerDoctorChecks(cfg: BrainstackConfig, deep: boolean): Promise
           ].join("\n")
         : "printf 'deep=skipped\\n'"
     ].join("\n");
-    const result = runWorkerShell(cfg, worker, script, deep ? 30 : 12);
+    const result = runWorkerShell(cfg, worker, script, deep ? 30 : 12, false);
     const combined = `${result.stdout}\n${result.stderr}`.trim();
     if (result.code !== 0) {
       checks.push(check("FAIL", "workers", `worker:${worker.name}`, combined || `exit ${result.code}`, `Verify SSH and ${family} on the worker.`));
       continue;
     }
     const harnessPath = workerProbeValue(combined, "harness_bin") || bin;
+    const detectedPath = workerProbeValue(combined, "path");
+    if (detectedPath) {
+      const cache = readWorkerEnvCache(cfg);
+      cache[worker.name] = {
+        worker: worker.name,
+        fingerprint: workerEnvFingerprint(cfg, worker),
+        path: detectedPath,
+        harness: family,
+        harnessBin: harnessPath,
+        harnessVersion: workerProbeValue(combined, "version") || "",
+        detectedAt: new Date().toISOString()
+      };
+      await writeWorkerEnvCache(cfg, cache);
+    }
     checks.push(check("PASS", "workers", `worker:${worker.name}`, `reachable via ${worker.transport}; ${family} bin=${harnessPath}`));
     for (const commandName of WORKER_REQUIRED_COMMANDS) {
       checks.push(workerCommandCheck(worker, combined, commandName));
@@ -2699,8 +2960,16 @@ function readEnvFile(path: string): Record<string, string> {
   return env;
 }
 
+function clientEnv(cfg: BrainstackConfig): Record<string, string> {
+  return readEnvFile(clientEnvPathAbs(cfg));
+}
+
+function resolveClientEnvValue(cfg: BrainstackConfig, name: string): string {
+  return process.env[name] || clientEnv(cfg)[name] || "";
+}
+
 function brainWriteConfig(cfg: BrainstackConfig): { baseUrl: string; token: string } {
-  const env = readEnvFile(clientEnvPathAbs(cfg));
+  const env = clientEnv(cfg);
   const baseUrl = process.env.BRAIN_BASE_URL || env.BRAIN_BASE_URL || cfg.brain.publicBaseUrl;
   const tokenValue = process.env.BRAIN_IMPORT_TOKEN || env.BRAIN_IMPORT_TOKEN || "";
   const legacyToken = process.env.BRAIN_WRITE_TOKEN || env.BRAIN_WRITE_TOKEN || "";
@@ -2708,6 +2977,458 @@ function brainWriteConfig(cfg: BrainstackConfig): { baseUrl: string; token: stri
     throw new Error("BRAIN_WRITE_TOKEN is no longer accepted; set BRAIN_IMPORT_TOKEN for client writes and keep BRAIN_ADMIN_TOKEN only on the control host.");
   }
   return { baseUrl, token: tokenValue };
+}
+
+interface ProjectBrain {
+  id: string;
+  label: string;
+  classification: "work" | "personal" | "neutral";
+  localPath: string;
+  baseUrl: string;
+  importTokenEnv: string;
+  sections: string[];
+  sectionsRestricted?: boolean;
+  write: "true" | "propose-only" | "false";
+}
+
+interface ResolvedProjectContext {
+  repo: string;
+  configPath: string | null;
+  brains: ProjectBrain[];
+  allowedBrains: ProjectBrain[];
+  deniedBrains: ProjectBrain[];
+  writeDefault: string;
+  sessionPath: string;
+}
+
+interface AllowRule {
+  decision: string;
+  sections: string[];
+  updated_at: string;
+}
+
+function projectSessionPath(cfg: BrainstackConfig, repo: string): string {
+  return join(cfg.paths.stateRoot, "context-sessions", `${sha256Hex(repo).slice(0, 32)}.json`);
+}
+
+function allowRulesPath(cfg: BrainstackConfig): string {
+  return join(cfg.paths.configRoot, "allow-rules.json");
+}
+
+function normalizeProjectBrainWrite(value: unknown, fallback: ProjectBrain["write"]): ProjectBrain["write"] {
+  if (value === false) {
+    return "false";
+  }
+  if (value === true) {
+    return "true";
+  }
+  if (typeof value !== "string" || !value.trim()) {
+    return fallback;
+  }
+  const normalized = value.trim();
+  if (normalized === "true" || normalized === "propose-only" || normalized === "false") {
+    return normalized;
+  }
+  throw new Error(`Unsupported project brain write mode: ${normalized}`);
+}
+
+function classifyProjectBrain(id: string, label: string, explicit?: unknown): ProjectBrain["classification"] {
+  if (typeof explicit === "string") {
+    const normalized = explicit.trim().toLowerCase();
+    if (normalized === "work" || normalized === "personal" || normalized === "neutral") {
+      return normalized;
+    }
+    throw new Error(`Unsupported project brain classification: ${explicit}`);
+  }
+  const text = `${id} ${label}`;
+  if (/personal|private|journal|health|family|finance/i.test(text)) {
+    return "personal";
+  }
+  if (/work|company|lindy|corp|corpo|business|team/i.test(text)) {
+    return "work";
+  }
+  return "neutral";
+}
+
+async function resolveRepoPath(input: string | null): Promise<string> {
+  const absolute = abs(input || ".");
+  return await realpath(absolute).catch(() => absolute);
+}
+
+async function findProjectBrainstackConfig(repo: string): Promise<string | null> {
+  let current = repo;
+  while (true) {
+    const candidate = join(current, ".brainstack.yaml");
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+    const parent = dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+}
+
+function projectBrainsFromRaw(raw: Record<string, unknown>, cfg: BrainstackConfig): ProjectBrain[] {
+  const brainsValue = raw.brains;
+  const entries: Array<Record<string, unknown>> = Array.isArray(brainsValue)
+    ? (brainsValue as Array<Record<string, unknown>>)
+    : brainsValue && typeof brainsValue === "object"
+      ? Object.entries(brainsValue as Record<string, unknown>).map(([id, value]) => ({
+          id,
+          ...(value && typeof value === "object" ? (value as Record<string, unknown>) : {})
+        }))
+      : [];
+  if (!entries.length) {
+    return [
+      {
+        id: "default",
+        label: "default",
+        classification: "neutral",
+        localPath: clientLocalPathAbs(cfg),
+        baseUrl: cfg.brain.publicBaseUrl,
+        importTokenEnv: "BRAIN_IMPORT_TOKEN",
+        sections: ["wiki", "raw", "proposals"],
+        write: "propose-only"
+      }
+    ];
+  }
+  return entries.map((entry) => {
+    if ("section" in entry && !("sections" in entry)) {
+      throw new Error("Invalid project brain config: use `sections`, not `section`.");
+    }
+    const id = stringAt(entry, "id", "default");
+    const label = stringAt(entry, "label", id);
+    const write = normalizeProjectBrainWrite(entry.write, "propose-only");
+    const baseUrl = stringAt(entry, "baseUrl", id === "default" ? cfg.brain.publicBaseUrl : "");
+    const importTokenEnv = stringAt(entry, "importTokenEnv", id === "default" ? "BRAIN_IMPORT_TOKEN" : "");
+    if ("sections" in entry && !Array.isArray(entry.sections)) {
+      throw new Error(`Invalid project brain config for ${id}: sections must be a YAML list such as [wiki, raw].`);
+    }
+    const sections = arrayAt(entry, "sections").map(String).map((item) => item.trim()).filter(Boolean);
+    const supportedSections = new Set(["wiki", "raw", "proposals"]);
+    const unknownSections = sections.filter((section) => !supportedSections.has(section));
+    if (unknownSections.length) {
+      throw new Error(`Invalid project brain config for ${id}: unknown section(s) ${unknownSections.join(", ")}. Supported sections: wiki, raw, proposals.`);
+    }
+    return {
+      id,
+      label,
+      classification: classifyProjectBrain(id, label, entry.classification),
+      localPath: absWithHome(stringAt(entry, "localPath", stringAt(entry, "path", clientLocalPathAbs(cfg))), cfg.paths.home),
+      baseUrl,
+      importTokenEnv,
+      sections,
+      write
+    };
+  });
+}
+
+function readAllowRules(cfg: BrainstackConfig): Record<string, Record<string, AllowRule>> {
+  const path = allowRulesPath(cfg);
+  if (!existsSync(path)) {
+    return {};
+  }
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as Record<string, Record<string, AllowRule>>;
+  } catch {
+    return {};
+  }
+}
+
+async function writeAllowRules(cfg: BrainstackConfig, rules: Record<string, unknown>): Promise<void> {
+  await ensureDir(dirname(allowRulesPath(cfg)));
+  await writeText(allowRulesPath(cfg), `${JSON.stringify(rules, null, 2)}\n`, 0o600);
+}
+
+async function consumeOnceAllowRules(cfg: BrainstackConfig, repo: string, brainIds: string[]): Promise<void> {
+  const rules = readAllowRules(cfg);
+  const repoRules = rules[repo];
+  if (!repoRules) {
+    return;
+  }
+  let changed = false;
+  for (const brainId of brainIds) {
+    if (repoRules[brainId]?.decision === "once") {
+      delete repoRules[brainId];
+      changed = true;
+    }
+  }
+  if (changed) {
+    if (!Object.keys(repoRules).length) {
+      delete rules[repo];
+    }
+    await writeAllowRules(cfg, rules);
+  }
+}
+
+function brainNeedsExplicitAllow(brain: ProjectBrain): boolean {
+  return brain.classification === "personal";
+}
+
+function applyAllowRuleSections(brain: ProjectBrain, rule: AllowRule | undefined): ProjectBrain {
+  if (!rule?.sections?.length) {
+    return brain;
+  }
+  const allowed = new Set(rule.sections);
+  const sections = (brain.sections.length ? brain.sections : ["wiki", "raw", "proposals"]).filter((section) => allowed.has(section));
+  return { ...brain, sections, sectionsRestricted: true };
+}
+
+async function resolveProjectContext(cfg: BrainstackConfig, repoInput: string | null): Promise<ResolvedProjectContext> {
+  const repo = await resolveRepoPath(repoInput);
+  const configPath = await findProjectBrainstackConfig(repo);
+  const raw = configPath ? parseSimpleYaml(await readFile(configPath, "utf8")) : {};
+  const brains = projectBrainsFromRaw(raw, cfg);
+  const writeDefault = stringAt(raw, "writeDefault", stringAt(raw, "defaultBrain", brains[0]?.id || "default"));
+  const rules = readAllowRules(cfg)[repo] || {};
+  const allowedBrains: ProjectBrain[] = [];
+  for (const brain of brains) {
+    const rule = rules[brain.id];
+    if (rule?.decision === "deny") {
+      continue;
+    }
+    if (!brainNeedsExplicitAllow(brain) || rule?.decision === "always" || rule?.decision === "once") {
+      allowedBrains.push(applyAllowRuleSections(brain, rule));
+    }
+  }
+  const allowedIds = new Set(allowedBrains.map((brain) => brain.id));
+  const deniedBrains = brains.filter((brain) => !allowedIds.has(brain.id));
+  return { repo, configPath, brains, allowedBrains, deniedBrains, writeDefault, sessionPath: projectSessionPath(cfg, repo) };
+}
+
+async function maybeSyncBrainClone(brain: ProjectBrain): Promise<string> {
+  if (!gitExists(brain.localPath)) {
+    return "missing";
+  }
+  const result = run(["git", "pull", "--ff-only"], { cwd: brain.localPath, check: false, timeoutMs: 20_000 });
+  return result.code === 0 ? "synced" : `stale: ${(result.stderr || result.stdout).trim().slice(0, 160)}`;
+}
+
+async function commandContext(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const resolved = await resolveProjectContext(cfg, flag(args, "repo"));
+  const sync = hasFlag(args, "sync") && !hasFlag(args, "no-sync");
+  const brainRows = [];
+  for (const brain of resolved.brains) {
+    const allowed = resolved.allowedBrains.includes(brain);
+    const status = sync && allowed ? await maybeSyncBrainClone(brain) : gitExists(brain.localPath) ? "local" : "missing";
+    brainRows.push({ ...brain, allowed, status });
+  }
+  if (hasFlag(args, "json")) {
+    console.log(JSON.stringify({ repo: resolved.repo, configPath: resolved.configPath, writeDefault: resolved.writeDefault, brains: brainRows }, null, 2));
+    return;
+  }
+  console.log(`repo=${resolved.repo}`);
+  console.log(`config=${resolved.configPath || "(default)"}`);
+  console.log(`write_default=${resolved.writeDefault}`);
+  for (const brain of brainRows) {
+    console.log(`[${brain.allowed ? "allowed" : "blocked"}] ${brain.id} path=${brain.localPath} status=${brain.status}`);
+  }
+  for (const brain of resolved.deniedBrains) {
+    console.log(`allow with: brainctl allow repo --repo ${shellSingleQuote(resolved.repo)} --brain ${shellSingleQuote(brain.id)} --always`);
+  }
+}
+
+function searchLocalBrain(brain: ProjectBrain, query: string): Array<{ brain: string; label: string; classification: string; path: string; line: number; text: string }> {
+  if (!gitExists(brain.localPath)) {
+    return [];
+  }
+  const configuredScopes = brain.sections.length ? brain.sections : brain.sectionsRestricted ? [] : ["wiki", "raw", "proposals"];
+  const scopes = configuredScopes.filter((scope) => existsSync(join(brain.localPath, scope)));
+  if (!scopes.length) {
+    return [];
+  }
+  const result = run(["rg", "-n", "-i", "--fixed-strings", "--", query, ...scopes], {
+    cwd: brain.localPath,
+    check: false,
+    timeoutMs: 15_000
+  });
+  if (result.code !== 0 && result.code !== 1) {
+    throw new Error(`search failed for ${brain.id}: ${(result.stderr || result.stdout).trim()}`);
+  }
+  return result.stdout
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .slice(0, 100)
+    .map((line) => {
+      const [path = "", lineNo = "0", ...rest] = line.split(":");
+      return { brain: brain.id, label: brain.label, classification: brain.classification, path, line: Number(lineNo) || 0, text: rest.join(":").trim() };
+    });
+}
+
+async function writeProjectSession(resolved: ResolvedProjectContext, data: Record<string, unknown>): Promise<void> {
+  await ensureDir(dirname(resolved.sessionPath));
+  await writeText(resolved.sessionPath, `${JSON.stringify({ ...data, repo: resolved.repo, updated_at: new Date().toISOString() }, null, 2)}\n`, 0o600);
+}
+
+async function commandSearch(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const query = args.positional.join(" ").trim() || flag(args, "query") || flag(args, "no-sync") || "";
+  if (!query) {
+    throw new Error("search requires a query");
+  }
+  const resolved = await resolveProjectContext(cfg, flag(args, "repo"));
+  if (hasFlag(args, "wait-fresh")) {
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      const pending = resolved.allowedBrains.filter((brain) => existsSync(join(brain.localPath, "derived", "search-reindex-needed.json")));
+      if (!pending.length) {
+        break;
+      }
+      await Bun.sleep(500);
+    }
+  }
+  const syncStatus: Record<string, string> = {};
+  if (args.flags["no-sync"] === undefined) {
+    for (const brain of resolved.allowedBrains) {
+      syncStatus[brain.id] = await maybeSyncBrainClone(brain);
+    }
+  }
+  const results = resolved.allowedBrains.flatMap((brain) => searchLocalBrain(brain, query));
+  const recentSources = [
+    ...new Map(
+      results.map((item) => [
+        item.brain,
+        {
+          id: item.brain,
+          label: item.label,
+          classification: item.classification,
+          sync_status: syncStatus[item.brain] || "not-synced"
+        }
+      ])
+    ).values()
+  ];
+  await writeProjectSession(resolved, { recent_search: query, recent_sources: recentSources });
+  for (const brain of resolved.allowedBrains) {
+    if (existsSync(join(brain.localPath, "derived", "search-reindex-needed.json"))) {
+      console.warn(`WARN [${brain.id}] search index refresh pending; local results may be stale.`);
+    }
+  }
+  if (hasFlag(args, "json")) {
+    console.log(JSON.stringify({ query, sync_status: syncStatus, results }, null, 2));
+    await consumeOnceAllowRules(cfg, resolved.repo, resolved.allowedBrains.map((brain) => brain.id));
+    return;
+  }
+  console.log(results.length ? results.map((item) => `[${item.brain} / ${item.path}:${item.line}] ${item.text}`).join("\n") : "(no local matches)");
+  await consumeOnceAllowRules(cfg, resolved.repo, resolved.allowedBrains.map((brain) => brain.id));
+}
+
+async function commandRemember(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const summary = flag(args, "summary") || flag(args, "text") || args.positional.join(" ");
+  if (!summary) {
+    throw new Error("remember requires --summary TEXT");
+  }
+  const resolved = await resolveProjectContext(cfg, flag(args, "repo"));
+  const targetId = flag(args, "target") || resolved.writeDefault;
+  const target = resolved.allowedBrains.find((brain) => brain.id === targetId);
+  if (!target) {
+    throw new Error(`target brain ${targetId} is not allowed for ${resolved.repo}. Run brainctl context --repo ${shellSingleQuote(resolved.repo)} for the explicit allow command.`);
+  }
+  if (target.write === "false") {
+    throw new Error(`target brain ${targetId} is read-only in project context`);
+  }
+  const session = existsSync(resolved.sessionPath) ? (JSON.parse(readFileSync(resolved.sessionPath, "utf8")) as Record<string, unknown>) : {};
+  const recentSources = Array.isArray(session.recent_sources) ? session.recent_sources : [];
+  const usedPersonal = recentSources.some((source) => {
+    if (typeof source === "string") {
+      return /personal|private|journal|health|family|finance/i.test(source);
+    }
+    if (source && typeof source === "object") {
+      const record = source as Record<string, unknown>;
+      return record.classification === "personal" || /personal|private|journal|health|family|finance/i.test(`${record.id || ""} ${record.label || ""}`);
+    }
+    return false;
+  });
+  const targetLooksWork = target.classification === "work" || /work|company|lindy|corp|corpo/i.test(`${target.id} ${target.label}`);
+  if (usedPersonal && targetLooksWork && !hasFlag(args, "confirm-cross-brain")) {
+    throw new Error("Refusing cross-brain remember from recent personal sources into a work/company target without --confirm-cross-brain.");
+  }
+  if (target.write !== "false" && (!target.baseUrl || !target.importTokenEnv)) {
+    throw new Error(`target brain ${targetId} is writable but missing explicit baseUrl/importTokenEnv`);
+  }
+  await postBrainWriteOrQueue(cfg, target.write === "true" ? "import" : "propose", {
+    title: `Remember: ${summary.slice(0, 80)}`,
+    text: summary,
+    body: summary,
+    source_harness: cfg.harness.name,
+    source_machine: cfg.machine.name,
+    source_type: "remember",
+    related_repo: resolved.repo,
+    tags: ["remember", target.id]
+  }, {
+    baseUrl: target.baseUrl,
+    importTokenEnv: target.importTokenEnv,
+    targetBrainId: target.id
+  });
+  await consumeOnceAllowRules(cfg, resolved.repo, [target.id]);
+}
+
+async function commandAllow(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const sub = args.positional[0] || "";
+  if (sub !== "repo") {
+    throw new Error("allow supports only: repo");
+  }
+  const repo = await resolveRepoPath(flag(args, "repo"));
+  const brain = flag(args, "brain");
+  if (!brain) {
+    throw new Error("allow repo requires --brain BRAIN_ID");
+  }
+  const resolved = await resolveProjectContext(cfg, repo);
+  const configuredBrain = resolved.brains.find((item) => item.id === brain);
+  if (!configuredBrain) {
+    throw new Error(`unknown brain ${brain} for repo ${repo}`);
+  }
+  const requestedSections = flag(args, "sections") ? flag(args, "sections")!.split(",").map((item) => item.trim()).filter(Boolean) : [];
+  if (requestedSections.length) {
+    const knownSections = new Set(configuredBrain.sections.length ? configuredBrain.sections : ["wiki", "raw", "proposals"]);
+    const unknownSections = requestedSections.filter((section) => !knownSections.has(section));
+    if (unknownSections.length) {
+      throw new Error(`unknown section(s) for brain ${brain}: ${unknownSections.join(", ")}. Known sections: ${[...knownSections].join(", ")}`);
+    }
+  }
+  const decision = hasFlag(args, "deny") ? "deny" : hasFlag(args, "once") ? "once" : "always";
+  const rules = readAllowRules(cfg);
+  rules[repo] = rules[repo] || {};
+  rules[repo][brain] = {
+    decision,
+    sections: requestedSections,
+    updated_at: new Date().toISOString()
+  };
+  await writeAllowRules(cfg, rules);
+  console.log(`allow_rule=${decision} repo=${repo} brain=${brain}`);
+}
+
+async function commandWorkerCache(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const sub = args.positional[0] || "status";
+  const cache = readWorkerEnvCache(cfg);
+  if (sub === "status") {
+    const worker = args.positional[1] || flag(args, "worker");
+    const records = Object.values(cache).filter((record) => !worker || record.worker === worker);
+    console.log(`worker_cache=${workerEnvCachePath(cfg)}`);
+    console.log(records.length ? records.map((record) => `${record.worker} harness=${record.harness} bin=${record.harnessBin} detected=${record.detectedAt}`).join("\n") : "(empty)");
+    return;
+  }
+  if (sub === "clear") {
+    if (hasFlag(args, "all")) {
+      await rm(workerEnvCachePath(cfg), { force: true });
+      console.log("worker_cache=cleared");
+      return;
+    }
+    const worker = args.positional[1] || flag(args, "worker");
+    if (!worker) {
+      throw new Error("worker-cache clear requires a worker name or --all");
+    }
+    delete cache[worker];
+    await writeWorkerEnvCache(cfg, cache);
+    console.log(`worker_cache_cleared=${worker}`);
+    return;
+  }
+  throw new Error("worker-cache subcommand must be status|clear");
 }
 
 function brainWriteTimeoutMs(): number {
@@ -2748,90 +3469,69 @@ async function brainWriteSmokeCheck(cfg: BrainstackConfig): Promise<DoctorCheck>
   }
 }
 
-interface OutboxItem {
-  id: string;
-  endpoint: "import" | "propose";
-  url: string;
-  payload: Record<string, unknown>;
-  created_at: string;
-  source_machine: string;
-  source_harness: string;
-  retry_count: number;
-  idempotency_key: string;
-  last_error: string | null;
-  terminal_error?: string | null;
-}
+type OutboxItem = SharedOutboxItem;
 
-function outboxItemKey(endpoint: "import" | "propose", payload: Record<string, unknown>): string {
-  return sha256Hex(canonicalJson({ endpoint, payload }));
-}
-
-async function readOutboxItem(path: string): Promise<OutboxItem | null> {
-  try {
-    return JSON.parse(await readFile(path, "utf8")) as OutboxItem;
-  } catch {
-    return null;
-  }
+function outboxItemKey(
+  endpoint: "import" | "propose",
+  payload: Record<string, unknown>,
+  destination: { brain_id?: string | null; url?: string | null; import_token_env?: string | null } = {}
+): string {
+  return sharedOutboxItemKey(endpoint, payload, destination);
 }
 
 async function findMatchingOutboxItem(root: string, endpoint: "import" | "propose", idempotencyKey: string): Promise<{ path: string; item: OutboxItem } | null> {
-  if (!existsSync(root)) {
-    return null;
-  }
-  for (const name of (await readdir(root)).filter((entry) => entry.endsWith(".json")).sort()) {
-    const path = join(root, name);
-    const item = await readOutboxItem(path);
-    if (!item || item.endpoint !== endpoint) {
+  const scan = await scanOutbox(root);
+  for (const entry of scan.items) {
+    if (entry.item.endpoint !== endpoint) {
       continue;
     }
-    const canonicalKey = outboxItemKey(item.endpoint, item.payload);
-    if (canonicalKey === idempotencyKey || item.idempotency_key === idempotencyKey) {
-      return { path, item };
+    if (entry.idempotencyKey === idempotencyKey || entry.item.idempotency_key === idempotencyKey) {
+      return { path: entry.path, item: entry.item };
     }
   }
   return null;
 }
 
 async function queueOutboxItem(cfg: BrainstackConfig, item: Omit<OutboxItem, "id" | "created_at" | "retry_count" | "idempotency_key" | "last_error">, error: string): Promise<string> {
-  const created = new Date().toISOString();
-  const idempotencyKey = outboxItemKey(item.endpoint, item.payload);
+  const payload = item.payload ? item.payload : decodeOutboxPayload(item as OutboxItem);
+  const destination = {
+    brain_id: item.brain_id || null,
+    url: item.url || null,
+    import_token_env: item.import_token_env || null
+  };
+  const idempotencyKey = outboxItemKey(item.endpoint, payload, destination);
   const id = `${item.endpoint}-${idempotencyKey.slice(0, 32)}`;
-  const root = outboxRoot(cfg);
-  await ensureDir(root);
+  const root = outboxRootForDestination(cfg, { brainId: item.brain_id, baseUrl: item.url });
+  await ensurePrivateOutboxDir(root);
   const stablePath = join(root, `${id}.json`);
   const matched = (await findMatchingOutboxItem(root, item.endpoint, idempotencyKey)) || null;
   const path = matched?.path || stablePath;
-  const existing = matched?.item || (existsSync(stablePath) ? await readOutboxItem(stablePath) : null);
-  await writeText(
+  const existing = matched?.item || null;
+  await writeOutboxItem(
     path,
-    `${JSON.stringify(
+    buildOutboxItem(
       {
         ...item,
-        id,
-        created_at: existing?.created_at || created,
-        retry_count: existing?.retry_count || 0,
-        idempotency_key: idempotencyKey,
-        last_error: error
-      } satisfies OutboxItem,
-      null,
-      2
-    )}\n`,
-    0o600
+        payload,
+        idempotency_key: idempotencyKey
+      },
+      error,
+      existing
+    )
   );
   return path;
 }
 
-function brainWriteIdempotencyKey(endpoint: "import" | "propose", payload: Record<string, unknown>): string {
-  return sha256Hex(canonicalJson({ endpoint, payload }));
+function brainWriteIdempotencyKey(
+  endpoint: "import" | "propose",
+  payload: Record<string, unknown>,
+  destination: { brain_id?: string | null; url?: string | null; import_token_env?: string | null } = {}
+): string {
+  return outboxItemKey(endpoint, payload, destination);
 }
 
 function normalizeOutboxItem(item: OutboxItem): OutboxItem {
-  const idempotencyKey = outboxItemKey(item.endpoint, item.payload);
-  return {
-    ...item,
-    id: `${item.endpoint}-${idempotencyKey.slice(0, 32)}`,
-    idempotency_key: idempotencyKey
-  };
+  return normalizeSharedOutboxItem(item);
 }
 
 function isRetryableBrainWriteStatus(status: number): boolean {
@@ -2851,17 +3551,26 @@ function idempotencyPendingTerminalError(item: OutboxItem, status: number, respo
   if ((item.retry_count || 0) < retryLimit) {
     return null;
   }
-  return `HTTP 425 persisted after ${item.retry_count} flush attempt(s); operator review required before replaying this idempotent write. ${responseText.slice(0, 240)}`;
+  return `HTTP 425 persisted after ${item.retry_count} flush attempt(s); operator review required before replaying this idempotent write. ${sanitizedHttpError(status, responseText)}`;
 }
 
-async function postBrainWriteOrQueue(cfg: BrainstackConfig, endpoint: "import" | "propose", payload: Record<string, unknown>): Promise<void> {
-  const { baseUrl, token: writeToken } = brainWriteConfig(cfg);
+async function postBrainWriteOrQueue(
+  cfg: BrainstackConfig,
+  endpoint: "import" | "propose",
+  payload: Record<string, unknown>,
+  overrides: { baseUrl?: string; importTokenEnv?: string; targetBrainId?: string } = {}
+): Promise<void> {
+  const writeConfig = brainWriteConfig(cfg);
+  const baseUrl = overrides.baseUrl || writeConfig.baseUrl;
+  const writeToken = overrides.importTokenEnv ? resolveClientEnvValue(cfg, overrides.importTokenEnv) : writeConfig.token;
   if (!baseUrl || !writeToken) {
     const queued = await queueOutboxItem(
       cfg,
       {
         endpoint,
         url: baseUrl || "",
+        brain_id: overrides.targetBrainId || undefined,
+        import_token_env: overrides.importTokenEnv || undefined,
         payload,
         source_machine: String(payload.source_machine || cfg.machine.name),
         source_harness: String(payload.source_harness || cfg.harness.name)
@@ -2878,7 +3587,11 @@ async function postBrainWriteOrQueue(cfg: BrainstackConfig, endpoint: "import" |
       headers: {
         Authorization: `Bearer ${writeToken}`,
         "Content-Type": "application/json",
-        "Idempotency-Key": brainWriteIdempotencyKey(endpoint, payload)
+        "Idempotency-Key": brainWriteIdempotencyKey(endpoint, payload, {
+          brain_id: overrides.targetBrainId || null,
+          url: baseUrl || null,
+          import_token_env: overrides.importTokenEnv || null
+        })
       },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(brainWriteTimeoutMs())
@@ -2886,9 +3599,9 @@ async function postBrainWriteOrQueue(cfg: BrainstackConfig, endpoint: "import" |
     if (!response.ok) {
       const text = await response.text();
       if (isRetryableBrainWriteStatus(response.status)) {
-        throw new Error(`brain returned HTTP ${response.status}: ${text.slice(0, 500)}`);
+        throw new Error(sanitizedHttpError(response.status, text));
       }
-      throw new Error(`brain rejected ${endpoint} with HTTP ${response.status}: ${text.slice(0, 500)}`);
+      throw new Error(`brain rejected ${endpoint} with HTTP ${response.status}: ${sanitizedHttpError(response.status, text)}`);
     }
     console.log(`shared-brain ${endpoint} accepted`);
   } catch (error) {
@@ -2901,6 +3614,8 @@ async function postBrainWriteOrQueue(cfg: BrainstackConfig, endpoint: "import" |
       {
         endpoint,
         url: baseUrl,
+        brain_id: overrides.targetBrainId || undefined,
+        import_token_env: overrides.importTokenEnv || undefined,
         payload,
         source_machine: String(payload.source_machine || cfg.machine.name),
         source_harness: String(payload.source_harness || cfg.harness.name)
@@ -2911,31 +3626,46 @@ async function postBrainWriteOrQueue(cfg: BrainstackConfig, endpoint: "import" |
   }
 }
 
-async function listOutboxItems(cfg: BrainstackConfig): Promise<Array<{ path: string; item: OutboxItem }>> {
-  const root = outboxRoot(cfg);
-  if (!existsSync(root)) {
-    return [];
+async function listOutboxEntries(cfg: BrainstackConfig): Promise<OutboxEntry[]> {
+  const roots = await outboxRoots(cfg);
+  const entries: OutboxEntry[] = [];
+  for (const root of roots) {
+    entries.push(...(await scanOutbox(root)).items);
   }
-  const names = (await readdir(root)).filter((name) => name.endsWith(".json")).sort();
-  const items: Array<{ path: string; item: OutboxItem }> = [];
-  for (const name of names) {
-    const path = join(root, name);
-    const item = await readOutboxItem(path);
-    if (item) {
-      items.push({ path, item });
+  return entries;
+}
+
+async function outboxRoots(cfg: BrainstackConfig): Promise<string[]> {
+  const roots = new Set<string>([outboxRoot(cfg)]);
+  const parent = outboxParentRoot(cfg);
+  if (existsSync(parent)) {
+    for (const name of await readdir(parent).catch(() => [])) {
+      const path = join(parent, name);
+      const info = await stat(path).catch(() => null);
+      if (info?.isDirectory()) {
+        roots.add(path);
+      }
     }
   }
-  return items;
+  return [...roots].sort();
+}
+
+async function scanAllOutboxes(cfg: BrainstackConfig): Promise<Array<Awaited<ReturnType<typeof scanOutbox>>>> {
+  const scans = [];
+  for (const root of await outboxRoots(cfg)) {
+    scans.push(await scanOutbox(root));
+  }
+  return scans;
 }
 
 async function coalesceOutboxItems(cfg: BrainstackConfig): Promise<void> {
-  const seen = new Map<string, { path: string; item: OutboxItem }>();
-  for (const entry of await listOutboxItems(cfg)) {
+  const seen = new Map<string, OutboxEntry>();
+  for (const entry of await listOutboxEntries(cfg)) {
     entry.item = normalizeOutboxItem(entry.item);
     const key = entry.item.idempotency_key;
     const prior = seen.get(key);
     if (!prior) {
-      await writeText(entry.path, `${JSON.stringify(entry.item, null, 2)}\n`, 0o600);
+      await writeOutboxItem(entry.path, entry.item);
       seen.set(key, entry);
       continue;
     }
@@ -2946,29 +3676,37 @@ async function coalesceOutboxItems(cfg: BrainstackConfig): Promise<void> {
     keep.item.idempotency_key = key;
     keep.item.last_error = keep.item.last_error || drop.item.last_error || null;
     keep.item.terminal_error = keep.item.terminal_error || drop.item.terminal_error || null;
-    await writeText(keep.path, `${JSON.stringify(keep.item, null, 2)}\n`, 0o600);
+    await writeOutboxItem(keep.path, keep.item);
     await rm(drop.path, { force: true });
     seen.set(key, keep);
   }
 }
 
-async function flushOutbox(cfg: BrainstackConfig): Promise<{ flushed: number; kept: number; terminalFailures: number }> {
-  const { token: writeToken } = brainWriteConfig(cfg);
+async function flushOutbox(cfg: BrainstackConfig): Promise<{ flushed: number; kept: number; terminalFailures: number; corrupt: number }> {
+  let scans = await scanAllOutboxes(cfg);
+  const corrupt = scans.reduce((sum, scan) => sum + scan.corrupt.length, 0);
+  if (corrupt > 0) {
+    const queued = scans.reduce((sum, scan) => sum + scan.items.length, 0);
+    const terminalFailures = scans.reduce((sum, scan) => sum + scan.items.filter((entry) => normalizeOutboxItem(entry.item).terminal_error).length, 0);
+    return { flushed: 0, kept: queued, terminalFailures, corrupt };
+  }
   await coalesceOutboxItems(cfg);
-  const items = await listOutboxItems(cfg);
+  scans = await scanAllOutboxes(cfg);
+  const items = await listOutboxEntries(cfg);
   let flushed = 0;
   let kept = 0;
   let terminalFailures = 0;
-  for (const { path, item } of items) {
+  for (const { path, item, payload } of items) {
     const normalizedItem = normalizeOutboxItem(item);
     if (normalizedItem.id !== item.id || normalizedItem.idempotency_key !== item.idempotency_key) {
-      await writeText(path, `${JSON.stringify(normalizedItem, null, 2)}\n`, 0o600);
+      await writeOutboxItem(path, normalizedItem);
     }
     if (normalizedItem.terminal_error) {
       terminalFailures += 1;
       continue;
     }
     const baseUrl = normalizedItem.url || brainWriteConfig(cfg).baseUrl;
+    const writeToken = normalizedItem.import_token_env ? resolveClientEnvValue(cfg, normalizedItem.import_token_env) : brainWriteConfig(cfg).token;
     if (!baseUrl || !writeToken) {
       kept += 1;
       continue;
@@ -2981,7 +3719,7 @@ async function flushOutbox(cfg: BrainstackConfig): Promise<{ flushed: number; ke
           "Content-Type": "application/json",
           "Idempotency-Key": normalizedItem.idempotency_key
         },
-        body: JSON.stringify(normalizedItem.payload),
+        body: JSON.stringify(payload),
         signal: AbortSignal.timeout(brainWriteTimeoutMs())
       });
       if (response.ok) {
@@ -2990,7 +3728,7 @@ async function flushOutbox(cfg: BrainstackConfig): Promise<{ flushed: number; ke
       } else {
         const responseText = await response.text();
         normalizedItem.retry_count += 1;
-        normalizedItem.last_error = `HTTP ${response.status}: ${responseText.slice(0, 300)}`;
+        normalizedItem.last_error = sanitizedHttpError(response.status, responseText);
         const pendingTerminalError = idempotencyPendingTerminalError(normalizedItem, response.status, responseText);
         if (pendingTerminalError) {
           normalizedItem.terminal_error = pendingTerminalError;
@@ -3001,16 +3739,16 @@ async function flushOutbox(cfg: BrainstackConfig): Promise<{ flushed: number; ke
         } else {
           kept += 1;
         }
-        await writeText(path, `${JSON.stringify(normalizedItem, null, 2)}\n`, 0o600);
+        await writeOutboxItem(path, normalizedItem);
       }
     } catch (error) {
       normalizedItem.retry_count += 1;
       normalizedItem.last_error = error instanceof Error ? error.message : String(error);
-      await writeText(path, `${JSON.stringify(normalizedItem, null, 2)}\n`, 0o600);
+      await writeOutboxItem(path, normalizedItem);
       kept += 1;
     }
   }
-  return { flushed, kept, terminalFailures };
+  return { flushed, kept, terminalFailures, corrupt };
 }
 
 async function commandImportText(args: ParsedArgs): Promise<void> {
@@ -3048,15 +3786,19 @@ async function commandPropose(args: ParsedArgs): Promise<void> {
 async function commandOutbox(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
   const sub = args.positional[0] || "status";
-  const items = await listOutboxItems(cfg);
+  const scans = await scanAllOutboxes(cfg);
+  const items = scans.flatMap((scan) => scan.items);
+  const corrupt = scans.flatMap((scan) => scan.corrupt);
   switch (sub) {
     case "status":
       console.log(`outbox=${outboxRoot(cfg)}`);
+      console.log(`namespaces=${scans.length}`);
       console.log(`queued=${items.length}`);
+      console.log(`corrupt=${corrupt.length}`);
       return;
     case "list":
       console.log(
-        items.length
+        items.length || corrupt.length
           ? items
               .map(({ item }) => {
                 const normalized = normalizeOutboxItem(item);
@@ -3067,21 +3809,29 @@ async function commandOutbox(args: ParsedArgs): Promise<void> {
                   normalized.endpoint,
                   `status=${status}`,
                   `retries=${normalized.retry_count}`,
+                  normalized.brain_id ? `brain=${normalized.brain_id}` : null,
+                  normalized.import_token_env ? `token_env=${normalized.import_token_env}` : null,
                   `source=${normalized.source_machine}/${normalized.source_harness}`,
                   detail ? `error=${detail.replace(/\s+/g, " ").slice(0, 300)}` : null
                 ]
                   .filter(Boolean)
                   .join(" ");
               })
+              .concat(
+                corrupt.map((entry) => `CORRUPT ${entry.name} error=${entry.error.replace(/\s+/g, " ").slice(0, 300)}`)
+              )
               .join("\n")
           : "(empty)"
       );
       return;
     case "flush": {
       const result = await flushOutbox(cfg);
-      console.log(`flushed=${result.flushed} kept=${result.kept} terminal_failures=${result.terminalFailures}`);
+      console.log(`flushed=${result.flushed} kept=${result.kept} terminal_failures=${result.terminalFailures} corrupt=${result.corrupt}`);
       if (result.terminalFailures > 0) {
         throw new Error("outbox flush encountered terminal write failures; inspect `brainctl outbox list` and purge or repair affected items");
+      }
+      if (result.corrupt > 0) {
+        throw new Error("outbox flush found corrupt/unsafe entries; inspect `brainctl outbox list` and purge or repair affected items");
       }
       return;
     }
@@ -3089,11 +3839,28 @@ async function commandOutbox(args: ParsedArgs): Promise<void> {
       if (!hasFlag(args, "yes")) {
         throw new Error("outbox purge is destructive; rerun with --yes");
       }
-      await rm(outboxRoot(cfg), { recursive: true, force: true });
-      console.log(`purged ${outboxRoot(cfg)}`);
+      {
+        const roots = await outboxRoots(cfg);
+        for (const root of roots) {
+          await rm(root, { recursive: true, force: true });
+        }
+        console.log(`purged=${roots.length}`);
+      }
+      return;
+    case "purge-corrupt":
+      if (!hasFlag(args, "yes")) {
+        throw new Error("outbox purge-corrupt is destructive; rerun with --yes");
+      }
+      {
+        let purged = 0;
+        for (const scan of scans) {
+          purged += await purgeCorruptOutboxEntries(scan);
+        }
+        console.log(`purged_corrupt=${purged}`);
+      }
       return;
     default:
-      throw new Error("outbox subcommand must be status|list|flush|purge");
+      throw new Error("outbox subcommand must be status|list|flush|purge|purge-corrupt");
   }
 }
 
@@ -3716,7 +4483,8 @@ function processAlive(pid: unknown): "yes" | "no" | "unknown" {
 }
 
 async function repoLockInfo(lockPath: string): Promise<RepoLockInfo> {
-  if (!existsSync(lockPath)) {
+  const linkInfo = await lstat(lockPath).catch(() => null);
+  if (!linkInfo) {
     return {
       path: lockPath,
       exists: false,
@@ -3731,8 +4499,23 @@ async function repoLockInfo(lockPath: string): Promise<RepoLockInfo> {
     };
   }
 
+  const ageMs = Math.max(0, Date.now() - linkInfo.mtime.getTime());
+  if (linkInfo.isSymbolicLink() || !linkInfo.isDirectory()) {
+    return {
+      path: lockPath,
+      exists: true,
+      ageMs,
+      entries: [],
+      ownerPath: null,
+      ownerToken: null,
+      owner: null,
+      pidAlive: "unknown",
+      safeToClear: false,
+      reason: linkInfo.isSymbolicLink() ? "lock path is a symlink; refusing to inspect target" : "lock path is not a directory"
+    };
+  }
+
   const lockStat = await stat(lockPath);
-  const ageMs = Math.max(0, Date.now() - lockStat.mtime.getTime());
   const entries = (await readdir(lockPath).catch(() => [])).sort();
   const ownerEntry = entries.find((entry) => entry.startsWith("owner-") && entry.endsWith(".json")) || null;
   const ownerPath = ownerEntry ? join(lockPath, ownerEntry) : null;
@@ -3957,6 +4740,11 @@ async function commandMigrateCurrentInstall(args: ParsedArgs): Promise<void> {
       configRoot: "~/.config/brainstack",
       systemdUserRoot: "~/.config/systemd/user"
     },
+    security: {
+      posture: "trusted-tailnet",
+      bindHost: "127.0.0.1",
+      trustedExposure: "none"
+    },
     brain: {
       bind: "127.0.0.1",
       port: 8080,
@@ -4023,10 +4811,20 @@ async function main(): Promise<void> {
       return await commandDoctor(args);
     case "updates":
       return await commandUpdates(args);
+    case "expose":
+      return await commandExpose(args);
     case "import-text":
       return await commandImportText(args);
     case "propose":
       return await commandPropose(args);
+    case "context":
+      return await commandContext(args);
+    case "search":
+      return await commandSearch(args);
+    case "remember":
+      return await commandRemember(args);
+    case "allow":
+      return await commandAllow(args);
     case "outbox":
       return await commandOutbox(args);
     case "backup":
@@ -4043,6 +4841,8 @@ async function main(): Promise<void> {
       return await commandJoinWorker(args);
     case "trust-worker":
       return await commandTrustWorker(args);
+    case "worker-cache":
+      return await commandWorkerCache(args);
     case "repo-lock":
     case "locks":
       return await commandRepoLock(args);

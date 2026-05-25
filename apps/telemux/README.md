@@ -122,9 +122,9 @@ If `BRAIN_BASE_URL` and `BRAIN_IMPORT_TOKEN` are set, successful runs import `.f
   `/newctx control-general control host`
 - `worker-general`
   `/newctx worker-general worker1 host`
-- `Project: bitfalls-dashboard`
-  `/newctx bitfalls-dashboard worker1 https://github.com/example/project.git master`
-  or `/newctx bitfalls-dashboard control /absolute/path/to/repo`
+- `Project: ops-dashboard`
+  `/newctx ops-dashboard worker1 https://github.com/example/project.git master`
+  or `/newctx ops-dashboard control /absolute/path/to/repo`
 - `Scratchpad`
   `/newctx scratchpad control scratch`
 

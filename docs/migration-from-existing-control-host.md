@@ -50,7 +50,7 @@ It does not stop services, move repos, rewrite hooks, or delete `/srv`.
 4. Point `braind.env` at serve and staging clones.
 5. Replace the old post-receive hook with the brainstack hook that updates only the serve clone.
 6. Restart `braind`.
-7. Test `/health`, page rendering, search, import, ingest, and git push.
+7. Test `/healthz`, admin `/admin/health`, page rendering, search, import, ingest, and git push.
 8. Only then retire the old `~/shared-brain/app` compatibility source.
 
 ## Current Known Legacy Issues

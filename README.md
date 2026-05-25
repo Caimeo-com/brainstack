@@ -23,6 +23,9 @@ bun run packages/brainctl/src/main.ts render --profile single-node --config exam
 bun run packages/brainctl/src/main.ts smoke --profile single-node --config examples/single-node.yaml
 bun run packages/brainctl/src/main.ts doctor --config examples/control.yaml --workers
 bun run packages/brainctl/src/main.ts updates --config examples/control.yaml
+bun run packages/brainctl/src/main.ts expose tailscale --config examples/control.yaml --dry-run
+bun run packages/brainctl/src/main.ts context --repo .
+bun run packages/brainctl/src/main.ts search --repo . "runbook"
 bun run packages/brainctl/src/main.ts outbox status --config examples/client-macos.yaml
 bun run packages/brainctl/src/main.ts upgrade --profile control --config examples/control.yaml
 bun run packages/brainctl/src/main.ts destroy --config ~/.config/brainstack/brainstack.yaml --dry-run
@@ -50,18 +53,30 @@ Generated source-run services also invoke Bun with `--no-env-file` and load expl
 - `worker`: worker host reachable by normal OpenSSH over Tailscale; no Telegram polling and no admin ingest token.
 - `client-macos`: local clone plus Codex/Claude/Cursor bootstrap; no local services.
 
-Private journaling should use an explicit separate repo/service/token boundary. Automatic multi-brain routing and a first-class `private-journal` provisioning profile are not implemented yet.
+Private journaling should use an explicit separate repo/service/token boundary. Local project context can search and write to explicitly configured brains, but automatic private-journal provisioning and hard policy routing are not implemented yet.
 
 Start with the quickstart docs in `docs/`.
 See [`docs/fresh-machine-install.md`](./docs/fresh-machine-install.md) for bootstrapping a new control, worker, or client machine from prerequisites through `doctor`.
 See [`docs/diagrams.md`](./docs/diagrams.md) for the read/write/outbox, Telegram coalescing, and control/client/worker topology diagrams.
 See [`docs/routines.md`](./docs/routines.md) for scheduled routines, built-in update checks, brain-curator setup, and daily check-ins.
+See [`docs/security-postures.md`](./docs/security-postures.md), [`docs/tailscale-exposure.md`](./docs/tailscale-exposure.md), [`docs/multi-brain.md`](./docs/multi-brain.md), and [`docs/outbox-security.md`](./docs/outbox-security.md) for the current posture, exposure, project-context, and outbox boundaries.
 
 `provision` is a first-stage checker/config generator. It does not install Bun, Git, SSH, Tailscale, Codex, or Claude; it fails with install hints when they are missing.
 
 `destroy` is intentionally manifest-driven and destructive only with `--yes`. Use `--scope control|worker|client|all` to limit removal to brainstack-owned artifacts for that role. It never removes package installs, Tailscale enrollment, Codex/Claude auth, or sudo policy.
 
-Client import/propose writes can queue into `~/.local/state/brainstack/outbox/<brain-id>/` when the brain is unreachable. Use `brainctl outbox status|list|flush|purge`; flush replays only import/propose payloads and never mutates canonical wiki pages offline.
+Client import/propose writes can queue into `~/.local/state/brainstack/outbox/<brain-id>/` when the brain is unreachable. Use `brainctl outbox status|list|flush|purge|purge-corrupt`; flush replays only import/propose payloads and never mutates canonical wiki pages offline.
+
+Security defaults are explicit in config:
+
+```yaml
+security:
+  posture: trusted-tailnet
+  bindHost: 127.0.0.1
+  trustedExposure: none
+```
+
+Expose through Tailscale Serve with `brainctl expose tailscale`; avoid direct public binds.
 
 Client/worker bootstrap accepts `BRAIN_IMPORT_TOKEN` or `BRAIN_IMPORT_TOKEN_FILE` and writes it into `~/.config/shared-brain.env` only when the token slot is blank. `brainctl doctor --write-smoke` performs an explicit mutating import smoke test when you want to prove pushback is ready.
 
