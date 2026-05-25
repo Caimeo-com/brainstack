@@ -20,6 +20,7 @@ import {
 import { WorkerService, type WorkspaceSeedFile } from "./workers";
 import { summarizeUsage } from "./usage";
 import { postBrainImportOrQueue } from "./brain-outbox";
+import { normalizeCodexModelOverride } from "./codex-runtime";
 import type { FactoryConfig } from "./config";
 import type { TelegramBot, TelegramTarget } from "./telegram";
 
@@ -83,10 +84,56 @@ function acceptedMessage(mode: DispatchMode, context: ContextRecord, logPath: st
   return [`Dispatched ${mode} for ${context.slug}.`, `Machine: ${context.machine}`, `Log: ${logPath}`].join("\n");
 }
 
+function parseJsonObject(value: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function collectErrorMessages(value: unknown, messages: string[]): void {
+  if (!value || typeof value !== "object") {
+    return;
+  }
+
+  const record = value as Record<string, unknown>;
+  const directMessage = record.message;
+  if (typeof directMessage === "string" && directMessage.trim()) {
+    const nested = parseJsonObject(directMessage.trim());
+    if (nested) {
+      collectErrorMessages(nested, messages);
+    } else {
+      messages.push(directMessage.trim());
+    }
+  }
+
+  collectErrorMessages(record.error, messages);
+}
+
+function codexErrorMessage(errorText: string): string | null {
+  const messages: string[] = [];
+  for (const line of errorText.split(/\r?\n/)) {
+    const parsed = parseJsonObject(line.trim());
+    if (parsed) {
+      collectErrorMessages(parsed, messages);
+    }
+  }
+
+  const unique = [...new Set(messages.map((message) => message.trim()).filter(Boolean))];
+  return unique[0] || null;
+}
+
 function formatRunFailureForTelegram(errorText: string | null, logPath: string, manualCompaction: boolean): string {
   const message = errorText?.trim() || "unknown error";
+  const parsedCodexMessage = codexErrorMessage(message);
   if (manualCompaction || /(?:codex_core::compact_remote|remote compaction failed|compact_error=|compaction failed)/i.test(message)) {
-    return ["Codex compaction failed.", `Log: ${logPath}`, `Error: ${snippet(message)}`].join("\n");
+    return ["Codex compaction failed.", `Log: ${logPath}`, `Error: ${snippet(parsedCodexMessage || message)}`].join("\n");
+  }
+
+  if (parsedCodexMessage) {
+    return ["Codex failed.", `Error: ${snippet(parsedCodexMessage)}`, `Log: ${logPath}`].join("\n");
   }
 
   return message;
@@ -356,10 +403,11 @@ export class Dispatcher {
 
       const prompt = options.rawPrompt ? instruction : buildPrompt(currentBeforeWorker, mode, instruction, preparedTelegramInput?.promptSection || null);
       let compactionNotified = false;
+      const rawModelOverride = options.modelOverride ?? currentBeforeWorker.modelOverride;
       const result = await this.workers.runCodex(currentBeforeWorker, prompt, mode, logPath, {
         workspaceFiles: preparedTelegramInput?.workspaceFiles,
         imagePaths: preparedTelegramInput?.imagePaths,
-        modelOverride: options.modelOverride ?? currentBeforeWorker.modelOverride,
+        modelOverride: rawModelOverride ? normalizeCodexModelOverride(rawModelOverride) : null,
         reasoningEffortOverride: options.reasoningEffortOverride ?? currentBeforeWorker.reasoningEffortOverride,
         onCompaction: async () => {
           if (options.notifyCompaction === false || compactionNotified) {
@@ -432,12 +480,13 @@ export class Dispatcher {
         return;
       }
 
+      const failureOutput = [result.stderr.trim(), result.stdout.trim()].filter(Boolean).join("\n");
       const saved = this.contexts.saveContext({
         ...afterRunContext,
         state: this.workers.isReachabilityFailure(result) ? "pending" : "error",
         latestRunLogPath: logPath,
         lastRunAt: new Date().toISOString(),
-        lastError: result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`
+        lastError: failureOutput || `exit ${result.exitCode}`
       });
 
       await this.telegram.sendText(

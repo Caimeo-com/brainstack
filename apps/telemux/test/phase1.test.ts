@@ -398,6 +398,18 @@ fi
 if printf '%s' "$prompt" | grep -q 'slow live session'; then
   sleep 1
 fi
+if printf '%s' "$prompt" | grep -q 'emit codex json error'; then
+  if printf '%s' "$prompt" | grep -q 'with stderr'; then
+    printf 'non-json stderr diagnostic\\n' >&2
+  fi
+  cat <<EOF
+{"type":"thread.started","thread_id":"$session_id"}
+{"type":"turn.started"}
+{"type":"error","message":"{\\"type\\":\\"error\\",\\"status\\":400,\\"error\\":{\\"type\\":\\"invalid_request_error\\",\\"message\\":\\"The '5.5' model is not supported when using Codex with a ChatGPT account.\\"}}"}
+{"type":"turn.failed","error":{"message":"{\\"type\\":\\"error\\",\\"status\\":400,\\"error\\":{\\"type\\":\\"invalid_request_error\\",\\"message\\":\\"The '5.5' model is not supported when using Codex with a ChatGPT account.\\"}}"}}
+EOF
+  exit 1
+fi
 if printf '%s' "$prompt" | grep -q 'emit compact event'; then
   printf '{"type":"thread.compaction.started"}\\n'
 fi
@@ -1904,7 +1916,7 @@ test("per-topic Codex mode, model, and effort overrides persist across resume wi
     const firstSession = fixture.db.getContextBySlug("tuning")?.codexSessionId || "";
     expect(firstSession).not.toBe("");
 
-    await fixture.commands.handleMessage(telegramMessage("/model gpt-5-codex", 70));
+    await fixture.commands.handleMessage(telegramMessage("/model 5.5", 70));
     expect(fixture.telegram.sent.at(-1)?.text).toContain("Codex mode now custom");
 
     await fixture.commands.handleMessage(telegramMessage("/effort high", 70));
@@ -1914,7 +1926,7 @@ test("per-topic Codex mode, model, and effort overrides persist across resume wi
     await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 2 for tuning.")));
 
     expect(fixture.db.getContextBySlug("tuning")?.codexSessionId).toBe(firstSession);
-    expect(await readFile(join(tuningRoot, ".factory", "fake-model.txt"), "utf8")).toBe("gpt-5-codex");
+    expect(await readFile(join(tuningRoot, ".factory", "fake-model.txt"), "utf8")).toBe("gpt-5.5");
     expect(await readFile(join(tuningRoot, ".factory", "fake-reasoning.txt"), "utf8")).toBe('model_reasoning_effort="high"');
 
     await fixture.commands.handleMessage(telegramMessage("/mode clear", 70));
@@ -1925,6 +1937,62 @@ test("per-topic Codex mode, model, and effort overrides persist across resume wi
 
     expect(await readFile(join(tuningRoot, ".factory", "fake-model.txt"), "utf8")).toBe("");
     expect(await readFile(join(tuningRoot, ".factory", "fake-reasoning.txt"), "utf8")).toBe("");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("legacy persisted bare numeric Codex model overrides are normalized at dispatch", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx legacy-model control scratch", 72));
+    const context = fixture.db.getContextBySlug("legacy-model");
+    fixture.contexts.saveContext({ ...context!, modelOverride: "5.5" });
+
+    await fixture.commands.handleMessage(telegramMessage("use persisted model override", 72));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for legacy-model.")));
+
+    const modelFile = join(context!.worktreePath, ".factory", "fake-model.txt");
+    expect(await readFile(modelFile, "utf8")).toBe("gpt-5.5");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("Codex JSON errors are summarized instead of dumped into Telegram", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx jsonerror control scratch", 71));
+    await fixture.commands.handleMessage(telegramMessage("emit codex json error", 71));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Codex failed.")));
+    const failureText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(failureText).toContain("jsonerror failed on control.");
+    expect(failureText).toContain("Codex failed.");
+    expect(failureText).toContain("The '5.5' model is not supported when using Codex with a ChatGPT account.");
+    expect(failureText).not.toContain('{"type":"thread.started"');
+    expect(failureText).not.toContain('\\"type\\":\\"error\\"');
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("Codex JSON errors are summarized even when stderr has diagnostics", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx jsonstderr control scratch", 73));
+    await fixture.commands.handleMessage(telegramMessage("emit codex json error with stderr", 73));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("jsonstderr failed on control.")));
+    const failureText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(failureText).toContain("Codex failed.");
+    expect(failureText).toContain("The '5.5' model is not supported when using Codex with a ChatGPT account.");
+    expect(failureText).not.toContain("non-json stderr diagnostic");
+    expect(failureText).not.toContain('{"type":"thread.started"');
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });

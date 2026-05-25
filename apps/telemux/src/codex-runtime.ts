@@ -47,7 +47,13 @@ export function parseCodexReasoningEffort(value: string): CodexReasoningEffort |
 
 export function normalizeCodexModelOverride(value: string): string | null {
   const normalized = value.trim();
-  return normalized ? normalized : null;
+  if (!normalized) {
+    return null;
+  }
+  if (/^\d+(?:\.\d+)+(?:-[a-z0-9][a-z0-9.-]*)?$/i.test(normalized)) {
+    return `gpt-${normalized}`;
+  }
+  return normalized;
 }
 
 export function formatCodexRuntimeOverrides(overrides: CodexRuntimeOverrides): string {
