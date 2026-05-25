@@ -16,6 +16,7 @@ The control host runs a small Bun service that acts as the control plane for Tel
 - Sends plain text replies with `sendMessage` and uploads files back into the same topic with `sendDocument`/`sendPhoto` when explicitly requested.
 - Treats plain text and captions in a bound topic as conversational Codex input:
   start a new session if none exists, otherwise resume the stored session id.
+- Keeps normal resume acceptance quiet in Telegram; the final answer is the acknowledgement. During active work, progress is represented by the `typing` heartbeat, and Codex compaction is summarized as one `Compacting thread…` status line.
 - Downloads supported inbound Telegram media with `getFile`, stages it into `.factory/inbox/telegram/<message_id>/` inside the bound workspace, and passes staged image files through to Codex with `--image`.
 - Rejects audio/voice-only inbound messages before Codex for now; transcription is a later phase.
 
@@ -136,6 +137,8 @@ If a remote worker is unavailable, context creation does not hard-fail. The cont
 12. Post the concise result back into the same Telegram topic.
 13. If the manifest requested attachments, fetch the recorded files from the worker workspace and upload them into the same Telegram topic.
 14. If shared-brain import env is configured, import `SUMMARY.md` and `ARTIFACTS.md` to `braind` as raw artifacts.
+
+`/compact` is a special Codex-only dispatcher path. It requires an existing stored session, sends the raw `/compact` prompt without the normal Brainstack task wrapper, suppresses the normal resume acknowledgement, and reports unsupported harnesses explicitly.
 
 ### Internal scheduler
 

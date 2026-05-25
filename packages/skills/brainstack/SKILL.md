@@ -52,7 +52,8 @@ When Telegram stops responding:
 - Check `getWebhookInfo`. Brainstack telemux uses polling, so `url` should be empty. A nonzero `pending_update_count` suggests updates are not being consumed.
 - Avoid `getUpdates` unless the user asked for live Telegram debugging or service state suggests no poller is active. If used, summarize only metadata: update id, chat id, thread id, sender id, date, text length, and attachment kinds.
 - Inspect `telemux.service` and recent logs on the control host. Look for startup crashes, Telegram 409 polling conflicts, missing `FACTORY_TELEGRAM_BOT_TOKEN`, wrong `FACTORY_ALLOWED_TELEGRAM_USER_ID`, bot privacy issues, DB write errors, stuck active context jobs, and worker SSH failures.
-- Check `/whoami`, `/workers`, `/updates`, `/topicinfo`, and `/tail` from the bound Telegram topic once the service is consuming updates again. `/workers` should show each worker's `sudo=ok|fail|missing|n/a`; `/updates` should run the same all-worker deterministic update-check used by the built-in routine.
+- Check `/whoami`, `/workers`, `/updates`, `/topicinfo`, `/context`, `/usage`, and `/tail` from the bound Telegram topic once the service is consuming updates again. `/workers` should show each worker's harness, model, thinking effort, and `sudo=ok|fail|missing|n/a`; `/updates` should run the same all-worker deterministic update-check used by the built-in routine.
+- Normal Telegram topic resumes should not emit "Dispatched resume" acknowledgements. Expect the typing heartbeat, optional `Compacting thread…`, and then the final result. Use `/compact` only for Codex-backed contexts with an existing session; Claude should report that manual compact is unsupported.
 - Restart `telemux.service` only after recording the current failure evidence, unless the user explicitly requests a blind restart.
 
 ## Worker Canary

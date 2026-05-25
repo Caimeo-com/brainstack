@@ -29,6 +29,7 @@ For a fresh-machine bootstrap, including passwordless sudo for the control user,
 - Context states: `active`, `pending`, `archived`, `error`.
 - `/newctx` is usually run once per reusable Telegram topic.
 - Plain text in a bound topic starts the configured harness if no session exists, otherwise resumes the stored topic session where supported.
+- Resume dispatch acknowledgements are silent by default; the bot uses `typing` while work is active and posts the final result. Codex compaction events are reduced to a single `Compacting thread…` status line.
 - Telegram captions are treated as user text too, so captioned media messages can drive harness runs.
 - Inbound Telegram media is staged into `.factory/inbox/telegram/<message_id>/` inside the bound workspace before the run.
 - Images are also forwarded to Codex with `--image` for faster visual response; Claude runs currently receive staged file paths as text context.
@@ -74,6 +75,9 @@ If `BRAIN_BASE_URL` and `BRAIN_IMPORT_TOKEN` are set, successful runs import `.f
 - `/synccommands`
 - `/showcommands`
 - `/workers`
+- `/updates`
+- `/context`
+- `/compact`
 - `/crons`
 - `/cron <subcommand>`
 - `/cron_run <id-or-label>`
@@ -90,6 +94,7 @@ If `BRAIN_BASE_URL` and `BRAIN_IMPORT_TOKEN` are set, successful runs import `.f
 - `/detach`
 - `/tail`
 - `/artifacts`
+- `/shred`
 - `/usage`
 
 `/status` is kept as an alias for `/topicinfo`.
@@ -133,6 +138,10 @@ Use `/mode`, `/model`, and `/effort` to change the Codex runtime for just that t
 
 Captioned image and file messages work in the same bound-topic flow. The control plane stages the inbound files into the workspace first, then runs Codex against that updated workspace.
 
+Use `/context` to inspect the bound context, effective harness, topic overrides or last-probed worker model/effort, session id, paths, and busy state. `/usage` includes the same context header plus latest token usage and manual compaction availability.
+
+Use `/compact` to request manual compaction for a Codex-backed context that already has a session. Claude contexts reply that manual compact is unsupported.
+
 Scheduled jobs can be created either by normal conversation in a bound topic, where Codex writes `.factory/CRON_REQUESTS.json`, or by deterministic job-management commands like `/crons`, `/cron create ...`, and `/cron install ...`.
 
 One-off reminders do not invoke Codex when they fire. Scheduled Codex jobs do, and they reuse the stored context session so proactive thread messages stay in-context.
@@ -150,6 +159,8 @@ If Codex records a real file in `.factory/ARTIFACTS.md` and the user explicitly 
 `/artifacts` shows the artifact notes as text.
 
 `/artifacts send [filter]` uploads matching recorded artifact files into the same Telegram topic.
+
+`/shred` lists cleanup shortcuts for recorded artifacts. It deletes only safe relative files inside the active workspace and removes matching entries from `.factory/ARTIFACTS.md`.
 
 ## Topic lifecycle
 

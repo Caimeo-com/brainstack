@@ -104,6 +104,7 @@ If the remote worker is unavailable, the context is still created and stored as 
 /showcommands
 /whoami
 /topicinfo
+/context
 /crons
 /cron show <id>
 /mode
@@ -117,6 +118,8 @@ If the remote worker is unavailable, the context is still created and stored as 
 /workers
 ```
 
+`/workers` probes configured machines and reports reachability, transport, local execution, harness family, model, thinking effort, and `sudo -n true` status. The model and effort shown for the currently bound topic reflect topic overrides when they apply.
+
 ### Start or continue work
 
 ```text
@@ -126,6 +129,8 @@ If the remote worker is unavailable, the context is still created and stored as 
 ```
 
 Inside a bound topic, plain text starts or resumes the configured harness automatically.
+
+Resume acknowledgements are intentionally silent for normal plain-text/topic resumes. While work is active, the bot sends `typing...`; when Codex reports compaction, Telegram receives only `Compacting thread…` before the final answer.
 
 You can change the harness runtime for the current topic without rebinding it:
 
@@ -202,13 +207,22 @@ Legacy `/bind <slug>` is still accepted to attach the topic to an existing store
 
 ```text
 /tail
+/context
 /artifacts
 /artifacts send
 /artifacts send screenshot
+/shred
 /usage
+/compact
 ```
 
 If a Codex reply says a file was created and recorded in `.factory/ARTIFACTS.md`, you can either ask for it in plain language in the same topic or explicitly run `/artifacts send [filter]` to have the control plane upload the matching file back into Telegram. Artifact paths must be relative paths inside the active workspace by default; absolute paths are rejected unless `FACTORY_ALLOW_ABSOLUTE_ARTIFACT_PATHS=true` is explicitly set.
+
+`/context` shows the current binding, effective harness, topic overrides or last-probed worker model/effort, session id, paths, summary, and log. `/usage` prepends that context header to latest token usage and says whether `/compact` is available.
+
+`/compact` sends Codex the raw `/compact` control prompt for the current stored session. It is accepted only for Codex-backed contexts with an existing session; Claude contexts reply that manual compact is unsupported.
+
+`/shred` lists artifact deletion shortcuts. Deletion removes the file from the active workspace and prunes matching `.factory/ARTIFACTS.md` entries; it is not a secure disk overwrite.
 
 While a job is running, the bot should show a `typing...` indicator in the same topic. That is expected while `/topicinfo` reports `Busy: yes`.
 

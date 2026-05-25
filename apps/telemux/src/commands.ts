@@ -624,6 +624,8 @@ export class CommandHandler {
               "/whoami",
               "/workers",
               "/updates",
+              "/context",
+              "/compact",
               "/crons",
               "/cron <subcommand>",
               "/cron_run <id|label>",
@@ -640,15 +642,16 @@ export class CommandHandler {
               "/detach",
               "/tail",
               "/artifacts",
-        "/artifact_latest",
-        "/shred",
-        "/shred_latest",
+              "/artifact_latest",
+              "/shred",
+              "/shred_latest",
               "/usage",
               "",
               "In a bound topic, plain text starts or resumes the stored Codex session.",
               "Use /artifacts to list tokenized send/send+del shortcuts. Generic requests such as \"send it\" send the latest artifact.",
               "Use /shred to list tokenized cleanup shortcuts.",
               "Use /mode, /model, and /effort to change Codex runtime behavior for this topic without rebinding it.",
+              "Use /context or /usage to inspect the current topic state. Use /compact to compact Codex topics when supported.",
               "Use /crons to inspect scheduled jobs linked to this topic/context. Use /cron install update-check, brain-curator, or daily-checkin to add built-in routines.",
               "Use /cron_run <id|label> or the shortcuts from /crons to test a scheduled job immediately."
             ].join("\n")
@@ -706,20 +709,27 @@ export class CommandHandler {
             target,
             workers.length
               ? workers
-                  .map((worker) =>
-                    [
+                  .map((worker) => {
+                    const runtime = this.workers.describeWorkerRuntime(worker.host, boundContext || undefined);
+                    const probedModel = detailValue(worker.details, "model") || "default";
+                    const probedEffort = detailValue(worker.details, "effort") || "default";
+                    const topicApplies = boundContext?.machine === worker.host;
+                    return [
                       worker.host,
                       `status=${worker.status}`,
                       `transport=${worker.transport || "n/a"}`,
                       `local=${worker.localExecution ? "yes" : "no"}`,
+                      `harness=${runtime?.harness || detailValue(worker.details, "harness") || "n/a"}`,
+                      `model=${topicApplies && boundContext?.modelOverride ? boundContext.modelOverride : probedModel}`,
+                      `effort=${topicApplies && boundContext?.reasoningEffortOverride ? boundContext.reasoningEffortOverride : probedEffort}`,
                       `sudo=${detailValue(worker.details, "sudo") || "n/a"}`,
                       worker.lastSeenAt ? `last_seen=${worker.lastSeenAt}` : null,
                       worker.lastCheckedAt ? `checked=${worker.lastCheckedAt}` : null,
                       worker.lastError ? `error=${compact(worker.lastError, 140)}` : null
                     ]
                       .filter(Boolean)
-                      .join(" | ")
-                  )
+                      .join(" | ");
+                  })
                   .join("\n")
               : "No workers configured."
           );
@@ -757,6 +767,53 @@ export class CommandHandler {
             return;
           }
           await this.telegram.sendText(target, formatUpdateCheckCommandResult(result));
+          return;
+        }
+
+        case "/context": {
+          if (!boundContext) {
+            await this.telegram.sendText(target, "This topic is not bound.");
+            return;
+          }
+
+          await this.telegram.sendText(target, this.formatContextStatus(boundContext));
+          return;
+        }
+
+        case "/compact": {
+          if (!boundContext) {
+            await this.telegram.sendText(target, "This topic is not bound.");
+            return;
+          }
+          if (boundContext.state === "archived") {
+            await this.telegram.sendText(target, `${boundContext.slug} is archived. Use /bind or /newctx first.`);
+            return;
+          }
+          if (this.dispatcher.isActive(boundContext.slug)) {
+            await this.telegram.sendText(target, `${boundContext.slug} already has an active job. Use /topicinfo or /tail.`);
+            return;
+          }
+
+          const runtime = this.workers.describeWorkerRuntime(boundContext.machine, boundContext);
+          if (runtime?.harness !== "codex") {
+            await this.telegram.sendText(target, "Claude has no manual compact support.");
+            return;
+          }
+          if (!boundContext.codexSessionId) {
+            await this.telegram.sendText(target, "No Codex session exists for this context yet.");
+            return;
+          }
+
+          await this.telegram.sendText(target, "Compacting thread…");
+          const response = await this.dispatcher.dispatch("resume", boundContext, "/compact", target, {
+            notifyAccepted: false,
+            notifyCompaction: false,
+            rawPrompt: true,
+            sourceLabel: "manual compact"
+          });
+          if (!response.accepted && response.message) {
+            await this.telegram.sendText(target, response.message);
+          }
           return;
         }
 
@@ -1227,7 +1284,24 @@ export class CommandHandler {
           }
 
           const usage = await summarizeUsage(boundContext);
-          await this.telegram.sendText(target, usage.text);
+          const runtime = this.workers.describeWorkerRuntime(boundContext.machine, boundContext);
+          const compactionStatus =
+            runtime?.harness === "codex"
+              ? boundContext.codexSessionId
+                ? "/compact available"
+                : "available after the first Codex session"
+              : "manual compact unavailable for this harness";
+          await this.telegram.sendText(
+            target,
+            [
+              this.formatContextStatus(boundContext),
+              "",
+              "Usage:",
+              usage.text,
+              "",
+              `Compaction: ${compactionStatus}`
+            ].join("\n")
+          );
           return;
         }
 
@@ -1380,6 +1454,7 @@ export class CommandHandler {
             threadId: context.telegramThreadId
           }
     ).length;
+    const runtime = this.workers.describeWorkerRuntime(context.machine, context);
 
     return [
       `Context: ${context.slug}`,
@@ -1393,6 +1468,9 @@ export class CommandHandler {
       `Root: ${context.rootPath}`,
       `Worktree: ${context.worktreePath}`,
       context.branchName ? `Branch: ${context.branchName}` : null,
+      runtime ? `Harness: ${runtime.harness}` : null,
+      runtime ? `Model: ${runtime.model}` : null,
+      runtime ? `Thinking effort: ${runtime.effort}` : null,
       `Codex mode: ${codexModeSummary(context)}`,
       `Session: ${context.codexSessionId || "none"}`,
       `Last run: ${context.lastRunAt || "never"}`,

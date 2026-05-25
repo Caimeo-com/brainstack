@@ -325,6 +325,24 @@ fi
 
 printf '%s' "$session_id" > "$session_file"
 
+if [[ "$prompt" == "/compact" ]]; then
+  printf '# Summary\\n\\nCompacted thread.\\n' > .factory/SUMMARY.md
+  printf '# TODO\\n\\n- Continue after compaction.\\n' > .factory/TODO.md
+  printf '# Artifacts\\n' > .factory/ARTIFACTS.md
+  cat > .factory/STATE.json <<EOF
+{
+  "sessionId": "$session_id",
+  "turns": $turns
+}
+EOF
+  if [[ -n "$output_file" ]]; then
+    printf 'Compacted thread.' > "$output_file"
+  fi
+  printf '{"type":"thread.compaction.started"}\\n'
+  printf '{"type":"turn.completed","usage":{"input_tokens":2,"cached_input_tokens":0,"output_tokens":1}}\\n'
+  exit 0
+fi
+
 printf '# Summary\\n\\nTurn %s for %s.\\n\\nPrompt: %s\\n' "$turns" "$(basename "$PWD")" "$prompt" > .factory/SUMMARY.md
 printf '%s' "$model" > .factory/fake-model.txt
 printf '%s' "$reasoning" > .factory/fake-reasoning.txt
@@ -379,6 +397,13 @@ else
 fi
 if printf '%s' "$prompt" | grep -q 'slow live session'; then
   sleep 1
+fi
+if printf '%s' "$prompt" | grep -q 'emit compact event'; then
+  printf '{"type":"thread.compaction.started"}\\n'
+fi
+if printf '%s' "$prompt" | grep -q 'emit final compact event without newline'; then
+  printf '{"type":"thread.compaction.started"}'
+  exit 0
 fi
 printf '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}\\n'
 `
@@ -548,6 +573,8 @@ test("phase 1 workflow covers local host/scratch and pending remote behavior", a
     expect(helpText).toContain("/mode [fast|normal|max|clear]");
     expect(helpText).toContain("/model [model-id|clear]");
     expect(helpText).toContain("/effort [low|medium|high|xhigh|clear]");
+    expect(helpText).toContain("/context");
+    expect(helpText).toContain("/compact");
     expect(helpText).toContain("/crons");
     expect(helpText).toContain("/cron <subcommand>");
 
@@ -575,12 +602,12 @@ test("phase 1 workflow covers local host/scratch and pending remote behavior", a
     expect(explainText).toContain("Old Telegram messages stay in Telegram");
 
     await fixture.commands.handleMessage(telegramMessage("Check free disk space and leave a note.", 10));
-    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Dispatched resume for control-general.")));
     await waitFor(() => Boolean(fixture.db.getContextBySlug("control-general")?.codexSessionId));
     const firstSession = fixture.db.getContextBySlug("control-general")?.codexSessionId || "";
     await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for control-general.")));
     expect(firstSession).not.toBe("");
     expect(fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for control-general."))).toBe(true);
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("Dispatched resume for control-general."))).toBe(false);
 
     await fixture.commands.handleMessage(telegramMessage("Continue the same topic.", 10));
     await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 2 for control-general.")));
@@ -631,6 +658,9 @@ test("phase 1 workflow covers local host/scratch and pending remote behavior", a
     expect(workersText).toContain("status=unreachable");
     expect(workersText).toContain("transport=ssh");
     expect(workersText).toContain("local=no");
+    expect(workersText).toContain("harness=codex");
+    expect(workersText).toContain("model=default");
+    expect(workersText).toContain("effort=default");
     expect(workersText).toContain("sudo=ok");
 
     await fixture.commands.handleMessage(
@@ -1629,6 +1659,151 @@ exit 0
     } else {
       process.env.FACTORY_TEST_FAKE_SSH_EXEC = previousFakeSshExec;
     }
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("worker health reads Codex runtime defaults without failing on sparse config", async () => {
+  const fixture = await createFixture();
+  const previousCodexHome = process.env.CODEX_HOME;
+  const codexHome = join(fixture.root, "codex-home");
+  const codexConfig = join(codexHome, "config.toml");
+
+  try {
+    await mkdir(codexHome, { recursive: true });
+    process.env.CODEX_HOME = codexHome;
+
+    await writeFile(codexConfig, "[profiles.default]\nmodel = \"nested-ignored\"\nmodel_reasoning_effort = \"xhigh\"\n");
+    await fixture.commands.handleMessage(telegramMessage("/workers", 89));
+    const sparseText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(sparseText).toContain("control | status=healthy");
+    expect(sparseText).toContain("model=default");
+    expect(sparseText).toContain("effort=default");
+
+    await writeFile(codexConfig, "model = \"gpt-configured\" # inline comment\n[profiles.default]\nmodel = \"nested-ignored\"\n");
+    await fixture.commands.handleMessage(telegramMessage("/workers", 89));
+    const modelOnlyText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(modelOnlyText).toContain("control | status=healthy");
+    expect(modelOnlyText).toContain("model=gpt-configured");
+    expect(modelOnlyText).toContain("effort=default");
+
+    await writeFile(codexConfig, "model_reasoning_effort = \"high\" # inline comment\n[profiles.default]\nmodel_reasoning_effort = \"xhigh\"\n");
+    await fixture.commands.handleMessage(telegramMessage("/workers", 89));
+    const effortOnlyText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(effortOnlyText).toContain("control | status=healthy");
+    expect(effortOnlyText).toContain("model=default");
+    expect(effortOnlyText).toContain("effort=high");
+  } finally {
+    if (previousCodexHome === undefined) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = previousCodexHome;
+    }
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("context usage and manual compaction stay concise and harness-aware", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx compact-empty control scratch", 92));
+    await fixture.commands.handleMessage(telegramMessage("/usage", 92));
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Compaction: available after the first Codex session");
+
+    await fixture.commands.handleMessage(telegramMessage("/newctx compact-lab control scratch", 90));
+    await fixture.commands.handleMessage(telegramMessage("Start the compact lab.", 90));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for compact-lab.")));
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("Dispatched resume for compact-lab."))).toBe(false);
+
+    await fixture.commands.handleMessage(telegramMessage("/context", 90));
+    const contextText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(contextText).toContain("Context: compact-lab");
+    expect(contextText).toContain("Harness: codex");
+    expect(contextText).toContain("Model: default");
+    expect(contextText).toContain("Thinking effort: default");
+
+    await fixture.commands.handleMessage(telegramMessage("/usage", 90));
+    const usageText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(usageText).toContain("Context: compact-lab");
+    expect(usageText).toContain("Usage:");
+    expect(usageText).toContain("Turns counted:");
+    expect(usageText).toContain("Compaction: /compact available");
+
+    const beforeCompactCount = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage("/compact", 90));
+    await waitFor(() => fixture.telegram.sent.some((entry, index) => index >= beforeCompactCount && entry.text.includes("Compacted thread.")));
+    const compactMessages = fixture.telegram.sent.slice(beforeCompactCount).map((entry) => entry.text);
+    expect(compactMessages[0]).toBe("Compacting thread…");
+    expect(compactMessages.some((text) => text.includes("Dispatched resume"))).toBe(false);
+    expect(await readFile(join(fixture.factoryRoot, "scratch", "compact-lab", ".factory", "control-plane.prompt.md"), "utf8")).toBe("/compact");
+
+    const beforeAutoCompactCount = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage("emit compact event", 90));
+    await waitFor(() => fixture.telegram.sent.slice(beforeAutoCompactCount).some((entry) => entry.text === "Compacting thread…"));
+    await waitFor(() => fixture.telegram.sent.slice(beforeAutoCompactCount).some((entry) => entry.text.includes("Reply turn 3 for compact-lab.")));
+
+    const beforeFinalCompactCount = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage("emit final compact event without newline", 90));
+    await waitFor(() => fixture.telegram.sent.slice(beforeFinalCompactCount).some((entry) => entry.text === "Compacting thread…"));
+    await waitFor(() => fixture.telegram.sent.slice(beforeFinalCompactCount).some((entry) => entry.text.includes("Reply turn 4 for compact-lab.")));
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("manual compaction failures are classified without false positives from normal compact text", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx compact-failure control scratch", 93));
+    await fixture.commands.handleMessage(telegramMessage("Start the compact failure lab.", 93));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for compact-failure.")));
+
+    await makeExecutable(
+      fixture.fakeCodex,
+      `#!/usr/bin/env bash
+cat >/dev/null
+echo 'ordinary run mentioned compact and failed' >&2
+exit 31
+`
+    );
+
+    const beforeNormalFailureCount = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage("ordinary compact word failure", 93));
+    await waitFor(() =>
+      fixture.telegram.sent.slice(beforeNormalFailureCount).some((entry) => entry.text.includes("ordinary run mentioned compact and failed"))
+    );
+    expect(fixture.telegram.sent.slice(beforeNormalFailureCount).some((entry) => entry.text.includes("Codex compaction failed."))).toBe(false);
+
+    const beforeManualFailureCount = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage("/compact", 93));
+    await waitFor(() =>
+      fixture.telegram.sent.slice(beforeManualFailureCount).some((entry) => entry.text.includes("Codex compaction failed."))
+    );
+    const manualFailureText = fixture.telegram.sent.slice(beforeManualFailureCount).map((entry) => entry.text).join("\n\n");
+    expect(manualFailureText).toContain("Compacting thread…");
+    expect(manualFailureText).toContain("Log:");
+    expect(manualFailureText).toContain("ordinary run mentioned compact and failed");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("manual compaction reports unsupported harnesses", async () => {
+  const fixture = await createFixture({
+    FACTORY_HARNESS: "claude"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx compact-claude control scratch", 91));
+    await fixture.commands.handleMessage(telegramMessage("/compact", 91));
+    expect(fixture.telegram.sent.at(-1)?.text).toBe("Claude has no manual compact support.");
+  } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }

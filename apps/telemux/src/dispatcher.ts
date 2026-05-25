@@ -32,6 +32,8 @@ export interface DispatchResponse {
 
 export interface DispatchOptions {
   notifyAccepted?: boolean;
+  notifyCompaction?: boolean;
+  rawPrompt?: boolean;
   telegramInput?: TelegramInboundMessageInput | null;
   modelOverride?: string | null;
   reasoningEffortOverride?: ContextRecord["reasoningEffortOverride"];
@@ -71,6 +73,23 @@ function defaultInstruction(context: ContextRecord, mode: DispatchMode): string 
   }
 
   return "";
+}
+
+function acceptedMessage(mode: DispatchMode, context: ContextRecord, logPath: string, notifyAccepted: boolean | undefined): string {
+  if (notifyAccepted === false || (mode === "resume" && notifyAccepted !== true)) {
+    return "";
+  }
+
+  return [`Dispatched ${mode} for ${context.slug}.`, `Machine: ${context.machine}`, `Log: ${logPath}`].join("\n");
+}
+
+function formatRunFailureForTelegram(errorText: string | null, logPath: string, manualCompaction: boolean): string {
+  const message = errorText?.trim() || "unknown error";
+  if (manualCompaction || /(?:codex_core::compact_remote|remote compaction failed|compact_error=|compaction failed)/i.test(message)) {
+    return ["Codex compaction failed.", `Log: ${logPath}`, `Error: ${snippet(message)}`].join("\n");
+  }
+
+  return message;
 }
 
 function buildPrompt(context: ContextRecord, mode: DispatchMode, instruction: string, telegramPromptSection: string | null = null): string {
@@ -231,14 +250,7 @@ export class Dispatcher {
 
     return {
       accepted: true,
-      message:
-        options.notifyAccepted === false
-          ? ""
-          : [
-              `Dispatched ${mode} for ${savedContext.slug}.`,
-              `Machine: ${savedContext.machine}`,
-              `Log: ${logPath}`
-            ].join("\n")
+      message: acceptedMessage(mode, savedContext, logPath, options.notifyAccepted)
     };
   }
 
@@ -342,12 +354,20 @@ export class Dispatcher {
         return;
       }
 
-      const prompt = buildPrompt(currentBeforeWorker, mode, instruction, preparedTelegramInput?.promptSection || null);
+      const prompt = options.rawPrompt ? instruction : buildPrompt(currentBeforeWorker, mode, instruction, preparedTelegramInput?.promptSection || null);
+      let compactionNotified = false;
       const result = await this.workers.runCodex(currentBeforeWorker, prompt, mode, logPath, {
         workspaceFiles: preparedTelegramInput?.workspaceFiles,
         imagePaths: preparedTelegramInput?.imagePaths,
         modelOverride: options.modelOverride ?? currentBeforeWorker.modelOverride,
         reasoningEffortOverride: options.reasoningEffortOverride ?? currentBeforeWorker.reasoningEffortOverride,
+        onCompaction: async () => {
+          if (options.notifyCompaction === false || compactionNotified) {
+            return;
+          }
+          compactionNotified = true;
+          await this.telegram.sendText(replyTarget, "Compacting thread…");
+        },
         onSessionId: async (sessionId) => {
           const current = this.db.getContextBySlug(context.slug) || currentBeforeWorker;
           if (current.state === "archived") {
@@ -425,7 +445,7 @@ export class Dispatcher {
         [
           `${saved.slug} failed on ${saved.machine}.`,
           `state=${saved.state} transport=${result.transport} exit=${result.exitCode}`,
-          saved.lastError || "unknown error"
+          formatRunFailureForTelegram(saved.lastError, logPath, Boolean(options.rawPrompt && instruction.trim() === "/compact"))
         ].join("\n")
       );
     } finally {

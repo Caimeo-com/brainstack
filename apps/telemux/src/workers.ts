@@ -56,6 +56,7 @@ export interface WorkspaceSeedFile {
 
 export interface CodexRunOptions {
   onSessionId?: (sessionId: string) => Promise<void> | void;
+  onCompaction?: () => Promise<void> | void;
   workspaceFiles?: WorkspaceSeedFile[];
   imagePaths?: string[];
   modelOverride?: string | null;
@@ -153,6 +154,40 @@ function cleanArtifactDeletePath(filePath: string): string {
 function probeField(output: string, key: string): string | null {
   const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return output.match(new RegExp(`^${escaped}=([^\\n]*)$`, "m"))?.[1]?.trim() || null;
+}
+
+function eventLooksLikeCompaction(value: unknown): boolean {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  if (Array.isArray(value)) {
+    return value.some(eventLooksLikeCompaction);
+  }
+
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof child === "string" && /^(type|event|kind|name|status)$/.test(key) && /compact/i.test(child)) {
+      return true;
+    }
+    if (child && typeof child === "object" && eventLooksLikeCompaction(child)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function lineLooksLikeCompactionEvent(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{")) {
+    return false;
+  }
+
+  try {
+    return eventLooksLikeCompaction(JSON.parse(trimmed));
+  } catch {
+    return false;
+  }
 }
 
 function parseSessionId(output: string): string | null {
@@ -315,11 +350,13 @@ export class WorkerService {
         `harness=${quoteSh(harness.family)}`,
         `harness_bin=${quoteSh(harness.bin)}`,
         ...(worker.transport === "local" ? [workerUserPathPrelude()] : []),
+        "brainstack_config_value() { key=\"$1\"; file=\"$2\"; [ -f \"$file\" ] || return 0; awk -v key=\"$key\" 'BEGIN { in_section=0 } /^[[:space:]]*\\[/ { in_section=1 } in_section == 0 { pattern=\"^[[:space:]]*\" key \"[[:space:]]*=\"; if ($0 ~ pattern) { sub(/^[^=]*=[[:space:]]*/, \"\"); sub(/[[:space:]]*#.*/, \"\"); gsub(/^[[:space:]\"]+|[[:space:]\"]+$/, \"\"); print; exit } }' \"$file\" || true; }",
         "printf 'harness=%s\\n' \"$harness\"",
         "if command -v \"$harness_bin\" >/dev/null 2>&1; then printf 'harness_bin=1\\n'; else printf 'harness_bin=0\\n'; fi",
         "printf 'harness_version=%s\\n' \"$($harness_bin --version 2>&1 | head -n 1 || true)\"",
         "if [ \"$harness\" = codex ]; then help=\"$($harness_bin exec --help 2>&1 || true)\"; else help=\"$($harness_bin --help 2>&1 || true)\"; fi",
         ...requiredHarnessFlags(harness.family).map((needle) => `case "$help" in *${quoteSh(needle)}*) printf 'flag:${needle}=1\\n' ;; *) printf 'flag:${needle}=0\\n' ;; esac`),
+        "if [ \"$harness\" = codex ]; then codex_config=\"${CODEX_HOME:-$HOME/.codex}/config.toml\"; model_config=\"$(brainstack_config_value model \"$codex_config\")\"; effort_config=\"$(brainstack_config_value model_reasoning_effort \"$codex_config\")\"; printf 'model=%s\\n' \"${model_config:-default}\"; printf 'effort=%s\\n' \"${effort_config:-default}\"; else printf 'model=default\\n'; printf 'effort=n/a\\n'; fi",
         "if command -v sudo >/dev/null 2>&1; then if sudo -n true >/dev/null 2>&1; then printf 'sudo=ok\\n'; else printf 'sudo=fail\\n'; fi; else printf 'sudo=missing\\n'; fi",
         "printf 'home=%s\\n' \"$HOME\""
       ].join("\n"),
@@ -362,6 +399,26 @@ export class WorkerService {
     };
 
     return this.db.saveWorker(workerRecord);
+  }
+
+  describeWorkerRuntime(host: string, context?: ContextRecord): { harness: HarnessName; harnessBin: string; model: string; effort: string } | null {
+    const worker = this.getWorkerConfig(host);
+    if (!worker) {
+      return null;
+    }
+
+    const contextOverride = context?.machine === host ? context : undefined;
+    const harness = this.resolveHarness(worker, contextOverride);
+    const latestProbe = this.db.getWorker(host);
+    const probedModel = probeField(latestProbe?.details || "", "model");
+    const probedEffort = probeField(latestProbe?.details || "", "effort");
+
+    return {
+      harness: harness.family,
+      harnessBin: harness.bin,
+      model: contextOverride?.modelOverride?.trim() || probedModel || "default",
+      effort: contextOverride?.reasoningEffortOverride?.trim() || probedEffort || "default"
+    };
   }
 
   async bootstrapContext(request: ContextBootstrapRequest): Promise<BootstrapResult> {
@@ -666,7 +723,9 @@ wait "$harness_pid"
     }
 
     let stdoutBuffer = "";
+    let stdoutLineBuffer = "";
     let seenSessionId: string | null = null;
+    let seenCompaction = false;
     const result = await this.runWorkerScript(worker, script, logPath, this.config.workerRunTimeoutSeconds, async (chunk) => {
       stdoutBuffer += chunk;
       const detected = parseSessionId(stdoutBuffer);
@@ -674,7 +733,18 @@ wait "$harness_pid"
         seenSessionId = detected;
         await options.onSessionId?.(detected);
       }
+      stdoutLineBuffer += chunk;
+      const lines = stdoutLineBuffer.split(/\r?\n/);
+      stdoutLineBuffer = lines.pop() || "";
+      if (!seenCompaction && lines.some(lineLooksLikeCompactionEvent)) {
+        seenCompaction = true;
+        await options.onCompaction?.();
+      }
     });
+    if (!seenCompaction && lineLooksLikeCompactionEvent(stdoutLineBuffer)) {
+      seenCompaction = true;
+      await options.onCompaction?.();
+    }
 
     return {
       ...result,
