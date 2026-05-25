@@ -114,6 +114,11 @@ const writeConcurrencyLimit =
   Number.isFinite(configuredWriteConcurrency) && configuredWriteConcurrency > 0
     ? Math.trunc(configuredWriteConcurrency)
     : 1;
+const configuredImportPreparationConcurrency = Number(process.env.BRAIN_IMPORT_PREPARATION_CONCURRENCY || "");
+const importPreparationConcurrencyLimit =
+  Number.isFinite(configuredImportPreparationConcurrency) && configuredImportPreparationConcurrency > 0
+    ? Math.trunc(configuredImportPreparationConcurrency)
+    : Math.max(1, writeConcurrencyLimit);
 const configuredRateLimit = Number(process.env.BRAIN_WRITE_RATE_LIMIT_PER_MINUTE || "");
 const writeRateLimitPerMinute =
   Number.isFinite(configuredRateLimit) && configuredRateLimit > 0
@@ -1457,9 +1462,9 @@ async function withMutationGate<T>(run: () => Promise<T>): Promise<T> {
 
 async function withImportPreparationGate<T>(run: () => Promise<T>): Promise<T> {
   const startedAt = Date.now();
-  while (activeImportPreparations >= writeConcurrencyLimit) {
+  while (activeImportPreparations >= importPreparationConcurrencyLimit) {
     if (Date.now() - startedAt > mutationQueueWaitMs) {
-      reject(503, `import preparation queue timed out after ${mutationQueueWaitMs}ms; limit=${writeConcurrencyLimit}`);
+      reject(503, `import preparation queue timed out after ${mutationQueueWaitMs}ms; limit=${importPreparationConcurrencyLimit}`);
     }
     await Bun.sleep(50);
   }
@@ -1757,7 +1762,7 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
     }
     assertWriteRateLimit(request, authScope, "import", requestShape.source_machine);
     return await withIdempotency(request, "import", requestHash, async (markSideEffectStarted) => {
-      const upstream = await safeFetchImportUrl(sourceUrl);
+      const upstream = await withImportPreparationGate(async () => safeFetchImportUrl(sourceUrl));
       if (!upstream.ok) {
         reject(400, `URL fetch failed: ${upstream.status} ${upstream.statusText}`);
       }
@@ -2083,7 +2088,7 @@ const server = Bun.serve({
       if (request.method === "POST" && url.pathname === "/api/import") {
         const authScope = assertImportAuth(request);
         assertPreBodyWriteRateLimit(request, authScope, "import");
-        return json(await withImportPreparationGate(async () => await importFromRequest(request, authScope)));
+        return json(await importFromRequest(request, authScope));
       }
       if (request.method === "POST" && url.pathname === "/api/ingest") {
         assertAdminAuth(request);

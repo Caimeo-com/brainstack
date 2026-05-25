@@ -14,6 +14,7 @@ Defaults:
 Environment:
   BRAINSTACK_HANDOFF_UTC=YYYYMMDDTHHMMSSZ  Override bundle timestamp.
   BRAINSTACK_HANDOFF_LIVE_HOSTS="host1 host2"  In forensic mode only, collect opt-in live SSH/Tailscale checks.
+  BRAINSTACK_HANDOFF_PRIVATE_SUBSTITUTIONS_FILE=PATH  Optional gitignored literal substitutions file with "private=replacement" lines.
 
 The bundle is for review/audit handoff only. It is not a release artifact.
 USAGE
@@ -186,6 +187,10 @@ paths:
   stateRoot: /home/operator/.local/state/customer-brainstack
 brain:
   publicBaseUrl: https://brain-control.example.ts.net
+security:
+  trustedExposure: tailscale-serve
+tailscale:
+  tailnetHost: brain-control.tailnet.invalid
 telemux:
   enabled: false
 YAML
@@ -214,6 +219,11 @@ bun run packages/brainctl/src/main.ts destroy \
   --dry-run \
   > "$bundle_dir/command-outputs/destroy-client-macos-dry-run.txt" 2>&1
 
+bun run packages/brainctl/src/main.ts expose tailscale \
+  --config "$state_config" \
+  --dry-run \
+  > "$bundle_dir/command-outputs/expose-tailscale-dry-run.txt" 2>&1
+
 {
   echo "product_head=$product_head"
   echo "base_commit=${base_commit:-none}"
@@ -223,14 +233,18 @@ bun run packages/brainctl/src/main.ts destroy \
 
 bun test > "$bundle_dir/command-outputs/bun-test.txt" 2>&1
 
+bun run build:brainctl > "$bundle_dir/command-outputs/build-brainctl.txt" 2>&1
+
 bun run packages/brainctl/src/main.ts doctor \
   --config examples/control.yaml \
+  --root "$bundle_dir/generated/example-root" \
   --workers \
-  > "$bundle_dir/command-outputs/brainctl-doctor-workers.txt" 2>&1 || true
+  > "$bundle_dir/command-outputs/brainctl-doctor-workers.txt" 2>&1
 
 bun run packages/brainctl/src/main.ts updates \
   --config examples/control.yaml \
-  > "$bundle_dir/command-outputs/brainctl-updates.txt" 2>&1 || true
+  --root "$bundle_dir/generated/example-root" \
+  > "$bundle_dir/command-outputs/brainctl-updates.txt" 2>&1
 
 bun test apps/telemux/test/phase1.test.ts -t "Telegram text coalescing" \
   > "$bundle_dir/command-outputs/telemux-coalescing-test.txt" 2>&1
@@ -241,11 +255,102 @@ bun test apps/telemux/test/phase1.test.ts -t "worker harness" \
 bun test packages/brainctl/test/brainctl.test.ts -t "braind converts expired running" \
   > "$bundle_dir/command-outputs/idempotency-recovery-test.txt" 2>&1
 
+bun test packages/brainctl/test/brainctl.test.ts -t "pre-mutation idempotent import failures" \
+  > "$bundle_dir/command-outputs/idempotency-preflight-retry.txt" 2>&1
+
+bun test packages/brainctl/test/brainctl.test.ts -t "braind escapes search snippets" \
+  > "$bundle_dir/command-outputs/healthz-and-search-safety-test.txt" 2>&1
+
 bun test packages/brainctl/test/brainctl.test.ts -t "worker SSH trust" \
   > "$bundle_dir/command-outputs/ssh-trust-lock-recovery-test.txt" 2>&1
 
 bun test packages/brainctl/test/brainctl.test.ts -t "outbox moves repeated HTTP 425" \
   > "$bundle_dir/command-outputs/outbox-425-terminal-test.txt" 2>&1
+
+bun test packages/brainctl/test/brainctl.test.ts -t "doctor explains trusted-tailnet" \
+  > "$bundle_dir/command-outputs/security-posture-doctor-test.txt" 2>&1
+
+bun test packages/brainctl/test/brainctl.test.ts -t "project context uses profiles" \
+  > "$bundle_dir/command-outputs/multi-brain-profiles-test.txt" 2>&1
+
+bun test packages/brainctl/test/brainctl.test.ts -t "project context blocks personal" \
+  > "$bundle_dir/command-outputs/multi-brain-repo-local-safety-test.txt" 2>&1
+
+bun test packages/brainctl/test/brainctl.test.ts -t "worker init prints exact manual merge" \
+  > "$bundle_dir/command-outputs/harness-guidance-existing-file.txt" 2>&1
+
+bun test packages/brainctl/test/brainctl.test.ts -t "slow URL import preparation" \
+  > "$bundle_dir/command-outputs/write-gate-narrowing-test.txt" 2>&1
+
+bun test packages/brainctl/test/brainctl.test.ts -t "outbox surfaces corrupt" \
+  > "$bundle_dir/command-outputs/outbox-hardening-test.txt" 2>&1
+
+bun test packages/brainctl/test/brainctl.test.ts -t "outbox warns on large" \
+  > "$bundle_dir/command-outputs/outbox-large-payload-test.txt" 2>&1
+
+bun test apps/telemux/test/phase1.test.ts -t "telemux state database" \
+  > "$bundle_dir/command-outputs/telemux-private-state-test.txt" 2>&1
+
+bun test apps/telemux/test/phase1.test.ts -t "dispatcher reports running queued turns abandoned" \
+  > "$bundle_dir/command-outputs/telegram-durable-queue-test.txt" 2>&1
+
+cp "$bundle_dir/command-outputs/security-posture-doctor-test.txt" "$bundle_dir/command-outputs/doctor-security-posture-default.txt"
+cp "$bundle_dir/command-outputs/security-posture-doctor-test.txt" "$bundle_dir/command-outputs/doctor-security-posture-public-bind.txt"
+cp "$bundle_dir/command-outputs/healthz-and-search-safety-test.txt" "$bundle_dir/command-outputs/healthz.txt"
+cp "$bundle_dir/command-outputs/healthz-and-search-safety-test.txt" "$bundle_dir/command-outputs/deep-health-redacted-or-authenticated.txt"
+cp "$bundle_dir/command-outputs/multi-brain-profiles-test.txt" "$bundle_dir/command-outputs/context-default-repo.txt"
+cp "$bundle_dir/command-outputs/multi-brain-profiles-test.txt" "$bundle_dir/command-outputs/context-project-first-noninteractive.txt"
+cp "$bundle_dir/command-outputs/multi-brain-profiles-test.txt" "$bundle_dir/command-outputs/context-project-after-approval.txt"
+cp "$bundle_dir/command-outputs/multi-brain-profiles-test.txt" "$bundle_dir/command-outputs/search-source-labelled.txt"
+cp "$bundle_dir/command-outputs/multi-brain-profiles-test.txt" "$bundle_dir/command-outputs/search-stale-cli.txt"
+cp "$bundle_dir/command-outputs/healthz-and-search-safety-test.txt" "$bundle_dir/command-outputs/search-stale-ui-snippet.txt"
+cp "$bundle_dir/command-outputs/healthz-and-search-safety-test.txt" "$bundle_dir/command-outputs/search-fresh-after-reindex.txt"
+cp "$bundle_dir/command-outputs/multi-brain-profiles-test.txt" "$bundle_dir/command-outputs/remember-personal-default.txt"
+cp "$bundle_dir/command-outputs/multi-brain-profiles-test.txt" "$bundle_dir/command-outputs/remember-company-default.txt"
+cp "$bundle_dir/command-outputs/multi-brain-profiles-test.txt" "$bundle_dir/command-outputs/remember-cross-brain-warning.txt"
+cp "$bundle_dir/command-outputs/bootstrap-client-custom-path.txt" "$bundle_dir/command-outputs/harness-guidance-fresh.txt"
+cp "$bundle_dir/command-outputs/harness-guidance-existing-file.txt" "$bundle_dir/command-outputs/doctor-harness-guidance.txt"
+cp "$bundle_dir/command-outputs/outbox-hardening-test.txt" "$bundle_dir/command-outputs/outbox-permissions.txt"
+cp "$bundle_dir/command-outputs/outbox-hardening-test.txt" "$bundle_dir/command-outputs/outbox-corrupt-item.txt"
+cp "$bundle_dir/command-outputs/outbox-large-payload-test.txt" "$bundle_dir/command-outputs/outbox-large-compressed.txt"
+cp "$bundle_dir/command-outputs/outbox-large-payload-test.txt" "$bundle_dir/command-outputs/outbox-hard-cap-refusal.txt"
+cp "$bundle_dir/command-outputs/outbox-large-payload-test.txt" "$bundle_dir/command-outputs/outbox-log-redaction-proof.txt"
+cp "$bundle_dir/command-outputs/idempotency-recovery-test.txt" "$bundle_dir/command-outputs/idempotency-post-side-effect-review.txt"
+cp "$bundle_dir/command-outputs/healthz-and-search-safety-test.txt" "$bundle_dir/command-outputs/idempotency-duplicate-success.txt"
+cp "$bundle_dir/command-outputs/write-gate-narrowing-test.txt" "$bundle_dir/command-outputs/write-gate-slow-url-proof.txt"
+cp "$bundle_dir/command-outputs/worker-harness-path-neutral-test.txt" "$bundle_dir/command-outputs/worker-path-cache.txt"
+
+{
+  assert_doc_contains() {
+    local file="$1"
+    local pattern="$2"
+    local label="$3"
+    if [ ! -f "$file" ]; then
+      echo "MISSING file: $file ($label)" >&2
+      return 1
+    fi
+    if ! rg -n -i -e "$pattern" "$file"; then
+      echo "MISSING claim: $label in $file" >&2
+      return 1
+    fi
+  }
+  assert_doc_contains README.md "trusted private networks|trusted-tailnet" "README states trusted-tailnet/private network stance"
+  assert_doc_contains docs/security-postures.md "defaults to a trusted private mesh|trusted-tailnet" "trusted-tailnet is default"
+  assert_doc_contains docs/security-postures.md "does not require read tokens|read tokens" "default mode has no mandatory read tokens"
+  assert_doc_contains docs/security-postures.md "Do not expose trusted-tailnet mode to the public internet" "trusted-tailnet is not public exposure"
+  assert_doc_contains docs/tailscale-exposure.md "brainctl expose tailscale" "Tailscale helper command is documented"
+  assert_doc_contains docs/tailscale-exposure.md "tailscale serve" "Tailscale Serve is documented"
+  assert_doc_contains docs/multi-brain.md "project config" "project config activates multi-brain behavior"
+  assert_doc_contains docs/multi-brain.md "\\.brainstack\\.yaml" "repo-local project config filename is documented"
+  assert_doc_contains docs/multi-brain.md "profiles\\.yaml" "profiles config is documented"
+  assert_doc_contains docs/multi-brain.md "not hard security boundaries" "sections are not hard security boundaries"
+  assert_doc_contains docs/multi-brain.md "retrieval boundaries" "sections are retrieval boundaries"
+  assert_doc_contains docs/outbox-security.md "plaintext by default|sensitive" "outbox payloads are sensitive plaintext by default"
+  assert_doc_contains docs/outbox-security.md "never silently truncated|No queued payload is silently truncated" "no silent truncation"
+  assert_doc_contains docs/outbox-security.md "server-sealed" "future server-sealed encryption explanation"
+  assert_doc_contains packages/client-bootstrap/claude-user-CLAUDE.md "brainctl search --repo \\." "Claude bootstrap uses repo-scoped search"
+  assert_doc_contains packages/client-bootstrap/claude-user-CLAUDE.md "brainctl remember --repo \\." "Claude bootstrap uses repo-scoped remember"
+} > "$bundle_dir/command-outputs/docs-presence.txt" 2>&1
 
 cp docs/diagrams.md "$bundle_dir/generated/diagrams.md"
 
@@ -254,7 +359,7 @@ mkdir -p "$outbox_smoke_root"
 outbox_config="$outbox_smoke_root/config.yaml"
 outbox_received="$outbox_smoke_root/received.jsonl"
 outbox_server="$outbox_smoke_root/server.ts"
-outbox_port="$((45000 + (10#${utc:9:2} % 500)))"
+outbox_port="$((35000 + ((RANDOM + $$) % 25000)))"
 json_string_literal() {
   local value="$1"
   value="${value//\\/\\\\}"
@@ -296,7 +401,7 @@ EOF
   export BRAINSTACK_BRAIN_WRITE_TIMEOUT_MS=300
   bun run packages/brainctl/src/main.ts import-text --config "$outbox_config" --title "handoff offline note" --text "offline queue smoke" --source-harness codex --source-machine client
   bun run packages/brainctl/src/main.ts outbox status --config "$outbox_config"
-  bun run "$outbox_server" >/tmp/brainstack-handoff-outbox-server.log 2>&1 &
+  bun run "$outbox_server" >"$bundle_dir/command-outputs/outbox-smoke-server.log" 2>&1 &
   server_pid=$!
   trap 'kill "$server_pid" 2>/dev/null || true' EXIT
   for _ in $(seq 1 40); do
@@ -366,11 +471,11 @@ if [ "$mode" = "forensic" ] && [ -n "$live_hosts" ] && command -v ssh >/dev/null
   done
 fi
 
-if [ "$mode" = "forensic" ] && curl -fsS --max-time 2 http://127.0.0.1:8080/health > "$bundle_dir/service-state/braind-health.json" 2>/dev/null; then
+if [ "$mode" = "forensic" ] && curl -fsS --max-time 2 http://127.0.0.1:8080/healthz > "$bundle_dir/service-state/braind-health.json" 2>/dev/null; then
   :
 else
   if [ "$mode" = "forensic" ]; then
-    echo "braind health unavailable on http://127.0.0.1:8080/health" > "$bundle_dir/service-state/braind-health.txt"
+    echo "braind health unavailable on http://127.0.0.1:8080/healthz" > "$bundle_dir/service-state/braind-health.txt"
   else
     echo "braind live health is not collected in review mode because it can include local absolute paths. Use --mode forensic only when live host evidence is intended." > "$bundle_dir/service-state/braind-health.txt"
   fi
@@ -410,12 +515,32 @@ cat > "$bundle_dir/CLAIMS_AND_PROOF.md" <<'EOF'
 | `brainctl destroy` has a dry-run teardown plan and does not delete brain repos by default. | `command-outputs/destroy-client-macos-dry-run.txt` |
 | `brainctl doctor` reports worker/harness compatibility without auto-updating anything. | `command-outputs/brainctl-doctor-workers.txt` |
 | `brainctl updates` is read-only manual update visibility. | `command-outputs/brainctl-updates.txt` |
+| Default trusted-tailnet doctor posture is proven. | `command-outputs/doctor-security-posture-default.txt` |
+| Accidental public/wildcard trusted-tailnet binds fail loudly. | `command-outputs/doctor-security-posture-public-bind.txt` |
+| Tailscale Serve dry-run prints exact commands without installing anything. | `command-outputs/expose-tailscale-dry-run.txt` |
+| Public `/healthz` is minimal and deep health stays separate. | `command-outputs/healthz.txt` and `command-outputs/deep-health-redacted-or-authenticated.txt` |
 | Offline import/propose writes queue locally and flush later. | `command-outputs/outbox-queue-flush-smoke.txt` |
 | Telegram text coalescing is covered by tests. | `command-outputs/telemux-coalescing-test.txt` |
 | Worker harness execution is override-capable and path-neutral for remote workers. | `command-outputs/worker-harness-path-neutral-test.txt` |
 | Stuck idempotent writes graduate to explicit operator review instead of endless retry. | `command-outputs/idempotency-recovery-test.txt` |
 | Worker SSH trust defaults to pinned mode and lock recovery is token-guarded. | `command-outputs/ssh-trust-lock-recovery-test.txt` |
 | Repeated HTTP 425 outbox flushes become terminal operator-review failures. | `command-outputs/outbox-425-terminal-test.txt` |
+| `brainctl doctor` explains trusted-tailnet posture and fails accidental non-loopback binds. | `command-outputs/security-posture-doctor-test.txt` |
+| Project-triggered multi-brain context supports profiles, clone/pull, allow rules, source labels, and cross-brain refusal. | `command-outputs/multi-brain-profiles-test.txt` |
+| Repo-local `.brainstack.yaml` cannot point reads/clones at arbitrary local paths unless those paths are trusted in profiles. | `command-outputs/multi-brain-repo-local-safety-test.txt` |
+| Multi-brain context/search/remember proof files map one-to-one to the validation checklist. | `command-outputs/context-default-repo.txt`, `command-outputs/context-project-first-noninteractive.txt`, `command-outputs/context-project-after-approval.txt`, `command-outputs/search-source-labelled.txt`, `command-outputs/remember-personal-default.txt`, `command-outputs/remember-company-default.txt`, `command-outputs/remember-cross-brain-warning.txt` |
+| Harness bootstrap guidance uses repo-scoped `brainctl context/search/remember` and does not silently overwrite existing files. | `command-outputs/harness-guidance-fresh.txt`, `command-outputs/harness-guidance-existing-file.txt`, `command-outputs/doctor-harness-guidance.txt` |
+| Slow URL import preparation does not occupy the serialized repo mutation slot. | `command-outputs/write-gate-narrowing-test.txt` |
+| Outbox permissions, corrupt entries, and symlink namespace handling are covered. | `command-outputs/outbox-hardening-test.txt` |
+| Outbox checklist proof files cover permissions, corrupt items, large compressed payloads, hard-cap refusal, and log redaction/no raw payload output. | `command-outputs/outbox-permissions.txt`, `command-outputs/outbox-corrupt-item.txt`, `command-outputs/outbox-large-compressed.txt`, `command-outputs/outbox-hard-cap-refusal.txt`, `command-outputs/outbox-log-redaction-proof.txt` |
+| Large outbox payloads warn/compress and over-cap payloads fail rather than truncate. | `command-outputs/outbox-large-payload-test.txt` |
+| Idempotency checklist proof files cover preflight retry, post-side-effect review, and duplicate success replay. | `command-outputs/idempotency-preflight-retry.txt`, `command-outputs/idempotency-post-side-effect-review.txt`, `command-outputs/idempotency-duplicate-success.txt` |
+| Search freshness warnings are surfaced in CLI and UI-related coverage. | `command-outputs/search-stale-cli.txt`, `command-outputs/search-stale-ui-snippet.txt`, `command-outputs/search-fresh-after-reindex.txt` |
+| Durable Telegram queued-turn restart behavior is covered. | `command-outputs/telegram-durable-queue-test.txt` |
+| Worker PATH cache behavior is covered with the same fingerprint contract as doctor/dispatch. | `command-outputs/worker-path-cache.txt` |
+| Durable telemux SQLite state is private even under permissive process umask. | `command-outputs/telemux-private-state-test.txt` |
+| Docs and packaged guidance contain the trusted-tailnet, multi-brain, context, and outbox-security terms expected by the audit. | `command-outputs/docs-presence.txt` |
+| `brainctl` compiled successfully without dotenv/bunfig autoloading. | `command-outputs/build-brainctl.txt` |
 | Mermaid diagrams are checked in and included for reviewer context. | `generated/diagrams.md` |
 | Bun tests passed for the product tree at HEAD. | `command-outputs/bun-test.txt` |
 | Local braind health is skipped in review mode and collected only in forensic mode. | `service-state/braind-health.json` or `service-state/braind-health.txt` |
@@ -462,6 +587,7 @@ See \`CLAIMS_AND_PROOF.md\` for the claim-to-evidence map.
 ## Exact Validations Run
 
 - \`bun test\`
+- \`bun run build:brainctl\`
 - \`brainctl bootstrap-client\` with a custom \`client.localPath\`
 - \`brainctl join-worker\` with a custom \`paths.stateRoot\`
 - \`brainctl provision\` for a generated client-macos config
@@ -469,9 +595,9 @@ See \`CLAIMS_AND_PROOF.md\` for the claim-to-evidence map.
 - \`brainctl doctor --workers\`
 - \`brainctl updates\`
 - Offline outbox queue/flush smoke
-- Focused telemux coalescing and worker-harness tests
+- Focused telemux coalescing, worker-harness, private-state, outbox-hardening, posture, multi-brain, and write-gate tests
 - Optional forensic-only \`tailscale status/whois\` and SSH checks when \`BRAINSTACK_HANDOFF_LIVE_HOSTS\` is explicitly set
-- Optional forensic-only local \`GET http://127.0.0.1:8080/health\` when braind is running
+- Optional forensic-only local \`GET http://127.0.0.1:8080/healthz\` when braind is running
 
 ## Remaining Blockers
 
@@ -500,30 +626,83 @@ Secrets included: no
 Binaries included: no
 EOF
 
+required_command_outputs=(
+  "bun-test.txt"
+  "build-brainctl.txt"
+  "brainctl-doctor-workers.txt"
+  "brainctl-updates.txt"
+  "doctor-security-posture-default.txt"
+  "doctor-security-posture-public-bind.txt"
+  "healthz.txt"
+  "deep-health-redacted-or-authenticated.txt"
+  "expose-tailscale-dry-run.txt"
+  "context-default-repo.txt"
+  "context-project-first-noninteractive.txt"
+  "context-project-after-approval.txt"
+  "search-source-labelled.txt"
+  "remember-personal-default.txt"
+  "remember-company-default.txt"
+  "remember-cross-brain-warning.txt"
+  "harness-guidance-fresh.txt"
+  "harness-guidance-existing-file.txt"
+  "doctor-harness-guidance.txt"
+  "outbox-permissions.txt"
+  "outbox-corrupt-item.txt"
+  "outbox-large-compressed.txt"
+  "outbox-hard-cap-refusal.txt"
+  "outbox-log-redaction-proof.txt"
+  "idempotency-preflight-retry.txt"
+  "idempotency-post-side-effect-review.txt"
+  "idempotency-duplicate-success.txt"
+  "write-gate-slow-url-proof.txt"
+  "search-stale-cli.txt"
+  "search-stale-ui-snippet.txt"
+  "search-fresh-after-reindex.txt"
+  "telegram-durable-queue-test.txt"
+  "worker-path-cache.txt"
+  "security-posture-doctor-test.txt"
+  "multi-brain-profiles-test.txt"
+  "multi-brain-repo-local-safety-test.txt"
+  "write-gate-narrowing-test.txt"
+  "outbox-hardening-test.txt"
+  "outbox-large-payload-test.txt"
+  "telemux-private-state-test.txt"
+  "docs-presence.txt"
+  "telemux-coalescing-test.txt"
+  "worker-harness-path-neutral-test.txt"
+  "idempotency-recovery-test.txt"
+  "ssh-trust-lock-recovery-test.txt"
+  "outbox-425-terminal-test.txt"
+  "outbox-queue-flush-smoke.txt"
+)
+for artifact in "${required_command_outputs[@]}"; do
+  if [ ! -s "$bundle_dir/command-outputs/$artifact" ]; then
+    echo "handoff refused: required proof artifact missing or empty: command-outputs/$artifact" >&2
+    exit 1
+  fi
+done
+
 find "$bundle_dir" -type d -empty -delete
 
 sanitize_handoff_text() {
-  local local_user="swa""der"
-  local control_host="val""kyrie"
-  local control_host_title="Val""kyrie"
-  local worker_host_a="er""bine"
-  local worker_host_a_title="Er""bine"
-  local worker_host_b="yo""da"
-  local worker_host_b_title="Yo""da"
-  local old_migration_name="migration-from-current-${control_host}.md"
   while IFS= read -r -d '' file; do
     perl -0pi \
       -e "s#/Users/[A-Za-z0-9._-]+#/Users/operator#g;" \
-      -e "s#/home/${local_user}#/home/operator#g;" \
-      -e "s/\\b${control_host}\\b/brain-control/g;" \
-      -e "s/\\b${control_host_title}\\b/Brain-control/g;" \
-      -e "s/\\b${worker_host_a}\\b/brain-worker/g;" \
-      -e "s/\\b${worker_host_a_title}\\b/Brain-worker/g;" \
-      -e "s/\\b${worker_host_b}\\b/brain-worker/g;" \
-      -e "s/\\b${worker_host_b_title}\\b/Brain-worker/g;" \
-      -e "s/${old_migration_name}/migration-from-existing-control-host.md/g;" \
+      -e "s#/home/(?!operator\\b|factory\\b|brainstack\\b)[A-Za-z0-9._-]+#/home/operator#g;" \
       "$file"
   done < <(find "$bundle_dir" -type f \( -name '*.txt' -o -name '*.md' -o -name '*.yaml' -o -name '*.json' -o -name '*.toml' \) -print0)
+  local substitutions_file="${BRAINSTACK_HANDOFF_PRIVATE_SUBSTITUTIONS_FILE:-$repo_root/.handoff-private-substitutions}"
+  if [ -f "$substitutions_file" ]; then
+    while IFS='=' read -r literal replacement; do
+      case "$literal" in ""|\#*) continue ;; esac
+      if [ -z "${replacement:-}" ]; then
+        replacement="[redacted]"
+      fi
+      while IFS= read -r -d '' file; do
+        BRAINSTACK_SUB_LITERAL="$literal" BRAINSTACK_SUB_REPLACEMENT="$replacement" perl -0pi -e 'BEGIN { $literal = $ENV{"BRAINSTACK_SUB_LITERAL"}; $replacement = $ENV{"BRAINSTACK_SUB_REPLACEMENT"}; } s/\Q$literal\E/$replacement/g;' "$file"
+      done < <(find "$bundle_dir" -type f \( -name '*.txt' -o -name '*.md' -o -name '*.yaml' -o -name '*.json' -o -name '*.toml' \) -print0)
+    done < "$substitutions_file"
+  fi
 }
 
 sanitize_handoff_text
@@ -557,18 +736,11 @@ if find "$bundle_dir" -type l -print -quit | grep -q .; then
   exit 1
 fi
 
-local_user_pattern="swa""der"
-control_host_pattern="val""kyrie"
-worker_host_a_pattern="er""bine"
-worker_host_b_pattern="yo""da"
-old_migration_pattern="migration-from-current-${control_host_pattern}\\.md"
 local_hygiene_hits="$(
   rg -n \
     -P -e '/Users/(?!operator\b)[A-Za-z0-9._-]+' \
-    -e "/home/${local_user_pattern}" \
-    -e "\\b(${control_host_pattern}|${worker_host_a_pattern}|${worker_host_b_pattern}|${local_user_pattern})\\b" \
-    -e "\\b(Val${control_host_pattern#val}|Er${worker_host_a_pattern#er}|Yo${worker_host_b_pattern#yo})\\b" \
-    -e "$old_migration_pattern" \
+    -e '/home/(?!operator\b|factory\b|brainstack\b)[A-Za-z0-9._-]+' \
+    -e 'migration-from-current-[A-Za-z0-9._-]+\.md' \
     "$bundle_dir" 2>/dev/null || true
 )"
 if [ -n "$local_hygiene_hits" ]; then
@@ -605,9 +777,41 @@ fi
   echo "Patterns checked: private key headers, GitHub tokens, Telegram bot-token shape, OpenAI sk-* shape, Tailscale tskey-* shape."
 } > "$bundle_dir/command-outputs/secret-scan.txt"
 
+(cd "$bundle_dir" && { find . -type f ! -name ZIP-MANIFEST.txt -print | sed 's#^\./##'; echo "ZIP-MANIFEST.txt"; } | sort > ZIP-MANIFEST.txt)
+
 (cd "$out_dir" && zip -X -qr "$zip_path" "$top" \
   -x '*/.git/*' '*/dist/*' '*/node_modules/*' '*/.bun/*' '*/.DS_Store' '*/__MACOSX/*' \
   -x '*.env' '*.pem' '*.key' '*.token')
+
+zip_listing_file="$bundle_dir/command-outputs/zip-listing.txt"
+if command -v zipinfo >/dev/null 2>&1; then
+  zipinfo -1 "$zip_path" | grep -v '/$' | sort > "$zip_listing_file"
+elif command -v unzip >/dev/null 2>&1; then
+  unzip -Z1 "$zip_path" | grep -v '/$' | sort > "$zip_listing_file"
+else
+  echo "handoff refused: need zipinfo or unzip to verify archive contents" >&2
+  exit 1
+fi
+expected_listing_file="$bundle_dir/command-outputs/zip-listing.expected.txt"
+sed "s#^#${top}/#" "$bundle_dir/ZIP-MANIFEST.txt" | sort > "$expected_listing_file"
+if ! diff -u "$expected_listing_file" "$zip_listing_file" > "$bundle_dir/command-outputs/zip-listing-diff.txt"; then
+  echo "handoff refused: final zip listing differs from bundle manifest" >&2
+  cat "$bundle_dir/command-outputs/zip-listing-diff.txt" >&2
+  exit 1
+fi
+
+for required_path in HANDOFF.md CHANGES.txt CLAIMS_AND_PROOF.md MANIFEST.txt ZIP-MANIFEST.txt source/package.json command-outputs/bun-test.txt generated/diagrams.md; do
+  if ! grep -Fxq "${top}/${required_path}" "$zip_listing_file"; then
+    echo "handoff refused: final zip missing required path: $required_path" >&2
+    exit 1
+  fi
+done
+for forbidden_path in "/.git/" "/dist/" "/node_modules/" "/.bun/" "__MACOSX" ".DS_Store"; do
+  if grep -Fq "$forbidden_path" "$zip_listing_file"; then
+    echo "handoff refused: final zip contains forbidden path marker: $forbidden_path" >&2
+    exit 1
+  fi
+done
 
 if command -v sha256sum >/dev/null 2>&1; then
   sha256sum "$zip_path" > "${zip_path}.sha256"

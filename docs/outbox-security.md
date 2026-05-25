@@ -12,6 +12,7 @@ Current guarantees:
 - corrupt entries are visible in `brainctl outbox status|list`
 - `brainctl outbox purge-corrupt --yes` removes corrupt entries explicitly
 - large entries are compressed above the configured threshold and refused above the hard cap
+- queued content is never silently truncated
 
 Defaults:
 
@@ -21,3 +22,14 @@ Defaults:
 
 Because payloads can contain sensitive prompt/context material, rely on host disk encryption and normal filesystem privacy. Brainstack intentionally does not add fake local encryption without solving key management.
 
+## Future Sealed Outbox Design
+
+Local encryption with the key beside the ciphertext is mostly fake security. A useful future mode for remote worker disks would be server-sealed:
+
+- `braind` publishes an outbox public key.
+- clients encrypt queued payloads to that key before writing disk entries.
+- clients cannot decrypt those payloads later.
+- flush sends ciphertext to a replay endpoint such as `/api/outbox/replay-sealed`.
+- `braind` decrypts and internally routes to import/propose.
+
+That design helps when the outbox lives on a remote worker. It does not help when the server key and outbox live under the same host/user, so it is documented here as future work rather than pretending the current local plaintext outbox is encrypted.

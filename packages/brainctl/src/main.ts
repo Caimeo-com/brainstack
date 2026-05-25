@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve, sep } from "node:path";
@@ -8,6 +8,7 @@ import {
   buildOutboxItem,
   decodeOutboxPayload,
   ensurePrivateOutboxDir,
+  outboxLimitsFromEnv,
   normalizeOutboxItem as normalizeSharedOutboxItem,
   outboxItemKey as sharedOutboxItemKey,
   purgeCorruptOutboxEntries,
@@ -26,7 +27,7 @@ type DestroyScope = "control" | "worker" | "client" | "all";
 type CheckStatus = "PASS" | "WARN" | "FAIL";
 type WorkerSshTrustMode = "pinned" | "accept-new";
 type SecurityPosture = "local" | "trusted-tailnet" | "guarded";
-type TrustedExposure = "none" | "tailscale-serve" | "public";
+type TrustedExposure = "none" | "tailscale-serve" | "vpn" | "manual";
 
 const CONFIG_SCHEMA_VERSION = 1;
 const MIN_BUN_VERSION = "1.3.10";
@@ -322,10 +323,10 @@ function normalizeSecurityPosture(value: string | null | undefined): SecurityPos
 
 function normalizeTrustedExposure(value: string | null | undefined): TrustedExposure {
   const normalized = (value || "none").trim().toLowerCase();
-  if (normalized === "none" || normalized === "tailscale-serve" || normalized === "public") {
+  if (normalized === "none" || normalized === "tailscale-serve" || normalized === "vpn" || normalized === "manual") {
     return normalized;
   }
-  throw new Error(`Unsupported trusted exposure: ${value}. Expected none, tailscale-serve, or public.`);
+  throw new Error(`Unsupported trusted exposure: ${value}. Expected none, tailscale-serve, vpn, or manual.`);
 }
 
 function splitKeyValue(text: string): [string, string] {
@@ -1169,6 +1170,7 @@ function braindService(cfg: BrainstackConfig): string {
     `EnvironmentFile=${join(cfg.paths.configRoot, "braind.secrets.env")}`,
     `ExecStartPre=${cfg.runtime.bunBin} --no-env-file run ${join(cfg.paths.productRepo, "apps", "braind", "src", "reindex.ts")} --quiet`,
     `ExecStart=${cfg.runtime.bunBin} --no-env-file run ${join(cfg.paths.productRepo, "apps", "braind", "src", "server.ts")}`,
+    "UMask=0077",
     "Restart=on-failure",
     "RestartSec=5",
     "",
@@ -1190,6 +1192,7 @@ function telemuxService(cfg: BrainstackConfig): string {
     `EnvironmentFile=${join(cfg.paths.configRoot, "telemux.runtime.env")}`,
     `EnvironmentFile=${join(cfg.paths.configRoot, "telemux.secrets.env")}`,
     `ExecStart=${cfg.runtime.bunBin} --no-env-file run ${join(cfg.paths.productRepo, "apps", "telemux", "src", "main.ts")}`,
+    "UMask=0077",
     "Restart=on-failure",
     "RestartSec=5",
     "",
@@ -1334,6 +1337,10 @@ async function commandExpose(args: ParsedArgs): Promise<void> {
     console.log("# Tailscale Serve config");
     console.log(rendered.trimEnd());
     console.log("# Apply command");
+    console.log(`mkdir -p ${shellSingleQuote(dirname(configPath))}`);
+    console.log(`cat > ${shellSingleQuote(configPath)} <<'JSON'`);
+    console.log(rendered.trimEnd());
+    console.log("JSON");
     console.log(command);
     return;
   }
@@ -2392,10 +2399,22 @@ async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Pro
         : check("FAIL", "security", "posture", `local posture must bind loopback, got ${cfg.security.bindHost}`, "Set security.bindHost to 127.0.0.1 or change the posture deliberately.")
     );
   } else if (cfg.security.posture === "trusted-tailnet") {
+    checks.push(check("PASS", "security", "read-auth", "disabled by design in trusted-tailnet mode"));
+    checks.push(check("PASS", "security", "trust-boundary", "private network reachability"));
+    checks.push(check("WARN", "security", "public-exposure", "do not expose trusted-tailnet mode to the public internet", "Bind loopback and expose through Tailscale Serve/VPN, or use guarded/manual controls for broader exposure."));
     checks.push(
       wildcardBind
-        ? check("WARN", "security", "posture", `trusted-tailnet bind=${cfg.security.bindHost}; exposure=${cfg.security.trustedExposure}`, "Prefer loopback bind plus `brainctl expose tailscale`; never expose this service directly to the public internet.")
+        ? check("FAIL", "security", "posture", `trusted-tailnet bind=${cfg.security.bindHost}; exposure=${cfg.security.trustedExposure}`, "Wildcard trusted-tailnet binds are too broad for this posture. Set security.bindHost to 127.0.0.1 and expose through Tailscale Serve/VPN, or implement guarded app-layer read controls.")
+        : !loopbackBind && (cfg.security.trustedExposure === "manual" || cfg.security.trustedExposure === "vpn")
+        ? check("WARN", "security", "posture", `trusted-tailnet bind=${cfg.security.bindHost}; exposure=${cfg.security.trustedExposure}`, "Manual/VPN exposure is explicit; verify the private-network boundary yourself.")
+        : !loopbackBind
+        ? check("FAIL", "security", "posture", `trusted-tailnet bind=${cfg.security.bindHost}; exposure=${cfg.security.trustedExposure}`, "Set security.bindHost to 127.0.0.1 and expose through Tailscale Serve/VPN, or explicitly choose guarded/manual exposure.")
         : check("PASS", "security", "posture", `trusted-tailnet bind=${cfg.security.bindHost}; exposure=${cfg.security.trustedExposure}`)
+    );
+    checks.push(
+      cfg.security.trustedExposure === "tailscale-serve"
+        ? check("PASS", "security", "tailscale-serve-exposure", "configured in brainstack.yaml")
+        : check("PASS", "security", "tailscale-serve-exposure", "no Tailscale Serve exposure declared; local-only until exposed")
     );
   } else {
     checks.push(check("WARN", "security", "posture", "guarded posture is reserved; no first-class read-token/IAM enforcement is implemented yet", "Use trusted-tailnet for the current product stance, or add guarded controls before broader exposure."));
@@ -2509,26 +2528,46 @@ async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Pro
       ? check("FAIL", "outbox", "corrupt-items", `${outboxCorrupt.length} corrupt/unsafe item(s)`, "Run `brainctl outbox list` and then `brainctl outbox purge-corrupt --yes` only if those drafts are unrecoverable.")
       : check("PASS", "outbox", "corrupt-items", "none")
   );
-  if (existsSync(outboxRoot(cfg))) {
-    const mode = (await stat(outboxRoot(cfg))).mode & 0o777;
-    checks.push(
-      (mode & 0o077) === 0
-        ? check("PASS", "outbox", "permissions", `dir mode=${mode.toString(8)}`)
-        : check("FAIL", "outbox", "permissions", `dir mode=${mode.toString(8)}; expected 0700`, `chmod 700 ${outboxRoot(cfg)}`)
-    );
-    const unsafeFiles = [];
-    for (const entry of outboxItems) {
-      const fileMode = (await stat(entry.path)).mode & 0o777;
-      if ((fileMode & 0o077) !== 0) {
-        unsafeFiles.push(`${entry.item.id}:${fileMode.toString(8)}`);
-      }
+  const unsafeOutboxDirs: string[] = [];
+  for (const dir of [outboxParentRoot(cfg), ...outboxScans.map((scan) => scan.root)]) {
+    const info = await lstat(dir).catch(() => null);
+    if (!info) {
+      continue;
     }
-    checks.push(
-      unsafeFiles.length
-        ? check("FAIL", "outbox", "file-permissions", unsafeFiles.join(", "), "Run `chmod 600 ~/.local/state/brainstack/outbox/*/*.json` or purge stale legacy entries after review.")
-        : check("PASS", "outbox", "file-permissions", "queued item files are private")
-    );
+    if (info.isSymbolicLink()) {
+      unsafeOutboxDirs.push(`${dir}:symlink`);
+      continue;
+    }
+    const mode = info.mode & 0o777;
+    if ((mode & 0o077) !== 0) {
+      unsafeOutboxDirs.push(`${dir}:${mode.toString(8)}`);
+    }
   }
+  checks.push(
+    unsafeOutboxDirs.length
+      ? check("WARN", "outbox", "permissions", unsafeOutboxDirs.join(", "), `chmod 700 ${outboxParentRoot(cfg)} and each namespace directory after review.`)
+      : check("PASS", "outbox", "permissions", "outbox directories are restrictive")
+  );
+  const unsafeFiles = [];
+  for (const entry of [...outboxItems.map((item) => ({ path: item.path, label: item.item.id })), ...outboxCorrupt.map((item) => ({ path: item.path, label: `CORRUPT:${item.name}` }))]) {
+    const info = await lstat(entry.path).catch(() => null);
+    if (!info) {
+      continue;
+    }
+    if (info.isSymbolicLink()) {
+      unsafeFiles.push(`${entry.label}:symlink`);
+      continue;
+    }
+    const fileMode = info.mode & 0o777;
+    if ((fileMode & 0o077) !== 0) {
+      unsafeFiles.push(`${entry.label}:${fileMode.toString(8)}`);
+    }
+  }
+  checks.push(
+    unsafeFiles.length
+      ? check("FAIL", "outbox", "file-permissions", unsafeFiles.join(", "), "Run `chmod 600 ~/.local/state/brainstack/outbox/*/*.json` or purge corrupt/temp entries after review.")
+      : check("PASS", "outbox", "file-permissions", "queued and corrupt item files are private")
+  );
   checks.push(
     outboxItems.length
       ? check("WARN", "outbox", "plaintext-posture", "queued payloads are stored locally and protected by filesystem permissions, not encrypted by brainstack", "Use disk encryption and keep the state root private; see docs/outbox-security.md.")
@@ -2592,14 +2631,16 @@ function workerEnvCachePath(cfg: BrainstackConfig): string {
   return join(cfg.paths.stateRoot, "worker-env-cache.json");
 }
 
-function workerEnvFingerprint(cfg: BrainstackConfig, worker: BrainstackWorkerConfig): string {
+function workerEnvFingerprint(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, family?: HarnessName, bin?: string): string {
+  const resolvedFamily = family || workerHarnessFamily(cfg, worker);
+  const resolvedBin = bin || workerHarnessBin(cfg, worker, resolvedFamily);
   return sha256Hex(canonicalJson({
     worker: worker.name,
     transport: worker.transport,
     sshTarget: worker.sshTarget || null,
     sshUser: worker.sshUser || null,
-    harness: worker.harness || cfg.harness.name,
-    harnessBin: worker.harnessBin || null
+    harness: resolvedFamily,
+    harnessBin: resolvedBin
   }));
 }
 
@@ -2622,7 +2663,9 @@ async function writeWorkerEnvCache(cfg: BrainstackConfig, cache: Record<string, 
 
 function cachedWorkerPath(cfg: BrainstackConfig, worker: BrainstackWorkerConfig): string | null {
   const record = readWorkerEnvCache(cfg)[worker.name];
-  if (!record || record.fingerprint !== workerEnvFingerprint(cfg, worker) || !record.path.trim()) {
+  const family = workerHarnessFamily(cfg, worker);
+  const bin = workerHarnessBin(cfg, worker, family);
+  if (!record || record.fingerprint !== workerEnvFingerprint(cfg, worker, family, bin) || !record.path.trim()) {
     return null;
   }
   const detectedAt = Date.parse(record.detectedAt);
@@ -2897,7 +2940,7 @@ async function workerDoctorChecks(cfg: BrainstackConfig, deep: boolean): Promise
       const cache = readWorkerEnvCache(cfg);
       cache[worker.name] = {
         worker: worker.name,
-        fingerprint: workerEnvFingerprint(cfg, worker),
+        fingerprint: workerEnvFingerprint(cfg, worker, family, bin),
         path: detectedPath,
         harness: family,
         harnessBin: harnessPath,
@@ -2984,10 +3027,12 @@ interface ProjectBrain {
   label: string;
   classification: "work" | "personal" | "neutral";
   localPath: string;
+  gitRemote: string;
   baseUrl: string;
   importTokenEnv: string;
   sections: string[];
   sectionsRestricted?: boolean;
+  readMode?: "allow" | "ask-once" | "ask-always" | "never";
   write: "true" | "propose-only" | "false";
 }
 
@@ -2998,6 +3043,7 @@ interface ResolvedProjectContext {
   allowedBrains: ProjectBrain[];
   deniedBrains: ProjectBrain[];
   writeDefault: string;
+  crossBrainWrites: Record<string, string>;
   sessionPath: string;
 }
 
@@ -3013,6 +3059,10 @@ function projectSessionPath(cfg: BrainstackConfig, repo: string): string {
 
 function allowRulesPath(cfg: BrainstackConfig): string {
   return join(cfg.paths.configRoot, "allow-rules.json");
+}
+
+function profilesPath(cfg: BrainstackConfig): string {
+  return join(cfg.paths.configRoot, "profiles.yaml");
 }
 
 function normalizeProjectBrainWrite(value: unknown, fallback: ProjectBrain["write"]): ProjectBrain["write"] {
@@ -3032,6 +3082,31 @@ function normalizeProjectBrainWrite(value: unknown, fallback: ProjectBrain["writ
   throw new Error(`Unsupported project brain write mode: ${normalized}`);
 }
 
+function normalizeProjectReadMode(value: unknown, fallback: ProjectBrain["readMode"] = "allow"): ProjectBrain["readMode"] {
+  if (value === false) {
+    return "never";
+  }
+  if (value === true || value === undefined || value === null || value === "") {
+    return fallback;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true" || normalized === "allow") {
+      return "allow";
+    }
+    if (normalized === "false" || normalized === "never" || normalized === "deny") {
+      return "never";
+    }
+    if (normalized === "ask-once" || normalized === "ask-always") {
+      return normalized;
+    }
+  }
+  if (typeof value === "object" && value && !Array.isArray(value)) {
+    return normalizeProjectReadMode((value as Record<string, unknown>).mode, fallback);
+  }
+  throw new Error(`Unsupported project brain read mode: ${String(value)}`);
+}
+
 function classifyProjectBrain(id: string, label: string, explicit?: unknown): ProjectBrain["classification"] {
   if (typeof explicit === "string") {
     const normalized = explicit.trim().toLowerCase();
@@ -3048,6 +3123,152 @@ function classifyProjectBrain(id: string, label: string, explicit?: unknown): Pr
     return "work";
   }
   return "neutral";
+}
+
+function stripYamlKeyQuotes(input: string): string {
+  const trimmed = input.trim();
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function objectAt(input: Record<string, unknown>, key: string): Record<string, unknown> {
+  const value = input[key];
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function entriesFromBrainsValue(value: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(value)) {
+    return value.map((entry) => {
+      if (typeof entry === "string") {
+        return { id: entry };
+      }
+      return entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
+    });
+  }
+  if (value && typeof value === "object") {
+    return Object.entries(value as Record<string, unknown>).map(([id, entry]) => ({
+      id,
+      ...(entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {})
+    }));
+  }
+  return [];
+}
+
+function safeProjectSection(section: string): boolean {
+  return Boolean(section) && !section.startsWith("/") && !section.split("/").includes("..") && /^[A-Za-z0-9._/@+-]+(?:\/[A-Za-z0-9._/@+-]+)*$/.test(section);
+}
+
+function validateProjectSections(id: string, sections: string[]): void {
+  const unsafe = sections.filter((section) => !safeProjectSection(section));
+  if (unsafe.length) {
+    throw new Error(`Invalid project brain config for ${id}: unsafe section path(s) ${unsafe.join(", ")}`);
+  }
+}
+
+function simpleGlobMatches(patternInput: string, repo: string, home: string): boolean {
+  let pattern = absWithHome(stripYamlKeyQuotes(patternInput), home);
+  if (pattern.endsWith("/**")) {
+    const prefixRaw = pattern.slice(0, -3);
+    const prefix = existsSync(prefixRaw) ? realpathSync(prefixRaw) : prefixRaw;
+    return repo === prefix || repo.startsWith(`${prefix}/`);
+  }
+  if (!pattern.includes("*") && existsSync(pattern)) {
+    pattern = realpathSync(pattern);
+  }
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*");
+  return new RegExp(`^${escaped}$`).test(repo);
+}
+
+function bestProfilesProjectMatch(profilesRaw: Record<string, unknown>, repo: string, home: string): Record<string, unknown> {
+  const projects = objectAt(profilesRaw, "projects");
+  let best: { pattern: string; raw: Record<string, unknown> } | null = null;
+  for (const [rawPattern, rawValue] of Object.entries(projects)) {
+    if (!rawValue || typeof rawValue !== "object" || Array.isArray(rawValue)) {
+      continue;
+    }
+    const pattern = stripYamlKeyQuotes(rawPattern);
+    if (!simpleGlobMatches(pattern, repo, home)) {
+      continue;
+    }
+    if (!best || pattern.length > best.pattern.length) {
+      best = { pattern, raw: rawValue as Record<string, unknown> };
+    }
+  }
+  return best?.raw || {};
+}
+
+function mergeRecord(base: Record<string, unknown>, override: Record<string, unknown>): Record<string, unknown> {
+  const merged = { ...base, ...override };
+  if (base.read && typeof base.read === "object" && override.read && typeof override.read === "object" && !Array.isArray(base.read) && !Array.isArray(override.read)) {
+    merged.read = { ...(base.read as Record<string, unknown>), ...(override.read as Record<string, unknown>) };
+  }
+  return merged;
+}
+
+function projectBrainOverrides(raw: Record<string, unknown>, id: string): Record<string, unknown> {
+  const value = raw[id];
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const override = value as Record<string, unknown>;
+    if ("mode" in override && !("read" in override)) {
+      return { ...override, read: { mode: override.mode, sections: override.sections || [] } };
+    }
+    return override;
+  }
+  return {};
+}
+
+function projectBrainLocalPathSpec(entry: Record<string, unknown>): string {
+  return stringAt(entry, "localClone", stringAt(entry, "localPath", stringAt(entry, "path", "")));
+}
+
+function withTrustedLocalPath(entry: Record<string, unknown>, cfg: BrainstackConfig, trustedSource: Record<string, unknown>): Record<string, unknown> {
+  const spec = projectBrainLocalPathSpec(trustedSource);
+  return spec ? { ...entry, __brainstackTrustedLocalPath: absWithHome(spec, cfg.paths.home) } : entry;
+}
+
+function mergeTrustedProjectBrain(id: string, entry: Record<string, unknown>, globalBrains: Record<string, unknown>, matchedProjectRaw: Record<string, unknown>, cfg: BrainstackConfig): Record<string, unknown> {
+  const globalRaw = objectAt(globalBrains, id);
+  const profileOverride = projectBrainOverrides(matchedProjectRaw, id);
+  const merged = mergeRecord(mergeRecord({ id, ...globalRaw }, profileOverride), entry);
+  return withTrustedLocalPath(withTrustedLocalPath(merged, cfg, globalRaw), cfg, profileOverride);
+}
+
+function projectRawWithProfiles(fileRaw: Record<string, unknown>, profilesRaw: Record<string, unknown>, repo: string, cfg: BrainstackConfig): Record<string, unknown> {
+  const defaultRaw = objectAt(profilesRaw, "default");
+  const matchedProjectRaw = bestProfilesProjectMatch(profilesRaw, repo, cfg.paths.home);
+  const globalBrains = objectAt(profilesRaw, "brains");
+  const selectorRaw = "brains" in fileRaw ? fileRaw : Object.keys(matchedProjectRaw).length ? matchedProjectRaw : defaultRaw;
+  const selectorEntries = entriesFromBrainsValue(selectorRaw.brains);
+  const entries = selectorEntries.length
+    ? selectorEntries
+    : entriesFromBrainsValue(defaultRaw.brains).length
+      ? entriesFromBrainsValue(defaultRaw.brains)
+      : [];
+  const brains = entries.map((entry) => {
+    const id = stringAt(entry, "id", "default");
+    return mergeTrustedProjectBrain(id, entry, globalBrains, matchedProjectRaw, cfg);
+  });
+  return {
+    ...defaultRaw,
+    ...matchedProjectRaw,
+    ...fileRaw,
+    brains: "brains" in fileRaw ? projectBrainsMergedWithProfiles(fileRaw.brains, globalBrains, matchedProjectRaw, cfg) : brains,
+    crossBrainWrites: {
+      ...objectAt(defaultRaw, "crossBrainWrites"),
+      ...objectAt(matchedProjectRaw, "crossBrainWrites"),
+      ...objectAt(fileRaw, "crossBrainWrites")
+    },
+    writeDefault: stringAt(fileRaw, "writeDefault", stringAt(fileRaw, "defaultBrain", stringAt(matchedProjectRaw, "writeDefault", stringAt(matchedProjectRaw, "defaultBrain", stringAt(defaultRaw, "writeDefault", stringAt(defaultRaw, "defaultBrain", brains[0]?.id ? String(brains[0].id) : "default"))))))
+  };
+}
+
+function projectBrainsMergedWithProfiles(value: unknown, globalBrains: Record<string, unknown>, matchedProjectRaw: Record<string, unknown>, cfg: BrainstackConfig): Array<Record<string, unknown>> {
+  return entriesFromBrainsValue(value).map((entry) => {
+    const id = stringAt(entry, "id", "default");
+    return mergeTrustedProjectBrain(id, entry, globalBrains, matchedProjectRaw, cfg);
+  });
 }
 
 async function resolveRepoPath(input: string | null): Promise<string> {
@@ -3070,6 +3291,71 @@ async function findProjectBrainstackConfig(repo: string): Promise<string | null>
   }
 }
 
+function safeBrainCloneName(id: string): string {
+  const safe = id.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return safe && safe !== "." && safe !== ".." && !safe.startsWith(".") ? safe : `brain-${sha256Hex(id).slice(0, 16)}`;
+}
+
+function localCloneForProfileBrain(entry: Record<string, unknown>, cfg: BrainstackConfig, id: string): string {
+  const explicit = projectBrainLocalPathSpec(entry);
+  if (explicit) {
+    const resolvedPath = absWithHome(explicit, cfg.paths.home);
+    const trustedPath = stringAt(entry, "__brainstackTrustedLocalPath", "");
+    if (trustedPath && resolvedPath === trustedPath) {
+      return resolvedPath;
+    }
+    const managedRoot = resolve(cfg.paths.stateRoot, "brain-clones");
+    if (resolvedPath.startsWith(`${managedRoot}${sep}`)) {
+      return resolvedPath;
+    }
+    throw new Error(`Repo-local project brain config for ${id} cannot set localClone/localPath/path outside ${managedRoot}. Define trusted local paths in ${profilesPath(cfg)}.`);
+  }
+  if (id === "default") {
+    return clientLocalPathAbs(cfg);
+  }
+  return join(cfg.paths.stateRoot, "brain-clones", safeBrainCloneName(id));
+}
+
+function projectReadSections(entry: Record<string, unknown>): string[] {
+  const direct = arrayAt(entry, "sections").map(String).map((item) => item.trim()).filter(Boolean);
+  if (direct.length) {
+    return direct;
+  }
+  const read = entry.read;
+  if (read && typeof read === "object" && !Array.isArray(read)) {
+    return arrayAt(read as Record<string, unknown>, "sections").map(String).map((item) => item.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function normalizeProjectBrainEntry(entry: Record<string, unknown>, cfg: BrainstackConfig): ProjectBrain {
+  if ("section" in entry && !("sections" in entry)) {
+    throw new Error("Invalid project brain config: use `sections`, not `section`.");
+  }
+  const id = stringAt(entry, "id", "default");
+  const label = stringAt(entry, "label", id);
+  const write = normalizeProjectBrainWrite(entry.write, "propose-only");
+  const baseUrl = stringAt(entry, "baseUrl", stringAt(entry, "url", id === "default" ? cfg.brain.publicBaseUrl : ""));
+  const importTokenEnv = stringAt(entry, "importTokenEnv", id === "default" ? "BRAIN_IMPORT_TOKEN" : "");
+  if ("sections" in entry && !Array.isArray(entry.sections)) {
+    throw new Error(`Invalid project brain config for ${id}: sections must be a YAML list such as [wiki, raw].`);
+  }
+  const sections = projectReadSections(entry);
+  validateProjectSections(id, sections);
+  return {
+    id,
+    label,
+    classification: classifyProjectBrain(id, label, entry.classification),
+    localPath: localCloneForProfileBrain(entry, cfg, id),
+    gitRemote: stringAt(entry, "gitRemote", stringAt(entry, "remote", stringAt(entry, "remoteSsh", ""))),
+    baseUrl,
+    importTokenEnv,
+    sections,
+    readMode: normalizeProjectReadMode("read" in entry ? entry.read : "mode" in entry ? entry.mode : undefined, "allow"),
+    write
+  };
+}
+
 function projectBrainsFromRaw(raw: Record<string, unknown>, cfg: BrainstackConfig): ProjectBrain[] {
   const brainsValue = raw.brains;
   const entries: Array<Record<string, unknown>> = Array.isArray(brainsValue)
@@ -3087,6 +3373,7 @@ function projectBrainsFromRaw(raw: Record<string, unknown>, cfg: BrainstackConfi
         label: "default",
         classification: "neutral",
         localPath: clientLocalPathAbs(cfg),
+        gitRemote: cfg.client.remoteSsh,
         baseUrl: cfg.brain.publicBaseUrl,
         importTokenEnv: "BRAIN_IMPORT_TOKEN",
         sections: ["wiki", "raw", "proposals"],
@@ -3094,35 +3381,7 @@ function projectBrainsFromRaw(raw: Record<string, unknown>, cfg: BrainstackConfi
       }
     ];
   }
-  return entries.map((entry) => {
-    if ("section" in entry && !("sections" in entry)) {
-      throw new Error("Invalid project brain config: use `sections`, not `section`.");
-    }
-    const id = stringAt(entry, "id", "default");
-    const label = stringAt(entry, "label", id);
-    const write = normalizeProjectBrainWrite(entry.write, "propose-only");
-    const baseUrl = stringAt(entry, "baseUrl", id === "default" ? cfg.brain.publicBaseUrl : "");
-    const importTokenEnv = stringAt(entry, "importTokenEnv", id === "default" ? "BRAIN_IMPORT_TOKEN" : "");
-    if ("sections" in entry && !Array.isArray(entry.sections)) {
-      throw new Error(`Invalid project brain config for ${id}: sections must be a YAML list such as [wiki, raw].`);
-    }
-    const sections = arrayAt(entry, "sections").map(String).map((item) => item.trim()).filter(Boolean);
-    const supportedSections = new Set(["wiki", "raw", "proposals"]);
-    const unknownSections = sections.filter((section) => !supportedSections.has(section));
-    if (unknownSections.length) {
-      throw new Error(`Invalid project brain config for ${id}: unknown section(s) ${unknownSections.join(", ")}. Supported sections: wiki, raw, proposals.`);
-    }
-    return {
-      id,
-      label,
-      classification: classifyProjectBrain(id, label, entry.classification),
-      localPath: absWithHome(stringAt(entry, "localPath", stringAt(entry, "path", clientLocalPathAbs(cfg))), cfg.paths.home),
-      baseUrl,
-      importTokenEnv,
-      sections,
-      write
-    };
-  });
+  return entries.map((entry) => normalizeProjectBrainEntry(entry, cfg));
 }
 
 function readAllowRules(cfg: BrainstackConfig): Record<string, Record<string, AllowRule>> {
@@ -3164,7 +3423,7 @@ async function consumeOnceAllowRules(cfg: BrainstackConfig, repo: string, brainI
 }
 
 function brainNeedsExplicitAllow(brain: ProjectBrain): boolean {
-  return brain.classification === "personal";
+  return brain.readMode === "ask-once" || brain.readMode === "ask-always" || brain.classification === "personal";
 }
 
 function applyAllowRuleSections(brain: ProjectBrain, rule: AllowRule | undefined): ProjectBrain {
@@ -3179,12 +3438,18 @@ function applyAllowRuleSections(brain: ProjectBrain, rule: AllowRule | undefined
 async function resolveProjectContext(cfg: BrainstackConfig, repoInput: string | null): Promise<ResolvedProjectContext> {
   const repo = await resolveRepoPath(repoInput);
   const configPath = await findProjectBrainstackConfig(repo);
-  const raw = configPath ? parseSimpleYaml(await readFile(configPath, "utf8")) : {};
+  const fileRaw = configPath ? parseSimpleYaml(await readFile(configPath, "utf8")) : {};
+  const profilesRaw = existsSync(profilesPath(cfg)) ? parseSimpleYaml(await readFile(profilesPath(cfg), "utf8")) : {};
+  const raw = projectRawWithProfiles(fileRaw, profilesRaw, repo, cfg);
   const brains = projectBrainsFromRaw(raw, cfg);
   const writeDefault = stringAt(raw, "writeDefault", stringAt(raw, "defaultBrain", brains[0]?.id || "default"));
+  const crossBrainWrites = objectAt(raw, "crossBrainWrites") as Record<string, string>;
   const rules = readAllowRules(cfg)[repo] || {};
   const allowedBrains: ProjectBrain[] = [];
   for (const brain of brains) {
+    if (brain.readMode === "never") {
+      continue;
+    }
     const rule = rules[brain.id];
     if (rule?.decision === "deny") {
       continue;
@@ -3195,12 +3460,17 @@ async function resolveProjectContext(cfg: BrainstackConfig, repoInput: string | 
   }
   const allowedIds = new Set(allowedBrains.map((brain) => brain.id));
   const deniedBrains = brains.filter((brain) => !allowedIds.has(brain.id));
-  return { repo, configPath, brains, allowedBrains, deniedBrains, writeDefault, sessionPath: projectSessionPath(cfg, repo) };
+  return { repo, configPath, brains, allowedBrains, deniedBrains, writeDefault, crossBrainWrites, sessionPath: projectSessionPath(cfg, repo) };
 }
 
 async function maybeSyncBrainClone(brain: ProjectBrain): Promise<string> {
   if (!gitExists(brain.localPath)) {
-    return "missing";
+    if (!brain.gitRemote) {
+      return "missing";
+    }
+    await mkdir(dirname(brain.localPath), { recursive: true });
+    const result = run(["git", "clone", brain.gitRemote, brain.localPath], { check: false, timeoutMs: 60_000 });
+    return result.code === 0 ? "cloned" : `missing: clone failed: ${(result.stderr || result.stdout).trim().slice(0, 160)}`;
   }
   const result = run(["git", "pull", "--ff-only"], { cwd: brain.localPath, check: false, timeoutMs: 20_000 });
   return result.code === 0 ? "synced" : `stale: ${(result.stderr || result.stdout).trim().slice(0, 160)}`;
@@ -3209,26 +3479,48 @@ async function maybeSyncBrainClone(brain: ProjectBrain): Promise<string> {
 async function commandContext(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
   const resolved = await resolveProjectContext(cfg, flag(args, "repo"));
-  const sync = hasFlag(args, "sync") && !hasFlag(args, "no-sync");
+  const sync = args.flags["no-sync"] === undefined;
   const brainRows = [];
+  const allowedIds = new Set(resolved.allowedBrains.map((brain) => brain.id));
   for (const brain of resolved.brains) {
-    const allowed = resolved.allowedBrains.includes(brain);
+    const allowed = allowedIds.has(brain.id);
     const status = sync && allowed ? await maybeSyncBrainClone(brain) : gitExists(brain.localPath) ? "local" : "missing";
     brainRows.push({ ...brain, allowed, status });
   }
   if (hasFlag(args, "json")) {
-    console.log(JSON.stringify({ repo: resolved.repo, configPath: resolved.configPath, writeDefault: resolved.writeDefault, brains: brainRows }, null, 2));
+    console.log(JSON.stringify({ repo: resolved.repo, configPath: resolved.configPath, writeDefault: resolved.writeDefault, crossBrainWrites: resolved.crossBrainWrites, brains: brainRows }, null, 2));
     return;
   }
-  console.log(`repo=${resolved.repo}`);
-  console.log(`config=${resolved.configPath || "(default)"}`);
+  console.log(`# Brainstack context for ${resolved.repo}`);
+  console.log("");
+  console.log(`config=${resolved.configPath || profilesPath(cfg)}`);
   console.log(`write_default=${resolved.writeDefault}`);
+  if (Object.keys(resolved.crossBrainWrites).length) {
+    console.log(`cross_brain_writes=${JSON.stringify(resolved.crossBrainWrites)}`);
+  }
+  console.log("");
+  console.log("Available brains:");
   for (const brain of brainRows) {
-    console.log(`[${brain.allowed ? "allowed" : "blocked"}] ${brain.id} path=${brain.localPath} status=${brain.status}`);
+    const readScope = brain.sections.length ? brain.sections.join(",") : "all local sections";
+    const writeLabel = brain.id === resolved.writeDefault ? `${brain.write} default` : brain.write;
+    console.log(`- [${brain.allowed ? "allowed" : "blocked"}] ${brain.id} (${brain.classification})`);
+    console.log(`  path=${brain.localPath}`);
+    console.log(`  freshness=${brain.status}`);
+    console.log(`  read=${brain.readMode || "allow"} sections=${readScope}`);
+    console.log(`  write=${writeLabel}`);
   }
   for (const brain of resolved.deniedBrains) {
-    console.log(`allow with: brainctl allow repo --repo ${shellSingleQuote(resolved.repo)} --brain ${shellSingleQuote(brain.id)} --always`);
+    const sectionFlag = brain.sections.length ? ` --sections ${shellSingleQuote(brain.sections.join(","))}` : "";
+    if (brain.readMode === "never") {
+      console.log(`blocked: ${brain.id} has read=false/never in this project context`);
+    } else {
+      console.log(`allow with: brainctl allow repo --repo ${shellSingleQuote(resolved.repo)} --brain ${shellSingleQuote(brain.id)}${sectionFlag} --always`);
+    }
   }
+  console.log("");
+  console.log("Use `brainctl search --repo . \"query\"` for labelled retrieval.");
+  console.log("Use `brainctl remember --repo . --summary \"...\"` for import/propose writes.");
+  console.log("Preserve source labels when reasoning across multiple brains. Do not manually clone, pull, or POST unless explicitly instructed.");
 }
 
 function searchLocalBrain(brain: ProjectBrain, query: string): Array<{ brain: string; label: string; classification: string; path: string; line: number; text: string }> {
@@ -3258,6 +3550,57 @@ function searchLocalBrain(brain: ProjectBrain, query: string): Array<{ brain: st
     });
 }
 
+function titleCaseBrainKey(value: string): string {
+  return value ? `${value[0]?.toUpperCase() || ""}${value.slice(1)}` : "";
+}
+
+function sourceRecordId(source: unknown): string {
+  return source && typeof source === "object" ? String((source as Record<string, unknown>).id || "") : String(source || "");
+}
+
+function sourceRecordClassification(source: unknown): ProjectBrain["classification"] {
+  if (source && typeof source === "object") {
+    const record = source as Record<string, unknown>;
+    if (record.classification === "work" || record.classification === "personal" || record.classification === "neutral") {
+      return record.classification;
+    }
+    return classifyProjectBrain(String(record.id || ""), String(record.label || ""));
+  }
+  return classifyProjectBrain(String(source || ""), String(source || ""));
+}
+
+function crossBrainPolicyRule(
+  rules: Record<string, string>,
+  source: { id: string; classification: ProjectBrain["classification"] },
+  target: ProjectBrain
+): string {
+  const candidates = [
+    `${source.id}To${titleCaseBrainKey(target.id)}`,
+    `${source.id}To${titleCaseBrainKey(target.classification)}`,
+    `${source.classification}To${titleCaseBrainKey(target.id)}`,
+    `${source.classification}To${titleCaseBrainKey(target.classification)}`
+  ];
+  if (source.classification === "personal" && target.classification === "work") {
+    candidates.push("personalToWork", "personalToCompany");
+  }
+  if (source.classification === "work" && target.classification === "personal") {
+    candidates.push("workToPersonal", "companyToPersonal");
+  }
+  for (const key of candidates) {
+    const value = rules[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim().toLowerCase();
+    }
+  }
+  if (
+    (source.classification === "personal" && target.classification === "work") ||
+    (source.classification === "work" && target.classification === "personal")
+  ) {
+    return "ask";
+  }
+  return "allow";
+}
+
 async function writeProjectSession(resolved: ResolvedProjectContext, data: Record<string, unknown>): Promise<void> {
   await ensureDir(dirname(resolved.sessionPath));
   await writeText(resolved.sessionPath, `${JSON.stringify({ ...data, repo: resolved.repo, updated_at: new Date().toISOString() }, null, 2)}\n`, 0o600);
@@ -3265,7 +3608,7 @@ async function writeProjectSession(resolved: ResolvedProjectContext, data: Recor
 
 async function commandSearch(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
-  const query = args.positional.join(" ").trim() || flag(args, "query") || flag(args, "no-sync") || "";
+  const query = (flag(args, "query") || args.positional.join(" ")).trim();
   if (!query) {
     throw new Error("search requires a query");
   }
@@ -3332,19 +3675,19 @@ async function commandRemember(args: ParsedArgs): Promise<void> {
   }
   const session = existsSync(resolved.sessionPath) ? (JSON.parse(readFileSync(resolved.sessionPath, "utf8")) as Record<string, unknown>) : {};
   const recentSources = Array.isArray(session.recent_sources) ? session.recent_sources : [];
-  const usedPersonal = recentSources.some((source) => {
-    if (typeof source === "string") {
-      return /personal|private|journal|health|family|finance/i.test(source);
-    }
-    if (source && typeof source === "object") {
-      const record = source as Record<string, unknown>;
-      return record.classification === "personal" || /personal|private|journal|health|family|finance/i.test(`${record.id || ""} ${record.label || ""}`);
-    }
-    return false;
-  });
-  const targetLooksWork = target.classification === "work" || /work|company|lindy|corp|corpo/i.test(`${target.id} ${target.label}`);
-  if (usedPersonal && targetLooksWork && !hasFlag(args, "confirm-cross-brain")) {
-    throw new Error("Refusing cross-brain remember from recent personal sources into a work/company target without --confirm-cross-brain.");
+  const crossBrainSources = recentSources
+    .map((source) => ({
+      id: sourceRecordId(source),
+      classification: sourceRecordClassification(source)
+    }))
+    .filter((source) => source.id && source.id !== target.id);
+  const neverSource = crossBrainSources.find((source) => crossBrainPolicyRule(resolved.crossBrainWrites, source, target) === "never");
+  if (neverSource) {
+    throw new Error(`Refusing cross-brain remember from recent ${neverSource.id} sources into ${target.id}; policy is never.`);
+  }
+  const askSource = crossBrainSources.find((source) => crossBrainPolicyRule(resolved.crossBrainWrites, source, target) === "ask");
+  if (askSource && !hasFlag(args, "confirm-cross-brain")) {
+    throw new Error(`Refusing cross-brain remember from recent ${askSource.id} sources into ${target.id} without --confirm-cross-brain; policy=ask. Rerun with --confirm-cross-brain only after verifying the source labels are safe to write into ${target.id}.`);
   }
   if (target.write !== "false" && (!target.baseUrl || !target.importTokenEnv)) {
     throw new Error(`target brain ${targetId} is writable but missing explicit baseUrl/importTokenEnv`);
@@ -3357,6 +3700,7 @@ async function commandRemember(args: ParsedArgs): Promise<void> {
     source_machine: cfg.machine.name,
     source_type: "remember",
     related_repo: resolved.repo,
+    recent_sources: recentSources,
     tags: ["remember", target.id]
   }, {
     baseUrl: target.baseUrl,
@@ -3476,11 +3820,17 @@ function outboxItemKey(
   payload: Record<string, unknown>,
   destination: { brain_id?: string | null; url?: string | null; import_token_env?: string | null } = {}
 ): string {
-  return sharedOutboxItemKey(endpoint, payload, destination);
+  return sharedOutboxItemKey(endpoint, payload, {
+    brain_id: destination.brain_id || null,
+    url: destination.url || null
+  });
 }
 
 async function findMatchingOutboxItem(root: string, endpoint: "import" | "propose", idempotencyKey: string): Promise<{ path: string; item: OutboxItem } | null> {
   const scan = await scanOutbox(root);
+  if (scan.corrupt.length) {
+    throw new Error(`outbox namespace contains ${scan.corrupt.length} corrupt/unsafe item(s); inspect with brainctl outbox list and run purge-corrupt before queueing new writes`);
+  }
   for (const entry of scan.items) {
     if (entry.item.endpoint !== endpoint) {
       continue;
@@ -3507,18 +3857,22 @@ async function queueOutboxItem(cfg: BrainstackConfig, item: Omit<OutboxItem, "id
   const matched = (await findMatchingOutboxItem(root, item.endpoint, idempotencyKey)) || null;
   const path = matched?.path || stablePath;
   const existing = matched?.item || null;
-  await writeOutboxItem(
-    path,
-    buildOutboxItem(
-      {
-        ...item,
-        payload,
-        idempotency_key: idempotencyKey
-      },
-      error,
-      existing
-    )
+  const queuedItem = buildOutboxItem(
+    {
+      ...item,
+      payload,
+      idempotency_key: idempotencyKey
+    },
+    error,
+    existing
   );
+  await writeOutboxItem(path, queuedItem);
+  const storage = queuedItem.payload_storage;
+  const limits = outboxLimitsFromEnv();
+  if (storage && storage.uncompressed_bytes >= limits.softWarnBytes) {
+    const compressedNote = storage.encoding === "json-gzip-base64" ? `, compressed to ${storage.stored_bytes} bytes` : "";
+    console.warn(`WARN queued large outbox item: ${storage.uncompressed_bytes} bytes${compressedNote}. No content was truncated.`);
+  }
   return path;
 }
 
@@ -3639,10 +3993,14 @@ async function outboxRoots(cfg: BrainstackConfig): Promise<string[]> {
   const roots = new Set<string>([outboxRoot(cfg)]);
   const parent = outboxParentRoot(cfg);
   if (existsSync(parent)) {
+    const parentInfo = await lstat(parent).catch(() => null);
+    if (!parentInfo?.isDirectory() || parentInfo.isSymbolicLink()) {
+      return [...roots].sort();
+    }
     for (const name of await readdir(parent).catch(() => [])) {
       const path = join(parent, name);
-      const info = await stat(path).catch(() => null);
-      if (info?.isDirectory()) {
+      const info = await lstat(path).catch(() => null);
+      if (info?.isDirectory() || info?.isSymbolicLink()) {
         roots.add(path);
       }
     }
@@ -3838,6 +4196,12 @@ async function commandOutbox(args: ParsedArgs): Promise<void> {
     case "purge":
       if (!hasFlag(args, "yes")) {
         throw new Error("outbox purge is destructive; rerun with --yes");
+      }
+      {
+        const unsafeCorrupt = corrupt.filter((entry) => /symlink|escape|not a directory/i.test(entry.error));
+        if (unsafeCorrupt.length) {
+          throw new Error("outbox purge found unsafe path entries; run `brainctl outbox purge-corrupt --yes` first so purge does not follow unsafe paths");
+        }
       }
       {
         const roots = await outboxRoots(cfg);

@@ -68,6 +68,7 @@ Outbox flushes also stop retrying persistent `425` in-progress responses after `
 `braind` keeps originals but rejects risky imports before storing them:
 
 - `BRAIN_MAX_IMPORT_BYTES` limits text, uploads, and URL fetch bodies.
+- `BRAIN_IMPORT_PREPARATION_CONCURRENCY` separately caps concurrent URL/body preparation so slow URL imports cannot consume unbounded sockets while ordinary text writes still reach the mutation queue.
 - URL response bodies are capped while streaming; the service does not rely on `Content-Length`.
 - `BRAIN_URL_FETCH_TIMEOUT_MS` caps URL fetch/header/body read time.
 - URL imports only allow `http` and `https`.

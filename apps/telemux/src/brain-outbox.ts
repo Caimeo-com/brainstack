@@ -5,6 +5,7 @@ import {
   buildOutboxItem,
   ensurePrivateOutboxDir,
   normalizeOutboxItem,
+  outboxLimitsFromEnv,
   outboxItemKey,
   sanitizedHttpError,
   scanOutbox,
@@ -46,6 +47,9 @@ function outboxRoot(config: FactoryConfig): string {
 
 async function findMatchingQueuedWrite(root: string, endpoint: BrainEndpoint, idempotencyKey: string): Promise<{ path: string; item: QueuedBrainWrite } | null> {
   const scan = await scanOutbox(root);
+  if (scan.corrupt.length) {
+    throw new Error(`brain outbox contains ${scan.corrupt.length} corrupt/unsafe item(s); inspect and purge before queueing new writes`);
+  }
   for (const entry of scan.items) {
     if (entry.item.endpoint !== endpoint) {
       continue;
@@ -67,24 +71,28 @@ async function queueBrainWrite(config: FactoryConfig, endpoint: BrainEndpoint, p
   const matched = await findMatchingQueuedWrite(root, endpoint, idempotencyKey);
   const path = matched?.path || stablePath;
   const existing = matched?.item || null;
-  await writeOutboxItem(
-    path,
-    buildOutboxItem(
-      {
-        endpoint,
-        url: config.brainBaseUrl,
-        payload,
-        created_at: existing?.created_at || created,
-        source_machine: String(payload.source_machine || config.localMachine),
-        source_harness: String(payload.source_harness || "telemux"),
-        retry_count: existing?.retry_count || 0,
-        idempotency_key: idempotencyKey,
-        last_error: error
-      },
-      error,
-      existing
-    )
+  const queuedItem = buildOutboxItem(
+    {
+      endpoint,
+      url: config.brainBaseUrl,
+      payload,
+      created_at: existing?.created_at || created,
+      source_machine: String(payload.source_machine || config.localMachine),
+      source_harness: String(payload.source_harness || "telemux"),
+      retry_count: existing?.retry_count || 0,
+      idempotency_key: idempotencyKey,
+      last_error: error
+    },
+    error,
+    existing
   );
+  await writeOutboxItem(path, queuedItem);
+  const storage = queuedItem.payload_storage;
+  const limits = outboxLimitsFromEnv();
+  if (storage && storage.uncompressed_bytes >= limits.softWarnBytes) {
+    const compressedNote = storage.encoding === "json-gzip-base64" ? `, compressed to ${storage.stored_bytes} bytes` : "";
+    console.warn(`WARN queued large shared brain import: ${storage.uncompressed_bytes} bytes${compressedNote}. No content was truncated.`);
+  }
   return path;
 }
 

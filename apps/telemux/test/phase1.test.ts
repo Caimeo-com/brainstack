@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { CommandHandler } from "../src/commands";
@@ -11,6 +11,7 @@ import { FactoryDb } from "../src/db";
 import { Dispatcher } from "../src/dispatcher";
 import { ensureBasicLoops } from "../src/basic-loops";
 import { flushBrainOutbox, postBrainImportOrQueue } from "../src/brain-outbox";
+import { canonicalJson, sha256Hex } from "../../../packages/outbox/src/outbox";
 import {
   parseArtifactEntries,
   removeArtifactEntriesFromMarkdown,
@@ -574,6 +575,35 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
   };
 }
 
+test("telemux state database and runtime roots are private under permissive umask", async () => {
+  const previousUmask = process.umask(0o000);
+  let fixture: Awaited<ReturnType<typeof createFixture>> | null = null;
+  try {
+    fixture = await createFixture();
+  } finally {
+    process.umask(previousUmask);
+  }
+
+  try {
+    expect(fixture).toBeTruthy();
+    if (!fixture) {
+      throw new Error("fixture setup failed");
+    }
+    const dbMode = (await stat(fixture.config.dbPath)).mode & 0o777;
+    const stateMode = (await stat(fixture.config.stateRoot)).mode & 0o777;
+    const controlMode = (await stat(fixture.config.controlRoot)).mode & 0o777;
+    expect(dbMode & 0o077).toBe(0);
+    expect(stateMode & 0o077).toBe(0);
+    expect(controlMode & 0o077).toBe(0);
+  } finally {
+    process.env.PATH = fixture?.previousPath || process.env.PATH;
+    process.umask(previousUmask);
+    if (fixture) {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("phase 1 workflow covers local host/scratch and pending remote behavior", async () => {
   const fixture = await createFixture();
 
@@ -985,6 +1015,72 @@ test("dispatcher drains queued turns after lock-only jobs finish", async () => {
     await lockDone;
     await waitFor(() => !fixture.dispatcher.isActive("lockqueue"));
     await waitFor(async () => (await readFile(join(context!.worktreePath, ".factory", "fake-turn-count"), "utf8")) === "1");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("dispatcher preserves Telegram user id on durable queued turns", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx queueuser control scratch", 83));
+    const context = fixture.db.getContextBySlug("queueuser");
+    expect(context).toBeTruthy();
+
+    const lockDone = fixture.dispatcher.withContextLock(context!, async () => {
+      const queued = await fixture.dispatcher.dispatch(
+        "resume",
+        context!,
+        "queued with user metadata",
+        { chatId: 4242, threadId: 83 },
+        { notifyAccepted: false, userId: 987654 }
+      );
+      expect(queued.accepted).toBe(true);
+      const claimed = fixture.db.claimNextQueuedTurn("queueuser");
+      expect(claimed?.userId).toBe(987654);
+      fixture.db.finishQueuedTurn(claimed!.id, "skipped", "metadata assertion complete");
+    });
+
+    await lockDone;
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("dispatcher rehydrates queued turn user id from the durable column when options are sparse", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx replayuser control scratch", 86));
+    const context = fixture.db.getContextBySlug("replayuser");
+    expect(context).toBeTruthy();
+    fixture.db.enqueueQueuedTurn({
+      contextSlug: "replayuser",
+      mode: "resume",
+      instruction: "queued sparse replay",
+      chatId: 4242,
+      threadId: 86,
+      userId: 24680,
+      optionsJson: "{}"
+    });
+
+    let seenUserId: number | null | undefined;
+    const dispatcherInternals = fixture.dispatcher as unknown as {
+      dispatch: typeof fixture.dispatcher.dispatch;
+      startNextQueuedTurn: (slug: string) => void;
+    };
+    const originalDispatch = dispatcherInternals.dispatch.bind(fixture.dispatcher);
+    dispatcherInternals.dispatch = async (_mode, _context, _instruction, _target, options) => {
+      seenUserId = options?.userId;
+      return { accepted: false, message: null };
+    };
+
+    dispatcherInternals.startNextQueuedTurn("replayuser");
+    await waitFor(() => seenUserId === 24680);
+    dispatcherInternals.dispatch = originalDispatch;
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
@@ -1790,6 +1886,62 @@ test("update-check marks an all-machine probe failure as failed", async () => {
   }
 }, 30_000);
 
+test("update-check reports known but unconfigured machines instead of silently omitting them", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx update-known control scratch", 88));
+    const context = fixture.db.getContextBySlug("update-known")!;
+    fixture.db.saveWorker({
+      host: "seen-only",
+      transport: "ssh",
+      status: "healthy",
+      reachable: true,
+      localExecution: false,
+      sshTarget: "seen-only.tailnet",
+      sshUser: "factory",
+      lastCheckedAt: new Date().toISOString(),
+      lastSeenAt: new Date().toISOString(),
+      lastError: null,
+      details: null,
+      updatedAt: new Date().toISOString()
+    });
+    const workerInternals = fixture.workers as unknown as {
+      runUpdateCheckProbe: (worker: { name: string; transport: string }) => Promise<{
+        ok: boolean;
+        host: string;
+        transport: string;
+        exitCode: number;
+        stdout: string;
+        stderr: string;
+        durationMs: number;
+        commandLabel: string;
+      }>;
+    };
+    const originalProbe = workerInternals.runUpdateCheckProbe.bind(fixture.workers);
+    workerInternals.runUpdateCheckProbe = async (worker) => ({
+      ok: true,
+      host: worker.name,
+      transport: worker.transport,
+      exitCode: 0,
+      stdout: "ok",
+      stderr: "",
+      durationMs: 1,
+      commandLabel: "update-check"
+    });
+
+    const result = await fixture.workers.runUpdateCheck(context);
+    workerInternals.runUpdateCheckProbe = originalProbe;
+    expect(result.ok).toBe(true);
+    expect(result.stdout).toContain("## seen-only");
+    expect(result.stdout).toContain("skipped: known machine has no configured worker entry for update-check");
+    expect(result.commandLabel).toContain("seen-only");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
 test("worker health degrades when sudo or harness probe checks fail", async () => {
   const fixture = await createFixture();
   const previousFakeSudoFail = process.env.FACTORY_TEST_FAKE_SUDO_FAIL;
@@ -2509,8 +2661,9 @@ test("telemux can run Claude as the selected harness", async () => {
 }, 15_000);
 
 test("worker harness selection supports worker and context overrides without control-host binary leakage", async () => {
-  const capture = join(tmpdir(), `telemux-ssh-capture-${Date.now()}.sh`);
-  const argsCapture = join(tmpdir(), `telemux-ssh-args-${Date.now()}.txt`);
+      const capture = join(tmpdir(), `telemux-ssh-capture-${Date.now()}.sh`);
+      const cachedCapture = join(tmpdir(), `telemux-ssh-cached-capture-${Date.now()}.sh`);
+      const argsCapture = join(tmpdir(), `telemux-ssh-args-${Date.now()}.txt`);
   const fixture = await createFixture({
     FACTORY_HARNESS: "codex",
     TEST_CONTROL_WORKER_HARNESS: "claude"
@@ -2530,23 +2683,56 @@ test("worker harness selection supports worker and context overrides without con
     await fixture.commands.handleMessage(telegramMessage("Context override should choose Codex.", 69));
     await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for workerharness.")));
 
-    process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT = capture;
-    process.env.FACTORY_TEST_CAPTURE_SSH_ARGS = argsCapture;
-    await fixture.workers.probeWorker("worker1");
-    const capturedArgs = await readFile(argsCapture, "utf8");
-    expect(capturedArgs).toContain("StrictHostKeyChecking=yes");
-    expect(capturedArgs).toContain(`UserKnownHostsFile=${fixture.config.sshKnownHostsPath}`);
-    const capturedScript = await readFile(capture, "utf8");
-    expect(capturedScript).toContain("harness_bin='codex'");
-    expect(capturedScript).toContain("__BRAINSTACK_PATH__");
-    expect(capturedScript).toContain("BRAINSTACK_WORKER_PATH");
-    expect(capturedScript).not.toContain(fixture.fakeCodex);
-  } finally {
-    delete process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT;
-    delete process.env.FACTORY_TEST_CAPTURE_SSH_ARGS;
+      process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT = capture;
+      process.env.FACTORY_TEST_CAPTURE_SSH_ARGS = argsCapture;
+      const doctorCompatibleFingerprint = sha256Hex(
+        canonicalJson({
+          worker: "worker1",
+          transport: "ssh",
+          sshTarget: "worker1.tailnet",
+          sshUser: "factory",
+          harness: "codex",
+          harnessBin: "codex"
+        })
+      );
+      await writeFile(
+        join(fixture.config.stateRoot, "worker-env-cache.json"),
+        `${JSON.stringify(
+          {
+            worker1: {
+              worker: "worker1",
+              fingerprint: doctorCompatibleFingerprint,
+              path: "/doctor/cached/bin:/usr/bin",
+              harness: "codex",
+              harnessBin: "codex",
+              harnessVersion: "codex fake",
+              detectedAt: new Date().toISOString()
+            }
+          },
+          null,
+          2
+        )}\n`
+      );
+      await fixture.workers.probeWorker("worker1");
+      const capturedArgs = await readFile(argsCapture, "utf8");
+      expect(capturedArgs).toContain("StrictHostKeyChecking=yes");
+      expect(capturedArgs).toContain(`UserKnownHostsFile=${fixture.config.sshKnownHostsPath}`);
+      const capturedScript = await readFile(capture, "utf8");
+      expect(capturedScript).toContain("harness_bin='codex'");
+      expect(capturedScript).toContain("__BRAINSTACK_PATH__");
+      expect(capturedScript).toContain("BRAINSTACK_WORKER_PATH");
+      expect(capturedScript).not.toContain(fixture.fakeCodex);
+      process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT = cachedCapture;
+      await fixture.workers.readFactoryFile({ ...context!, machine: "worker1", worktreePath: "/srv/factory/scratch/cache-test" }, "SUMMARY.md");
+      const cachedScript = await readFile(cachedCapture, "utf8");
+      expect(cachedScript).toContain("BRAINSTACK_WORKER_PATH='/doctor/cached/bin:/usr/bin'");
+    } finally {
+      delete process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT;
+      delete process.env.FACTORY_TEST_CAPTURE_SSH_ARGS;
     process.env.PATH = fixture.previousPath;
-    await rm(capture, { force: true });
-    await rm(argsCapture, { force: true });
+      await rm(capture, { force: true });
+      await rm(cachedCapture, { force: true });
+      await rm(argsCapture, { force: true });
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 15_000);
@@ -2761,6 +2947,30 @@ test("Telegram text coalescing keeps pending text durable when dispatch refuses 
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 10_000);
+
+test("Telegram text recovery drops stale pending text instead of auto-running it", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_RECOVERY_MAX_AGE_MS: "1"
+  });
+
+  try {
+    fixture.db.upsertPendingText({
+      key: "4242:99:123456789",
+      contextSlug: "stale",
+      chatId: 4242,
+      threadId: 99,
+      userId: TEST_ALLOWED_TELEGRAM_USER_ID,
+      partsJson: JSON.stringify(["old text"])
+    });
+    await Bun.sleep(5);
+    fixture.commands.recoverPendingText();
+    expect(fixture.db.pendingTextStats().count).toBe(0);
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("too old to auto-dispatch");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
 
 test("Telegram text coalescing flushes before buffers grow without bound", async () => {
   const fixture = await createFixture({

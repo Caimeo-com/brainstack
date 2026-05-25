@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
+import { canonicalJson, sha256Hex } from "../../../packages/outbox/src/outbox";
 import type { CodexReasoningEffort } from "./codex-runtime";
 import { loadWorkerConfigsFromPath, type FactoryConfig, type FactoryWorkerConfig, type HarnessName } from "./config";
 import { ContextKind, ContextRecord, ContextState, FactoryDb, WorkerRecord } from "./db";
@@ -99,10 +99,6 @@ interface WorkerEnvCacheRecord {
   detectedAt: string;
 }
 
-function cacheSha(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
-}
-
 function workerEnvCachePath(config: FactoryConfig): string {
   return join(config.stateRoot, "worker-env-cache.json");
 }
@@ -125,14 +121,14 @@ async function writeWorkerEnvCache(config: FactoryConfig, cache: Record<string, 
 }
 
 function workerEnvFingerprint(worker: FactoryWorkerConfig, harness: { family: HarnessName; bin: string }): string {
-  return cacheSha({
+  return sha256Hex(canonicalJson({
     worker: worker.name,
     transport: worker.transport,
     sshTarget: worker.sshTarget || null,
     sshUser: worker.sshUser || null,
     harness: harness.family,
     harnessBin: harness.bin
-  });
+  }));
 }
 
 function workerUserPathPrelude(): string {
@@ -903,19 +899,28 @@ wait "$harness_pid"
         }
       }
     };
-    const result = await this.runWorkerScript(worker, script, logPath, this.config.workerRunTimeoutSeconds, async (chunk) => {
-      stdoutBuffer = appendBoundedOutput(stdoutBuffer, chunk, this.config.workerCaptureMaxBytes);
-      await consumeControlEvents(chunk);
-      const detected = parseSessionId(chunk);
-      if (detected && detected !== seenSessionId) {
-        seenSessionId = detected;
-        await options.onSessionId?.(detected);
-      }
-      if (!seenCompaction && lineLooksLikeCompactionEvent(chunk)) {
-        seenCompaction = true;
-        await options.onCompaction?.();
-      }
-    });
+    const result = await this.runWorkerScript(
+      worker,
+      script,
+      logPath,
+      this.config.workerRunTimeoutSeconds,
+      async (chunk) => {
+        stdoutBuffer = appendBoundedOutput(stdoutBuffer, chunk, this.config.workerCaptureMaxBytes);
+        await consumeControlEvents(chunk);
+        const detected = parseSessionId(chunk);
+        if (detected && detected !== seenSessionId) {
+          seenSessionId = detected;
+          await options.onSessionId?.(detected);
+        }
+        if (!seenCompaction && lineLooksLikeCompactionEvent(chunk)) {
+          seenCompaction = true;
+          await options.onCompaction?.();
+        }
+      },
+      this.config.workerCaptureMaxBytes,
+      true,
+      harness
+    );
     if (stdoutControlLineBuffer) {
       const detected = parseSessionId(stdoutControlLineBuffer);
       if (detected && detected !== seenSessionId) {
@@ -955,9 +960,23 @@ wait "$harness_pid"
     const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
     const reportPath = `.factory/reports/update-check-${stamp}.md`;
     const targets = this.updateCheckTargets(contextWorker);
+    const targetNames = new Set(targets.map((worker) => worker.name));
+    const unconfigured = this.knownHosts()
+      .filter((host) => !targetNames.has(host))
+      .sort()
+      .map((host) => ({
+        ok: false,
+        host,
+        transport: "stack" as const,
+        exitCode: 77,
+        stdout: "",
+        stderr: "skipped: known machine has no configured worker entry for update-check",
+        durationMs: 0,
+        commandLabel: "update-check skipped"
+      }));
     const { scheduled, skipped } = this.limitUpdateCheckTargets(targets);
     const probed = await this.runUpdateCheckProbes(scheduled, logPath);
-    const results = [...probed, ...skipped];
+    const results = [...probed, ...skipped, ...unconfigured];
     const report = this.formatStackUpdateReport(context, stamp, results);
     const failed = results.filter((result) => !result.ok);
     const allFailed = results.length > 0 && failed.length === results.length;
@@ -987,7 +1006,7 @@ wait "$harness_pid"
       stdout: `BRAINSTACK_UPDATE_REPORT=${reportPath}\n${report}`,
       stderr: allFailed ? `update-check failed on all ${results.length} machine(s)` : "",
       durationMs: Date.now() - startedAt,
-      commandLabel: `update-check ${targets.map((worker) => worker.name).join(",")}`,
+      commandLabel: `update-check ${[...targetNames, ...unconfigured.map((result) => result.host)].sort().join(",")}`,
       reportPath
     };
   }
@@ -1945,9 +1964,10 @@ printf 'BRANCH=%s\\n' "$branch_name"
     timeoutSeconds?: number,
     onStdoutChunk?: (chunk: string) => Promise<void> | void,
     captureMaxBytes = this.config.workerCaptureMaxBytes,
-    usePathCache = true
+    usePathCache = true,
+    harnessOverride?: { family: HarnessName; bin: string }
   ): Promise<WorkerExecResult> {
-    const harness = this.resolveHarness(worker);
+    const harness = harnessOverride || this.resolveHarness(worker);
     const cachedPath = usePathCache && worker.transport !== "local" ? await this.cachedWorkerPath(worker, harness) : null;
     const cachePrelude = cachedPath ? `BRAINSTACK_WORKER_PATH=${quoteSh(cachedPath)}\nexport BRAINSTACK_WORKER_PATH\n` : "";
     const uncachedPrelude = usePathCache ? "" : "unset BRAINSTACK_WORKER_PATH\n";

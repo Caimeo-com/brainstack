@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 export type WorkerTransport = "local" | "ssh" | "tailscale-ssh";
@@ -60,6 +60,7 @@ export interface FactoryConfig {
   brainImportToken: string;
   allowAbsoluteArtifactPaths: boolean;
   textCoalesceMs: number;
+  pendingTextRecoveryMaxAgeMs: number;
 }
 
 export interface WorkerConfigInput {
@@ -320,7 +321,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
     brainBaseUrl: env.BRAIN_BASE_URL?.trim() || "",
     brainImportToken: env.BRAIN_IMPORT_TOKEN?.trim() || "",
     allowAbsoluteArtifactPaths: ["1", "true", "yes", "on"].includes((env.FACTORY_ALLOW_ABSOLUTE_ARTIFACT_PATHS || "").toLowerCase()),
-    textCoalesceMs: readNumber(env, "FACTORY_TEXT_COALESCE_MS", 1500)
+    textCoalesceMs: readNumber(env, "FACTORY_TEXT_COALESCE_MS", 1500),
+    pendingTextRecoveryMaxAgeMs: readNumber(env, "FACTORY_TEXT_COALESCE_RECOVERY_MAX_AGE_MS", 5 * 60_000)
   };
 }
 
@@ -340,6 +342,11 @@ export function ensureProjectPaths(targetConfig: FactoryConfig = config): void {
   ];
 
   for (const dir of dirs) {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try {
+      chmodSync(dir, 0o700);
+    } catch {
+      // Best-effort on filesystems that do not support POSIX modes.
+    }
   }
 }

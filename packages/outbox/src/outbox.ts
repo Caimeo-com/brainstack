@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
-import { chmod, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
 
 export type BrainEndpoint = "import" | "propose";
@@ -97,12 +97,56 @@ export function outboxItemKey(endpoint: BrainEndpoint, payload: Record<string, u
   return sha256Hex(canonicalJson({ endpoint, payload, destination: destination || null }));
 }
 
+function outboxDestinationForKey(item: Pick<OutboxItem, "brain_id" | "url">): Record<string, unknown> {
+  return {
+    brain_id: item.brain_id || null,
+    url: item.url || null
+  };
+}
+
 export function outboxItemId(endpoint: BrainEndpoint, idempotencyKey: string): string {
   return `${endpoint}-${idempotencyKey.slice(0, 32)}`;
 }
 
+async function unsafeOutboxPath(path: string): Promise<{ path: string; error: string } | null> {
+  const MAX_OUTBOX_TRUST_BOUNDARY_DEPTH = 4;
+  const absolute = resolve(path);
+  let current = absolute;
+  for (let depth = 0; depth < MAX_OUTBOX_TRUST_BOUNDARY_DEPTH; depth += 1) {
+    const info = await lstat(current).catch(() => null);
+    if (!info) {
+      const parent = dirname(current);
+      if (parent === current) {
+        break;
+      }
+      current = parent;
+      continue;
+    }
+    if (info.isSymbolicLink()) {
+      return { path: current, error: "outbox path ancestor is a symlink" };
+    }
+    if (!info.isDirectory()) {
+      return { path: current, error: "outbox path ancestor is not a directory" };
+    }
+    const parent = dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  return null;
+}
+
 export async function ensurePrivateOutboxDir(root: string): Promise<void> {
+  const unsafeBefore = await unsafeOutboxPath(root);
+  if (unsafeBefore) {
+    throw new Error(`${unsafeBefore.error}: ${unsafeBefore.path}`);
+  }
   await mkdir(root, { recursive: true, mode: 0o700 });
+  const unsafeAfter = await unsafeOutboxPath(root);
+  if (unsafeAfter) {
+    throw new Error(`${unsafeAfter.error}: ${unsafeAfter.path}`);
+  }
   await chmod(root, 0o700).catch(() => undefined);
 }
 
@@ -215,7 +259,7 @@ export function decodeOutboxPayload(
     }
     const compressed = Buffer.from(storage.data, "base64");
     validateStoredNumber(storage.stored_bytes, compressed.byteLength, "compressed payload stored_bytes");
-    const rawBytes = gunzipSync(compressed);
+    const rawBytes = gunzipSync(compressed, { maxOutputLength: limits.hardMaxBytes + 1 });
     validatePayloadSize(rawBytes, limits, "compressed payload");
     validateStoredNumber(storage.uncompressed_bytes, rawBytes.byteLength, "compressed payload uncompressed_bytes");
     if (sha256Hex(rawBytes) !== storage.sha256) {
@@ -233,11 +277,7 @@ export function decodeOutboxPayload(
 
 export function normalizeOutboxItem(item: OutboxItem, limits: OutboxLimits = outboxLimitsFromEnv()): OutboxItem {
   const payload = decodeOutboxPayload(item, limits);
-  const idempotencyKey = outboxItemKey(item.endpoint, payload, {
-    brain_id: item.brain_id || null,
-    url: item.url || null,
-    import_token_env: item.import_token_env || null
-  });
+  const idempotencyKey = outboxItemKey(item.endpoint, payload, outboxDestinationForKey(item));
   return {
     ...item,
     id: outboxItemId(item.endpoint, idempotencyKey),
@@ -258,24 +298,49 @@ export async function readOutboxEntry(
   }
   const item = JSON.parse(await readFile(path, "utf8")) as OutboxItem;
   const payload = decodeOutboxPayload(item, limits);
-  const idempotencyKey = outboxItemKey(item.endpoint, payload, {
-    brain_id: item.brain_id || null,
-    url: item.url || null,
-    import_token_env: item.import_token_env || null
-  });
+  const idempotencyKey = outboxItemKey(item.endpoint, payload, outboxDestinationForKey(item));
   return { path, item, payload, idempotencyKey };
 }
 
 export async function scanOutbox(root: string, limits: OutboxLimits = outboxLimitsFromEnv()): Promise<OutboxScan> {
+  const unsafe = await unsafeOutboxPath(root);
+  if (unsafe) {
+    return { root, items: [], corrupt: [{ path: unsafe.path, name: basename(unsafe.path), error: unsafe.error }] };
+  }
   if (!existsSync(root)) {
     return { root, items: [], corrupt: [] };
   }
+  const rootInfo = await lstat(root).catch(() => null);
+  if (!rootInfo) {
+    return { root, items: [], corrupt: [] };
+  }
+  if (rootInfo.isSymbolicLink()) {
+    return { root, items: [], corrupt: [{ path: root, name: basename(root), error: "outbox namespace is a symlink" }] };
+  }
+  if (!rootInfo.isDirectory()) {
+    return { root, items: [], corrupt: [{ path: root, name: basename(root), error: "outbox namespace is not a directory" }] };
+  }
   await ensurePrivateOutboxDir(root);
+  const rootReal = await realpath(root).catch(() => root);
   const names = (await readdir(root)).filter((name) => name.endsWith(".json") || name.endsWith(".tmp")).sort();
   const items: OutboxEntry[] = [];
   const corrupt: CorruptOutboxEntry[] = [];
   for (const name of names) {
     const path = join(root, name);
+    const info = await lstat(path).catch(() => null);
+    if (!info) {
+      corrupt.push({ path, name, error: "outbox item disappeared during scan" });
+      continue;
+    }
+    if (info.isSymbolicLink()) {
+      corrupt.push({ path, name, error: "outbox item is a symlink" });
+      continue;
+    }
+    const itemReal = await realpath(path).catch(() => path);
+    if (itemReal !== rootReal && !itemReal.startsWith(`${rootReal}${sep}`)) {
+      corrupt.push({ path, name, error: "outbox item escapes namespace realpath" });
+      continue;
+    }
     if (name.endsWith(".tmp")) {
       corrupt.push({ path, name, error: "stale temporary outbox file" });
       continue;
@@ -305,11 +370,7 @@ export function buildOutboxItem(
   existing?: OutboxItem | null,
   limits: OutboxLimits = outboxLimitsFromEnv()
 ): OutboxItem {
-  const idempotencyKey = outboxItemKey(input.endpoint, input.payload || {}, {
-    brain_id: input.brain_id || null,
-    url: input.url || null,
-    import_token_env: input.import_token_env || null
-  });
+  const idempotencyKey = outboxItemKey(input.endpoint, input.payload || {}, outboxDestinationForKey(input));
   return normalizeOutboxItem(
     {
       ...input,
@@ -340,8 +401,18 @@ export function sanitizeOutboxError(error: string): string {
 
 export async function purgeCorruptOutboxEntries(scan: OutboxScan): Promise<number> {
   let removed = 0;
+  const scanRoot = resolve(scan.root);
   for (const entry of scan.corrupt) {
-    await rm(entry.path, { force: true });
+    const entryPath = resolve(entry.path);
+    if (entryPath !== scanRoot && !entryPath.startsWith(`${scanRoot}${sep}`)) {
+      continue;
+    }
+    const info = await lstat(entry.path).catch(() => null);
+    if (info?.isSymbolicLink()) {
+      await unlink(entry.path).catch(() => undefined);
+    } else {
+      await rm(entry.path, { force: true });
+    }
     removed += 1;
   }
   return removed;

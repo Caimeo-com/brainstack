@@ -19,7 +19,7 @@ Before sharing brainstack with another machine or person:
 - Large binary policy is documented and tested.
 - Backup and restore docs are sufficient without tribal knowledge.
 - Routine docs explain deterministic `/cron create`, built-in routine installation, read-only update checks, and scheduler health checks.
-- Private-journal docs are honest about the current boundary: separate explicit installs/configs only, no automatic multi-brain routing yet.
+- Multi-brain docs are honest about the current boundary: brain instances are hard boundaries, sections are retrieval boundaries, and project context uses `.brainstack.yaml`, `profiles.yaml`, local allow rules, source labels, and explicit cross-brain write policy.
 
 ## Release Artifacts
 

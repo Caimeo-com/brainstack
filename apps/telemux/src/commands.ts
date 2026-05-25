@@ -464,7 +464,8 @@ export class CommandHandler {
         }
 
         const response = await this.dispatcher.dispatch("resume", boundContext, text, target, {
-          telegramInput
+          telegramInput,
+          userId: message.from?.id ?? null
         });
         if (response.message) {
           await this.telegram.sendText(target, response.message);
@@ -809,7 +810,8 @@ export class CommandHandler {
             notifyAccepted: false,
             notifyCompaction: false,
             rawPrompt: true,
-            sourceLabel: "manual compact"
+            sourceLabel: "manual compact",
+            userId: message.from?.id ?? null
           });
           if (!response.accepted && response.message) {
             await this.telegram.sendText(target, response.message);
@@ -1193,7 +1195,8 @@ export class CommandHandler {
           }
 
           const response = await this.dispatcher.dispatch(mode, boundContext, parsed.rest, target, {
-            telegramInput
+            telegramInput,
+            userId: message.from?.id ?? null
           });
           if (response.message) {
             await this.telegram.sendText(target, response.message);
@@ -1418,7 +1421,8 @@ export class CommandHandler {
     }
     try {
       const response = await this.dispatcher.dispatch("resume", context, prompt, pending.target, {
-        telegramInput: null
+        telegramInput: null,
+        userId: pending.userId
       });
       if (response.accepted) {
         this.db.deletePendingText(key);
@@ -1457,6 +1461,15 @@ export class CommandHandler {
         this.db.deletePendingText(stored.key);
         continue;
       }
+      const createdAt = Date.parse(stored.createdAt) || Date.now();
+      if (Date.now() - createdAt > this.config.pendingTextRecoveryMaxAgeMs) {
+        this.db.deletePendingText(stored.key);
+        void this.telegram.sendText(
+          { chatId: stored.chatId, threadId: stored.threadId },
+          "Pending Telegram text from before restart was too old to auto-dispatch. Please resend it."
+        );
+        continue;
+      }
       const target = { chatId: stored.chatId, threadId: stored.threadId };
       this.pendingText.set(stored.key, {
         key: stored.key,
@@ -1464,7 +1477,7 @@ export class CommandHandler {
         userId: stored.userId,
         contextSlug: stored.contextSlug,
         parts,
-        createdAt: Date.parse(stored.createdAt) || Date.now(),
+        createdAt,
         timer: setTimeout(() => void this.flushPendingText(target, stored.userId).catch((error) => this.reportPendingTextFlushError(target, error)), Math.max(1, this.config.textCoalesceMs))
       });
     }

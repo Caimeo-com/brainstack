@@ -42,6 +42,7 @@ export interface DispatchOptions {
   reasoningEffortOverride?: ContextRecord["reasoningEffortOverride"];
   sourceLabel?: string | null;
   queuedTurnId?: string | null;
+  userId?: number | null;
 }
 
 function nowStamp(): string {
@@ -224,6 +225,7 @@ export class Dispatcher {
       instruction: turn.instruction,
       chatId: turn.replyTarget.chatId,
       threadId: turn.replyTarget.threadId,
+      userId: turn.options.userId ?? null,
       optionsJson: JSON.stringify(turn.options)
     });
     return true;
@@ -255,7 +257,8 @@ export class Dispatcher {
       void this.dispatch(next.mode as DispatchMode, context, next.instruction, replyTarget, {
         ...options,
         notifyAccepted: false,
-        queuedTurnId: next.id
+        queuedTurnId: next.id,
+        userId: options.userId ?? next.userId ?? null
       })
         .then((response) => {
           if (!response.accepted) {

@@ -53,7 +53,7 @@ Generated source-run services also invoke Bun with `--no-env-file` and load expl
 - `worker`: worker host reachable by normal OpenSSH over Tailscale; no Telegram polling and no admin ingest token.
 - `client-macos`: local clone plus Codex/Claude/Cursor bootstrap; no local services.
 
-Private journaling should use an explicit separate repo/service/token boundary. Local project context can search and write to explicitly configured brains, but automatic private-journal provisioning and hard policy routing are not implemented yet.
+Private journaling should use an explicit separate repo/service/token boundary. Local project context can search and write to explicitly configured brains through `.brainstack.yaml` and `~/.config/brainstack/profiles.yaml`, with local allow rules for personal sections and source-labelled retrieval.
 
 Start with the quickstart docs in `docs/`.
 See [`docs/fresh-machine-install.md`](./docs/fresh-machine-install.md) for bootstrapping a new control, worker, or client machine from prerequisites through `doctor`.
@@ -77,6 +77,8 @@ security:
 ```
 
 Expose through Tailscale Serve with `brainctl expose tailscale`; avoid direct public binds.
+
+Brainstack is designed for trusted private networks. In `trusted-tailnet` mode, anyone who can reach the Brainstack service on your private mesh can read the brain. Tailscale, VPN routing, and grants are the boundary in this mode; do not expose it to the public internet. Future `guarded` mode may add stricter app-layer read auth, but the default path intentionally avoids password and IAM ceremony.
 
 Client/worker bootstrap accepts `BRAIN_IMPORT_TOKEN` or `BRAIN_IMPORT_TOKEN_FILE` and writes it into `~/.config/shared-brain.env` only when the token slot is blank. `brainctl doctor --write-smoke` performs an explicit mutating import smoke test when you want to prove pushback is ready.
 

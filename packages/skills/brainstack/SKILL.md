@@ -73,8 +73,10 @@ The required grant shape is directional: operator to control/worker, control to 
 
 ## Shared-Brain Writes
 
-- Read freshness comes from local clone sync: `git -C ~/shared-brain pull --ff-only`.
-- Write continuity comes from `POST /api/import` and `POST /api/propose`, or `brainctl import-text` and `brainctl propose`.
+- Before substantial work in a repository, run `brainctl context --repo .` and follow the returned Brainstack instructions.
+- Read freshness and source labels should come through `brainctl search --repo . "query"` instead of hand-rolled clone/pull logic.
+- Write continuity should come through `brainctl remember --repo . --summary "..."`, or the lower-level `brainctl import-text` and `brainctl propose` commands when project context is not available.
+- Do not manually POST to Brainstack endpoints unless explicitly instructed.
 - If a write reports idempotency `review_required`, inspect the matching record under `derived/idempotency/` and repo state before retrying with a new key; do not force replay an ambiguous side effect.
 - Client bootstrap can receive `BRAIN_IMPORT_TOKEN` or `BRAIN_IMPORT_TOKEN_FILE`; it fills the local token slot only when blank and never prints the value.
 - If the brain is unreachable, use `brainctl outbox status|list|flush|purge|purge-corrupt`. Outbox files may contain sensitive note text and should stay in private local state.

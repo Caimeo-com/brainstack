@@ -1,7 +1,7 @@
 # Shared Brain Client
 
-- Consult `__SHARED_BRAIN_LOCAL_PATH__` for prior decisions, machines, skills, runbooks, and source pages.
-- Run `git -C __SHARED_BRAIN_LOCAL_PATH__ pull --ff-only` before assuming the clone is current.
-- Default writes are imports and proposals through the HTTP API using `BRAIN_IMPORT_TOKEN`.
+- Before substantial work in a repository, run `brainctl context --repo .`.
+- Follow the returned Brainstack instructions. Use `brainctl search --repo . "query"` for retrieval and `brainctl remember --repo . --summary "..."` for imports/proposals.
+- Preserve source labels when multiple brains are active.
 - Do not directly edit canonical wiki pages unless explicitly instructed.
 - Keep project-local state in the project, not in global memory.

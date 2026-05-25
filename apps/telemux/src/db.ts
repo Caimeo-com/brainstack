@@ -1,5 +1,7 @@
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import type { CodexReasoningEffort } from "./codex-runtime";
 import { CronJobRecord, CronRunRecord, normalizeCronSchedule } from "./cron-jobs";
 
@@ -236,8 +238,10 @@ export class FactoryDb {
   private readonly db: Database;
 
   constructor(dbPath: string) {
+    hardenDbPath(dbPath);
     this.db = new Database(dbPath, { create: true });
     this.init();
+    hardenDbPath(dbPath);
   }
 
   private hasColumn(table: string, column: string): boolean {
@@ -533,7 +537,7 @@ export class FactoryDb {
           status, attempts, received_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)
       `)
-      .run(id, input.contextSlug, input.mode, input.instruction, input.chatId, input.threadId, input.userId || null, input.optionsJson, now, now);
+      .run(id, input.contextSlug, input.mode, input.instruction, input.chatId, input.threadId, input.userId ?? null, input.optionsJson, now, now);
     return this.getQueuedTurn(id)!;
   }
 
@@ -1010,5 +1014,25 @@ export class FactoryDb {
           updated_at = excluded.updated_at
       `)
       .run(key, value, updatedAt);
+  }
+}
+
+function hardenDbPath(dbPath: string): void {
+  const dir = dirname(dbPath);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    // Best-effort on filesystems that do not support POSIX modes.
+  }
+  for (const path of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    if (!existsSync(path)) {
+      continue;
+    }
+    try {
+      chmodSync(path, 0o600);
+    } catch {
+      // Best-effort on filesystems that do not support POSIX modes.
+    }
   }
 }

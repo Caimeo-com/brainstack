@@ -13,8 +13,11 @@ build/
 coverage/
 tmp/
 .brainstack-render/
+.handoff-private-substitutions
 .factory/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
 *.tgz
+handoff-*.zip
+handoff-*.zip.sha256
