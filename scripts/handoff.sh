@@ -501,15 +501,15 @@ sanitize_handoff_text() {
   local old_migration_name="migration-from-current-${control_host}.md"
   while IFS= read -r -d '' file; do
     perl -0pi \
-      -e "s#/Users/[A-Za-z0-9._-]+#/Users/operator#g" \
-      -e "s#/home/${local_user}#/home/operator#g" \
-      -e "s/\\b${control_host}\\b/brain-control/g" \
-      -e "s/\\b${control_host_title}\\b/Brain-control/g" \
-      -e "s/\\b${worker_host_a}\\b/brain-worker/g" \
-      -e "s/\\b${worker_host_a_title}\\b/Brain-worker/g" \
-      -e "s/\\b${worker_host_b}\\b/brain-worker/g" \
-      -e "s/\\b${worker_host_b_title}\\b/Brain-worker/g" \
-      -e "s/${old_migration_name}/migration-from-existing-control-host.md/g" \
+      -e "s#/Users/[A-Za-z0-9._-]+#/Users/operator#g;" \
+      -e "s#/home/${local_user}#/home/operator#g;" \
+      -e "s/\\b${control_host}\\b/brain-control/g;" \
+      -e "s/\\b${control_host_title}\\b/Brain-control/g;" \
+      -e "s/\\b${worker_host_a}\\b/brain-worker/g;" \
+      -e "s/\\b${worker_host_a_title}\\b/Brain-worker/g;" \
+      -e "s/\\b${worker_host_b}\\b/brain-worker/g;" \
+      -e "s/\\b${worker_host_b_title}\\b/Brain-worker/g;" \
+      -e "s/${old_migration_name}/migration-from-existing-control-host.md/g;" \
       "$file"
   done < <(find "$bundle_dir" -type f \( -name '*.txt' -o -name '*.md' -o -name '*.yaml' -o -name '*.json' -o -name '*.toml' \) -print0)
 }
