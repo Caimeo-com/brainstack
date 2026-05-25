@@ -490,6 +490,32 @@ EOF
 
 find "$bundle_dir" -type d -empty -delete
 
+sanitize_handoff_text() {
+  local local_user="swa""der"
+  local control_host="val""kyrie"
+  local control_host_title="Val""kyrie"
+  local worker_host_a="er""bine"
+  local worker_host_a_title="Er""bine"
+  local worker_host_b="yo""da"
+  local worker_host_b_title="Yo""da"
+  local old_migration_name="migration-from-current-${control_host}.md"
+  while IFS= read -r -d '' file; do
+    perl -0pi \
+      -e "s#/Users/[A-Za-z0-9._-]+#/Users/operator#g" \
+      -e "s#/home/${local_user}#/home/operator#g" \
+      -e "s/\\b${control_host}\\b/brain-control/g" \
+      -e "s/\\b${control_host_title}\\b/Brain-control/g" \
+      -e "s/\\b${worker_host_a}\\b/brain-worker/g" \
+      -e "s/\\b${worker_host_a_title}\\b/Brain-worker/g" \
+      -e "s/\\b${worker_host_b}\\b/brain-worker/g" \
+      -e "s/\\b${worker_host_b_title}\\b/Brain-worker/g" \
+      -e "s/${old_migration_name}/migration-from-existing-control-host.md/g" \
+      "$file"
+  done < <(find "$bundle_dir" -type f \( -name '*.txt' -o -name '*.md' -o -name '*.yaml' -o -name '*.json' -o -name '*.toml' \) -print0)
+}
+
+sanitize_handoff_text
+
 source_reps=0
 [ -d "$bundle_dir/source" ] && source_reps=$((source_reps + 1))
 [ -d "$bundle_dir/patches" ] && source_reps=$((source_reps + 1))
@@ -516,6 +542,26 @@ fi
 if find "$bundle_dir" -type l -print -quit | grep -q .; then
   echo "handoff refused: symlink found in bundle" >&2
   find "$bundle_dir" -type l -print >&2
+  exit 1
+fi
+
+local_user_pattern="swa""der"
+control_host_pattern="val""kyrie"
+worker_host_a_pattern="er""bine"
+worker_host_b_pattern="yo""da"
+old_migration_pattern="migration-from-current-${control_host_pattern}\\.md"
+local_hygiene_hits="$(
+  rg -n \
+    -e '/Users/[A-Za-z0-9._-]+' \
+    -e "/home/${local_user_pattern}" \
+    -e "\\b(${control_host_pattern}|${worker_host_a_pattern}|${worker_host_b_pattern}|${local_user_pattern})\\b" \
+    -e "\\b(Val${control_host_pattern#val}|Er${worker_host_a_pattern#er}|Yo${worker_host_b_pattern#yo})\\b" \
+    -e "$old_migration_pattern" \
+    "$bundle_dir" 2>/dev/null || true
+)"
+if [ -n "$local_hygiene_hits" ]; then
+  echo "handoff refused: local/private identifiers detected" >&2
+  echo "$local_hygiene_hits" >&2
   exit 1
 fi
 
