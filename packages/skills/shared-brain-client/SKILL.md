@@ -11,6 +11,6 @@ Use this skill from client machines and harnesses.
 - Sync with `git pull --ff-only` before relying on local content.
 - Prefer reading local markdown over calling remote endpoints.
 - Use the HTTP API or client CLI for imports and proposals.
+- Verify write readiness with `brainctl doctor --write-smoke` only when an explicit mutating setup proof is wanted.
 - Do not directly edit canonical wiki pages unless the operator explicitly asks for trusted power-user mode.
 - Never request or store the admin ingest token on client or worker profiles.
-

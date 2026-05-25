@@ -53,6 +53,7 @@ Generated source-run services also invoke Bun with `--no-env-file` and load expl
 Private journaling should use an explicit separate repo/service/token boundary. Automatic multi-brain routing and a first-class `private-journal` provisioning profile are not implemented yet.
 
 Start with the quickstart docs in `docs/`.
+See [`docs/fresh-machine-install.md`](./docs/fresh-machine-install.md) for bootstrapping a new control, worker, or client machine from prerequisites through `doctor`.
 See [`docs/diagrams.md`](./docs/diagrams.md) for the read/write/outbox, Telegram coalescing, and control/client/worker topology diagrams.
 See [`docs/routines.md`](./docs/routines.md) for scheduled routines, built-in update checks, brain-curator setup, and daily check-ins.
 
@@ -61,5 +62,7 @@ See [`docs/routines.md`](./docs/routines.md) for scheduled routines, built-in up
 `destroy` is intentionally manifest-driven and destructive only with `--yes`. Use `--scope control|worker|client|all` to limit removal to brainstack-owned artifacts for that role. It never removes package installs, Tailscale enrollment, Codex/Claude auth, or sudo policy.
 
 Client import/propose writes can queue into `~/.local/state/brainstack/outbox/<brain-id>/` when the brain is unreachable. Use `brainctl outbox status|list|flush|purge`; flush replays only import/propose payloads and never mutates canonical wiki pages offline.
+
+Client/worker bootstrap accepts `BRAIN_IMPORT_TOKEN` or `BRAIN_IMPORT_TOKEN_FILE` and writes it into `~/.config/shared-brain.env` only when the token slot is blank. `brainctl doctor --write-smoke` performs an explicit mutating import smoke test when you want to prove pushback is ready.
 
 Read [`docs/operator-preflight.md`](./docs/operator-preflight.md) before enabling `telemux`. The control-plane profile assumes a trusted private machine; telemux passes authorized Telegram work into the configured harness process and is not a sandbox.

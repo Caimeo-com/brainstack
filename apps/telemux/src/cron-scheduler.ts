@@ -387,7 +387,8 @@ export class CronScheduler {
   private formatUpdateCheckResult(result: { stdout: string; reportPath: string | null }): string {
     const body = result.stdout.replace(/^BRAINSTACK_UPDATE_REPORT=.*$/m, "").trim();
     const compactBody = body.length > 3200 ? `${body.slice(0, 3200)}\n\n... truncated; see artifact.` : body;
-    return [`Update check complete.`, result.reportPath ? `Artifact: ${result.reportPath}` : null, compactBody].filter(Boolean).join("\n\n");
+    const heading = body.includes("- status: degraded") ? "Update check degraded." : "Update check complete.";
+    return [heading, result.reportPath ? `Artifact: ${result.reportPath}` : null, compactBody].filter(Boolean).join("\n\n");
   }
 
   private async advanceWhilePending(job: CronJobRecord, referenceIso: string): Promise<void> {

@@ -4,6 +4,8 @@ Brainstack routines are telemux scheduled jobs. They live in the telemux SQLite 
 
 Use routines for periodic operator workflows such as update checks, shared-brain curation, and daily check-ins. They are not OS cron jobs.
 
+When telemux starts with `FACTORY_TELEGRAM_CONTROL_CHAT_ID` configured, it idempotently creates a `brainstack-routines` scratch context and installs the deterministic `update-check` routine. If the control chat id is not configured, no automatic routine is created and `/cron install update-check` remains the manual path.
+
 ## Commands
 
 List jobs linked to the current topic or context:
@@ -84,7 +86,9 @@ You can override the default schedule:
 
 ### `update-check`
 
-Runs a deterministic read-only update report without invoking an LLM harness. Telemux runs Brainstack's `brainctl updates` path on the target worker when available, writes a report artifact, records it in `.factory/ARTIFACTS.md`, and posts a concise Telegram summary. The report checks Brainstack git state, Codex/Claude versions and compatibility, and supported OS package managers where available:
+Runs a deterministic read-only update report without invoking an LLM harness. Telemux runs Brainstack's `brainctl updates` path on every configured worker when available, falls back to safe local probes when the product checkout/config is missing on a worker, writes one stack report artifact, records it in `.factory/ARTIFACTS.md`, and posts a concise Telegram summary. A partially unreachable stack is reported as degraded; an all-machine probe failure fails the routine.
+
+The report checks Brainstack git state, Codex/Claude versions and compatibility, and supported OS package managers where available:
 
 - Homebrew: `HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew outdated --quiet`
 - Arch/Omarchy: `pacman -Qu`, plus `checkupdates` when installed
@@ -93,6 +97,8 @@ Runs a deterministic read-only update report without invoking an LLM harness. Te
 - openSUSE: `zypper --no-refresh list-updates`
 
 The routine does not install, upgrade, remove, reboot, restart, or mutate packages/services. It reports manual commands only.
+
+`FACTORY_WORKERS_FILE` is re-read by telemux when worker state is refreshed. After `brainctl join-worker` plus `brainctl upgrade` updates `workers.json`, the next update-check includes the new machine without additional routine setup. If the worker file becomes malformed or disappears after telemux has loaded it, worker dispatch fails closed until the file is fixed.
 
 ### `brain-curator`
 

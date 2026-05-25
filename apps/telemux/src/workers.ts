@@ -1,7 +1,8 @@
+import { existsSync } from "node:fs";
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { CodexReasoningEffort } from "./codex-runtime";
-import { FactoryConfig, FactoryWorkerConfig, HarnessName } from "./config";
+import { loadWorkerConfigsFromPath, type FactoryConfig, type FactoryWorkerConfig, type HarnessName } from "./config";
 import { ContextKind, ContextRecord, ContextState, FactoryDb, WorkerRecord } from "./db";
 import { isProtectedArtifactPath, TELEGRAM_ATTACHMENTS_WORKSPACE_PATH } from "./telegram-attachments";
 
@@ -15,6 +16,9 @@ export interface WorkerExecResult {
   durationMs: number;
   commandLabel: string;
 }
+
+const UPDATE_CHECK_CONCURRENCY = 4;
+const UPDATE_CHECK_MAX_TARGETS = 32;
 
 export interface BootstrapResult extends WorkerExecResult {
   kind: ContextKind;
@@ -199,25 +203,81 @@ brainstack_base64_decode() {
 }
 
 export class WorkerService {
+  private currentWorkers: FactoryWorkerConfig[];
+  private workerConfigError: string | null = null;
+  private loadedWorkersFromFile: boolean;
+
   constructor(
     private readonly config: FactoryConfig,
     private readonly db: FactoryDb
-  ) {}
+  ) {
+    this.currentWorkers = config.workers;
+    this.loadedWorkersFromFile = Boolean(config.workersFileInitiallyLoaded);
+  }
 
   knownHosts(): string[] {
     const contextHosts = this.db.listContexts().map((context) => context.machine);
     const workerHosts = this.db.listWorkers().map((worker) => worker.host);
-    const configured = this.config.workers.map((worker) => worker.name);
+    const configured = this.configuredWorkers().map((worker) => worker.name);
     return uniqueHosts([...configured, ...contextHosts, ...workerHosts]);
   }
 
   getWorkerConfig(machine: string): FactoryWorkerConfig | null {
-    return this.config.workers.find((worker) => worker.name === machine) || null;
+    return this.configuredWorkers().find((worker) => worker.name === machine) || null;
   }
 
   async refreshWorkers(): Promise<WorkerRecord[]> {
     const workers = await Promise.all(this.knownHosts().map((host) => this.probeWorker(host)));
+    if (this.workerConfigError) {
+      workers.push(
+        this.db.saveWorker({
+          host: "workers-config",
+          transport: "file",
+          status: "error",
+          reachable: false,
+          localExecution: false,
+          sshTarget: null,
+          sshUser: null,
+          lastCheckedAt: nowIso(),
+          lastSeenAt: null,
+          lastError: this.workerConfigError,
+          details: this.config.workersFilePath,
+          updatedAt: nowIso()
+        })
+      );
+    }
     return workers.sort((left, right) => left.host.localeCompare(right.host));
+  }
+
+  private configuredWorkers(): FactoryWorkerConfig[] {
+    if (!this.config.workersFilePath) {
+      return this.currentWorkers;
+    }
+
+    try {
+      if (!existsSync(this.config.workersFilePath)) {
+        if (this.config.workersFileExplicit || this.loadedWorkersFromFile) {
+          throw new Error(`workers file does not exist: ${this.config.workersFilePath}`);
+        }
+
+        this.workerConfigError = null;
+        return this.currentWorkers;
+      }
+
+      this.currentWorkers = loadWorkerConfigsFromPath(this.config.workersFilePath, {
+        localMachine: this.config.localMachine,
+        managedRepoRoot: this.config.managedRepoRoot,
+        managedHostRoot: this.config.managedHostRoot,
+        managedScratchRoot: this.config.managedScratchRoot
+      });
+      this.loadedWorkersFromFile = true;
+      this.workerConfigError = null;
+    } catch (error) {
+      this.workerConfigError = error instanceof Error ? error.message : String(error);
+      return [];
+    }
+
+    return this.currentWorkers;
   }
 
   async probeWorker(host: string): Promise<WorkerRecord> {
@@ -599,10 +659,112 @@ wait "$harness_pid"
   }
 
   async runUpdateCheck(context: ContextRecord, logPath?: string): Promise<WorkerExecResult & { reportPath: string | null }> {
-    const worker = this.requireWorker(context.machine);
+    const contextWorker = this.requireWorker(context.machine);
+    const currentBeforeLaunch = this.db.getContextBySlug(context.slug);
+    if (currentBeforeLaunch?.state === "archived") {
+      return {
+        ok: false,
+        host: contextWorker.name,
+        transport: contextWorker.transport,
+        exitCode: 89,
+        stdout: "",
+        stderr: `context archived before update-check launch: ${context.slug}`,
+        durationMs: 0,
+        commandLabel: "update-check",
+        reportPath: null
+      };
+    }
+
+    const startedAt = Date.now();
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+    const reportPath = `.factory/reports/update-check-${stamp}.md`;
+    const targets = this.updateCheckTargets(contextWorker);
+    const { scheduled, skipped } = this.limitUpdateCheckTargets(targets);
+    const probed = await this.runUpdateCheckProbes(scheduled, logPath);
+    const results = [...probed, ...skipped];
+    const report = this.formatStackUpdateReport(context, stamp, results);
+    const failed = results.filter((result) => !result.ok);
+    const allFailed = results.length > 0 && failed.length === results.length;
+
+    try {
+      await this.writeWorkspaceFile(context, reportPath, report);
+      await this.recordUpdateCheckArtifact(context, reportPath);
+    } catch (error) {
+      return {
+        ok: false,
+        host: contextWorker.name,
+        transport: contextWorker.transport,
+        exitCode: 46,
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error),
+        durationMs: Date.now() - startedAt,
+        commandLabel: "update-check",
+        reportPath: null
+      };
+    }
+
+    return {
+      ok: !allFailed,
+      host: contextWorker.name,
+      transport: "stack",
+      exitCode: allFailed ? 75 : 0,
+      stdout: `BRAINSTACK_UPDATE_REPORT=${reportPath}\n${report}`,
+      stderr: allFailed ? `update-check failed on all ${results.length} machine(s)` : "",
+      durationMs: Date.now() - startedAt,
+      commandLabel: `update-check ${targets.map((worker) => worker.name).join(",")}`,
+      reportPath
+    };
+  }
+
+  private limitUpdateCheckTargets(targets: FactoryWorkerConfig[]): { scheduled: FactoryWorkerConfig[]; skipped: WorkerExecResult[] } {
+    const scheduled = targets.slice(0, UPDATE_CHECK_MAX_TARGETS);
+    const skipped = targets.slice(UPDATE_CHECK_MAX_TARGETS).map((worker) => ({
+      ok: false,
+      host: worker.name,
+      transport: worker.transport,
+      exitCode: 76,
+      stdout: "",
+      stderr: `skipped: update-check target cap ${UPDATE_CHECK_MAX_TARGETS} reached`,
+      durationMs: 0,
+      commandLabel: "update-check skipped"
+    }));
+
+    return { scheduled, skipped };
+  }
+
+  private async runUpdateCheckProbes(workers: FactoryWorkerConfig[], logPath?: string): Promise<WorkerExecResult[]> {
+    const results: WorkerExecResult[] = [];
+    let next = 0;
+
+    const runNext = async (): Promise<void> => {
+      while (next < workers.length) {
+        const index = next;
+        next += 1;
+        const worker = workers[index];
+        if (!worker) {
+          continue;
+        }
+        results[index] = await this.runUpdateCheckProbe(worker, logPath);
+      }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(UPDATE_CHECK_CONCURRENCY, workers.length) }, () => runNext()));
+    return results;
+  }
+
+  private updateCheckTargets(contextWorker: FactoryWorkerConfig): FactoryWorkerConfig[] {
+    const ordered = new Map<string, FactoryWorkerConfig>();
+    for (const worker of this.configuredWorkers()) {
+      ordered.set(worker.name, worker);
+    }
+    ordered.set(contextWorker.name, contextWorker);
+    return [...ordered.values()].sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  private buildUpdateCheckProbeScript(worker: FactoryWorkerConfig): string {
     const productRoot = worker.localExecution ? this.config.projectRoot : "~/brainstack";
-    const script = `
-set -euo pipefail
+    return `
+set -uo pipefail
 expand_home_path() {
   case "$1" in
     "~") printf '%s\\n' "$HOME" ;;
@@ -636,125 +798,78 @@ run_readonly() {
   wait "$probe_pid" 2>&1 || printf 'exit=%s\\n' "$?"
 }
 
-worktree="$(expand_home_path ${quoteSh(context.worktreePath)})"
 product_root="$(expand_home_path ${quoteSh(productRoot)})"
 config_path="$(expand_home_path ~/.config/brainstack/brainstack.yaml)"
-stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-report=".factory/reports/update-check-$stamp.md"
-cd "$worktree"
-worktree_real="$(pwd -P)"
-if [ -L .factory ]; then
-  echo "refusing symlinked .factory directory" >&2
-  exit 46
+printf -- '- hostname: %s\\n' "$(hostname 2>/dev/null || printf unknown)"
+printf -- '- transport: %s\\n' ${quoteSh(worker.transport)}
+if [ -f "$product_root/packages/brainctl/src/main.ts" ] && command -v bun >/dev/null 2>&1 && [ -f "$config_path" ]; then
+  printf '\\n### brainctl updates\\n'
+  (cd "$product_root" && BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS="\${BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS:-20000}" bun run packages/brainctl/src/main.ts updates --config "$config_path") 2>&1 || printf 'brainctl updates failed with exit=%s\\n' "$?"
+else
+  printf '\\n### fallback checks\\n'
+  run_readonly uname -a
+  if command -v codex >/dev/null 2>&1; then run_readonly codex --version; else printf '\\ncodex: missing\\n'; fi
+  if command -v claude >/dev/null 2>&1; then run_readonly claude --version; else printf '\\nclaude: missing\\n'; fi
+  if command -v brew >/dev/null 2>&1; then HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 run_readonly brew outdated --quiet; fi
+  if command -v pacman >/dev/null 2>&1; then run_readonly pacman -Qu; fi
+  if command -v checkupdates >/dev/null 2>&1; then run_readonly checkupdates; fi
+  if command -v apt >/dev/null 2>&1; then run_readonly apt list --upgradable; fi
+  if command -v dnf >/dev/null 2>&1; then run_readonly dnf --cacheonly check-update --quiet; fi
+  if command -v zypper >/dev/null 2>&1; then run_readonly zypper --no-refresh list-updates; fi
 fi
-mkdir -p .factory
-factory_real="$(cd .factory && pwd -P)"
-case "$factory_real" in
-  "$worktree_real/.factory") ;;
-  *) echo ".factory escapes worktree" >&2; exit 46 ;;
-esac
-if [ -L .factory/reports ]; then
-  echo "refusing symlinked .factory/reports directory" >&2
-  exit 46
-fi
-mkdir -p .factory/reports
-reports_real="$(cd .factory/reports && pwd -P)"
-case "$reports_real" in
-  "$factory_real/reports") ;;
-  *) echo ".factory/reports escapes worktree" >&2; exit 46 ;;
-esac
-report_path="$reports_real/update-check-$stamp.md"
-tmp_report="$(mktemp "$reports_real/.update-check.XXXXXX")"
-cleanup_update_check() {
-  rm -f "$tmp_report"
-  if [ -n "\${artifact_lock_dir:-}" ] && [ -d "$artifact_lock_dir" ]; then
-    rmdir "$artifact_lock_dir" 2>/dev/null || true
-  fi
-}
-trap cleanup_update_check EXIT
+`.trim();
+  }
 
-{
-  printf '# Update Check\\n\\n'
-  printf -- '- machine: %s\\n' "$(hostname 2>/dev/null || printf unknown)"
-  printf -- '- generated_at: %s\\n\\n' "$stamp"
-  if [ -f "$product_root/packages/brainctl/src/main.ts" ] && command -v bun >/dev/null 2>&1 && [ -f "$config_path" ]; then
-    printf '## brainctl updates\\n'
-    (cd "$product_root" && BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS="\${BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS:-20000}" bun run packages/brainctl/src/main.ts updates --config "$config_path") 2>&1 || printf 'brainctl updates failed with exit=%s\\n' "$?"
-  else
-    printf '## fallback checks\\n'
-    run_readonly uname -a
-    if command -v codex >/dev/null 2>&1; then run_readonly codex --version; else printf '\\ncodex: missing\\n'; fi
-    if command -v claude >/dev/null 2>&1; then run_readonly claude --version; else printf '\\nclaude: missing\\n'; fi
-    if command -v brew >/dev/null 2>&1; then HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 run_readonly brew outdated --quiet; fi
-    if command -v pacman >/dev/null 2>&1; then run_readonly pacman -Qu; fi
-    if command -v checkupdates >/dev/null 2>&1; then run_readonly checkupdates; fi
-    if command -v apt >/dev/null 2>&1; then run_readonly apt list --upgradable; fi
-    if command -v dnf >/dev/null 2>&1; then run_readonly dnf --cacheonly check-update --quiet; fi
-    if command -v zypper >/dev/null 2>&1; then run_readonly zypper --no-refresh list-updates; fi
-  fi
-  printf '\\nNo packages or services were changed by this deterministic update check.\\n'
-} > "$tmp_report"
-mv -f "$tmp_report" "$report_path"
+  private async runUpdateCheckProbe(worker: FactoryWorkerConfig, logPath?: string): Promise<WorkerExecResult> {
+    return this.runWorkerScript(worker, this.buildUpdateCheckProbeScript(worker), logPath, 120);
+  }
 
-artifacts_path="$factory_real/ARTIFACTS.md"
-if [ -L "$artifacts_path" ]; then
-  echo "refusing symlinked .factory/ARTIFACTS.md" >&2
-  exit 46
-fi
-if [ -e "$artifacts_path" ] && [ ! -f "$artifacts_path" ]; then
-  echo "refusing non-file .factory/ARTIFACTS.md" >&2
-  exit 46
-fi
-artifact_lock_dir="$factory_real/.artifacts.lock"
-artifact_lock_acquired=0
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if mkdir "$artifact_lock_dir" 2>/dev/null; then
-    artifact_lock_acquired=1
-    break
-  fi
-  sleep 0.2
-done
-if [ "$artifact_lock_acquired" != "1" ]; then
-  echo "timed out waiting for artifact metadata lock" >&2
-  exit 75
-fi
-if [ ! -f "$artifacts_path" ]; then
-  tmp_artifacts="$(mktemp "$factory_real/.artifacts.XXXXXX")"
-  printf '# Artifacts\\n' > "$tmp_artifacts"
-  mv -f "$tmp_artifacts" "$artifacts_path"
-fi
-if ! grep -F "$report" "$artifacts_path" >/dev/null 2>&1; then
-  tmp_artifacts="$(mktemp "$factory_real/.artifacts.XXXXXX")"
-  cat "$artifacts_path" > "$tmp_artifacts"
-  printf '\\n- \`%s\` - read-only OS, Brainstack, Codex, and Claude update report\\n' "$report" >> "$tmp_artifacts"
-  mv -f "$tmp_artifacts" "$artifacts_path"
-fi
+  private formatStackUpdateReport(context: ContextRecord, stamp: string, results: WorkerExecResult[]): string {
+    const failed = results.filter((result) => !result.ok);
+    const status = failed.length === 0 ? "ok" : failed.length === results.length ? "failed" : "degraded";
+    const lines = [
+      "# Update Check",
+      "",
+      `- generated_at: ${stamp}`,
+      `- context: ${context.slug}`,
+      `- status: ${status}`,
+      `- machines_checked: ${results.length}`,
+      `- failed_machines: ${failed.length}`,
+      "",
+      "This deterministic update check is read-only. It does not install, upgrade, remove, reboot, restart, or mutate packages/services.",
+      ""
+    ];
 
-printf 'BRAINSTACK_UPDATE_REPORT=%s\\n' "$report"
-cat "$report_path"
-	`;
-
-    const currentBeforeLaunch = this.db.getContextBySlug(context.slug);
-    if (currentBeforeLaunch?.state === "archived") {
-      return {
-        ok: false,
-        host: worker.name,
-        transport: worker.transport,
-        exitCode: 89,
-        stdout: "",
-        stderr: `context archived before update-check launch: ${context.slug}`,
-        durationMs: 0,
-        commandLabel: "update-check",
-        reportPath: null
-      };
+    for (const result of results) {
+      lines.push(`## ${result.host}`, "");
+      lines.push(`- status: ${result.ok ? "ok" : "failed"}`);
+      lines.push(`- transport: ${result.transport}`);
+      lines.push(`- exit: ${result.exitCode}`);
+      lines.push(`- duration_ms: ${result.durationMs}`);
+      lines.push("");
+      const body = `${result.stdout}${result.stderr ? `\n${result.stderr}` : ""}`.trim();
+      lines.push(body ? body : "(no output)");
+      lines.push("");
     }
 
-    const result = await this.runWorkerScript(worker, script, logPath, 120);
-    const reportPath = result.stdout.match(/^BRAINSTACK_UPDATE_REPORT=(.+)$/m)?.[1]?.trim() || null;
-    return {
-      ...result,
-      reportPath
-    };
+    lines.push("No packages or services were changed by this deterministic update check.", "");
+    return lines.join("\n");
+  }
+
+  private async recordUpdateCheckArtifact(context: ContextRecord, reportPath: string): Promise<void> {
+    const entry = `- \`${reportPath}\` - read-only stack update report`;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = await this.readFactoryFile(context, "ARTIFACTS.md");
+      const next = current?.trim()
+        ? current.includes(reportPath)
+          ? current
+          : `${current.trimEnd()}\n\n${entry}\n`
+        : `# Artifacts\n\n${entry}\n`;
+      if (current === next || (await this.writeWorkspaceFileIfUnchanged(context, ".factory/ARTIFACTS.md", current, next))) {
+        return;
+      }
+    }
+    throw new Error("timed out waiting for artifact metadata lock");
   }
 
   async readFactoryFile(context: ContextRecord, fileName: string): Promise<string | null> {

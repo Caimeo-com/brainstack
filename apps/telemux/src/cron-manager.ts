@@ -147,6 +147,11 @@ export class CronManager {
     const executionContextSlug = draft.executionContextSlug ?? defaults.context?.slug ?? null;
     const targetChatId = draft.targetChatId ?? defaults.target.chatId;
     const targetThreadId = draft.targetThreadId ?? defaults.target.threadId;
+    const baseId = createCronJobId(draft.label, createdAt);
+    let id = baseId;
+    for (let attempt = 2; this.db.getCronJob(id); attempt += 1) {
+      id = `${baseId}-${attempt}`;
+    }
 
     if (targetChatId === null || targetChatId === undefined) {
       throw new Error("Cron jobs require a Telegram target chat id");
@@ -158,7 +163,7 @@ export class CronManager {
     assertCronSchedulePolicy({ kind: draft.kind, schedule: draft.schedule });
 
     const job: CronJobRecord = {
-      id: createCronJobId(draft.label, createdAt),
+      id,
       label: draft.label,
       kind: draft.kind,
       runner: draft.runner || null,

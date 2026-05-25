@@ -25,10 +25,10 @@ Keep the active control config at `~/.config/brainstack/brainstack.yaml`. Machin
 
 ```bash
 cd ~/brainstack
-bun run packages/brainctl/src/main.ts init --profile control --config examples/control.yaml
+bun run packages/brainctl/src/main.ts init --profile control --config ~/.config/brainstack/brainstack.yaml
 loginctl enable-linger "$USER"
 systemctl --user daemon-reload
-bun run packages/brainctl/src/main.ts upgrade --profile control --config examples/control.yaml
+bun run packages/brainctl/src/main.ts upgrade --profile control --config ~/.config/brainstack/brainstack.yaml
 systemctl --user daemon-reload
 systemctl --user restart braind.service
 ```
@@ -39,13 +39,13 @@ Generate a worker join plan without touching the worker:
 
 ```bash
 cd ~/brainstack
-bun run packages/brainctl/src/main.ts join-worker --config examples/control.yaml --worker brain-worker
+bun run packages/brainctl/src/main.ts join-worker --config ~/.config/brainstack/brainstack.yaml --worker brain-worker
 ```
 
 The join plan is a YAML patch for `brainstack.yaml`; `workers.json` remains rendered output. Workers may override the global harness:
 
 ```bash
-bun run packages/brainctl/src/main.ts join-worker --config examples/control.yaml --worker brain-worker --harness claude
+bun run packages/brainctl/src/main.ts join-worker --config ~/.config/brainstack/brainstack.yaml --worker brain-worker --harness claude
 ```
 
 Harness precedence is explicit context override, then worker default, then global default. Remote workers resolve `codex` or `claude` via their own `PATH` unless a worker-specific `harnessBin` is configured; the control host's local absolute harness path is not reused on workers.
@@ -73,19 +73,21 @@ On a worker host, `brainctl init --profile worker` performs a real client bootst
 
 ```bash
 cd ~/brainstack
-bun run packages/brainctl/src/main.ts init --profile worker --config examples/worker.yaml
+BRAIN_IMPORT_TOKEN_FILE=~/brain-import-token.txt \
+  bun run packages/brainctl/src/main.ts init --profile worker --config ~/.config/brainstack/brainstack.yaml
 ```
 
-That clones the shared-brain repo to the configured client path, writes `~/.config/shared-brain.env` if missing, and installs Codex/Claude/Cursor shared-brain guidance. It does not run local `braind`, does not run Telegram polling, and does not write an admin ingest token.
+That clones the shared-brain repo to the configured client path, writes `~/.config/shared-brain.env` if missing, fills `BRAIN_IMPORT_TOKEN` only when provided and currently blank, and installs Codex/Claude/Cursor shared-brain guidance. It does not run local `braind`, does not run Telegram polling, and does not write an admin ingest token.
 
 Before a first real worker canary, run:
 
 ```bash
 bun run packages/brainctl/src/main.ts doctor --config ~/.config/brainstack/brainstack.yaml --workers
+bun run packages/brainctl/src/main.ts doctor --config ~/.config/brainstack/brainstack.yaml --write-smoke
 bun run packages/brainctl/src/main.ts updates --config ~/.config/brainstack/brainstack.yaml
 ```
 
-Use `--deep` only when you want doctor to invoke the configured harness on the control/worker to prove bypass/yolo sudo behavior. It can consume LLM quota and should not be part of every health check.
+Use `--write-smoke` when you intentionally want to post a small import artifact to prove client pushback. Use `--deep` only when you want doctor to invoke the configured harness on the control/worker to prove bypass/yolo sudo behavior. It can consume LLM quota and should not be part of every health check.
 
 If that fails with a timeout while ping works, the likely blocker is Tailscale grants. The required grant shape is:
 
@@ -165,4 +167,6 @@ Compatibility installs may set `telemux.controlRoot` and `telemux.factoryRoot` i
 
 If the shared brain is unreachable, telemux queues opted-in run-summary imports under the same outbox root used by `brainctl outbox`.
 
-After telemux is healthy, use [`routines.md`](./routines.md) to add built-in scheduled workflows such as `update-check`, `brain-curator`, and `daily-checkin`.
+If `FACTORY_TELEGRAM_CONTROL_CHAT_ID` is set, telemux creates or reuses a `brainstack-routines` scratch context on startup and installs the deterministic `update-check` routine automatically. The routine reports every configured worker known to telemux; `workers.json` is reloaded without a service restart after `brainctl upgrade` rewrites it.
+
+After telemux is healthy, use [`routines.md`](./routines.md) to add optional workflows such as `brain-curator` and `daily-checkin`.

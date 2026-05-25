@@ -15,7 +15,9 @@ Copy or fetch that bootstrap directory on the Mac, then run:
 
 ```bash
 cd /tmp/brainstack-client
-BRAIN_GIT_REMOTE=operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git ./install-client.sh
+BRAIN_GIT_REMOTE=operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git \
+BRAIN_IMPORT_TOKEN_FILE=~/brain-import-token.txt \
+  ./install-client.sh
 ```
 
 ## Client Env
@@ -29,6 +31,17 @@ SHARED_BRAIN_LOCAL_PATH=~/shared-brain
 ```
 
 Do not put `BRAIN_ADMIN_TOKEN` on ordinary clients. The generated client env example intentionally omits it.
+
+The installer also accepts `BRAIN_IMPORT_TOKEN=...`. It writes the token into `~/.config/shared-brain.env` only when the existing `BRAIN_IMPORT_TOKEN` slot is blank, and it never prints the value. It also creates `~/.config/brainstack/brainstack.yaml` when that file is missing, so the client has a runnable doctor config immediately after bootstrap.
+
+To prove pushback after install:
+
+```bash
+cd ~/brainstack
+bun run packages/brainctl/src/main.ts doctor --config ~/.config/brainstack/brainstack.yaml --write-smoke
+```
+
+`--write-smoke` posts a small import artifact, so use it as an explicit setup verification rather than a routine health check.
 
 ## Harness Instructions
 

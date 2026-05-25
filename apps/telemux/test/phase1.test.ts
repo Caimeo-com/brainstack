@@ -9,6 +9,7 @@ import { CronScheduler } from "../src/cron-scheduler";
 import { ContextService } from "../src/contexts";
 import { FactoryDb } from "../src/db";
 import { Dispatcher } from "../src/dispatcher";
+import { ensureBasicLoops } from "../src/basic-loops";
 import {
   parseArtifactEntries,
   removeArtifactEntriesFromMarkdown,
@@ -497,10 +498,12 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
     root,
     controlRoot,
     factoryRoot,
+    workersFile,
     fakeCodex,
     fakeClaude,
     fakeSsh,
     previousPath,
+    config,
     db,
     contexts,
     cronManager,
@@ -1088,7 +1091,9 @@ test("deterministic cron commands install built-ins and run jobs immediately", a
 
     await fixture.cronManager.updateJob(updateCheck!, { label: "weekly-updates" });
     await fixture.commands.handleMessage(telegramMessage("/cron_run weekly-updates", 81));
-    expect(fixture.telegram.sent.some((entry) => entry.text.includes("Update check complete."))).toBe(true);
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("Update check degraded."))).toBe(true);
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("## worker1"))).toBe(true);
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("- status: degraded"))).toBe(true);
     expect(fixture.telegram.sent.at(-1)?.text).toContain("Cron run completed:");
     const routinesRoot = join(fixture.factoryRoot, "scratch", "routines");
     expect(await Bun.file(join(routinesRoot, ".factory", "fake-codex-turn-count")).exists()).toBe(false);
@@ -1322,6 +1327,148 @@ test("deterministic cron commands install built-ins and run jobs immediately", a
     expect(overview).toContain("/cron_install_brain_curator");
     expect(overview).toMatch(/\/cron_run_[a-z0-9]{6,10}_\d+/);
     expect(overview).toContain("daily-checkin");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("basic loops bootstrap installs update-check and workers reload without restart", async () => {
+  const fixture = await createFixture({
+    FACTORY_TELEGRAM_CONTROL_CHAT_ID: "4242"
+  });
+
+  try {
+    const result = await ensureBasicLoops(fixture.config, fixture.contexts, fixture.workers, fixture.cronManager);
+    expect(result).toContain("created:");
+    const updateCheck = fixture.db.listCronJobs().find((job) => job.label === "update-check");
+    expect(updateCheck?.runner).toBe("deterministic-update-check");
+    expect(updateCheck?.targetChatId).toBe(4242);
+    expect(updateCheck?.executionContextSlug).toBe("brainstack-routines");
+
+    await fixture.cronScheduler.runJobNow(updateCheck!);
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("Update check degraded."))).toBe(true);
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("- status: degraded"))).toBe(true);
+
+    const workers = JSON.parse(await readFile(fixture.workersFile, "utf8")) as Array<Record<string, unknown>>;
+    workers.push({
+      name: "worker2",
+      transport: "ssh",
+      sshTarget: "worker2.tailnet",
+      sshUser: "factory",
+      managedRepoRoot: "/srv/factory/repos",
+      managedHostRoot: "/srv/factory/hostctx",
+      managedScratchRoot: "/srv/factory/scratch"
+    });
+    await writeFile(fixture.workersFile, `${JSON.stringify(workers, null, 2)}\n`);
+
+    await fixture.commands.handleMessage(telegramMessage("/workers", 81));
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("worker2");
+
+    await fixture.cronScheduler.runJobNow(fixture.db.getCronJob(updateCheck!.id)!);
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("## worker2"))).toBe(true);
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("basic loops do not retarget user-owned update-check jobs", async () => {
+  const fixture = await createFixture({
+    FACTORY_TELEGRAM_CONTROL_CHAT_ID: "4242"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx user-updates control scratch", 86));
+    const userContext = fixture.db.getContextBySlug("user-updates");
+    const userJob = await fixture.cronManager.createJob(
+      {
+        label: "update-check",
+        kind: "codex",
+        runner: "deterministic-update-check",
+        schedule: {
+          type: "daily",
+          time: "09:30",
+          timezone: "Europe/Zagreb"
+        },
+        executionContextSlug: "user-updates",
+        targetChatId: 4242,
+        targetThreadId: 86,
+        instruction: "User-scoped update check."
+      },
+      { context: userContext, target: { chatId: 4242, threadId: 86 } }
+    );
+
+    const result = await ensureBasicLoops(fixture.config, fixture.contexts, fixture.workers, fixture.cronManager);
+    expect(result).toContain("created:");
+    const preserved = fixture.db.getCronJob(userJob.id);
+    expect(preserved?.executionContextSlug).toBe("user-updates");
+    expect(preserved?.targetThreadId).toBe(86);
+    expect(preserved?.instruction).toBe("User-scoped update check.");
+    expect(fixture.db.listCronJobs().some((job) => job.label === "update-check" && job.executionContextSlug === "brainstack-routines")).toBe(true);
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("worker config reload fails closed after malformed or deleted workers file", async () => {
+  const fixture = await createFixture();
+
+  try {
+    expect(fixture.workers.getWorkerConfig("worker1")?.name).toBe("worker1");
+    await writeFile(fixture.workersFile, "{ not-json");
+    expect(fixture.workers.getWorkerConfig("worker1")).toBeNull();
+    const malformed = await fixture.workers.refreshWorkers();
+    expect(malformed.some((worker) => worker.host === "workers-config" && worker.status === "error")).toBe(true);
+
+    await rm(fixture.workersFile, { force: true });
+    expect(fixture.workers.getWorkerConfig("control")).toBeNull();
+    const deleted = await fixture.workers.refreshWorkers();
+    expect(deleted.some((worker) => worker.host === "workers-config" && worker.lastError?.includes("does not exist"))).toBe(true);
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("update-check marks an all-machine probe failure as failed", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx update-failures control scratch", 87));
+    const context = fixture.db.getContextBySlug("update-failures")!;
+    const workerInternals = fixture.workers as unknown as {
+      runUpdateCheckProbe: (worker: { name: string; transport: string }) => Promise<{
+        ok: boolean;
+        host: string;
+        transport: string;
+        exitCode: number;
+        stdout: string;
+        stderr: string;
+        durationMs: number;
+        commandLabel: string;
+      }>;
+    };
+    const originalProbe = workerInternals.runUpdateCheckProbe.bind(fixture.workers);
+    workerInternals.runUpdateCheckProbe = async (worker) => ({
+      ok: false,
+      host: worker.name,
+      transport: worker.transport,
+      exitCode: 70,
+      stdout: "",
+      stderr: "synthetic update probe failure",
+      durationMs: 1,
+      commandLabel: "update-check"
+    });
+
+    const result = await fixture.workers.runUpdateCheck(context);
+    workerInternals.runUpdateCheckProbe = originalProbe;
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(75);
+    expect(result.stderr).toContain("failed on all");
+    expect(result.stdout).toContain("- status: failed");
+    expect(result.stdout).toContain("- failed_machines: 2");
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
@@ -1695,7 +1842,7 @@ test("artifact cleanup preserves concurrent manifest additions and rejects symli
 
     const updateCheck = await fixture.workers.runUpdateCheck(context!);
     expect(updateCheck.ok).toBe(false);
-    expect(updateCheck.stderr).toContain("refusing symlinked .factory/ARTIFACTS.md");
+    expect(updateCheck.stderr).toContain("workspace write refused symlink target: .factory/ARTIFACTS.md");
     expect(await readFile(outside, "utf8")).toBe("outside");
 
     await rm(artifactPath, { force: true });

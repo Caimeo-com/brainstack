@@ -145,10 +145,10 @@ const ALLOWED_TOP_LEVEL_CONFIG_KEYS = new Set([
 function usage(): string {
   return `Usage:
   brainctl init --profile single-node|control|worker|client-macos --config brainstack.yaml [--dry-run] [--root /tmp/install-root] [--seed-missing|--force-seed]
-  brainctl provision --profile single-node|control|worker|client-macos [--out brainstack.yaml] [--harness codex|claude] [--harness-bin PATH_OR_NAME] [--enable-telemux] [--enroll-tailscale] [--tailscale-tag tag:brain] [--brain-base-url URL] [--brain-remote SSH_OR_PATH] [--test-bot]
+  brainctl provision --profile single-node|control|worker|client-macos [--out brainstack.yaml] [--harness codex|claude] [--harness-bin PATH_OR_NAME] [--enable-telemux] [--enroll-tailscale] [--tailscale-tag tag:brain] [--brain-base-url URL] [--brain-remote SSH_OR_PATH] [--require-harness-sudo] [--test-bot]
   brainctl upgrade --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
   brainctl apply-runtime --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
-  brainctl doctor --config brainstack.yaml [--profile ...] [--json] [--workers] [--deep]
+  brainctl doctor --config brainstack.yaml [--profile ...] [--json] [--workers] [--deep] [--write-smoke]
   brainctl updates --config brainstack.yaml [--profile ...]
   brainctl backup --config brainstack.yaml [--out DIR] [--pause-telemux]
   brainctl restore --backup DIR_OR_TGZ --target DIR [--apply]
@@ -692,6 +692,47 @@ async function writeIfMissing(path: string, text: string, mode?: number): Promis
   }
   await writeText(path, text, mode);
   return true;
+}
+
+async function readEnvSecretOrFile(envName: string, fileEnvName: string): Promise<string> {
+  const filePath = process.env[fileEnvName]?.trim();
+  if (filePath) {
+    return (await readFile(abs(filePath), "utf8")).split(/\r?\n/)[0]?.trim() || "";
+  }
+  return process.env[envName]?.trim() || "";
+}
+
+async function setEnvIfBlank(path: string, key: string, value: string): Promise<boolean> {
+  if (!value.trim()) {
+    return false;
+  }
+  const existing = existsSync(path) ? await readFile(path, "utf8") : "";
+  const lines = existing.split(/\r?\n/);
+  let changed = false;
+  let found = false;
+  const next = lines.map((line) => {
+    if (!line.startsWith(`${key}=`)) {
+      return line;
+    }
+    found = true;
+    if (line.slice(key.length + 1).trim()) {
+      return line;
+    }
+    changed = true;
+    return `${key}=${value}`;
+  });
+  if (!found) {
+    if (next.length && next[next.length - 1] !== "") {
+      next.push(`${key}=${value}`);
+    } else {
+      next.splice(Math.max(0, next.length - 1), 0, `${key}=${value}`);
+    }
+    changed = true;
+  }
+  if (changed) {
+    await writeText(path, `${next.join("\n").replace(/\n+$/, "")}\n`, 0o600);
+  }
+  return changed;
 }
 
 function token(): string {
@@ -1380,6 +1421,13 @@ async function installLocalClientBootstrap(cfg: BrainstackConfig): Promise<strin
   if (await writeIfMissing(envPath, bootstrapFiles["client.env.example"], 0o600)) {
     touched.push(envPath);
   }
+  const importToken = await readEnvSecretOrFile("BRAIN_IMPORT_TOKEN", "BRAIN_IMPORT_TOKEN_FILE");
+  if (await setEnvIfBlank(envPath, "BRAIN_IMPORT_TOKEN", importToken)) {
+    if (!touched.includes(envPath)) {
+      touched.push(envPath);
+    }
+    console.log(`BRAIN_IMPORT_TOKEN installed in ${envPath}; value not printed.`);
+  }
 
   const codexHome = join(cfg.paths.home, ".codex");
   await ensureDir(codexHome);
@@ -1517,11 +1565,11 @@ function requiredProvisionCommands(profile: Profile): string[] {
 }
 
 function profileRequiresPasswordlessSudo(profile: Profile): boolean {
-  return profile === "single-node" || profile === "control" || profile === "worker";
+  return profile === "single-node" || profile === "control";
 }
 
 function provisionRequiresPasswordlessSudo(profile: Profile, args: ParsedArgs): boolean {
-  return profileRequiresPasswordlessSudo(profile) || hasFlag(args, "enroll-tailscale");
+  return profileRequiresPasswordlessSudo(profile) || hasFlag(args, "enroll-tailscale") || hasFlag(args, "require-harness-sudo");
 }
 
 function ensureProvisionPrereqs(profile: Profile): Record<string, string> {
@@ -1792,7 +1840,7 @@ async function commandProvision(args: ParsedArgs): Promise<void> {
   if (provisionRequiresPasswordlessSudo(profile, args)) {
     ensurePasswordlessSudo();
   }
-  if (profileRequiresPasswordlessSudo(profile) && !hasFlag(args, "skip-harness-sudo-test")) {
+  if ((profileRequiresPasswordlessSudo(profile) || hasFlag(args, "require-harness-sudo")) && !hasFlag(args, "skip-harness-sudo-test")) {
     await testHarnessSudo(selectedHarness);
   }
   if (hasFlag(args, "test-bot")) {
@@ -2204,6 +2252,36 @@ async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Pro
 
   checks.push(check("PASS", "outbox", "queued-items", `${await countOutboxItems(cfg)} queued item(s)`));
 
+  if (cfg.profile === "worker" || cfg.profile === "client-macos") {
+    const localClone = clientLocalPathAbs(cfg);
+    checks.push(
+      gitExists(localClone)
+        ? check("PASS", "client", "shared-brain-clone", localClone)
+        : check("WARN", "client", "shared-brain-clone", `${localClone} missing or not a git clone`, "Run brainctl init for this profile, or run the rendered client bootstrap installer.")
+    );
+    const envPath = clientEnvPathAbs(cfg);
+    checks.push(
+      existsSync(envPath)
+        ? check("PASS", "client", "shared-brain-env", envPath)
+        : check("WARN", "client", "shared-brain-env", `${envPath} missing`, "Run brainctl init or the rendered client bootstrap installer.")
+    );
+    const writeConfig = brainWriteConfig(cfg);
+    checks.push(
+      writeConfig.baseUrl
+        ? check("PASS", "client", "brain-base-url", "configured")
+        : check("WARN", "client", "brain-base-url", "missing", "Set BRAIN_BASE_URL in env or shared-brain.env.")
+    );
+    checks.push(
+      writeConfig.token
+        ? check("PASS", "client", "brain-import-token", "present")
+        : check("WARN", "client", "brain-import-token", "missing or empty", "Pass BRAIN_IMPORT_TOKEN or BRAIN_IMPORT_TOKEN_FILE during install/init, or edit shared-brain.env.")
+    );
+  }
+
+  if (hasFlag(args, "write-smoke")) {
+    checks.push(await brainWriteSmokeCheck(cfg));
+  }
+
   if (hasFlag(args, "workers") || hasFlag(args, "deep")) {
     checks.push(...(await workerDoctorChecks(cfg, hasFlag(args, "deep"))));
   }
@@ -2388,6 +2466,39 @@ function brainWriteConfig(cfg: BrainstackConfig): { baseUrl: string; token: stri
 function brainWriteTimeoutMs(): number {
   const value = Number(process.env.BRAINSTACK_BRAIN_WRITE_TIMEOUT_MS || "15000");
   return Number.isFinite(value) && value > 0 ? value : 15000;
+}
+
+async function brainWriteSmokeCheck(cfg: BrainstackConfig): Promise<DoctorCheck> {
+  const { baseUrl, token: writeToken } = brainWriteConfig(cfg);
+  if (!baseUrl || !writeToken) {
+    return check("FAIL", "client", "brain-write-smoke", "BRAIN_BASE_URL or BRAIN_IMPORT_TOKEN is missing", "Set client write env before running --write-smoke.");
+  }
+
+  try {
+    const response = await fetch(new URL("/api/import", baseUrl).toString(), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${writeToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        title: `Brainstack doctor write smoke ${new Date().toISOString()}`,
+        text: "Brainstack doctor write smoke. This is a small import/propose path verification artifact.",
+        source_harness: cfg.harness.name,
+        source_machine: cfg.machine.name,
+        source_type: "doctor-smoke",
+        tags: ["brainstack", "doctor-smoke"]
+      }),
+      signal: AbortSignal.timeout(brainWriteTimeoutMs())
+    });
+    if (!response.ok) {
+      return check("FAIL", "client", "brain-write-smoke", `HTTP ${response.status}`);
+    }
+    const body = (await response.json()) as Record<string, unknown>;
+    return check("PASS", "client", "brain-write-smoke", `import accepted artifact_id=${String(body.artifact_id || "unknown")}`);
+  } catch (error) {
+    return check("FAIL", "client", "brain-write-smoke", error instanceof Error ? error.message : String(error));
+  }
 }
 
 interface OutboxItem {

@@ -42,6 +42,9 @@ export interface FactoryConfig {
   cronPollIntervalSeconds: number;
   workerRunTimeoutSeconds: number;
   localMachine: string;
+  workersFilePath?: string | null;
+  workersFileExplicit?: boolean;
+  workersFileInitiallyLoaded?: boolean;
   workers: FactoryWorkerConfig[];
   usageAdapter: string;
   harness: HarnessName;
@@ -53,7 +56,7 @@ export interface FactoryConfig {
   textCoalesceMs: number;
 }
 
-interface WorkerConfigInput {
+export interface WorkerConfigInput {
   name: string;
   transport?: string;
   sshTarget?: string | null;
@@ -152,24 +155,45 @@ function normalizeWorkerConfig(
   };
 }
 
-function loadWorkerInputs(projectRoot: string, env: NodeJS.ProcessEnv): WorkerConfigInput[] | null {
+function workersFilePath(projectRoot: string, env: NodeJS.ProcessEnv): { path: string; explicit: boolean } {
   const workersFile = env.FACTORY_WORKERS_FILE?.trim() || "./workers.json";
-  const resolved = resolveMaybeRelative(projectRoot, workersFile);
+  return {
+    path: resolveMaybeRelative(projectRoot, workersFile),
+    explicit: Boolean(env.FACTORY_WORKERS_FILE?.trim())
+  };
+}
 
-  if (!existsSync(resolved)) {
-    if (env.FACTORY_WORKERS_FILE?.trim()) {
-      throw new Error(`FACTORY_WORKERS_FILE does not exist: ${resolved}`);
+function loadWorkerInputs(projectRoot: string, env: NodeJS.ProcessEnv): {
+  path: string;
+  explicit: boolean;
+  loaded: boolean;
+  inputs: WorkerConfigInput[];
+} {
+  const resolved = workersFilePath(projectRoot, env);
+  if (!existsSync(resolved.path)) {
+    if (resolved.explicit) {
+      throw new Error(`FACTORY_WORKERS_FILE does not exist: ${resolved.path}`);
     }
 
-    return [
-      {
-        name: env.FACTORY_LOCAL_MACHINE?.trim() || "control",
-        transport: "local"
-      }
-    ];
+    return {
+      path: resolved.path,
+      explicit: resolved.explicit,
+      loaded: false,
+      inputs: [
+        {
+          name: env.FACTORY_LOCAL_MACHINE?.trim() || "control",
+          transport: "local"
+        }
+      ]
+    };
   }
 
-  return JSON.parse(readFileSync(resolved, "utf8")) as WorkerConfigInput[];
+  return {
+    path: resolved.path,
+    explicit: resolved.explicit,
+    loaded: true,
+    inputs: JSON.parse(readFileSync(resolved.path, "utf8")) as WorkerConfigInput[]
+  };
 }
 
 function uniqueWorkers(workers: FactoryWorkerConfig[]): FactoryWorkerConfig[] {
@@ -188,6 +212,30 @@ function uniqueWorkers(workers: FactoryWorkerConfig[]): FactoryWorkerConfig[] {
   return ordered;
 }
 
+export function normalizeWorkerInputs(
+  inputs: WorkerConfigInput[],
+  defaults: {
+    localMachine: string;
+    managedRepoRoot: string;
+    managedHostRoot: string;
+    managedScratchRoot: string;
+  }
+): FactoryWorkerConfig[] {
+  return uniqueWorkers(inputs.map((input) => normalizeWorkerConfig(input, defaults)));
+}
+
+export function loadWorkerConfigsFromPath(
+  path: string,
+  defaults: {
+    localMachine: string;
+    managedRepoRoot: string;
+    managedHostRoot: string;
+    managedScratchRoot: string;
+  }
+): FactoryWorkerConfig[] {
+  return normalizeWorkerInputs(JSON.parse(readFileSync(path, "utf8")) as WorkerConfigInput[], defaults);
+}
+
 const projectRoot = resolve(import.meta.dir, "..");
 
 function defaultStateRoot(): string {
@@ -202,18 +250,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
   const managedRepoRoot = resolve(factoryRoot, "repos");
   const managedHostRoot = resolve(factoryRoot, "hostctx");
   const managedScratchRoot = resolve(factoryRoot, "scratch");
-  const workerInputs = loadWorkerInputs(projectRoot, env) || [];
+  const workerSource = loadWorkerInputs(projectRoot, env);
 
-  const workers = uniqueWorkers(
-    workerInputs.map((input) =>
-      normalizeWorkerConfig(input, {
-        localMachine,
-        managedRepoRoot,
-        managedHostRoot,
-        managedScratchRoot
-      })
-    )
-  );
+  const workerDefaults = {
+    localMachine,
+    managedRepoRoot,
+    managedHostRoot,
+    managedScratchRoot
+  };
+  const workers = normalizeWorkerInputs(workerSource.inputs, workerDefaults);
   const harness = normalizeHarness(env.FACTORY_HARNESS?.trim());
   const harnessBin = env.FACTORY_HARNESS_BIN?.trim() || (harness === "codex" ? env.FACTORY_CODEX_BIN?.trim() || "codex" : "claude");
 
@@ -240,6 +285,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
     cronPollIntervalSeconds: readNumber(env, "FACTORY_CRON_POLL_INTERVAL_SECONDS", 30),
     workerRunTimeoutSeconds: readNumber(env, "FACTORY_WORKER_RUN_TIMEOUT_SECONDS", 21600),
     localMachine,
+    workersFilePath: workerSource.path,
+    workersFileExplicit: workerSource.explicit,
+    workersFileInitiallyLoaded: workerSource.loaded,
     workers,
     usageAdapter: env.FACTORY_USAGE_ADAPTER?.trim() || "manual",
     harness,

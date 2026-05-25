@@ -44,6 +44,91 @@ render_template() {
   sed "s#$escaped_search#$escaped#g" "$source" > "$target"
 }
 
+read_import_token() {
+  if [ -n "${BRAIN_IMPORT_TOKEN_FILE:-}" ]; then
+    if [ ! -f "$BRAIN_IMPORT_TOKEN_FILE" ]; then
+      echo "BRAIN_IMPORT_TOKEN_FILE does not exist: $BRAIN_IMPORT_TOKEN_FILE" >&2
+      exit 2
+    fi
+    sed -n '1p' "$BRAIN_IMPORT_TOKEN_FILE" | tr -d '\r\n'
+    return
+  fi
+  printf '%s' "${BRAIN_IMPORT_TOKEN:-}"
+}
+
+set_env_if_blank() {
+  local key="$1"
+  local value="$2"
+  local tmp
+  if [ -z "$value" ]; then
+    return
+  fi
+  if grep -Eq "^${key}=.+" "$ENV_FILE" 2>/dev/null; then
+    echo "$key already present in $ENV_FILE; leaving existing value in place."
+    return
+  fi
+  tmp="$(mktemp "$ENV_FILE.XXXXXX")"
+  if grep -Eq "^${key}=" "$ENV_FILE" 2>/dev/null; then
+    awk -v key="$key" -v value="$value" 'BEGIN{prefix=key"="} index($0,prefix)==1{$0=prefix value} {print}' "$ENV_FILE" > "$tmp"
+  else
+    cat "$ENV_FILE" > "$tmp"
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  fi
+  mv -f "$tmp" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  echo "$key installed in $ENV_FILE."
+}
+
+yaml_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"
+}
+
+write_client_config_if_missing() {
+  local config_file="$CONFIG_DIR/brainstack/brainstack.yaml"
+  local machine_name
+  local host_name
+  local user_name
+  local product_repo
+  local brain_base_url
+
+  if [ -f "$config_file" ]; then
+    echo "Brainstack config already exists at $config_file; leaving it in place."
+    return
+  fi
+
+  mkdir -p "$(dirname "$config_file")"
+  machine_name="${BRAINSTACK_MACHINE_NAME:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf client)}"
+  host_name="${BRAINSTACK_HOSTNAME:-$(hostname 2>/dev/null || printf client)}"
+  user_name="${USER:-operator}"
+  product_repo="${BRAINSTACK_PRODUCT_REPO:-~/brainstack}"
+  brain_base_url="${BRAIN_BASE_URL:-__BRAIN_BASE_URL__}"
+
+  cat > "$config_file" <<YAML
+schema_version: 1
+profile: client-macos
+machine:
+  name: $(yaml_quote "$machine_name")
+  user: $(yaml_quote "$user_name")
+  role: client
+  sshUser: $(yaml_quote "$user_name")
+  hostname: $(yaml_quote "$host_name")
+paths:
+  home: $(yaml_quote "$HOME")
+  productRepo: $(yaml_quote "$product_repo")
+  sharedBrainRoot: $(yaml_quote "$TARGET_ABS")
+  stateRoot: ~/.local/state/brainstack
+  configRoot: ~/.config/brainstack
+brain:
+  publicBaseUrl: $(yaml_quote "$brain_base_url")
+client:
+  localPath: $(yaml_quote "$TARGET_ABS")
+  envPath: $(yaml_quote "$ENV_FILE")
+  remoteSsh: $(yaml_quote "$REMOTE")
+YAML
+  chmod 600 "$config_file"
+  echo "Brainstack client config installed at $config_file."
+}
+
 TARGET_ABS="$(expand_path "$TARGET")"
 BOOTSTRAP_ABS="$(expand_path "$BOOTSTRAP_DIR")"
 
@@ -64,6 +149,9 @@ if [ ! -f "$ENV_FILE" ]; then
   cp "$(dirname "$0")/client.env.example" "$ENV_FILE"
   chmod 600 "$ENV_FILE"
 fi
+IMPORT_TOKEN_VALUE="$(read_import_token)"
+set_env_if_blank "BRAIN_IMPORT_TOKEN" "$IMPORT_TOKEN_VALUE"
+write_client_config_if_missing
 
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 mkdir -p "$CODEX_HOME"

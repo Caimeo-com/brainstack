@@ -35,12 +35,14 @@ For a fresh-machine bootstrap, including passwordless sudo for the control user,
 - Audio/voice-only Telegram messages are intentionally not forwarded to the harness yet; they are reserved for the later transcription phase.
 - While a job is active, the bot sends a lightweight `typing` heartbeat into the same Telegram topic so long runs do not look stalled.
 - Scheduled jobs live inside `telemux.service`, not OS cron. The scheduler checks the SQLite job registry on an interval and can proactively post into a Telegram topic even when no one is actively chatting there.
+- If `FACTORY_TELEGRAM_CONTROL_CHAT_ID` is configured, startup bootstraps a `brainstack-routines` scratch context and installs the deterministic `update-check` routine.
 - Scheduled jobs can either send a direct reminder into Telegram or run the configured harness against a stored context/session and post the result back into the bound topic.
 - Scheduled jobs have their own optional model/effort overrides. Effective runtime is `cron override -> context override -> global default`.
 - `host` and `scratch` contexts auto-create lightweight local git repos so the harness always has a safe working directory.
 - Managed `host` and `scratch` workspaces get an initial commit so `git status` and future diffs start clean.
 - `repo` contexts can bind an existing repo path or clone a git URL into a managed repo root.
 - Worker transport is configurable per worker: `local`, `ssh`, or optional `tailscale-ssh`.
+- `FACTORY_WORKERS_FILE` is re-read during worker refresh, so generated `workers.json` changes are picked up without a telemux restart.
 
 ## Filesystem layout
 

@@ -362,6 +362,69 @@ describe("brainctl install safety", () => {
     }
   });
 
+  test("worker provision makes privileged sudo proof explicit", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-provision-worker-sudo-"));
+    try {
+      const binDir = join(dir, "bin");
+      const configPath = join(dir, "worker.yaml");
+      await mkdir(binDir, { recursive: true });
+      await writeFile(join(binDir, "codex"), "#!/usr/bin/env sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'codex fake\\n'; exit 0; fi\nexit 0\n");
+      await writeFile(join(binDir, "sudo"), "#!/usr/bin/env sh\necho 'sudo should be explicit for worker provision' >&2\nexit 42\n");
+      await writeFile(join(binDir, "tailscale"), "#!/usr/bin/env sh\nexit 0\n");
+      await writeFile(join(binDir, "sshd"), "#!/usr/bin/env sh\nexit 0\n");
+      await chmod(join(binDir, "codex"), 0o755);
+      await chmod(join(binDir, "sudo"), 0o755);
+      await chmod(join(binDir, "tailscale"), 0o755);
+      await chmod(join(binDir, "sshd"), 0o755);
+
+      const result = runBrainctl(
+        [
+          "provision",
+          "--profile",
+          "worker",
+          "--out",
+          configPath,
+          "--harness",
+          "codex",
+          "--brain-base-url",
+          "https://brain-control.example.ts.net",
+          "--brain-remote",
+          "operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git"
+        ],
+        {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        }
+      );
+      expectSuccess(result);
+      expect(await readFile(configPath, "utf8")).toContain("profile: worker");
+      expect(`${result.stdout}\n${result.stderr}`).not.toContain("sudo should be explicit");
+
+      const strict = runBrainctl(
+        [
+          "provision",
+          "--profile",
+          "worker",
+          "--out",
+          join(dir, "strict-worker.yaml"),
+          "--harness",
+          "codex",
+          "--brain-base-url",
+          "https://brain-control.example.ts.net",
+          "--brain-remote",
+          "operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          "--require-harness-sudo"
+        ],
+        {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        }
+      );
+      expect(strict.code).not.toBe(0);
+      expect(`${strict.stdout}\n${strict.stderr}`).toContain("sudo should be explicit for worker provision");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("destroy removes rendered runtime paths but keeps canonical repos unless requested", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-destroy-"));
     try {
@@ -531,11 +594,11 @@ describe("brainctl install safety", () => {
         ].join("\n")
       );
 
-      expectSuccess(runBrainctl(["init", "--profile", "worker", "--config", configPath]));
+      expectSuccess(runBrainctl(["init", "--profile", "worker", "--config", configPath], { BRAIN_IMPORT_TOKEN: "test-import-token" }));
       expect(await Bun.file(join(home, "shared-brain", "AGENTS.shared-client.md")).exists()).toBe(true);
       expect(await Bun.file(join(configRoot, "client-bootstrap", "codex-shared-brain.include.md")).exists()).toBe(true);
       expect(await Bun.file(join(home, ".codex", "AGENTS.md")).exists()).toBe(true);
-      expect(await readFile(join(home, ".config", "shared-brain.env"), "utf8")).toContain("BRAIN_IMPORT_TOKEN=");
+      expect(await readFile(join(home, ".config", "shared-brain.env"), "utf8")).toContain("BRAIN_IMPORT_TOKEN=test-import-token");
       expect(await readFile(join(home, ".config", "shared-brain.env"), "utf8")).not.toContain("BRAIN_ADMIN_TOKEN");
       expect(await Bun.file(join(configRoot, "braind.runtime.env")).exists()).toBe(false);
       expect(await Bun.file(join(configRoot, "braind.secrets.env")).exists()).toBe(false);
@@ -1067,6 +1130,8 @@ describe("public release hygiene", () => {
       expectSuccess(install);
       expect(await Bun.file(join(home, "shared-brain", "AGENTS.shared-client.md")).exists()).toBe(true);
       expect(await Bun.file(join(home, ".config", "shared-brain.env")).exists()).toBe(true);
+      expect(await Bun.file(join(home, ".config", "brainstack", "brainstack.yaml")).exists()).toBe(true);
+      expect(await readFile(join(home, ".config", "brainstack", "brainstack.yaml"), "utf8")).toContain("profile: client-macos");
       expect(await Bun.file(join(home, ".codex", "AGENTS.md")).exists()).toBe(true);
       expect(await readFile(join(home, ".claude", "CLAUDE.md"), "utf8")).toContain(
         `@${join(home, ".config", "brainstack", "client-bootstrap", "claude-user-CLAUDE.md")}`
@@ -1074,6 +1139,80 @@ describe("public release hygiene", () => {
       expect(await readFile(join(home, ".config", "brainstack", "client-bootstrap", "claude-user-CLAUDE.md"), "utf8")).toContain(
         `@${join(home, "shared-brain", "AGENTS.shared-client.md")}`
       );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("install-client token file succeeds, preserves existing token, and fails on missing token file", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-client-install-token-"));
+    try {
+      const bare = join(dir, "shared-brain.git");
+      const seed = join(dir, "seed");
+      const out = join(dir, "bootstrap");
+      const home = join(dir, "home");
+      const tokenFile = join(dir, "token.txt");
+      git(["init", "--bare", "--initial-branch=main", bare], dir);
+      git(["clone", bare, seed], dir);
+      await writeFile(join(seed, "AGENTS.shared-client.md"), "# Shared Client\n");
+      git(["add", "AGENTS.shared-client.md"], seed);
+      git(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "seed"], seed);
+      git(["push", "-u", "origin", "main"], seed);
+
+      expectSuccess(
+        runBrainctl([
+          "bootstrap-client",
+          "--profile",
+          "client-macos",
+          "--config",
+          join(PRODUCT_ROOT, "examples", "client-macos.yaml"),
+          "--out",
+          out
+        ])
+      );
+
+      await writeFile(tokenFile, "first-token\n");
+      const install = runCommand(["bash", join(out, "install-client.sh")], {
+        cwd: out,
+        env: {
+          HOME: home,
+          BRAIN_GIT_REMOTE: bare,
+          BRAIN_IMPORT_TOKEN_FILE: tokenFile,
+          PATH: process.env.PATH || ""
+        }
+      });
+      expectSuccess(install);
+      const envPath = join(home, ".config", "shared-brain.env");
+      expect(await readFile(envPath, "utf8")).toContain("BRAIN_IMPORT_TOKEN=first-token");
+      expect(`${install.stdout}\n${install.stderr}`).not.toContain("first-token");
+
+      const preserve = runCommand(["bash", join(out, "install-client.sh")], {
+        cwd: out,
+        env: {
+          HOME: home,
+          BRAIN_GIT_REMOTE: bare,
+          BRAIN_IMPORT_TOKEN: "second-token",
+          PATH: process.env.PATH || ""
+        }
+      });
+      expectSuccess(preserve);
+      const preservedEnv = await readFile(envPath, "utf8");
+      expect(preservedEnv).toContain("BRAIN_IMPORT_TOKEN=first-token");
+      expect(preservedEnv).not.toContain("second-token");
+      expect(`${preserve.stdout}\n${preserve.stderr}`).not.toContain("second-token");
+
+      const missingHome = join(dir, "missing-home");
+      const missing = runCommand(["bash", join(out, "install-client.sh")], {
+        cwd: out,
+        env: {
+          HOME: missingHome,
+          BRAIN_GIT_REMOTE: bare,
+          BRAIN_IMPORT_TOKEN_FILE: join(dir, "missing-token.txt"),
+          PATH: process.env.PATH || ""
+        }
+      });
+      expect(missing.code).toBe(2);
+      expect(missing.stderr).toContain("BRAIN_IMPORT_TOKEN_FILE does not exist");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -1486,6 +1625,110 @@ describe("public release hygiene", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  test("doctor reports client write readiness and explicit write smoke", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-client-readiness-"));
+    const port = 36_000 + Math.floor(Math.random() * 3_000);
+    try {
+      const binDir = join(dir, "bin");
+      const configPath = join(dir, "worker.yaml");
+      const home = join(dir, "home");
+      const receivedPath = join(dir, "received.jsonl");
+      const serverScript = join(dir, "server.ts");
+      await mkdir(binDir, { recursive: true });
+      await mkdir(join(home, ".config"), { recursive: true });
+      await writeFile(
+        serverScript,
+        [
+          `const port = ${port};`,
+          `const receivedPath = ${JSON.stringify(receivedPath)};`,
+          "Bun.serve({",
+          "  hostname: '127.0.0.1',",
+          "  port,",
+          "  async fetch(req) {",
+          "    if (new URL(req.url).pathname === '/health') return Response.json({ ok: true });",
+          "    if (new URL(req.url).pathname !== '/api/import') return Response.json({ error: 'not found' }, { status: 404 });",
+          "    if (req.headers.get('authorization') !== 'Bearer test-import-token') return Response.json({ error: 'forbidden' }, { status: 403 });",
+          "    const payload = await req.json();",
+          "    const existing = await Bun.file(receivedPath).exists() ? await Bun.file(receivedPath).text() : '';",
+          "    await Bun.write(receivedPath, `${existing}${JSON.stringify(payload)}\\n`);",
+          "    return Response.json({ ok: true, artifact_id: 'doctor-smoke-artifact' });",
+          "  }",
+          "});",
+          "await new Promise(() => {});",
+          ""
+        ].join("\n")
+      );
+      await writeFile(
+        join(binDir, "codex"),
+        "#!/usr/bin/env sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'codex fake\\n'; exit 0; fi\nprintf '%s\\n' '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check'\n"
+      );
+      await writeFile(join(binDir, "tailscale"), "#!/usr/bin/env sh\nexit 0\n");
+      await chmod(join(binDir, "codex"), 0o755);
+      await chmod(join(binDir, "tailscale"), 0o755);
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: worker",
+          "harness:",
+          "  name: codex",
+          "  bin: codex",
+          "machine:",
+          "  name: brain-worker",
+          "  user: operator",
+          "paths:",
+          `  home: ${home}`,
+          `  configRoot: ${join(home, ".config", "brainstack")}`,
+          `  stateRoot: ${join(home, ".local", "state", "brainstack")}`,
+          "brain:",
+          `  publicBaseUrl: http://127.0.0.1:${port}`,
+          "client:",
+          "  localPath: ~/shared-brain",
+          "  envPath: ~/.config/shared-brain.env",
+          ""
+        ].join("\n")
+      );
+      await writeFile(join(home, ".config", "shared-brain.env"), `BRAIN_BASE_URL=http://127.0.0.1:${port}\nBRAIN_IMPORT_TOKEN=\n`);
+
+      const readiness = runBrainctl(["doctor", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1"
+      });
+      expectSuccess(readiness);
+      expect(readiness.stdout).toContain("WARN [client] brain-import-token: missing or empty");
+
+      const server = Bun.spawn(["bun", "run", serverScript], {
+        stdout: "pipe",
+        stderr: "pipe"
+      });
+      try {
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          try {
+            await fetch(`http://127.0.0.1:${port}/health`);
+            break;
+          } catch {
+            await Bun.sleep(25);
+          }
+        }
+        const smoke = runBrainctl(["doctor", "--config", configPath, "--write-smoke"], {
+          PATH: `${binDir}:${process.env.PATH || ""}`,
+          BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1",
+          BRAIN_IMPORT_TOKEN: "test-import-token"
+        });
+        expectSuccess(smoke);
+        expect(smoke.stdout).toContain("PASS [client] brain-write-smoke: import accepted artifact_id=doctor-smoke-artifact");
+        const requests = (await readFile(receivedPath, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line) as Record<string, unknown>);
+        expect(requests).toHaveLength(1);
+        expect(requests[0]?.source_type).toBe("doctor-smoke");
+      } finally {
+        server.kill();
+        await server.exited;
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   test("doctor resolves remote worker harness through the worker user's shell PATH", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-remote-path-"));

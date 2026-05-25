@@ -8,6 +8,7 @@ import { CommandHandler } from "./commands";
 import { startDashboard } from "./dashboard";
 import { TelegramBot } from "./telegram";
 import { WorkerService } from "./workers";
+import { ensureBasicLoops } from "./basic-loops";
 
 ensureProjectPaths();
 
@@ -33,6 +34,13 @@ setInterval(() => {
 }, 60_000);
 
 if (telegram.isConfigured()) {
+  void ensureBasicLoops(config, contexts, workers, cronManager)
+    .then((result) => {
+      console.log(`basic loops: ${result}`);
+    })
+    .catch((error) => {
+      console.error("basic loops bootstrap failed", error);
+    });
   void telegram
     .syncCommands()
     .then((results) => {

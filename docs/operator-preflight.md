@@ -68,9 +68,11 @@ Put durable Codex configuration under the target user's Codex config, not inside
 
 If using Claude Code as a harness, configure its equivalent bypass/permission mode only on machines where you accept full command execution as the current user. Keep Claude-specific config outside the brain content repo.
 
-`brainctl provision --harness claude` tests Claude with `--dangerously-skip-permissions --permission-mode bypassPermissions`. `brainctl provision --harness codex` tests Codex with `--dangerously-bypass-approvals-and-sandbox`. Both tests ask the harness to run `sudo -n true`; failures mean the machine is not ready for unattended telemux control.
+For control and single-node profiles, `brainctl provision --harness claude` tests Claude with `--dangerously-skip-permissions --permission-mode bypassPermissions`, and `brainctl provision --harness codex` tests Codex with `--dangerously-bypass-approvals-and-sandbox`. Those tests ask the harness to run `sudo -n true`; failures mean the machine is not ready for unattended telemux control.
 
-Provisioning and doctor checks do not install packages or silently change sudo/harness policy. They stop with remediation text if Bun, Git, OpenSSH, Tailscale, Codex, Claude, passwordless sudo, or harness bypass behavior is missing. Use `brainctl doctor --deep` when you want to repeat the expensive harness sudo proof after installation.
+Worker provisioning does not require passwordless sudo by default. Add `--require-harness-sudo` for workers that are expected to perform privileged machine administration, or use `brainctl doctor --deep` later for an explicit harness sudo proof.
+
+Provisioning and doctor checks do not install packages or silently change sudo/harness policy. They stop with remediation text if Bun, Git, OpenSSH, Tailscale, Codex, Claude, required passwordless sudo, or required harness bypass behavior is missing. Use `brainctl doctor --deep` when you want to repeat the expensive harness sudo proof after installation.
 
 ## Telemux Trust Boundary
 
