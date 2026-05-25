@@ -242,6 +242,7 @@ async function createFixture(envOverrides: Record<string, string> = {}) {
   const fakeCodex = join(binDir, "codex");
   const fakeClaude = join(binDir, "claude");
   const fakeSsh = join(binDir, "ssh");
+  const fakeSudo = join(binDir, "sudo");
 
   await mkdir(binDir, { recursive: true });
 
@@ -391,8 +392,24 @@ if [[ -n "\${FACTORY_TEST_CAPTURE_SSH_SCRIPT:-}" ]]; then
   echo "ssh capture: No route to host" >&2
   exit 255
 fi
+if [[ "\${FACTORY_TEST_FAKE_SSH_EXEC:-}" == "1" ]]; then
+  exec bash -s --
+fi
 echo "ssh: connect to host unreachable: No route to host" >&2
 exit 255
+`
+  );
+
+  await makeExecutable(
+    fakeSudo,
+    `#!/usr/bin/env bash
+if [[ "\${FACTORY_TEST_FAKE_SUDO_FAIL:-}" == "1" ]]; then
+  exit 1
+fi
+if [[ "\${1:-}" == "-n" && "\${2:-}" == "true" ]]; then
+  exit 0
+fi
+exit 0
 `
   );
 
@@ -502,6 +519,7 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
     fakeCodex,
     fakeClaude,
     fakeSsh,
+    fakeSudo,
     previousPath,
     config,
     db,
@@ -613,6 +631,7 @@ test("phase 1 workflow covers local host/scratch and pending remote behavior", a
     expect(workersText).toContain("status=unreachable");
     expect(workersText).toContain("transport=ssh");
     expect(workersText).toContain("local=no");
+    expect(workersText).toContain("sudo=ok");
 
     await fixture.commands.handleMessage(
       telegramMessage("/newctx myproj worker1 https://example.com/acme/project.git", 40)
@@ -652,26 +671,88 @@ test("phase 1 workflow covers local host/scratch and pending remote behavior", a
 
 test("addressed commands for other bots are ignored and updates probes are bounded", async () => {
   const fixture = await createFixture({ FACTORY_TELEGRAM_BOT_USERNAME: "brainstackbot" });
+  const previousProbeTimeout = process.env.BRAINSTACK_UPDATE_PROBE_TIMEOUT_SECONDS;
 
   try {
     await fixture.commands.handleMessage(telegramMessage("/help@otherbot", 10));
     expect(fixture.telegram.sent).toHaveLength(0);
 
+    await fixture.commands.handleMessage(telegramMessage("/newctx update-command control scratch", 10));
     await makeExecutable(
       fixture.fakeCodex,
       `#!/usr/bin/env bash
 exec sleep 30
 `
     );
+    process.env.BRAINSTACK_UPDATE_PROBE_TIMEOUT_SECONDS = "1";
     const startedAt = Date.now();
     await fixture.commands.handleMessage(telegramMessage("/updates@brainstackbot", 10));
     expect(Date.now() - startedAt).toBeLessThan(7000);
-    expect(fixture.telegram.sent.at(-1)?.text).toContain("codex=timeout after");
+    const updatesText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(updatesText).toContain("Update check degraded.");
+    expect(updatesText).toContain("Artifact: .factory/reports/update-check-");
+    expect(updatesText).toContain("## control");
+    expect(updatesText).toContain("exit=124");
+    const reportPath = updatesText.match(/Artifact: (.+)/)?.[1]?.trim() || "";
+    const reportText = await readFile(join(fixture.factoryRoot, "scratch", "update-command", reportPath), "utf8");
+    expect(reportText).toContain("## worker1");
   } finally {
+    if (previousProbeTimeout === undefined) {
+      delete process.env.BRAINSTACK_UPDATE_PROBE_TIMEOUT_SECONDS;
+    } else {
+      process.env.BRAINSTACK_UPDATE_PROBE_TIMEOUT_SECONDS = previousProbeTimeout;
+    }
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 10_000);
+
+test("/updates prefers the routines context and rejects non-active report contexts", async () => {
+  const fixture = await createFixture({
+    FACTORY_TELEGRAM_CONTROL_CHAT_ID: "4242"
+  });
+
+  try {
+    await ensureBasicLoops(fixture.config, fixture.contexts, fixture.workers, fixture.cronManager);
+    await fixture.commands.handleMessage(telegramMessage("/newctx topic-updates control scratch", 89));
+
+    const originalRunUpdateCheck = fixture.workers.runUpdateCheck.bind(fixture.workers);
+    let usedContextSlug: string | null = null;
+    fixture.workers.runUpdateCheck = async (context, _logPath) => {
+      usedContextSlug = context.slug;
+      return {
+        ok: true,
+        host: context.machine,
+        transport: "stack",
+        exitCode: 0,
+        stdout: "BRAINSTACK_UPDATE_REPORT=.factory/reports/mock-update.md\n# Update Check\n\n- status: ok\n\n## control\n\nok",
+        stderr: "",
+        durationMs: 1,
+        commandLabel: "update-check control",
+        reportPath: ".factory/reports/mock-update.md"
+      };
+    };
+
+    await fixture.commands.handleMessage(telegramMessage("/updates", 89));
+    expect(usedContextSlug).toBe("brainstack-routines");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Update check complete.");
+    fixture.workers.runUpdateCheck = originalRunUpdateCheck;
+
+    const routines = fixture.db.getContextBySlug("brainstack-routines")!;
+    fixture.db.saveContext({ ...routines, state: "archived", updatedAt: new Date().toISOString() });
+    const bound = fixture.db.getContextBySlug("topic-updates")!;
+    fixture.db.saveContext({ ...bound, state: "pending", updatedAt: new Date().toISOString() });
+
+    await fixture.commands.handleMessage(telegramMessage("/updates", 89));
+    const rejectedText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(rejectedText).toContain("No active context is available");
+    expect(rejectedText).toContain("brainstack-routines:archived");
+    expect(rejectedText).toContain("topic-updates:pending");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 30_000);
 
 test("cron jobs can be created from a normal Codex turn, tuned later, mirrored into the workspace, and dispatched by the scheduler", async () => {
   const fixture = await createFixture();
@@ -1364,6 +1445,7 @@ test("basic loops bootstrap installs update-check and workers reload without res
 
     await fixture.commands.handleMessage(telegramMessage("/workers", 81));
     expect(fixture.telegram.sent.at(-1)?.text).toContain("worker2");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("sudo=ok");
 
     await fixture.cronScheduler.runJobNow(fixture.db.getCronJob(updateCheck!.id)!);
     expect(fixture.telegram.sent.some((entry) => entry.text.includes("## worker2"))).toBe(true);
@@ -1470,6 +1552,83 @@ test("update-check marks an all-machine probe failure as failed", async () => {
     expect(result.stdout).toContain("- status: failed");
     expect(result.stdout).toContain("- failed_machines: 2");
   } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("worker health degrades when sudo or harness probe checks fail", async () => {
+  const fixture = await createFixture();
+  const previousFakeSudoFail = process.env.FACTORY_TEST_FAKE_SUDO_FAIL;
+  const previousFakeSshExec = process.env.FACTORY_TEST_FAKE_SSH_EXEC;
+
+  try {
+    process.env.FACTORY_TEST_FAKE_SUDO_FAIL = "1";
+    await fixture.commands.handleMessage(telegramMessage("/workers", 88));
+    const sudoText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(sudoText).toContain("control | status=degraded");
+    expect(sudoText).toContain("sudo=fail");
+    expect(sudoText).toContain("error=sudo -n true failed");
+
+    if (previousFakeSudoFail === undefined) {
+      delete process.env.FACTORY_TEST_FAKE_SUDO_FAIL;
+    } else {
+      process.env.FACTORY_TEST_FAKE_SUDO_FAIL = previousFakeSudoFail;
+    }
+
+    process.env.FACTORY_TEST_FAKE_SSH_EXEC = "1";
+    process.env.FACTORY_TEST_FAKE_SUDO_FAIL = "1";
+    await fixture.commands.handleMessage(telegramMessage("/workers", 88));
+    const remoteSudoText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(remoteSudoText).toContain("worker1 | status=degraded");
+    expect(remoteSudoText).toContain("sudo=fail");
+
+    if (previousFakeSudoFail === undefined) {
+      delete process.env.FACTORY_TEST_FAKE_SUDO_FAIL;
+    } else {
+      process.env.FACTORY_TEST_FAKE_SUDO_FAIL = previousFakeSudoFail;
+    }
+    process.env.FACTORY_TEST_FAKE_SUDO_FAIL = "0";
+
+    const badCodex = join(dirname(fixture.fakeCodex), "bad-codex");
+    await makeExecutable(
+      badCodex,
+      `#!/usr/bin/env bash
+if [[ "\${1:-}" == "--version" ]]; then
+  echo 'bad codex'
+  exit 0
+fi
+if [[ "\${1:-}" == "exec" && "\${2:-}" == "--help" ]]; then
+  echo 'exec help without required flags'
+  exit 0
+fi
+exit 0
+`
+    );
+
+    const workers = JSON.parse(await readFile(fixture.workersFile, "utf8")) as Array<Record<string, unknown>>;
+    workers[0] = {
+      ...workers[0],
+      harnessBin: badCodex
+    };
+    await writeFile(fixture.workersFile, `${JSON.stringify(workers, null, 2)}\n`);
+
+    await fixture.commands.handleMessage(telegramMessage("/workers", 88));
+    const harnessText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(harnessText).toContain("control | status=degraded");
+    expect(harnessText).toContain("sudo=ok");
+    expect(harnessText).toContain("error=missing harness flag: --dangerously-bypass-approvals-and-sandbox");
+  } finally {
+    if (previousFakeSudoFail === undefined) {
+      delete process.env.FACTORY_TEST_FAKE_SUDO_FAIL;
+    } else {
+      process.env.FACTORY_TEST_FAKE_SUDO_FAIL = previousFakeSudoFail;
+    }
+    if (previousFakeSshExec === undefined) {
+      delete process.env.FACTORY_TEST_FAKE_SSH_EXEC;
+    } else {
+      process.env.FACTORY_TEST_FAKE_SSH_EXEC = previousFakeSshExec;
+    }
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }

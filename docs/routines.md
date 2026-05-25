@@ -34,6 +34,8 @@ Run a job immediately by id or label:
 /cron run update-check
 ```
 
+`/updates` is the same deterministic stack-wide check as the built-in `update-check` routine. It prefers the auto-created active `brainstack-routines` context for report artifacts so update visibility still works from worker-specific topics; if that context is unavailable, it falls back to the current active bound topic.
+
 Create a deterministic reminder:
 
 ```text

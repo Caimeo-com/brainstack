@@ -150,6 +150,11 @@ function cleanArtifactDeletePath(filePath: string): string {
   return normalized;
 }
 
+function probeField(output: string, key: string): string | null {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return output.match(new RegExp(`^${escaped}=([^\\n]*)$`, "m"))?.[1]?.trim() || null;
+}
+
 function parseSessionId(output: string): string | null {
   const patterns = [
     /"session_id":"([^"]+)"/,
@@ -315,6 +320,7 @@ export class WorkerService {
         "printf 'harness_version=%s\\n' \"$($harness_bin --version 2>&1 | head -n 1 || true)\"",
         "if [ \"$harness\" = codex ]; then help=\"$($harness_bin exec --help 2>&1 || true)\"; else help=\"$($harness_bin --help 2>&1 || true)\"; fi",
         ...requiredHarnessFlags(harness.family).map((needle) => `case "$help" in *${quoteSh(needle)}*) printf 'flag:${needle}=1\\n' ;; *) printf 'flag:${needle}=0\\n' ;; esac`),
+        "if command -v sudo >/dev/null 2>&1; then if sudo -n true >/dev/null 2>&1; then printf 'sudo=ok\\n'; else printf 'sudo=fail\\n'; fi; else printf 'sudo=missing\\n'; fi",
         "printf 'home=%s\\n' \"$HOME\""
       ].join("\n"),
       undefined,
@@ -322,18 +328,36 @@ export class WorkerService {
     );
 
     const existing = this.db.getWorker(host);
+    const details = result.ok ? result.stdout.trim() : "";
+    const probeIssues: string[] = [];
+    if (result.ok) {
+      if (probeField(details, "harness_bin") !== "1") {
+        probeIssues.push(`harness binary not found: ${harness.bin}`);
+      } else {
+        for (const flag of requiredHarnessFlags(harness.family)) {
+          if (probeField(details, `flag:${flag}`) !== "1") {
+            probeIssues.push(`missing harness flag: ${flag}`);
+          }
+        }
+      }
+
+      const sudoStatus = probeField(details, "sudo");
+      if (sudoStatus !== "ok") {
+        probeIssues.push(sudoStatus === "missing" ? "sudo -n true missing" : sudoStatus === "fail" ? "sudo -n true failed" : "sudo probe missing");
+      }
+    }
     const workerRecord: WorkerRecord = {
       host,
       transport: worker.transport,
-      status: result.ok ? "healthy" : "unreachable",
+      status: result.ok ? (probeIssues.length ? "degraded" : "healthy") : "unreachable",
       reachable: result.ok,
       localExecution: worker.localExecution,
       sshTarget: worker.sshTarget,
       sshUser: worker.sshUser,
       lastCheckedAt: nowIso(),
       lastSeenAt: result.ok ? nowIso() : (existing?.lastSeenAt || null),
-      lastError: result.ok ? null : (result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`),
-      details: result.ok ? result.stdout.trim() : null,
+      lastError: result.ok ? (probeIssues.length ? probeIssues.join("; ") : null) : (result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`),
+      details: result.ok ? details : null,
       updatedAt: nowIso()
     };
 

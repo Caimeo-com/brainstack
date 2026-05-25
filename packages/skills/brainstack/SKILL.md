@@ -38,7 +38,7 @@ Prefer this order:
 3. On the control host, run `brainctl doctor --config "$BRAINSTACK_CONFIG" --workers`; use `--deep` only when intentionally proving yolo/bypass sudo through the harness.
 4. Check services: `systemctl --user status braind.service telemux.service --no-pager`, `journalctl --user -u telemux.service -n 200 --no-pager`, and `journalctl --user -u braind.service -n 200 --no-pager`.
 5. Check local health endpoints on the host: `curl -fsS http://127.0.0.1:8080/health` for braind and `curl -fsS http://127.0.0.1:8787/healthz` for telemux.
-6. Check manual update visibility with `brainctl updates --config "$BRAINSTACK_CONFIG"`. Do not auto-apply updates.
+6. Check stack update visibility with `/updates` in Telegram or `brainctl updates --config "$BRAINSTACK_CONFIG"` on a host. Do not auto-apply updates.
 7. Use `brainctl doctor --workers --config "$BRAINSTACK_CONFIG"` to verify each worker's shell PATH exposes Bun, Git, SSH, Tailscale, and the configured harness.
 8. On installed client/worker profiles, use `brainctl doctor --write-smoke --config "$BRAINSTACK_CONFIG"` only when explicitly proving import/propose pushback; it posts a small import artifact.
 
@@ -52,7 +52,7 @@ When Telegram stops responding:
 - Check `getWebhookInfo`. Brainstack telemux uses polling, so `url` should be empty. A nonzero `pending_update_count` suggests updates are not being consumed.
 - Avoid `getUpdates` unless the user asked for live Telegram debugging or service state suggests no poller is active. If used, summarize only metadata: update id, chat id, thread id, sender id, date, text length, and attachment kinds.
 - Inspect `telemux.service` and recent logs on the control host. Look for startup crashes, Telegram 409 polling conflicts, missing `FACTORY_TELEGRAM_BOT_TOKEN`, wrong `FACTORY_ALLOWED_TELEGRAM_USER_ID`, bot privacy issues, DB write errors, stuck active context jobs, and worker SSH failures.
-- Check `/whoami`, `/workers`, `/updates`, `/topicinfo`, and `/tail` from the bound Telegram topic once the service is consuming updates again.
+- Check `/whoami`, `/workers`, `/updates`, `/topicinfo`, and `/tail` from the bound Telegram topic once the service is consuming updates again. `/workers` should show each worker's `sudo=ok|fail|missing|n/a`; `/updates` should run the same all-worker deterministic update-check used by the built-in routine.
 - Restart `telemux.service` only after recording the current failure evidence, unless the user explicitly requests a blind restart.
 
 ## Worker Canary

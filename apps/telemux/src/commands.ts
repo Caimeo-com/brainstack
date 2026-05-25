@@ -1,5 +1,4 @@
 import { deliverAttachmentRequests, formatAttachmentDeliveryIssues } from "./attachment-delivery";
-import { resolve } from "node:path";
 import {
   CODEX_MODE_PRESETS,
   formatCodexRuntimeOverrides,
@@ -357,93 +356,27 @@ function commandTimezone(): string {
   }
 }
 
-async function runBoundedCommand(args: string[], options: { cwd?: string; timeoutMs?: number } = {}): Promise<string> {
-  const timeoutMs = options.timeoutMs ?? 5000;
-  const proc = Bun.spawn(
-    [
-      "bash",
-      "-lc",
-      [
-        "if command -v setsid >/dev/null 2>&1; then exec setsid \"$@\"; fi",
-        "brainstack_kill_descendants() {",
-        "  if ! command -v pgrep >/dev/null 2>&1; then return; fi",
-        "  for child in $(pgrep -P \"$1\" 2>/dev/null || true); do",
-        "    brainstack_kill_descendants \"$child\" \"$2\"",
-        "    kill \"-$2\" \"$child\" 2>/dev/null || true",
-        "  done",
-        "}",
-        "\"$@\" &",
-        "child_pid=$!",
-        "brainstack_stop_child() {",
-        "  brainstack_kill_descendants \"$child_pid\" TERM",
-        "  kill -TERM \"$child_pid\" 2>/dev/null || true",
-        "  sleep 0.2",
-        "  brainstack_kill_descendants \"$child_pid\" KILL",
-        "  kill -KILL \"$child_pid\" 2>/dev/null || true",
-        "}",
-        "trap brainstack_stop_child TERM INT HUP",
-        "wait \"$child_pid\""
-      ].join("\n"),
-      "brainstack-probe",
-      ...args
-    ],
-    {
-      cwd: options.cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-      env: process.env
-    }
-  );
-  const killProbe = (signal: "TERM" | "KILL") => {
-    proc.kill(`SIG${signal}`);
-    if (proc.pid) {
-      void Bun.spawn(["bash", "-lc", `kill -${signal} -- -"$1" 2>/dev/null || true`, "brainstack-probe-kill", String(proc.pid)]).exited;
-    }
-  };
-  const collect = (async () => {
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text().catch(() => ""),
-      new Response(proc.stderr).text().catch(() => ""),
-      proc.exited.catch(() => 124)
-    ]);
-    const output = (stdout || stderr).trim();
-    return exitCode === 0 ? output : output || `exit=${exitCode}`;
-  })();
-
-  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
-  let forceKillTimer: ReturnType<typeof setTimeout> | null = null;
-  let timedOut = false;
-  const timeout = new Promise<string>((resolve) => {
-    timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      killProbe("TERM");
-      forceKillTimer = setTimeout(() => killProbe("KILL"), 500);
-      resolve(`timeout after ${timeoutMs}ms`);
-    }, timeoutMs);
-    void collect.finally(() => {
-      if (timeoutTimer) {
-        clearTimeout(timeoutTimer);
-      }
-      if (forceKillTimer && !timedOut) {
-        clearTimeout(forceKillTimer);
-      }
-    });
-  });
-
-  try {
-    return await Promise.race([collect, timeout]);
-  } finally {
-    if (timeoutTimer) {
-      clearTimeout(timeoutTimer);
-    }
-    if (forceKillTimer && !timedOut) {
-      clearTimeout(forceKillTimer);
-    }
+function detailValue(details: string | null, key: string): string | null {
+  if (!details) {
+    return null;
   }
+
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return details.match(new RegExp(`^${escaped}=([^\\n]*)$`, "m"))?.[1]?.trim() || null;
 }
 
-function firstLine(value: string): string {
-  return value.split(/\r?\n/)[0]?.trim() || "missing";
+function formatUpdateCheckCommandResult(result: {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  reportPath: string | null;
+}): string {
+  const body = result.stdout.replace(/^BRAINSTACK_UPDATE_REPORT=.*$/m, "").trim();
+  const combined = body || result.stderr.trim() || `update-check exited ${result.exitCode}`;
+  const compactBody = combined.length > 3200 ? `${combined.slice(0, 3200)}\n\n... truncated; see artifact.` : combined;
+  const heading = !result.ok ? "Update check failed." : body.includes("- status: degraded") ? "Update check degraded." : "Update check complete.";
+  return [heading, result.reportPath ? `Artifact: ${result.reportPath}` : null, compactBody].filter(Boolean).join("\n\n");
 }
 
 export class CommandHandler {
@@ -779,6 +712,7 @@ export class CommandHandler {
                       `status=${worker.status}`,
                       `transport=${worker.transport || "n/a"}`,
                       `local=${worker.localExecution ? "yes" : "no"}`,
+                      `sudo=${detailValue(worker.details, "sudo") || "n/a"}`,
                       worker.lastSeenAt ? `last_seen=${worker.lastSeenAt}` : null,
                       worker.lastCheckedAt ? `checked=${worker.lastCheckedAt}` : null,
                       worker.lastError ? `error=${compact(worker.lastError, 140)}` : null
@@ -793,24 +727,36 @@ export class CommandHandler {
         }
 
         case "/updates": {
-          const productRoot = resolve(this.config.projectRoot, "..", "..");
-          const [head, branch, codex, claude] = await Promise.all([
-            runBoundedCommand(["git", "rev-parse", "--short", "HEAD"], { cwd: productRoot }),
-            runBoundedCommand(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd: productRoot }),
-            runBoundedCommand(["bash", "-lc", "command -v codex >/dev/null && codex --version || true"]),
-            runBoundedCommand(["bash", "-lc", "command -v claude >/dev/null && claude --version || true"])
-          ]);
-          await this.telegram.sendText(
-            target,
-            [
-              "Updates are manual/read-only.",
-              `brainstack=${firstLine(branch)}@${firstLine(head)}`,
-              `selected_harness=${this.config.harness}`,
-              `codex=${firstLine(codex)}`,
-              `claude=${firstLine(claude)}`,
-              "Run on control host: brainctl updates --config ~/.config/brainstack/brainstack.yaml"
-            ].join("\n")
-          );
+          const routinesContext = this.db.getContextBySlug("brainstack-routines");
+          const updateContext =
+            routinesContext?.state === "active" ? routinesContext : boundContext?.state === "active" ? boundContext : null;
+          if (!updateContext) {
+            const knownContexts = [routinesContext, boundContext]
+              .filter((context): context is ContextRecord => Boolean(context))
+              .map((context) => `${context.slug}:${context.state}`)
+              .join(", ");
+            await this.telegram.sendText(
+              target,
+              [
+                "No active context is available for update-check artifacts.",
+                knownContexts ? `Known update contexts: ${knownContexts}` : null,
+                "Use /newctx or install the update-check routine first."
+              ]
+                .filter(Boolean)
+                .join("\n")
+            );
+            return;
+          }
+
+          const logPath = `${this.config.logsDir}/manual-update-check-${Date.now()}.log`;
+          let result;
+          try {
+            result = await this.dispatcher.withContextLock(updateContext, () => this.workers.runUpdateCheck(updateContext, logPath));
+          } catch (error) {
+            await this.telegram.sendText(target, `Update check could not start: ${error instanceof Error ? error.message : String(error)}`);
+            return;
+          }
+          await this.telegram.sendText(target, formatUpdateCheckCommandResult(result));
           return;
         }
 
