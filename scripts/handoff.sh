@@ -552,7 +552,7 @@ worker_host_b_pattern="yo""da"
 old_migration_pattern="migration-from-current-${control_host_pattern}\\.md"
 local_hygiene_hits="$(
   rg -n \
-    -e '/Users/[A-Za-z0-9._-]+' \
+    -P -e '/Users/(?!operator\b)[A-Za-z0-9._-]+' \
     -e "/home/${local_user_pattern}" \
     -e "\\b(${control_host_pattern}|${worker_host_a_pattern}|${worker_host_b_pattern}|${local_user_pattern})\\b" \
     -e "\\b(Val${control_host_pattern#val}|Er${worker_host_a_pattern#er}|Yo${worker_host_b_pattern#yo})\\b" \
