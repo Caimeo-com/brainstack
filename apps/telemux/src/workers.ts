@@ -116,6 +116,51 @@ fi
 `.trim();
 }
 
+function sshTrustArgs(config: FactoryConfig, worker: FactoryWorkerConfig): string[] {
+  const knownHostsPath = worker.sshKnownHostsPath || config.sshKnownHostsPath;
+  const trustMode = worker.sshTrustMode || "pinned";
+  return [
+    "-o",
+    trustMode === "accept-new" ? "StrictHostKeyChecking=accept-new" : "StrictHostKeyChecking=yes",
+    "-o",
+    `UserKnownHostsFile=${knownHostsPath}`
+  ];
+}
+
+function workerSshHost(worker: FactoryWorkerConfig): string {
+  const target = worker.sshTarget || worker.name;
+  const withoutUser = target.includes("@") ? target.slice(target.lastIndexOf("@") + 1) : target;
+  const bracketMatch = withoutUser.match(/^\[([^\]]+)\](?::\d+)?$/);
+  if (bracketMatch) {
+    return bracketMatch[1];
+  }
+  if (/^[^:]+:\d+$/.test(withoutUser)) {
+    return withoutUser.replace(/:\d+$/, "");
+  }
+  return withoutUser;
+}
+
+function workerSshEmbeddedUser(worker: FactoryWorkerConfig): string | null {
+  const target = worker.sshTarget || worker.name;
+  return target.includes("@") ? target.slice(0, target.lastIndexOf("@")) : null;
+}
+
+function workerSshPort(worker: FactoryWorkerConfig): string | null {
+  const target = worker.sshTarget || worker.name;
+  const withoutUser = target.includes("@") ? target.slice(target.lastIndexOf("@") + 1) : target;
+  const bracketMatch = withoutUser.match(/^\[[^\]]+\]:(\d+)$/);
+  if (bracketMatch) {
+    return bracketMatch[1];
+  }
+  const hostPort = withoutUser.match(/^[^:]+:(\d+)$/);
+  return hostPort ? hostPort[1] : null;
+}
+
+function workerSshPortArgs(worker: FactoryWorkerConfig): string[] {
+  const port = workerSshPort(worker);
+  return port ? ["-p", port] : [];
+}
+
 function uniqueHosts(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort();
 }
@@ -1800,8 +1845,10 @@ printf 'BRANCH=%s\\n' "$branch_name"
       return "";
     }
 
-    const target = worker.sshTarget || worker.name;
-    return worker.sshUser ? `${worker.sshUser}@${target}` : target;
+    const host = workerSshHost(worker);
+    const remoteHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+    const user = worker.sshUser || workerSshEmbeddedUser(worker);
+    return user ? `${user}@${remoteHost}` : remoteHost;
   }
 
   private async runWorkerScript(
@@ -1833,10 +1880,8 @@ printf 'BRANCH=%s\\n' "$branch_name"
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=8",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-o",
-            `UserKnownHostsFile=${this.config.sshKnownHostsPath}`,
+            ...sshTrustArgs(this.config, worker),
+            ...workerSshPortArgs(worker),
             this.remoteTarget(worker),
             "bash",
             "-s",

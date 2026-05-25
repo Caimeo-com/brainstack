@@ -22,6 +22,10 @@ Fresh installs use three repo views:
 
 `braind` synchronizes the staging clone under the repo lock before every write. If staging is clean and behind `origin/main`, it fast-forwards. If staging is dirty, ahead, or diverged, the write fails with a precise error instead of risking a stale-clone push or silent overwrite.
 
+The repo lock fails closed. Brainstack does not auto-break a lock that looks stale because a slow write can look stale from the outside. Use `brainctl repo-lock status --config ~/.config/brainstack/brainstack.yaml` to inspect owner metadata, copy the reported `clear_token`, then run `brainctl repo-lock clear --config ~/.config/brainstack/brainstack.yaml --yes --token <clear_token>` only after confirming no `braind` write is active. The clear command removes only the matching owner/release marker files and then `rmdir`s the lock directory; `--force` is reserved for operator-confirmed recovery, including the special `--force --token EMPTY` path for an interrupted empty lock directory.
+
+Import/propose idempotency records are durable under `derived/idempotency/`. Duplicate requests replay completed responses, conflicting reuse returns a hard conflict, and expired records that reached `running` become `review_required` instead of producing endless retryable responses.
+
 Search uses local SQLite under `derived/` in the serve clone and is never shared over a network filesystem.
 
 ## Install And Upgrade Boundary

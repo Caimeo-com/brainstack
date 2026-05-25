@@ -52,6 +52,15 @@ Harness precedence is explicit context override, then worker default, then globa
 
 For remote workers, Brainstack first asks the worker user's own shell for its interactive-login `PATH` and then resolves `codex` or `claude` there. That means user-owned wrappers are acceptable if `codex --version` or `claude --version` works for the SSH user. Brainstack itself still uses Bun; it does not install or invoke Node/npm/npx as part of its own product code. If a worker uses a nonstandard binary location that is not in the user's shell PATH, set that worker's `harnessBin` explicitly in `brainstack.yaml`.
 
+Worker SSH host trust is pinned by default. After merging a worker into `brainstack.yaml` and before restarting telemux, record the host key from the control host:
+
+```bash
+bun run packages/brainctl/src/main.ts trust-worker --config ~/.config/brainstack/brainstack.yaml --worker brain-worker
+bun run packages/brainctl/src/main.ts doctor --config ~/.config/brainstack/brainstack.yaml --workers
+```
+
+The generated worker entry uses `sshTrustMode: pinned`. Temporary `sshTrustMode: accept-new` is allowed only for an explicit bootstrap window; it will be reported as a warning by doctor.
+
 The worker transport default is normal OpenSSH over Tailscale:
 
 ```bash

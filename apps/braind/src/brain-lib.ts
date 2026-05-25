@@ -1851,6 +1851,8 @@ export async function lintWiki(repoRoot: string): Promise<LintResult> {
 export async function withRepoLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
   const { lockDir } = getRepoPaths(repoRoot);
   const startedAt = Date.now();
+  const configuredWaitMs = Number(process.env.BRAIN_REPO_LOCK_WAIT_MS || "");
+  const waitMs = Number.isFinite(configuredWaitMs) && configuredWaitMs > 0 ? Math.trunc(configuredWaitMs) : 30_000;
   const lockToken = randomUUID();
   const lockHostname = hostname();
   const lockStartedAt = isoNow();
@@ -1878,12 +1880,14 @@ export async function withRepoLock<T>(repoRoot: string, fn: () => Promise<T>): P
         await writeOwnerUnsafe();
         await writeText(tokenPath, lockToken);
       } catch (error) {
-        await rm(lockDir, { recursive: true, force: true });
+        await rm(tokenPath, { force: true }).catch(() => undefined);
+        await rm(ownerPath, { force: true }).catch(() => undefined);
+        await rmdir(lockDir).catch(() => undefined);
         throw error;
       }
       break;
     } catch (error) {
-      if (Date.now() - startedAt > 30_000) {
+      if (Date.now() - startedAt > waitMs) {
         let owner = "unknown owner";
         if (existsSync(lockDir)) {
           const entries = await readdir(lockDir).catch(() => []);
@@ -1896,7 +1900,7 @@ export async function withRepoLock<T>(repoRoot: string, fn: () => Promise<T>): P
             owner = `owner metadata missing; lock mtime=${info.mtime.toISOString()}`;
           }
         }
-        throw new Error(`Timed out waiting for shared-brain repo lock at ${lockDir}; ${owner}. Brainstack does not auto-break repo locks; inspect the owner before removing a stale lock manually.`);
+        throw new Error(`Timed out waiting for shared-brain repo lock at ${lockDir}; ${owner}. Brainstack does not auto-break repo locks; run brainctl repo-lock status before any manual recovery.`);
       }
       await Bun.sleep(200);
     }

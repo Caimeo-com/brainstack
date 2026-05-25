@@ -6,6 +6,8 @@
 
 Normal OpenSSH over Tailscale is the default worker transport. Tailscale SSH is disabled by default.
 
+OpenSSH worker trust is pinned by default after bootstrap. `brainctl trust-worker --config ~/.config/brainstack/brainstack.yaml --worker <name>` records the worker host key in Brainstack's product known-hosts file, and telemux dispatch then uses `StrictHostKeyChecking=yes`. `sshTrustMode: accept-new` exists only as an explicit bootstrap/canary escape hatch; switch back to `sshTrustMode: pinned` before treating the worker as enrolled.
+
 ## Tailscale Policy Shape
 
 Use grants:
@@ -56,6 +58,10 @@ Examples must leave secret values blank. `brainctl rotate-token` writes generate
 Runtime env files are generated and may be overwritten by upgrade. Secrets env files are operator-managed and must not be overwritten by upgrade.
 
 Offline outbox files store pending import/propose payloads under the local state root. They are not secrets by design, but they may contain sensitive note text or proposal bodies. Treat the state root as private user data and do not sync it through public storage.
+
+Import/propose writes use idempotency records in `derived/idempotency/`. If a process dies after side effects may have started and the running lease later expires, the record moves to `review_required` and returns a non-retryable client error. Operators must inspect the record and repository state before retrying with a new idempotency key; clients should not replay that write forever.
+
+Outbox flushes also stop retrying persistent `425` in-progress responses after `BRAINSTACK_OUTBOX_MAX_425_RETRIES` attempts, defaulting to 12, and keep the queued item as a terminal operator-review artifact.
 
 ## Import Guardrails
 

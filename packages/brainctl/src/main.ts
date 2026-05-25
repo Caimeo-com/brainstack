@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { dirname, join, resolve } from "node:path";
-import { tmpdir } from "node:os";
+import { dirname, join, resolve, sep } from "node:path";
+import { hostname, tmpdir } from "node:os";
 
 type Profile = "single-node" | "control" | "worker" | "client-macos" | "private-journal";
 const SUPPORTED_PROFILES: Profile[] = ["single-node", "control", "worker", "client-macos"];
@@ -11,6 +11,7 @@ type SeedMode = "empty-only" | "missing" | "force";
 type HarnessName = "codex" | "claude";
 type DestroyScope = "control" | "worker" | "client" | "all";
 type CheckStatus = "PASS" | "WARN" | "FAIL";
+type WorkerSshTrustMode = "pinned" | "accept-new";
 
 const CONFIG_SCHEMA_VERSION = 1;
 const MIN_BUN_VERSION = "1.3.10";
@@ -26,6 +27,8 @@ interface BrainstackWorkerConfig {
   transport: string;
   sshTarget?: string | null;
   sshUser?: string | null;
+  sshTrustMode?: WorkerSshTrustMode;
+  sshKnownHostsPath?: string | null;
   managedRepoRoot: string;
   managedHostRoot: string;
   managedScratchRoot: string;
@@ -155,6 +158,9 @@ function usage(): string {
   brainctl render --config brainstack.yaml --profile ... --out DIR
   brainctl bootstrap-client --profile client-macos --config brainstack.yaml --out DIR
   brainctl join-worker --config brainstack.yaml --worker WORKER_HOST [--ssh-user USER] [--out DIR]
+  brainctl trust-worker --config brainstack.yaml --worker WORKER_NAME [--host HOST] [--dry-run]
+  brainctl repo-lock status|clear --config brainstack.yaml [--repo write|serve] [--path LOCK_DIR] [--yes] [--token LOCK_TOKEN] [--force] [--min-age-ms MS]
+  brainctl locks status|clear --config brainstack.yaml [--repo write|serve] [--path LOCK_DIR] [--yes] [--token LOCK_TOKEN] [--force] [--min-age-ms MS]
   brainctl rotate-token --kind import|admin|telegram-placeholder --config brainstack.yaml [--env FILE]
   brainctl import-text --config brainstack.yaml --title TITLE --text TEXT --source-harness HARNESS --source-machine MACHINE [--source-type note]
   brainctl propose --config brainstack.yaml --title TITLE --body BODY
@@ -267,6 +273,16 @@ function normalizeHarness(value: string | undefined, fallback: HarnessName = "co
     return normalized;
   }
   throw new Error(`Unsupported harness: ${value}. Expected codex or claude.`);
+}
+
+function normalizeWorkerSshTrustMode(value: string | null | undefined, transport: string): WorkerSshTrustMode {
+  if (transport === "local" || transport === "tailscale-ssh") {
+    return "pinned";
+  }
+  if (value === "accept-new") {
+    return "accept-new";
+  }
+  return "pinned";
 }
 
 function splitKeyValue(text: string): [string, string] {
@@ -504,11 +520,14 @@ function normalizeWorkerConfig(input: Record<string, unknown>, cfg: Pick<Brainst
   const transport = stringAt(input, "transport", name === cfg.machine.name ? "local" : "ssh");
   const harnessValue = optionalStringAt(input, "harness");
   const capabilities = arrayAt(input, "capabilities").map(String).filter(Boolean);
+  const sshTrustValue = optionalStringAt(input, "sshTrustMode") || optionalStringAt(input, "sshTrust");
   return {
     name,
     transport,
     sshTarget: optionalStringAt(input, "sshTarget"),
     sshUser: optionalStringAt(input, "sshUser"),
+    sshTrustMode: normalizeWorkerSshTrustMode(sshTrustValue, transport),
+    sshKnownHostsPath: optionalStringAt(input, "sshKnownHostsPath"),
     managedRepoRoot: stringAt(input, "managedRepoRoot", join(cfg.telemux.factoryRoot, "repos")),
     managedHostRoot: stringAt(input, "managedHostRoot", join(cfg.telemux.factoryRoot, "hostctx")),
     managedScratchRoot: stringAt(input, "managedScratchRoot", join(cfg.telemux.factoryRoot, "scratch")),
@@ -983,6 +1002,7 @@ function telemuxRuntimeEnv(cfg: BrainstackConfig): string {
     `FACTORY_CONTROL_ROOT=${cfg.telemux.controlRoot}`,
     `FACTORY_FACTORY_ROOT=${cfg.telemux.factoryRoot}`,
     `FACTORY_WORKERS_FILE=${join(cfg.paths.configRoot, "workers.json")}`,
+    `FACTORY_SSH_KNOWN_HOSTS=${join(cfg.paths.configRoot, "ssh_known_hosts")}`,
     "FACTORY_USAGE_ADAPTER=manual",
     `FACTORY_HARNESS=${cfg.harness.name}`,
     `FACTORY_HARNESS_BIN=${cfg.harness.bin}`,
@@ -1013,6 +1033,35 @@ function telemuxSecretsEnv(): string {
     "BRAIN_IMPORT_TOKEN=",
     ""
   ].join("\n");
+}
+
+async function preserveSshKnownHosts(cfg: BrainstackConfig): Promise<void> {
+  const target = join(cfg.paths.configRoot, "ssh_known_hosts");
+  if (existsSync(target)) {
+    return;
+  }
+  const legacy = join(cfg.telemux.controlRoot, "ssh_known_hosts");
+  if (!existsSync(legacy)) {
+    return;
+  }
+  const legacyText = await readFile(legacy, "utf8").catch(() => "");
+  if (!legacyText.split(/\r?\n/).some(isKnownHostLine)) {
+    return;
+  }
+  await ensureDir(dirname(target));
+  await cp(legacy, target, { force: false });
+}
+
+function isKnownHostLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith("@revoked ")) {
+    return false;
+  }
+  const parts = trimmed.split(/\s+/);
+  if (parts[0] === "@cert-authority") {
+    return parts.length >= 4 && /^(?:ssh|ecdsa|sk)-/.test(parts[2]);
+  }
+  return parts.length >= 3 && /^(?:ssh|ecdsa|sk)-/.test(parts[1]);
 }
 
 function defaultWorkers(cfg: BrainstackConfig): BrainstackWorkerConfig[] {
@@ -1327,6 +1376,7 @@ function expectedManagedArtifacts(cfg: BrainstackConfig): ManagedArtifact[] {
     artifacts.push(
       { path: join(cfg.paths.configRoot, "telemux.runtime.env"), kind: "file", scope: "control", reason: "generated telemux runtime env" },
       { path: join(cfg.paths.configRoot, "workers.json"), kind: "file", scope: "control", reason: "generated worker config render" },
+      { path: join(cfg.paths.configRoot, "ssh_known_hosts"), kind: "file", scope: "control", reason: "brainstack worker OpenSSH pinned host keys", optional: true },
       { path: join(cfg.paths.systemdUserRoot, "telemux.service"), kind: "service", scope: "control", reason: "generated telemux user service" },
       { path: cfg.telemux.controlRoot, kind: "dir", scope: "control", reason: "telemux control state root", optional: true },
       { path: cfg.telemux.factoryRoot, kind: "dir", scope: "control", reason: "telemux factory workspace root", optional: true }
@@ -1478,7 +1528,7 @@ async function installLocalClientBootstrap(cfg: BrainstackConfig): Promise<strin
 }
 
 function commandPath(name: string): string | null {
-  const proc = run(["bash", "-lc", `command -v ${shellSingleQuote(name)}`], { check: false, env: userShellPathEnv() });
+  const proc = run(["bash", "-c", `command -v ${shellSingleQuote(name)}`], { check: false, env: userShellPathEnv() });
   return proc.code === 0 && proc.stdout.trim() ? proc.stdout.trim().split(/\r?\n/)[0] : null;
 }
 
@@ -1992,6 +2042,7 @@ async function commandInit(args: ParsedArgs): Promise<void> {
     await writeText(join(cfg.paths.systemdUserRoot, "braind.service"), braindService(cfg));
   }
   if (cfg.telemux.enabled) {
+    await preserveSshKnownHosts(cfg);
     await writeText(join(cfg.paths.configRoot, "telemux.runtime.env"), telemuxRuntimeEnv(cfg), 0o644);
     await writeIfMissing(join(cfg.paths.configRoot, "telemux.secrets.env"), telemuxSecretsEnv(), 0o600);
     await writeText(join(cfg.paths.configRoot, "workers.json"), `${JSON.stringify(defaultWorkers(cfg), null, 2)}\n`);
@@ -2024,6 +2075,7 @@ async function applyRuntime(cfg: BrainstackConfig): Promise<string[]> {
     touched.push(join(cfg.repos.bare, "hooks", "pre-receive"));
   }
   if (cfg.telemux.enabled) {
+    await preserveSshKnownHosts(cfg);
     await writeText(join(cfg.paths.configRoot, "telemux.runtime.env"), telemuxRuntimeEnv(cfg), 0o644);
     await writeIfMissing(join(cfg.paths.configRoot, "telemux.secrets.env"), telemuxSecretsEnv(), 0o600);
     await writeText(join(cfg.paths.configRoot, "workers.json"), `${JSON.stringify(defaultWorkers(cfg), null, 2)}\n`);
@@ -2159,6 +2211,25 @@ function gitClean(path: string): DoctorCheck {
     : check("PASS", "git", `git-clean:${path}`, "clean");
 }
 
+async function lockDoctorCheck(label: string, lockPath: string): Promise<DoctorCheck> {
+  const info = await repoLockInfo(lockPath);
+  if (!info.exists) {
+    return check("PASS", "locks", label, `absent: ${lockPath}`);
+  }
+  const safe = info.safeToClear ? "safe-to-clear=yes" : "safe-to-clear=no";
+  return check(
+    "WARN",
+    "locks",
+    label,
+    `present age_ms=${info.ageMs ?? "unknown"} pid_alive=${info.pidAlive} ${safe}; ${info.reason}`,
+    `Inspect with brainctl repo-lock status --config <config>; clear only after confirming no write is active.`
+  );
+}
+
+function pendingReindexPathFor(cfg: BrainstackConfig): string {
+  return join(cfg.repos.serve, "derived", "search-reindex-needed.json");
+}
+
 function outboxRoot(cfg: BrainstackConfig): string {
   return join(cfg.paths.stateRoot, "outbox", brainInstanceId(cfg));
 }
@@ -2212,6 +2283,13 @@ async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Pro
     checks.push(existsSync(cfg.repos.bare) ? check("PASS", "git", "bare-repo", cfg.repos.bare) : check("WARN", "git", "bare-repo", `${cfg.repos.bare} missing`));
     if (gitExists(cfg.repos.staging)) checks.push(gitClean(cfg.repos.staging)); else checks.push(check("WARN", "git", "staging-clone", `${cfg.repos.staging} missing`));
     if (gitExists(cfg.repos.serve)) checks.push(gitClean(cfg.repos.serve)); else checks.push(check("WARN", "git", "serve-clone", `${cfg.repos.serve} missing`));
+    checks.push(await lockDoctorCheck("write-repo-lock", join(cfg.repos.staging, ".shared-brain.lock")));
+    checks.push(await lockDoctorCheck("serve-repo-lock", join(cfg.repos.serve, ".shared-brain.lock")));
+    checks.push(
+      existsSync(pendingReindexPathFor(cfg))
+        ? check("WARN", "locks", "pending-reindex", pendingReindexPathFor(cfg), "braind should retry this automatically; inspect braind logs if it persists.")
+        : check("PASS", "locks", "pending-reindex", "absent")
+    );
     try {
       const response = await fetch(`http://${cfg.brain.bind}:${cfg.brain.port}/health`, { signal: AbortSignal.timeout(2000) });
       checks.push(response.ok ? check("PASS", "health", "braind-health", `HTTP ${response.status}`) : check("WARN", "health", "braind-health", `HTTP ${response.status}`));
@@ -2323,8 +2401,69 @@ function workerHarnessBin(cfg: BrainstackConfig, worker: BrainstackWorkerConfig,
 }
 
 function workerRemoteTarget(worker: BrainstackWorkerConfig): string {
+  const host = workerSshHost(worker);
+  const remoteHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  const embeddedUser = workerSshEmbeddedUser(worker);
+  const user = worker.sshUser || embeddedUser;
+  return user ? `${user}@${remoteHost}` : remoteHost;
+}
+
+function workerSshEmbeddedUser(worker: BrainstackWorkerConfig): string | null {
   const target = worker.sshTarget || worker.name;
-  return worker.sshUser ? `${worker.sshUser}@${target}` : target;
+  return target.includes("@") ? target.slice(0, target.lastIndexOf("@")) : null;
+}
+
+function workerSshHost(worker: BrainstackWorkerConfig): string {
+  const target = worker.sshTarget || worker.name;
+  const withoutUser = target.includes("@") ? target.slice(target.lastIndexOf("@") + 1) : target;
+  const bracketMatch = withoutUser.match(/^\[([^\]]+)\](?::\d+)?$/);
+  if (bracketMatch) {
+    return bracketMatch[1];
+  }
+  if (/^[^:]+:\d+$/.test(withoutUser)) {
+    return withoutUser.replace(/:\d+$/, "");
+  }
+  return withoutUser;
+}
+
+function workerSshPort(worker: BrainstackWorkerConfig): string | null {
+  const target = worker.sshTarget || worker.name;
+  const withoutUser = target.includes("@") ? target.slice(target.lastIndexOf("@") + 1) : target;
+  const bracketMatch = withoutUser.match(/^\[[^\]]+\]:(\d+)$/);
+  if (bracketMatch) {
+    return bracketMatch[1];
+  }
+  const hostPort = withoutUser.match(/^[^:]+:(\d+)$/);
+  return hostPort ? hostPort[1] : null;
+}
+
+function workerSshKnownHostsLookup(worker: BrainstackWorkerConfig): string {
+  const host = workerSshHost(worker);
+  const port = workerSshPort(worker);
+  return port ? `[${host}]:${port}` : host;
+}
+
+function workerSshKnownHostsPath(cfg: BrainstackConfig, worker: BrainstackWorkerConfig): string {
+  return absWithHome(worker.sshKnownHostsPath || join(cfg.paths.configRoot, "ssh_known_hosts"), cfg.paths.home);
+}
+
+function workerSshTrustMode(worker: BrainstackWorkerConfig): WorkerSshTrustMode {
+  return worker.sshTrustMode === "accept-new" ? "accept-new" : "pinned";
+}
+
+function workerSshTrustArgs(cfg: BrainstackConfig, worker: BrainstackWorkerConfig): string[] {
+  const mode = workerSshTrustMode(worker);
+  return [
+    "-o",
+    mode === "accept-new" ? "StrictHostKeyChecking=accept-new" : "StrictHostKeyChecking=yes",
+    "-o",
+    `UserKnownHostsFile=${workerSshKnownHostsPath(cfg, worker)}`
+  ];
+}
+
+function workerSshPortArgs(worker: BrainstackWorkerConfig): string[] {
+  const port = workerSshPort(worker);
+  return port ? ["-p", port] : [];
 }
 
 function workerUserPathPrelude(): string {
@@ -2369,8 +2508,8 @@ function runWorkerShell(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, s
           "BatchMode=yes",
           "-o",
           "ConnectTimeout=8",
-          "-o",
-          "StrictHostKeyChecking=accept-new",
+          ...workerSshTrustArgs(cfg, worker),
+          ...workerSshPortArgs(worker),
           workerRemoteTarget(worker),
           "bash",
           "-lc",
@@ -2407,9 +2546,54 @@ function workerCommandCheck(worker: BrainstackWorkerConfig, output: string, comm
   return check("PASS", "workers", `worker:${worker.name}:cmd:${commandName}`, version ? `${path}; ${version}` : path);
 }
 
+function workerSshTrustCheck(cfg: BrainstackConfig, worker: BrainstackWorkerConfig): DoctorCheck | null {
+  if (worker.transport !== "ssh") {
+    return null;
+  }
+  const mode = workerSshTrustMode(worker);
+  if (mode === "accept-new") {
+    return check(
+      "WARN",
+      "workers",
+      `worker:${worker.name}:ssh-trust`,
+      "bootstrap trust mode accept-new",
+      `Run brainctl trust-worker --config <config> --worker ${worker.name} and switch the worker to sshTrustMode: pinned after enrollment.`
+    );
+  }
+  const knownHostsPath = workerSshKnownHostsPath(cfg, worker);
+  if (!existsSync(knownHostsPath)) {
+    return check(
+      "FAIL",
+      "workers",
+      `worker:${worker.name}:ssh-trust`,
+      `pinned known_hosts file missing: ${knownHostsPath}`,
+      `Run brainctl trust-worker --config <config> --worker ${worker.name} before dispatching to this worker.`
+    );
+  }
+  const sshKeygen = Bun.which("ssh-keygen");
+  if (!sshKeygen) {
+    return check("WARN", "workers", `worker:${worker.name}:ssh-trust`, "ssh-keygen missing; cannot verify pinned host entry");
+  }
+  const host = workerSshKnownHostsLookup(worker);
+  const found = run([sshKeygen, "-F", host, "-f", knownHostsPath], { check: false });
+  return found.code === 0
+    ? check("PASS", "workers", `worker:${worker.name}:ssh-trust`, `pinned host key present for ${host}`)
+    : check(
+        "FAIL",
+        "workers",
+        `worker:${worker.name}:ssh-trust`,
+        `no pinned host key for ${host} in ${knownHostsPath}`,
+        `Run brainctl trust-worker --config <config> --worker ${worker.name}, then rerun doctor.`
+      );
+}
+
 async function workerDoctorChecks(cfg: BrainstackConfig, deep: boolean): Promise<DoctorCheck[]> {
   const checks: DoctorCheck[] = [];
   for (const worker of defaultWorkers(cfg)) {
+    const trustCheck = workerSshTrustCheck(cfg, worker);
+    if (trustCheck) {
+      checks.push(trustCheck);
+    }
     const family = workerHarnessFamily(cfg, worker);
     const bin = workerHarnessBin(cfg, worker, family);
     const required =
@@ -2654,6 +2838,22 @@ function isRetryableBrainWriteStatus(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
+function maxPendingIdempotencyRetries(): number {
+  const raw = Number(process.env.BRAINSTACK_OUTBOX_MAX_425_RETRIES || "");
+  return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : 12;
+}
+
+function idempotencyPendingTerminalError(item: OutboxItem, status: number, responseText: string): string | null {
+  if (status !== 425) {
+    return null;
+  }
+  const retryLimit = maxPendingIdempotencyRetries();
+  if ((item.retry_count || 0) < retryLimit) {
+    return null;
+  }
+  return `HTTP 425 persisted after ${item.retry_count} flush attempt(s); operator review required before replaying this idempotent write. ${responseText.slice(0, 240)}`;
+}
+
 async function postBrainWriteOrQueue(cfg: BrainstackConfig, endpoint: "import" | "propose", payload: Record<string, unknown>): Promise<void> {
   const { baseUrl, token: writeToken } = brainWriteConfig(cfg);
   if (!baseUrl || !writeToken) {
@@ -2791,7 +2991,11 @@ async function flushOutbox(cfg: BrainstackConfig): Promise<{ flushed: number; ke
         const responseText = await response.text();
         normalizedItem.retry_count += 1;
         normalizedItem.last_error = `HTTP ${response.status}: ${responseText.slice(0, 300)}`;
-        if (!isRetryableBrainWriteStatus(response.status)) {
+        const pendingTerminalError = idempotencyPendingTerminalError(normalizedItem, response.status, responseText);
+        if (pendingTerminalError) {
+          normalizedItem.terminal_error = pendingTerminalError;
+          terminalFailures += 1;
+        } else if (!isRetryableBrainWriteStatus(response.status)) {
           normalizedItem.terminal_error = normalizedItem.last_error;
           terminalFailures += 1;
         } else {
@@ -3323,6 +3527,8 @@ async function commandJoinWorker(args: ParsedArgs): Promise<void> {
     transport: "ssh",
     sshTarget: worker,
     sshUser,
+    sshTrustMode: "pinned",
+    sshKnownHostsPath: null,
     managedRepoRoot: join(cfg.telemux.factoryRoot, "repos"),
     managedHostRoot: join(cfg.telemux.factoryRoot, "hostctx"),
     managedScratchRoot: join(cfg.telemux.factoryRoot, "scratch"),
@@ -3351,6 +3557,7 @@ async function commandJoinWorker(args: ParsedArgs): Promise<void> {
     "## Apply after editing brainstack.yaml",
     "",
     "```bash",
+    `brainctl trust-worker --config brainstack.yaml --worker ${worker}`,
     "brainctl upgrade --config brainstack.yaml --profile control",
     "systemctl --user daemon-reload",
     "# if telemux is enabled: systemctl --user restart telemux.service",
@@ -3397,6 +3604,292 @@ async function commandJoinWorker(args: ParsedArgs): Promise<void> {
     await writeText(abs(out), text);
   }
   console.log(text);
+}
+
+async function commandTrustWorker(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const workerName = flag(args, "worker") || args.positional[0];
+  if (!workerName) {
+    throw new Error("trust-worker requires --worker WORKER_NAME");
+  }
+  const worker = defaultWorkers(cfg).find((entry) => entry.name === workerName);
+  if (!worker) {
+    throw new Error(`Unknown worker ${workerName}; run brainctl join-worker first or add it to telemux.workers.`);
+  }
+  if (worker.transport !== "ssh") {
+    throw new Error(`Worker ${worker.name} uses transport=${worker.transport}; trust-worker only manages OpenSSH known_hosts.`);
+  }
+  const hostOverride = flag(args, "host");
+  const hostSource = hostOverride ? { ...worker, sshTarget: hostOverride, sshUser: null } : worker;
+  const host = workerSshHost(hostSource);
+  const port = workerSshPort(hostSource) || workerSshPort(worker);
+  const knownHostsLookup = port ? `[${host}]:${port}` : host;
+  const knownHostsPath = workerSshKnownHostsPath(cfg, worker);
+  const keyscanArgs = ["-T", "8", ...(port ? ["-p", port] : []), host];
+  if (hasFlag(args, "dry-run")) {
+    console.log(`would scan host key: ssh-keyscan ${keyscanArgs.join(" ")}`);
+    console.log(`would write pinned known_hosts: ${knownHostsPath}`);
+    return;
+  }
+  const sshKeygen = Bun.which("ssh-keygen");
+  if (sshKeygen && existsSync(knownHostsPath)) {
+    const found = run([sshKeygen, "-F", knownHostsLookup, "-f", knownHostsPath], { check: false });
+    if (found.code === 0) {
+      console.log(`pinned host key already present for ${knownHostsLookup} in ${knownHostsPath}`);
+      return;
+    }
+  }
+  const sshKeyscan = Bun.which("ssh-keyscan");
+  if (!sshKeyscan) {
+    throw new Error("ssh-keyscan not found; install OpenSSH client tools before pinning worker host keys.");
+  }
+  const scan = run([sshKeyscan, ...keyscanArgs], { check: false, timeoutMs: 12_000 });
+  const scannedLines = scan.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(isKnownHostLine);
+  if (!scannedLines.length) {
+    throw new Error(`ssh-keyscan returned no host keys for ${host}; stderr=${scan.stderr.trim() || "(empty)"}`);
+  }
+  await ensureDir(dirname(knownHostsPath));
+  const existing = existsSync(knownHostsPath) ? await readFile(knownHostsPath, "utf8") : "";
+  const additions = scannedLines.filter((line) => !existing.split(/\r?\n/).includes(line));
+  if (!additions.length) {
+    console.log(`pinned host key lines already present for ${host} in ${knownHostsPath}`);
+    return;
+  }
+  const prefix = existing && !existing.endsWith("\n") ? "\n" : "";
+  await writeText(knownHostsPath, `${existing}${prefix}${additions.join("\n")}\n`, 0o644);
+  console.log(`pinned ${additions.length} host key line(s) for ${host} in ${knownHostsPath}`);
+  console.log(`worker ${worker.name} should use sshTrustMode: pinned`);
+}
+
+function repoLockPath(cfg: BrainstackConfig, repo: string | null = null): string {
+  const selector = repo || "write";
+  const root = selector === "serve" || selector === "read" ? cfg.repos.serve : cfg.repos.staging;
+  return join(root, ".shared-brain.lock");
+}
+
+function operatorLockPath(cfg: BrainstackConfig, args: ParsedArgs): string {
+  const explicitPath = flag(args, "path");
+  if (!explicitPath) {
+    return repoLockPath(cfg, flag(args, "repo"));
+  }
+  const candidate = resolve(explicitPath);
+  const allowedRoots = [resolve(cfg.repos.staging), resolve(cfg.repos.serve)];
+  if (!allowedRoots.some((root) => candidate === root || candidate.startsWith(`${root}${sep}`))) {
+    throw new Error(`Refusing lock path outside Brainstack repos: ${candidate}`);
+  }
+  return candidate;
+}
+
+function isRepoLockEntry(name: string): boolean {
+  return /^owner-[A-Fa-f0-9-]+\.json$/.test(name) || /^release-[A-Fa-f0-9-]+$/.test(name);
+}
+
+interface RepoLockInfo {
+  path: string;
+  exists: boolean;
+  ageMs: number | null;
+  entries: string[];
+  ownerPath: string | null;
+  ownerToken: string | null;
+  owner: Record<string, unknown> | null;
+  pidAlive: "yes" | "no" | "unknown";
+  safeToClear: boolean;
+  reason: string;
+}
+
+function processAlive(pid: unknown): "yes" | "no" | "unknown" {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+    return "unknown";
+  }
+  try {
+    process.kill(pid, 0);
+    return "yes";
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code) : "";
+    if (code === "ESRCH") return "no";
+    if (code === "EPERM") return "yes";
+    return "unknown";
+  }
+}
+
+async function repoLockInfo(lockPath: string): Promise<RepoLockInfo> {
+  if (!existsSync(lockPath)) {
+    return {
+      path: lockPath,
+      exists: false,
+      ageMs: null,
+      entries: [],
+      ownerPath: null,
+      ownerToken: null,
+      owner: null,
+      pidAlive: "unknown",
+      safeToClear: false,
+      reason: "absent"
+    };
+  }
+
+  const lockStat = await stat(lockPath);
+  const ageMs = Math.max(0, Date.now() - lockStat.mtime.getTime());
+  const entries = (await readdir(lockPath).catch(() => [])).sort();
+  const ownerEntry = entries.find((entry) => entry.startsWith("owner-") && entry.endsWith(".json")) || null;
+  const ownerPath = ownerEntry ? join(lockPath, ownerEntry) : null;
+  let owner: Record<string, unknown> | null = null;
+  if (ownerPath) {
+    try {
+      owner = JSON.parse(await readFile(ownerPath, "utf8")) as Record<string, unknown>;
+    } catch {
+      owner = null;
+    }
+  }
+
+  const ownerHost = typeof owner?.hostname === "string" ? owner.hostname : null;
+  const releaseTokens = entries
+    .map((entry) => entry.match(/^release-([A-Fa-f0-9-]+)$/)?.[1] || null)
+    .filter((token): token is string => Boolean(token));
+  const ownerToken =
+    typeof owner?.token === "string" && owner.token.trim()
+      ? owner.token.trim()
+      : releaseTokens.length === 1
+        ? releaseTokens[0]
+        : null;
+  const localHost = hostname();
+  const pidAlive = ownerHost && ownerHost !== localHost ? "unknown" : processAlive(owner?.pid);
+  const safeToClear = Boolean(owner && pidAlive === "no");
+  const reason = entries.length === 0
+    ? "lock directory is empty; likely interrupted acquisition or release"
+    : !owner
+    ? "owner metadata missing or unreadable"
+    : ownerHost && ownerHost !== localHost
+      ? `owner host ${ownerHost} is not local host ${localHost}`
+      : pidAlive === "no"
+        ? "owner process is not running on this host"
+        : pidAlive === "yes"
+          ? "owner process is still running"
+          : "owner process liveness is unknown";
+
+  return {
+    path: lockPath,
+    exists: true,
+    ageMs,
+    entries,
+    ownerPath,
+    ownerToken,
+    owner,
+    pidAlive,
+    safeToClear,
+    reason
+  };
+}
+
+function repoLockMinAgeMs(args: ParsedArgs): number {
+  const raw = Number(flag(args, "min-age-ms") || "");
+  return Number.isFinite(raw) && raw >= 0 ? Math.trunc(raw) : 60_000;
+}
+
+async function appendLockRecoveryLog(cfg: BrainstackConfig, entry: Record<string, unknown>): Promise<void> {
+  const logPath = join(cfg.paths.stateRoot, "lock-recovery.jsonl");
+  await ensureDir(dirname(logPath));
+  await writeFile(
+    logPath,
+    `${JSON.stringify({ created_at: new Date().toISOString(), ...entry })}\n`,
+    { encoding: "utf8", flag: "a", mode: 0o600 }
+  );
+}
+
+async function commandRepoLock(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0] || "status";
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const lockPath = operatorLockPath(cfg, args);
+  const lock = await repoLockInfo(lockPath);
+  if (action === "status") {
+    if (!lock.exists) {
+      console.log(`repo-lock=absent path=${lockPath}`);
+      return;
+    }
+    console.log(`repo-lock=present path=${lockPath}`);
+    console.log(`age_ms=${lock.ageMs}`);
+    console.log(`pid_alive=${lock.pidAlive}`);
+    console.log(`safe_to_clear=${lock.safeToClear ? "yes" : "no"}`);
+    console.log(`reason=${lock.reason}`);
+    console.log(`clear_token=${lock.ownerToken || (lock.entries.length === 0 ? "EMPTY" : "(missing)")}`);
+    const entries = lock.entries;
+    if (!entries.length) {
+      console.log("entries=(empty)");
+      return;
+    }
+    for (const entry of entries) {
+      const fullPath = join(lockPath, entry);
+      const text = entry.endsWith(".json") ? (await readFile(fullPath, "utf8").catch(() => "")).trim() : "";
+      console.log(text ? `${entry}: ${text}` : entry);
+    }
+    return;
+  }
+  if (action === "clear") {
+    if (!lock.exists) {
+      console.log(`repo-lock already absent: ${lockPath}`);
+      return;
+    }
+    if (!hasFlag(args, "yes")) {
+      throw new Error(`Refusing to clear repo lock without --yes. First run: brainctl repo-lock status --config <config>`);
+    }
+    const info = await lstat(lockPath);
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw new Error(`Refusing to clear non-directory or symlink repo lock: ${lockPath}`);
+    }
+    const entries = await readdir(lockPath);
+    const unsafe = entries.filter((entry) => !isRepoLockEntry(entry));
+    if (unsafe.length) {
+      throw new Error(`Refusing to clear repo lock with unknown entries: ${unsafe.join(", ")}`);
+    }
+    const clearToken = flag(args, "token")?.trim() || "";
+    if (!clearToken) {
+      throw new Error("Refusing to clear repo lock without --token. Copy clear_token from `brainctl repo-lock status` after inspection.");
+    }
+    const emptyLockRecovery = !lock.ownerToken && entries.length === 0 && clearToken === "EMPTY";
+    if (!lock.ownerToken) {
+      if (!emptyLockRecovery) {
+        throw new Error("Refusing to clear repo lock because owner token is missing; inspect manually instead of using automated cleanup.");
+      }
+      if (!hasFlag(args, "force")) {
+        throw new Error("Refusing to clear empty ownerless repo lock without --force --token EMPTY.");
+      }
+    }
+    if (lock.ownerToken && clearToken !== lock.ownerToken) {
+      throw new Error("Refusing to clear repo lock because --token does not match the recorded owner token.");
+    }
+    const minAgeMs = repoLockMinAgeMs(args);
+    const oldEnough = (lock.ageMs ?? 0) >= minAgeMs;
+    if ((!lock.safeToClear || !oldEnough) && !hasFlag(args, "force")) {
+      throw new Error(
+        [
+          `Refusing to clear repo lock automatically: ${lock.reason}.`,
+          `age_ms=${lock.ageMs ?? "unknown"} min_age_ms=${minAgeMs} safe_to_clear=${lock.safeToClear ? "yes" : "no"}.`,
+          "Use --force only after inspecting `brainctl repo-lock status` and confirming no braind write is active."
+        ].join(" ")
+      );
+    }
+    await appendLockRecoveryLog(cfg, {
+      action: "clear",
+      lock_path: lockPath,
+      clear_token: clearToken,
+      force: hasFlag(args, "force"),
+      age_ms: lock.ageMs,
+      safe_to_clear: lock.safeToClear,
+      reason: lock.reason,
+      owner: lock.owner
+    });
+    if (!emptyLockRecovery) {
+      await rm(join(lockPath, `release-${clearToken}`), { force: true });
+      await rm(join(lockPath, `owner-${clearToken}.json`), { force: true });
+    }
+    await rmdir(lockPath);
+    console.log(`repo-lock cleared: ${lockPath}${hasFlag(args, "force") ? " force=yes" : ""}`);
+    return;
+  }
+  throw new Error("repo-lock action must be status or clear");
 }
 
 async function upsertEnv(path: string, key: string, value: string): Promise<void> {
@@ -3548,6 +4041,11 @@ async function main(): Promise<void> {
       return await commandBootstrapClient(args);
     case "join-worker":
       return await commandJoinWorker(args);
+    case "trust-worker":
+      return await commandTrustWorker(args);
+    case "repo-lock":
+    case "locks":
+      return await commandRepoLock(args);
     case "rotate-token":
       return await commandRotateToken(args);
     case "migrate-current-install":

@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 
 export type WorkerTransport = "local" | "ssh" | "tailscale-ssh";
 export type HarnessName = "codex" | "claude";
+export type WorkerSshTrustMode = "pinned" | "accept-new";
 
 export interface FactoryWorkerConfig {
   name: string;
@@ -13,6 +14,8 @@ export interface FactoryWorkerConfig {
   managedHostRoot: string;
   managedScratchRoot: string;
   localExecution: boolean;
+  sshTrustMode: WorkerSshTrustMode;
+  sshKnownHostsPath: string | null;
   harness: HarnessName | null;
   harnessBin: string | null;
   notes: string | null;
@@ -68,6 +71,9 @@ export interface WorkerConfigInput {
   managedHostRoot?: string;
   managedScratchRoot?: string;
   localExecution?: boolean;
+  sshTrustMode?: string | null;
+  sshTrust?: string | null;
+  sshKnownHostsPath?: string | null;
   harness?: string | null;
   harnessBin?: string | null;
   notes?: string | null;
@@ -129,6 +135,16 @@ function normalizeHarness(value: string | undefined): HarnessName {
   return value === "claude" ? "claude" : "codex";
 }
 
+function normalizeSshTrustMode(value: string | null | undefined, transport: WorkerTransport): WorkerSshTrustMode {
+  if (transport === "local" || transport === "tailscale-ssh") {
+    return "pinned";
+  }
+  if (value === "accept-new") {
+    return "accept-new";
+  }
+  return "pinned";
+}
+
 function normalizeWorkerConfig(
   input: WorkerConfigInput,
   defaults: {
@@ -151,6 +167,8 @@ function normalizeWorkerConfig(
     managedHostRoot: input.managedHostRoot?.trim() ? resolvePath(input.managedHostRoot.trim()) : defaults.managedHostRoot,
     managedScratchRoot: input.managedScratchRoot?.trim() ? resolvePath(input.managedScratchRoot.trim()) : defaults.managedScratchRoot,
     localExecution: input.localExecution ?? transport === "local",
+    sshTrustMode: normalizeSshTrustMode(input.sshTrustMode?.trim() || input.sshTrust?.trim() || null, transport),
+    sshKnownHostsPath: input.sshKnownHostsPath?.trim() ? resolvePath(input.sshKnownHostsPath.trim()) : null,
     harness: input.harness?.trim() ? normalizeHarness(input.harness.trim()) : null,
     harnessBin: input.harnessBin?.trim() || null,
     notes: input.notes?.trim() || null,
@@ -273,7 +291,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
     contextsDir: resolve(controlRoot, "contexts"),
     cronSnapshotsDir: resolve(controlRoot, "crons"),
     logsDir: resolve(controlRoot, "logs"),
-    sshKnownHostsPath: resolve(controlRoot, "ssh_known_hosts"),
+    sshKnownHostsPath: env.FACTORY_SSH_KNOWN_HOSTS?.trim() ? resolvePath(env.FACTORY_SSH_KNOWN_HOSTS.trim()) : resolve(controlRoot, "ssh_known_hosts"),
     factoryRoot,
     managedRepoRoot,
     managedHostRoot,

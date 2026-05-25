@@ -77,17 +77,19 @@ bun run packages/brainctl/src/main.ts join-worker \
   --harness codex
 ```
 
-Merge the printed YAML into `~/.config/brainstack/brainstack.yaml`, then apply runtime:
+Merge the printed YAML into `~/.config/brainstack/brainstack.yaml`, pin OpenSSH host trust, apply runtime, and prove the worker path before restarting telemux:
 
 ```bash
+bun run packages/brainctl/src/main.ts trust-worker --config ~/.config/brainstack/brainstack.yaml --worker <worker-host>
 bun run packages/brainctl/src/main.ts upgrade --profile control --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts doctor --config ~/.config/brainstack/brainstack.yaml --workers
 systemctl --user daemon-reload
 systemctl --user restart telemux.service
 ```
 
 ## 6. Run Doctors
 
-From the control host:
+From the control host after restart, run the normal and deep doctors:
 
 ```bash
 bun run packages/brainctl/src/main.ts doctor --config ~/.config/brainstack/brainstack.yaml --workers
@@ -95,6 +97,7 @@ bun run packages/brainctl/src/main.ts doctor --config ~/.config/brainstack/brain
 ```
 
 Use `--deep` deliberately. It invokes the selected harness and proves bypass/yolo sudo behavior.
+Then smoke `/workers` in Telegram so you see the same configured worker/harness/trust status through the live control plane.
 
 ## 7. First Telegram Worker Task
 

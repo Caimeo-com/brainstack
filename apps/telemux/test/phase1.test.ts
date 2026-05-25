@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { CommandHandler } from "../src/commands";
@@ -10,6 +10,7 @@ import { ContextService } from "../src/contexts";
 import { FactoryDb } from "../src/db";
 import { Dispatcher } from "../src/dispatcher";
 import { ensureBasicLoops } from "../src/basic-loops";
+import { flushBrainOutbox, postBrainImportOrQueue } from "../src/brain-outbox";
 import {
   parseArtifactEntries,
   removeArtifactEntriesFromMarkdown,
@@ -424,6 +425,9 @@ printf '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens
   await makeExecutable(
     fakeSsh,
     `#!/usr/bin/env bash
+if [[ -n "\${FACTORY_TEST_CAPTURE_SSH_ARGS:-}" ]]; then
+  printf '%s\\n' "$*" > "$FACTORY_TEST_CAPTURE_SSH_ARGS"
+fi
 if [[ -n "\${FACTORY_TEST_CAPTURE_SSH_SCRIPT:-}" ]]; then
   cat > "$FACTORY_TEST_CAPTURE_SSH_SCRIPT"
   echo "ssh capture: No route to host" >&2
@@ -504,7 +508,7 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
         {
           name: "worker1",
           transport: "ssh",
-          sshTarget: "worker1.tailnet",
+          sshTarget: envOverrides.TEST_WORKER1_SSH_TARGET || "worker1.tailnet",
           sshUser: "factory",
           managedRepoRoot: "/srv/factory/repos",
           managedHostRoot: "/srv/factory/hostctx",
@@ -2442,6 +2446,7 @@ test("telemux can run Claude as the selected harness", async () => {
 
 test("worker harness selection supports worker and context overrides without control-host binary leakage", async () => {
   const capture = join(tmpdir(), `telemux-ssh-capture-${Date.now()}.sh`);
+  const argsCapture = join(tmpdir(), `telemux-ssh-args-${Date.now()}.txt`);
   const fixture = await createFixture({
     FACTORY_HARNESS: "codex",
     TEST_CONTROL_WORKER_HARNESS: "claude"
@@ -2462,7 +2467,11 @@ test("worker harness selection supports worker and context overrides without con
     await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for workerharness.")));
 
     process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT = capture;
+    process.env.FACTORY_TEST_CAPTURE_SSH_ARGS = argsCapture;
     await fixture.workers.probeWorker("worker1");
+    const capturedArgs = await readFile(argsCapture, "utf8");
+    expect(capturedArgs).toContain("StrictHostKeyChecking=yes");
+    expect(capturedArgs).toContain(`UserKnownHostsFile=${fixture.config.sshKnownHostsPath}`);
     const capturedScript = await readFile(capture, "utf8");
     expect(capturedScript).toContain("harness_bin='codex'");
     expect(capturedScript).toContain("__BRAINSTACK_PATH__");
@@ -2470,8 +2479,31 @@ test("worker harness selection supports worker and context overrides without con
     expect(capturedScript).not.toContain(fixture.fakeCodex);
   } finally {
     delete process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT;
+    delete process.env.FACTORY_TEST_CAPTURE_SSH_ARGS;
     process.env.PATH = fixture.previousPath;
     await rm(capture, { force: true });
+    await rm(argsCapture, { force: true });
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("SSH workers with explicit ports use the port for dispatch without leaking it into the remote target", async () => {
+  const argsCapture = join(tmpdir(), `telemux-ssh-port-args-${Date.now()}.txt`);
+  const fixture = await createFixture({
+    TEST_WORKER1_SSH_TARGET: "[worker1.tailnet]:2222"
+  });
+
+  try {
+    process.env.FACTORY_TEST_CAPTURE_SSH_ARGS = argsCapture;
+    await fixture.workers.probeWorker("worker1");
+    const capturedArgs = await readFile(argsCapture, "utf8");
+    expect(capturedArgs).toContain("-p 2222");
+    expect(capturedArgs).toContain("factory@worker1.tailnet");
+    expect(capturedArgs).not.toContain("factory@[worker1.tailnet]:2222");
+  } finally {
+    delete process.env.FACTORY_TEST_CAPTURE_SSH_ARGS;
+    process.env.PATH = fixture.previousPath;
+    await rm(argsCapture, { force: true });
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 15_000);
@@ -2502,6 +2534,72 @@ test("local worker resolves harness through BRAINSTACK_WORKER_PATH when service 
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 15_000);
+
+test("telemux brain outbox moves repeated HTTP 425 responses to terminal review", async () => {
+  const port = 45_000 + Math.floor(Math.random() * 2_000);
+  const stateRoot = await mkdtemp(join(tmpdir(), "telemux-outbox-state-"));
+  const previousMax425 = process.env.BRAINSTACK_OUTBOX_MAX_425_RETRIES;
+  let server: ReturnType<typeof Bun.serve> | null = null;
+  const fixture = await createFixture({
+    BRAINSTACK_STATE_ROOT: stateRoot,
+    BRAIN_BASE_URL: `http://127.0.0.1:${port}`,
+    BRAIN_IMPORT_TOKEN: "outbox-token"
+  });
+
+  async function jsonFiles(root: string): Promise<string[]> {
+    const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+    const files: string[] = [];
+    for (const entry of entries) {
+      const fullPath = join(root, entry.name);
+      if (entry.isDirectory()) {
+        files.push(...(await jsonFiles(fullPath)));
+      } else if (entry.isFile() && entry.name.endsWith(".json")) {
+        files.push(fullPath);
+      }
+    }
+    return files;
+  }
+
+  try {
+    process.env.BRAINSTACK_OUTBOX_MAX_425_RETRIES = "2";
+    server = Bun.serve({
+      hostname: "127.0.0.1",
+      port,
+      fetch() {
+        return Response.json({ error: "idempotent request is already in progress" }, { status: 425 });
+      }
+    });
+
+    const status = await postBrainImportOrQueue(fixture.config, {
+      title: "Pending import",
+      text: "pending body",
+      source_machine: "control",
+      source_harness: "telemux",
+      source_type: "test"
+    });
+    expect(status).toBe("queued");
+
+    expect(await flushBrainOutbox(fixture.config)).toEqual({ flushed: 0, kept: 1 });
+    expect(await flushBrainOutbox(fixture.config)).toEqual({ flushed: 0, kept: 1 });
+
+    const files = await jsonFiles(join(fixture.config.stateRoot, "outbox"));
+    expect(files.length).toBe(1);
+    const item = JSON.parse(await readFile(files[0], "utf8")) as { terminal_error?: string };
+    expect(item.terminal_error || "").toContain("HTTP 425 persisted");
+  } finally {
+    if (server) {
+      server.stop(true);
+    }
+    if (previousMax425 === undefined) {
+      delete process.env.BRAINSTACK_OUTBOX_MAX_425_RETRIES;
+    } else {
+      process.env.BRAINSTACK_OUTBOX_MAX_425_RETRIES = previousMax425;
+    }
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+}, 10_000);
 
 test("Telegram text coalescing merges quick text and commands flush pending text", async () => {
   const fixture = await createFixture({

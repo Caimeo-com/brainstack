@@ -238,6 +238,15 @@ bun test apps/telemux/test/phase1.test.ts -t "Telegram text coalescing" \
 bun test apps/telemux/test/phase1.test.ts -t "worker harness" \
   > "$bundle_dir/command-outputs/worker-harness-path-neutral-test.txt" 2>&1
 
+bun test packages/brainctl/test/brainctl.test.ts -t "braind converts expired running" \
+  > "$bundle_dir/command-outputs/idempotency-recovery-test.txt" 2>&1
+
+bun test packages/brainctl/test/brainctl.test.ts -t "worker SSH trust" \
+  > "$bundle_dir/command-outputs/ssh-trust-lock-recovery-test.txt" 2>&1
+
+bun test packages/brainctl/test/brainctl.test.ts -t "outbox moves repeated HTTP 425" \
+  > "$bundle_dir/command-outputs/outbox-425-terminal-test.txt" 2>&1
+
 cp docs/diagrams.md "$bundle_dir/generated/diagrams.md"
 
 outbox_smoke_root="$bundle_dir/generated/outbox-smoke"
@@ -404,6 +413,9 @@ cat > "$bundle_dir/CLAIMS_AND_PROOF.md" <<'EOF'
 | Offline import/propose writes queue locally and flush later. | `command-outputs/outbox-queue-flush-smoke.txt` |
 | Telegram text coalescing is covered by tests. | `command-outputs/telemux-coalescing-test.txt` |
 | Worker harness execution is override-capable and path-neutral for remote workers. | `command-outputs/worker-harness-path-neutral-test.txt` |
+| Stuck idempotent writes graduate to explicit operator review instead of endless retry. | `command-outputs/idempotency-recovery-test.txt` |
+| Worker SSH trust defaults to pinned mode and lock recovery is token-guarded. | `command-outputs/ssh-trust-lock-recovery-test.txt` |
+| Repeated HTTP 425 outbox flushes become terminal operator-review failures. | `command-outputs/outbox-425-terminal-test.txt` |
 | Mermaid diagrams are checked in and included for reviewer context. | `generated/diagrams.md` |
 | Bun tests passed for the product tree at HEAD. | `command-outputs/bun-test.txt` |
 | Local braind health is skipped in review mode and collected only in forensic mode. | `service-state/braind-health.json` or `service-state/braind-health.txt` |

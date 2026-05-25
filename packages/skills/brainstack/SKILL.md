@@ -64,9 +64,10 @@ Use a non-destructive canary before repurposing a reused worker:
 2. Prove worker prerequisites: `bun`, `git`, `ssh`, `tailscale`, chosen `codex` or `claude`, and `sudo -n true` if privileged work is expected.
 3. Prove worker-to-control Git freshness with `git ls-remote <control-user>@<control-host>:<shared-brain-bare-repo> HEAD`.
 4. Add or verify the worker in control config with a worker-specific harness override when needed.
-5. Run `brainctl doctor --workers`; run `--deep` once deliberately after harness auth is known good.
-6. Send a boring Telegram worker task that creates a scratch artifact with hostname, user, uname, and current repo commit.
-7. Inventory legacy services and dotfiles before deleting anything.
+5. Pin OpenSSH host trust from the control host with `brainctl trust-worker --config "$BRAINSTACK_CONFIG" --worker <worker>`; `sshTrustMode: accept-new` is bootstrap-only and should not be the steady state.
+6. Run `brainctl doctor --workers`; run `--deep` once deliberately after harness auth is known good.
+7. Send a boring Telegram worker task that creates a scratch artifact with hostname, user, uname, and current repo commit.
+8. Inventory legacy services and dotfiles before deleting anything.
 
 The required grant shape is directional: operator to control/worker, control to worker on `tcp:22`, and worker to control on `tcp:22` plus `tcp:443`.
 
@@ -74,9 +75,19 @@ The required grant shape is directional: operator to control/worker, control to 
 
 - Read freshness comes from local clone sync: `git -C ~/shared-brain pull --ff-only`.
 - Write continuity comes from `POST /api/import` and `POST /api/propose`, or `brainctl import-text` and `brainctl propose`.
+- If a write reports idempotency `review_required`, inspect the matching record under `derived/idempotency/` and repo state before retrying with a new key; do not force replay an ambiguous side effect.
 - Client bootstrap can receive `BRAIN_IMPORT_TOKEN` or `BRAIN_IMPORT_TOKEN_FILE`; it fills the local token slot only when blank and never prints the value.
 - If the brain is unreachable, use `brainctl outbox status|list|flush|purge`. Outbox files may contain sensitive note text and should stay in private local state.
 - Keep `BRAIN_ADMIN_TOKEN` on organizer/control hosts only. Clients and workers should use import/propose scope.
+
+## Repo Lock Recovery
+
+- `braind` does not auto-break `.shared-brain.lock`.
+- Use `brainctl repo-lock status --config "$BRAINSTACK_CONFIG"` to inspect owner metadata.
+- Clear only after proving no write is active and copying the reported clear token: `brainctl repo-lock clear --config "$BRAINSTACK_CONFIG" --yes --token <clear_token>`.
+- For a stuck idempotency lock, use `brainctl locks status --config "$BRAINSTACK_CONFIG" --path <lock-dir>` and clear with the same `--path` plus `--token <clear_token>`.
+- If the owner process is still live, unknown, or on another host, `repo-lock clear` should refuse unless `--force` is supplied after manual confirmation.
+- If status reports `clear_token=EMPTY`, use `--force --token EMPTY` only after proving no write is active; this is for interrupted empty lock directories, not normal lock cleanup.
 
 ## Handoff Bundles
 

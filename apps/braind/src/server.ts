@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rename, rm, rmdir, writeFile, readdir } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, rmdir, stat, writeFile, readdir } from "node:fs/promises";
 import { lookup } from "node:dns/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -35,7 +35,8 @@ import {
 class HttpError extends Error {
   constructor(
     public readonly status: number,
-    message: string
+    message: string,
+    public readonly code?: string
   ) {
     super(message);
   }
@@ -120,6 +121,26 @@ const reindexTimeoutMs =
   Number.isFinite(configuredReindexTimeoutMs) && configuredReindexTimeoutMs > 0
     ? Math.trunc(configuredReindexTimeoutMs)
     : 120_000;
+const configuredIdempotencyClaimLeaseMs = Number(process.env.BRAIN_IDEMPOTENCY_CLAIM_LEASE_MS || "");
+const idempotencyClaimLeaseMs =
+  Number.isFinite(configuredIdempotencyClaimLeaseMs) && configuredIdempotencyClaimLeaseMs > 0
+    ? Math.trunc(configuredIdempotencyClaimLeaseMs)
+    : 60_000;
+const configuredIdempotencyRunningLeaseMs = Number(process.env.BRAIN_IDEMPOTENCY_RUNNING_LEASE_MS || "");
+const idempotencyRunningLeaseMs =
+  Number.isFinite(configuredIdempotencyRunningLeaseMs) && configuredIdempotencyRunningLeaseMs > 0
+    ? Math.trunc(configuredIdempotencyRunningLeaseMs)
+    : 30 * 60_000;
+const configuredIdempotencyLockWaitMs = Number(process.env.BRAIN_IDEMPOTENCY_LOCK_WAIT_MS || "");
+const idempotencyLockWaitMs =
+  Number.isFinite(configuredIdempotencyLockWaitMs) && configuredIdempotencyLockWaitMs > 0
+    ? Math.trunc(configuredIdempotencyLockWaitMs)
+    : 30_000;
+const configuredLockStaleMs = Number(process.env.BRAIN_LOCK_STALE_MS || "");
+const lockStaleMs =
+  Number.isFinite(configuredLockStaleMs) && configuredLockStaleMs > 0
+    ? Math.trunc(configuredLockStaleMs)
+    : 5 * 60_000;
 const maxSearchLimit = 50;
 const reindexWorkerPath = join(import.meta.dir, "reindex-worker.ts");
 const pendingReindexPath = join(repoRoot, "derived", "search-reindex-needed.json");
@@ -491,8 +512,74 @@ function wantsJson(request: Request, url: URL): boolean {
   return url.searchParams.get("format") === "json" || request.headers.get("accept")?.includes("application/json") === true;
 }
 
-function reject(status: number, message: string): never {
-  throw new HttpError(status, message);
+function reject(status: number, message: string, code?: string): never {
+  throw new HttpError(status, message, code);
+}
+
+async function lockStatus(lockDir: string): Promise<Record<string, unknown>> {
+  if (!existsSync(lockDir)) {
+    return { path: lockDir, present: false };
+  }
+  const info = await stat(lockDir);
+  const entries = await readdir(lockDir).catch(() => []);
+  const ageMs = Math.max(0, Date.now() - info.mtime.getTime());
+  const owners: Array<Record<string, unknown>> = [];
+  for (const entry of entries.filter((name) => name.startsWith("owner-") && name.endsWith(".json")).sort()) {
+    const owner = await readJsonFile<Record<string, unknown>>(join(lockDir, entry));
+    owners.push({ file: entry, ...(owner || { unreadable: true }) });
+  }
+  return {
+    path: lockDir,
+    present: true,
+    mtime: info.mtime.toISOString(),
+    age_ms: ageMs,
+    stale: ageMs > lockStaleMs,
+    entries,
+    owners
+  };
+}
+
+async function idempotencyLockStatuses(idempotencyDir: string): Promise<Array<Record<string, unknown>>> {
+  if (!existsSync(idempotencyDir)) {
+    return [];
+  }
+  const locks: Array<Record<string, unknown>> = [];
+  for (const endpoint of await readdir(idempotencyDir).catch(() => [])) {
+    const endpointDir = join(idempotencyDir, endpoint);
+    for (const name of await readdir(endpointDir).catch(() => [])) {
+      if (!name.endsWith(".json.lock")) {
+        continue;
+      }
+      locks.push({ endpoint, ...(await lockStatus(join(endpointDir, name))) });
+    }
+  }
+  return locks;
+}
+
+async function pendingReindexStatus(): Promise<Record<string, unknown>> {
+  if (!existsSync(pendingReindexPath)) {
+    return { present: false, path: pendingReindexPath };
+  }
+  const info = await stat(pendingReindexPath);
+  return {
+    present: true,
+    path: pendingReindexPath,
+    age_ms: Math.max(0, Date.now() - info.mtime.getTime()),
+    marker: await readJsonFile<Record<string, unknown>>(pendingReindexPath)
+  };
+}
+
+async function operationalHealth(): Promise<Record<string, unknown>> {
+  const readPaths = getRepoPaths(repoRoot);
+  const writePaths = getRepoPaths(writeRepoRoot);
+  return {
+    ...(await getHealth(repoRoot)),
+    write_repo_root: writeRepoRoot,
+    repo_lock: await lockStatus(readPaths.lockDir),
+    write_repo_lock: await lockStatus(writePaths.lockDir),
+    idempotency_locks: await idempotencyLockStatuses(writePaths.idempotencyDir),
+    pending_reindex: await pendingReindexStatus()
+  };
 }
 
 function sha256Text(value: string): string {
@@ -524,11 +611,12 @@ interface IdempotencyRecord {
   endpoint: "import" | "propose";
   key_hash: string;
   request_hash: string;
-  status: "claimed" | "running" | "complete" | "failed";
+  status: "claimed" | "running" | "complete" | "failed" | "review_required";
   created_at: string;
   updated_at: string;
   lease_until?: string;
   side_effect_started_at?: string;
+  review_required_at?: string;
   error?: string;
   response_body?: Record<string, unknown>;
 }
@@ -557,6 +645,25 @@ function errorCode(error: unknown): string | null {
   return error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code) : null;
 }
 
+function isLeaseExpired(record: Pick<IdempotencyRecord, "lease_until">): boolean {
+  return record.lease_until ? Date.parse(record.lease_until) < Date.now() : false;
+}
+
+async function idempotencyLockDetails(lockDir: string): Promise<string> {
+  try {
+    const entries = await readdir(lockDir);
+    const ownerEntry = entries.find((entry) => entry.startsWith("owner-") && entry.endsWith(".json"));
+    const lockStat = await stat(lockDir);
+    if (ownerEntry) {
+      const ownerText = (await readFile(join(lockDir, ownerEntry), "utf8")).trim().slice(0, 500);
+      return `lock=${lockDir} owner=${ownerText || ownerEntry} mtime=${lockStat.mtime.toISOString()}`;
+    }
+    return `lock=${lockDir} owner=missing mtime=${lockStat.mtime.toISOString()}`;
+  } catch {
+    return `lock=${lockDir} owner=unreadable`;
+  }
+}
+
 async function withIdempotency(
   request: Request,
   endpoint: "import" | "propose",
@@ -574,6 +681,7 @@ async function withIdempotency(
   const paths = getRepoPaths(writeRepoRoot);
   const keyHash = sha256Text(rawKey);
   const recordPath = join(paths.idempotencyDir, endpoint, `${keyHash}.json`);
+  const relativeRecordPath = `derived/idempotency/${endpoint}/${keyHash}.json`;
   const lockDir = `${recordPath}.lock`;
   await mkdir(dirname(recordPath), { recursive: true });
   const lockToken = randomUUID();
@@ -587,7 +695,9 @@ async function withIdempotency(
         await writeJsonFile(lockOwnerPath, { token: lockToken, pid: process.pid, created_at: isoNow() }, { createOnly: true });
         await writeFile(lockTokenPath, lockToken, { encoding: "utf8", flag: "wx" });
       } catch (error) {
-        await rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
+        await rm(lockTokenPath, { force: true }).catch(() => undefined);
+        await rm(lockOwnerPath, { force: true }).catch(() => undefined);
+        await rmdir(lockDir).catch(() => undefined);
         throw error;
       }
       break;
@@ -595,8 +705,40 @@ async function withIdempotency(
       if (errorCode(error) !== "EEXIST") {
         throw error;
       }
-      if (Date.now() - lockStartedAt > 30_000) {
-        reject(425, "Idempotent request is already in progress; retry later or inspect the idempotency lock if this persists");
+      if (Date.now() - lockStartedAt > idempotencyLockWaitMs) {
+        const existing = await readJsonFile<IdempotencyRecord>(recordPath);
+        if (existing?.endpoint === endpoint && existing.request_hash === requestHash) {
+          if (existing.status === "complete" && existing.response_body) {
+            return { ...existing.response_body, idempotent_replay: true };
+          }
+          if ((existing.status === "claimed" || existing.status === "running") && isLeaseExpired(existing)) {
+            const reviewRecord: IdempotencyRecord = {
+              ...existing,
+              status: "review_required",
+              updated_at: isoNow(),
+              review_required_at: isoNow(),
+              error:
+                existing.error ||
+                `Idempotent request lock persisted past its lease; inspect ${relativeRecordPath} and ${lockDir} before retrying with a new key.`
+            };
+            await writeJsonFile(recordPath, reviewRecord).catch(() => undefined);
+            reject(
+              409,
+              `Idempotent request requires operator review before retry; inspect ${relativeRecordPath} and clear the persisted idempotency lock only after confirming side effects.`,
+              "IDEMPOTENCY_REVIEW_REQUIRED"
+            );
+          }
+          if (existing.status === "failed" || existing.status === "review_required") {
+            reject(
+              409,
+              `Idempotent request requires operator review before retry; inspect ${relativeRecordPath} and retry with a new Idempotency-Key only if the side effect did not land.`,
+              "IDEMPOTENCY_REVIEW_REQUIRED"
+            );
+          }
+          reject(425, "Idempotent request is already in progress; retry later", "IDEMPOTENCY_IN_PROGRESS");
+        }
+        const detail = await idempotencyLockDetails(lockDir);
+        reject(409, `Idempotent request is blocked by a persisted request lock and requires operator review. ${detail}`, "IDEMPOTENCY_LOCK_REVIEW_REQUIRED");
       }
       await Bun.sleep(100);
     }
@@ -609,7 +751,7 @@ async function withIdempotency(
     status: "claimed",
     created_at: now,
     updated_at: now,
-    lease_until: new Date(Date.now() + 60_000).toISOString()
+    lease_until: new Date(Date.now() + idempotencyClaimLeaseMs).toISOString()
   };
 
   try {
@@ -629,13 +771,50 @@ async function withIdempotency(
       if (existing.status === "complete" && existing.response_body) {
         return { ...existing.response_body, idempotent_replay: true };
       }
-      const leaseExpired = existing.lease_until ? Date.parse(existing.lease_until) < Date.now() : false;
+      const leaseExpired = isLeaseExpired(existing);
       if (existing.status === "claimed" && leaseExpired && !existing.side_effect_started_at) {
         await writeJsonFile(recordPath, pending);
+      } else if (existing.status === "claimed" && leaseExpired && existing.side_effect_started_at) {
+        const reviewRecord: IdempotencyRecord = {
+          ...existing,
+          status: "review_required",
+          updated_at: isoNow(),
+          review_required_at: isoNow(),
+          error:
+            existing.error ||
+            `Idempotent request reached inconsistent claimed state with side effects started; inspect ${relativeRecordPath} before retrying with a new key.`
+        };
+        await writeJsonFile(recordPath, reviewRecord);
+        reject(
+          409,
+          `Idempotent request requires operator review before retry; inspect ${relativeRecordPath} and retry with a new Idempotency-Key only if the side effect did not land.`
+        );
+      } else if (existing.status === "running" && leaseExpired) {
+        const reviewRecord: IdempotencyRecord = {
+          ...existing,
+          status: "review_required",
+          updated_at: isoNow(),
+          review_required_at: isoNow(),
+          error:
+            existing.error ||
+            `Idempotent request exceeded its running lease after side effects may have started; inspect ${relativeRecordPath} before retrying with a new key.`
+        };
+        await writeJsonFile(recordPath, reviewRecord);
+        reject(
+          409,
+          `Idempotent request requires operator review before retry; inspect ${relativeRecordPath} and retry with a new Idempotency-Key only if the side effect did not land.`,
+          "IDEMPOTENCY_REVIEW_REQUIRED"
+        );
       } else if (existing.status === "failed") {
-        reject(409, "Idempotent request failed previously; retry with a new Idempotency-Key after operator review");
+        reject(409, "Idempotent request failed previously; retry with a new Idempotency-Key after operator review", "IDEMPOTENCY_REVIEW_REQUIRED");
+      } else if (existing.status === "review_required") {
+        reject(
+          409,
+          `Idempotent request requires operator review before retry; inspect ${relativeRecordPath} and retry with a new Idempotency-Key only if the side effect did not land.`,
+          "IDEMPOTENCY_REVIEW_REQUIRED"
+        );
       } else {
-        reject(425, "Idempotent request is already in progress or requires operator review; retry later");
+        reject(425, "Idempotent request is already in progress; retry later", "IDEMPOTENCY_IN_PROGRESS");
       }
     }
 
@@ -650,7 +829,7 @@ async function withIdempotency(
         ...pending,
         status: "running",
         updated_at: isoNow(),
-        lease_until: new Date(Date.now() + 30 * 60_000).toISOString(),
+        lease_until: new Date(Date.now() + idempotencyRunningLeaseMs).toISOString(),
         side_effect_started_at: isoNow()
       };
       await writeJsonFile(recordPath, activeRecord);
@@ -1597,7 +1776,7 @@ const server = Bun.serve({
     const url = new URL(request.url);
     try {
       if (request.method === "GET" && url.pathname === "/health") {
-        return json(await getHealth(repoRoot));
+        return json(await operationalHealth());
       }
       if (request.method === "GET" && url.pathname === "/") {
         return await renderHome();
@@ -1672,7 +1851,7 @@ const server = Bun.serve({
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (error instanceof HttpError) {
-        return json({ error: message }, error.status);
+        return json({ error: message, ...(error.code ? { code: error.code } : {}) }, error.status);
       }
       if (message === "Unauthorized") {
         return json({ error: message }, 401);

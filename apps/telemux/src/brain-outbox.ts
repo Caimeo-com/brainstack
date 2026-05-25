@@ -55,6 +55,22 @@ function isRetryableBrainWriteStatus(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
+function maxPendingIdempotencyRetries(): number {
+  const raw = Number(process.env.BRAINSTACK_OUTBOX_MAX_425_RETRIES || "");
+  return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : 12;
+}
+
+function idempotencyPendingTerminalError(item: QueuedBrainWrite, status: number, responseText: string): string | null {
+  if (status !== 425) {
+    return null;
+  }
+  const retryLimit = maxPendingIdempotencyRetries();
+  if ((item.retry_count || 0) < retryLimit) {
+    return null;
+  }
+  return `HTTP 425 persisted after ${item.retry_count} flush attempt(s); operator review required before replaying this idempotent write. ${responseText.slice(0, 240)}`;
+}
+
 function outboxRoot(config: FactoryConfig): string {
   const brainId = sha256(config.brainBaseUrl || "unconfigured-brain").slice(0, 16);
   return resolve(config.stateRoot, "outbox", brainId);
@@ -226,7 +242,10 @@ export async function flushBrainOutbox(config: FactoryConfig): Promise<{ flushed
         const responseText = await response.text();
         normalized.retry_count += 1;
         normalized.last_error = `HTTP ${response.status}: ${responseText.slice(0, 300)}`;
-        if (!isRetryableBrainWriteStatus(response.status)) {
+        const pendingTerminalError = idempotencyPendingTerminalError(normalized, response.status, responseText);
+        if (pendingTerminalError) {
+          normalized.terminal_error = pendingTerminalError;
+        } else if (!isRetryableBrainWriteStatus(response.status)) {
           normalized.terminal_error = normalized.last_error;
         }
         await writeText(path, `${JSON.stringify(normalized, null, 2)}\n`);
