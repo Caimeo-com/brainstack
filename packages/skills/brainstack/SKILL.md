@@ -39,7 +39,8 @@ Prefer this order:
 4. Check services: `systemctl --user status braind.service telemux.service --no-pager`, `journalctl --user -u telemux.service -n 200 --no-pager`, and `journalctl --user -u braind.service -n 200 --no-pager`.
 5. Check local health endpoints on the host: `curl -fsS http://127.0.0.1:8080/health` for braind and `curl -fsS http://127.0.0.1:8787/healthz` for telemux.
 6. Check manual update visibility with `brainctl updates --config "$BRAINSTACK_CONFIG"`. Do not auto-apply updates.
-7. On installed client/worker profiles, use `brainctl doctor --write-smoke --config "$BRAINSTACK_CONFIG"` only when explicitly proving import/propose pushback; it posts a small import artifact.
+7. Use `brainctl doctor --workers --config "$BRAINSTACK_CONFIG"` to verify each worker's shell PATH exposes Bun, Git, SSH, Tailscale, and the configured harness.
+8. On installed client/worker profiles, use `brainctl doctor --write-smoke --config "$BRAINSTACK_CONFIG"` only when explicitly proving import/propose pushback; it posts a small import artifact.
 
 Brainstack's intended worker transport is normal OpenSSH over Tailscale, not Tailscale SSH. Use Tailscale SSH only as a temporary recovery/debug path when normal OpenSSH access is blocked.
 

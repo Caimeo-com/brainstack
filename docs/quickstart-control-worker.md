@@ -89,6 +89,8 @@ bun run packages/brainctl/src/main.ts updates --config ~/.config/brainstack/brai
 
 Use `--write-smoke` when you intentionally want to post a small import artifact to prove client pushback. Use `--deep` only when you want doctor to invoke the configured harness on the control/worker to prove bypass/yolo sudo behavior. It can consume LLM quota and should not be part of every health check.
 
+`doctor --workers` resolves each worker user's shell PATH before probing, then reports the path and version for required worker tools: Bun, Git, OpenSSH, Tailscale, and the configured Codex/Claude harness. If an interactive shell can see a tool but doctor cannot, treat that as a Brainstack bug rather than a normal setup warning.
+
 If that fails with a timeout while ping works, the likely blocker is Tailscale grants. The required grant shape is:
 
 ```json

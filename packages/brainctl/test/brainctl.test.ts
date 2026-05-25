@@ -1754,6 +1754,21 @@ describe("public release hygiene", () => {
         ].join("\n")
       );
       await chmod(fakeCodex, 0o755);
+      for (const name of ["bun", "git", "ssh", "tailscale"]) {
+        const fakeCommand = join(remoteBin, name);
+        await writeFile(
+          fakeCommand,
+          [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "if [ \"${1:-}\" = \"-V\" ]; then echo '" + name + " remote fake'; exit 0; fi",
+            "if [ \"${1:-}\" = \"--version\" ]; then echo '" + name + " remote fake'; exit 0; fi",
+            "echo '" + name + " remote fake'",
+            ""
+          ].join("\n")
+        );
+        await chmod(fakeCommand, 0o755);
+      }
 
       const fakeShell = join(dir, "worker-shell");
       await writeFile(
@@ -1821,6 +1836,8 @@ describe("public release hygiene", () => {
       });
       expectSuccess(result);
       expect(result.stdout).toContain("PASS [workers] worker:worker1");
+      expect(result.stdout).toContain(`PASS [workers] worker:worker1:cmd:bun: ${join(remoteBin, "bun")}; bun remote fake`);
+      expect(result.stdout).toContain(`PASS [workers] worker:worker1:cmd:tailscale: ${join(remoteBin, "tailscale")}; tailscale remote fake`);
       expect(result.stdout).toContain("PASS [workers] worker:worker1:harness-compat");
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -1914,6 +1931,20 @@ describe("public release hygiene", () => {
         ].join("\n")
       );
       await chmod(fakeCodex, 0o755);
+      for (const name of ["bun", "git", "ssh", "tailscale"]) {
+        const fakeCommand = join(dir, name);
+        await writeFile(
+          fakeCommand,
+          [
+            "#!/usr/bin/env sh",
+            "if [ \"$1\" = \"-V\" ]; then echo '" + name + " fake'; exit 0; fi",
+            "if [ \"$1\" = \"--version\" ]; then echo '" + name + " fake'; exit 0; fi",
+            "echo '" + name + " fake'",
+            ""
+          ].join("\n")
+        );
+        await chmod(fakeCommand, 0o755);
+      }
       const configPath = join(dir, "config.yaml");
       await writeFile(
         configPath,
@@ -1935,7 +1966,9 @@ describe("public release hygiene", () => {
           ""
         ].join("\n")
       );
-      const result = runBrainctl(["doctor", "--config", configPath, "--workers"]);
+      const result = runBrainctl(["doctor", "--config", configPath, "--workers"], {
+        BRAINSTACK_WORKER_PATH: dir
+      });
       expect(result.code).not.toBe(0);
       expect(`${result.stdout}\n${result.stderr}`).toContain("missing required CLI surface");
     } finally {

@@ -2313,8 +2313,8 @@ function workerRemoteTarget(worker: BrainstackWorkerConfig): string {
 
 function workerUserPathPrelude(): string {
   return `
-# Brainstack itself stays Bun-only, but worker harness commands are resolved
-# through the target user's own shell PATH so existing codex/claude installs work.
+# Worker tool and harness commands are resolved through the target user's own
+# shell PATH so user-managed Bun/Codex/Claude installs work over non-login SSH.
 if [ -z "\${BRAINSTACK_SKIP_USER_PATH_RESOLVE:-}" ]; then
   __brainstack_detected_path=""
   if [ -n "\${BRAINSTACK_WORKER_PATH:-}" ]; then
@@ -2340,10 +2340,10 @@ fi
 }
 
 function runWorkerShell(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, script: string, timeoutSeconds = 10) {
-  if (worker.transport === "local") {
-    return run(["bash", "-lc", script], { check: false });
-  }
   const wrappedScript = `${workerUserPathPrelude()}\n${script}`;
+  if (worker.transport === "local") {
+    return run(["bash", "-lc", wrappedScript], { check: false });
+  }
   const sshArgs =
     worker.transport === "tailscale-ssh"
       ? ["tailscale", "ssh", workerRemoteTarget(worker), "bash", "-lc", wrappedScript]
@@ -2364,6 +2364,33 @@ function runWorkerShell(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, s
   return run(timeoutBin ? [timeoutBin, `${timeoutSeconds}s`, ...sshArgs] : sshArgs, { check: false });
 }
 
+const WORKER_REQUIRED_COMMANDS = ["bun", "git", "ssh", "tailscale"];
+
+function regexEscape(value: string): string {
+  return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+}
+
+function workerProbeValue(output: string, key: string): string | null {
+  const match = output.match(new RegExp(`^${regexEscape(key)}=(.*)$`, "m"));
+  return match?.[1]?.trim() || null;
+}
+
+function workerCommandCheck(worker: BrainstackWorkerConfig, output: string, commandName: string): DoctorCheck {
+  const path = workerProbeValue(output, `cmd:${commandName}`);
+  if (!path || path === "missing") {
+    return check(
+      "FAIL",
+      "workers",
+      `worker:${worker.name}:cmd:${commandName}`,
+      "missing from worker shell PATH",
+      `Install ${commandName} on ${worker.name}, or add its bin directory to the worker user's login shell PATH.`
+    );
+  }
+
+  const version = workerProbeValue(output, `cmdver:${commandName}`);
+  return check("PASS", "workers", `worker:${worker.name}:cmd:${commandName}`, version ? `${path}; ${version}` : path);
+}
+
 async function workerDoctorChecks(cfg: BrainstackConfig, deep: boolean): Promise<DoctorCheck[]> {
   const checks: DoctorCheck[] = [];
   for (const worker of defaultWorkers(cfg)) {
@@ -2379,6 +2406,18 @@ async function workerDoctorChecks(cfg: BrainstackConfig, deep: boolean): Promise
       `harness_family=${quoteForBash(family)}`,
       "printf 'worker=%s\\n' \"$(hostname)\"",
       "if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then printf 'sudo=ok\\n'; else printf 'sudo=fail\\n'; fi",
+      "probe_command() {",
+      "  name=\"$1\"",
+      "  if ! command -v \"$name\" >/dev/null 2>&1; then printf 'cmd:%s=missing\\n' \"$name\"; return 0; fi",
+      "  path=\"$(command -v \"$name\")\"",
+      "  printf 'cmd:%s=%s\\n' \"$name\" \"$path\"",
+      "  case \"$name\" in",
+      "    ssh) version=\"$($path -V 2>&1 | head -n 1 || true)\" ;;",
+      "    *) version=\"$($path --version 2>&1 | head -n 1 || true)\" ;;",
+      "  esac",
+      "  printf 'cmdver:%s=%s\\n' \"$name\" \"$version\"",
+      "}",
+      ...WORKER_REQUIRED_COMMANDS.map((name) => `probe_command ${quoteForBash(name)}`),
       "if ! command -v \"$harness_bin\" >/dev/null 2>&1; then printf 'harness_bin=missing\\n'; exit 7; fi",
       "printf 'harness_bin=%s\\n' \"$(command -v \"$harness_bin\")\"",
       "\"$harness_bin\" --version 2>&1 | head -n 1 | sed 's/^/version=/' || true",
@@ -2405,7 +2444,11 @@ async function workerDoctorChecks(cfg: BrainstackConfig, deep: boolean): Promise
       checks.push(check("FAIL", "workers", `worker:${worker.name}`, combined || `exit ${result.code}`, `Verify SSH and ${family} on the worker.`));
       continue;
     }
-    checks.push(check("PASS", "workers", `worker:${worker.name}`, `reachable via ${worker.transport}; ${family} bin=${bin}`));
+    const harnessPath = workerProbeValue(combined, "harness_bin") || bin;
+    checks.push(check("PASS", "workers", `worker:${worker.name}`, `reachable via ${worker.transport}; ${family} bin=${harnessPath}`));
+    for (const commandName of WORKER_REQUIRED_COMMANDS) {
+      checks.push(workerCommandCheck(worker, combined, commandName));
+    }
     checks.push(combined.includes("sudo=ok") ? check("PASS", "workers", `worker:${worker.name}:sudo`, "sudo -n true works") : check("WARN", "workers", `worker:${worker.name}:sudo`, "sudo -n true failed", "Configure passwordless sudo only if this worker profile needs privileged operations."));
     const missingFlags = required.filter((needle) => combined.includes(`flag:${needle}=missing`));
     checks.push(

@@ -72,7 +72,7 @@ For control and single-node profiles, `brainctl provision --harness claude` test
 
 Worker provisioning does not require passwordless sudo by default. Add `--require-harness-sudo` for workers that are expected to perform privileged machine administration, or use `brainctl doctor --deep` later for an explicit harness sudo proof.
 
-Provisioning and doctor checks do not install packages or silently change sudo/harness policy. They stop with remediation text if Bun, Git, OpenSSH, Tailscale, Codex, Claude, required passwordless sudo, or required harness bypass behavior is missing. Use `brainctl doctor --deep` when you want to repeat the expensive harness sudo proof after installation.
+Provisioning and doctor checks do not install packages or silently change sudo/harness policy. They stop with remediation text if Bun, Git, OpenSSH, Tailscale, Codex, Claude, required passwordless sudo, or required harness bypass behavior is missing. `brainctl doctor --workers` resolves every configured worker through the worker user's shell PATH and reports required worker tool paths/versions, so non-interactive SSH PATH drift is visible. Use `brainctl doctor --deep` when you want to repeat the expensive harness sudo proof after installation.
 
 ## Telemux Trust Boundary
 
