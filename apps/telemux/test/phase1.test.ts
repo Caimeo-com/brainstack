@@ -913,10 +913,74 @@ test("dispatcher reserves context locks before asynchronous setup can race", asy
     );
 
     expect(first.accepted).toBe(true);
+    expect(second.accepted).toBe(true);
+    expect(second.message).toContain("queued this turn");
+    await waitFor(() => !fixture.dispatcher.isActive("lockrace"));
+    await waitFor(async () => (await readFile(join(context!.worktreePath, ".factory", "fake-turn-count"), "utf8")) === "2");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("dispatcher can reject busy turns instead of accepting volatile queue entries", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx lockreject control scratch", 87));
+    const context = fixture.db.getContextBySlug("lockreject");
+    expect(context).toBeTruthy();
+
+    const first = await fixture.dispatcher.dispatch(
+      "resume",
+      context!,
+      "slow live session from first dispatch",
+      { chatId: 4242, threadId: 87 },
+      { notifyAccepted: false }
+    );
+    const second = await fixture.dispatcher.dispatch(
+      "resume",
+      context!,
+      "cron-style dispatch must not enter the in-memory queue",
+      { chatId: 4242, threadId: 87 },
+      { notifyAccepted: false, allowQueue: false }
+    );
+
+    expect(first.accepted).toBe(true);
     expect(second.accepted).toBe(false);
     expect(second.message).toContain("already has an active job");
-    await waitFor(() => !fixture.dispatcher.isActive("lockrace"));
-    expect(await readFile(join(context!.worktreePath, ".factory", "fake-turn-count"), "utf8")).toBe("1");
+    await waitFor(() => !fixture.dispatcher.isActive("lockreject"));
+    await waitFor(async () => (await readFile(join(context!.worktreePath, ".factory", "fake-turn-count"), "utf8")) === "1");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("dispatcher drains queued turns after lock-only jobs finish", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx lockqueue control scratch", 86));
+    const context = fixture.db.getContextBySlug("lockqueue");
+    expect(context).toBeTruthy();
+
+    const lockDone = fixture.dispatcher.withContextLock(context!, async () => {
+      const queued = await fixture.dispatcher.dispatch(
+        "resume",
+        context!,
+        "queued behind lock-only job",
+        { chatId: 4242, threadId: 86 },
+        { notifyAccepted: false }
+      );
+      expect(queued.accepted).toBe(true);
+      expect(queued.message).toContain("queued this turn in memory");
+      await Bun.sleep(100);
+    });
+
+    await lockDone;
+    await waitFor(() => !fixture.dispatcher.isActive("lockqueue"));
+    await waitFor(async () => (await readFile(join(context!.worktreePath, ".factory", "fake-turn-count"), "utf8")) === "1");
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
@@ -1020,6 +1084,65 @@ test("archived contexts stop pre-worker dispatch and pause linked cron slots", a
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 15_000);
+
+test("worker execution keeps full logs but bounds in-memory stdout and stderr", async () => {
+  const fixture = await createFixture({ FACTORY_WORKER_CAPTURE_MAX_BYTES: "256" });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx noisy control scratch", 91));
+    const context = fixture.db.getContextBySlug("noisy");
+    expect(context).toBeTruthy();
+
+    await makeExecutable(
+      fixture.fakeCodex,
+      `#!/usr/bin/env bash
+	set -euo pipefail
+	cat >/dev/null
+	printf '{"type":"session.started","session_'
+	sleep 0.1
+	printf 'id":"split-session-noisy"}'
+	printf 'stdout-start\\n'
+	for _ in $(seq 1 400); do printf '0123456789'; done
+	printf '\\nstdout-end\\n'
+printf 'stderr-start\\n' >&2
+for _ in $(seq 1 400); do printf 'abcdefghij'; done >&2
+printf '\\nstderr-end\\n' >&2
+`
+    );
+
+    const logPath = join(fixture.controlRoot, "logs", "noisy.log");
+    const result = await fixture.workers.runCodex(context!, "Produce noisy output.", "run", logPath);
+
+    expect(result.ok).toBe(true);
+    expect(result.sessionId).toBe("split-session-noisy");
+    expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(256);
+    expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(256);
+    expect(result.stdout).toContain("output truncated");
+    expect(result.stdout).toContain("stdout-end");
+    expect(result.stderr).toContain("output truncated");
+    expect(result.stderr).toContain("stderr-end");
+
+    const fullLog = await readFile(logPath, "utf8");
+    expect(fullLog).toContain("stdout-start");
+    expect(fullLog).toContain("stderr-start");
+    expect(fullLog.length).toBeGreaterThan(4000);
+
+    await mkdir(join(context!.worktreePath, "output"), { recursive: true });
+    await writeFile(join(context!.worktreePath, "output", "large-artifact.txt"), "artifact-body-".repeat(100));
+    const artifact = await fixture.workers.readArtifactFile(context!, "output/large-artifact.txt", 4096);
+    expect(artifact.fileName).toBe("large-artifact.txt");
+    expect(Buffer.from(artifact.content).toString("utf8")).toContain("artifact-body-artifact-body");
+
+    const biggerContent = "artifact-large-body\n".repeat(18_000);
+    await writeFile(join(context!.worktreePath, "output", "capture-cap-bypass.txt"), biggerContent);
+    const biggerArtifact = await fixture.workers.readArtifactFile(context!, "output/capture-cap-bypass.txt", 512 * 1024);
+    expect(biggerArtifact.fileName).toBe("capture-cap-bypass.txt");
+    expect(Buffer.from(biggerArtifact.content).toString("utf8")).toBe(biggerContent);
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
 
 test("cron outcome saves do not resurrect jobs deleted after claim", async () => {
   const fixture = await createFixture();

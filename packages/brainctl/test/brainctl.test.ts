@@ -77,6 +77,76 @@ async function writeFixtureConfig(path: string): Promise<void> {
   );
 }
 
+async function waitForBraind(port: number): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      const health = await fetch(`http://127.0.0.1:${port}/health`);
+      if (health.ok) {
+        return;
+      }
+    } catch {
+      // wait for server startup
+    }
+    await Bun.sleep(100);
+  }
+  throw new Error(`braind did not become ready on port ${port}`);
+}
+
+async function waitForCondition(condition: () => Promise<boolean>, label: string, attempts = 50): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (await condition()) {
+      return;
+    }
+    await Bun.sleep(100);
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
+function braindTestEnv(root: string, port: number, overrides: Record<string, string> = {}): Record<string, string> {
+  return {
+    ...process.env,
+    BRAIN_BIND: "127.0.0.1",
+    BRAIN_PORT: String(port),
+    BRAIN_IMPORT_TOKEN: "import-test-token",
+    BRAIN_ADMIN_TOKEN: "admin-test-token",
+    SHARED_BRAIN_REPO_ROOT: join(root, "shared-brain", "serve", "shared-brain"),
+    SHARED_BRAIN_WRITE_REPO_ROOT: join(root, "shared-brain", "staging", "shared-brain"),
+    BRAIN_BLOB_STORE: join(root, "state", "blobs", "shared-brain"),
+    ...overrides
+  };
+}
+
+async function createSingleNodeInstall(dir: string): Promise<string> {
+  const configPath = join(dir, "config.yaml");
+  const root = join(dir, "install");
+  await writeFixtureConfig(configPath);
+  expectSuccess(runBrainctl(["init", "--profile", "single-node", "--config", configPath, "--root", root]));
+  return root;
+}
+
+async function startBraind(root: string, port: number, overrides: Record<string, string> = {}): Promise<ReturnType<typeof Bun.spawn>> {
+  const proc = Bun.spawn(["bun", "run", SERVER], {
+    cwd: PRODUCT_ROOT,
+    env: braindTestEnv(root, port, overrides),
+    stdout: "pipe",
+    stderr: "pipe"
+  });
+  await waitForBraind(port);
+  return proc;
+}
+
+async function stopBraind(proc: ReturnType<typeof Bun.spawn> | null): Promise<void> {
+  if (!proc) {
+    return;
+  }
+  proc.kill();
+  await proc.exited;
+}
+
+function repoPathUrl(repoPath: string): string {
+  return encodeURIComponent(repoPath).replace(/%2F/g, "/");
+}
+
 async function listFiles(root: string): Promise<string[]> {
   const entries = await readdir(root, { withFileTypes: true });
   const files: string[] = [];
@@ -955,6 +1025,318 @@ describe("braind write safety", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  test("braind rejects legacy token collapse at startup", () => {
+    const legacy = runCommand(["bun", "run", SERVER], {
+      env: {
+        BRAIN_WRITE_TOKEN: "legacy-write-token",
+        BRAIN_IMPORT_TOKEN: "import-test-token",
+        BRAIN_ADMIN_TOKEN: "admin-test-token"
+      }
+    });
+    expect(legacy.code).not.toBe(0);
+    expect(legacy.stderr).toContain("BRAIN_WRITE_TOKEN is no longer accepted");
+
+    const collapsed = runCommand(["bun", "run", SERVER], {
+      env: {
+        BRAIN_WRITE_TOKEN: "",
+        BRAIN_IMPORT_TOKEN: "same-token",
+        BRAIN_ADMIN_TOKEN: "same-token"
+      }
+    });
+    expect(collapsed.code).not.toBe(0);
+    expect(collapsed.stderr).toContain("BRAIN_IMPORT_TOKEN and BRAIN_ADMIN_TOKEN must be distinct");
+
+    const padded = runCommand(["bun", "run", SERVER], {
+      env: {
+        BRAIN_IMPORT_TOKEN: " import-test-token ",
+        BRAIN_ADMIN_TOKEN: "admin-test-token"
+      }
+    });
+    expect(padded.code).not.toBe(0);
+    expect(padded.stderr).toContain("BRAIN_IMPORT_TOKEN must not contain leading or trailing whitespace");
+  });
+
+  test("braind escapes search snippets, allowlists external links, and serves active raw files inertly", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-content-safety-"));
+    const port = 44_000 + Math.floor(Math.random() * 4_000);
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    let sourceServer: ReturnType<typeof Bun.serve> | null = null;
+    try {
+      const root = await createSingleNodeInstall(dir);
+      proc = await startBraind(root, port, { BRAIN_ALLOW_PRIVATE_URL_IMPORTS: "true", BRAIN_WRITE_CONCURRENCY: "2" });
+
+      const payload = {
+        title: "Needle Attack",
+        text: [
+          "# Needle Attack",
+          "",
+          "Needle <img src=x onerror=alert(1)> should be visible as text only.",
+          "[blocked](javascript:alert(1)) and [allowed](https://example.com/ok)."
+        ].join("\n"),
+        source_harness: "test-harness",
+        source_machine: "test-machine",
+        source_type: "note"
+      };
+      const importResponse = await fetch(`http://127.0.0.1:${port}/api/import`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "content-safety-note"
+        },
+        body: JSON.stringify(payload)
+      });
+      expect(importResponse.status).toBe(200);
+      const imported = (await importResponse.json()) as {
+        artifact_id?: string;
+        touched_files?: string[];
+      };
+      expect(typeof imported.artifact_id).toBe("string");
+
+      const replayResponse = await fetch(`http://127.0.0.1:${port}/api/import`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "content-safety-note"
+        },
+        body: JSON.stringify(payload)
+      });
+      expect(replayResponse.status).toBe(200);
+      const replayed = (await replayResponse.json()) as {
+        artifact_id?: string;
+        idempotent_replay?: boolean;
+      };
+      expect(replayed.artifact_id).toBe(imported.artifact_id);
+      expect(replayed.idempotent_replay).toBe(true);
+
+      const conflictResponse = await fetch(`http://127.0.0.1:${port}/api/import`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "content-safety-note"
+        },
+        body: JSON.stringify({ ...payload, text: `${payload.text}\nchanged` })
+      });
+      expect(conflictResponse.status).toBe(409);
+
+      const concurrentPayload = {
+        ...payload,
+        title: "Concurrent idempotent note",
+        text: `${payload.text}\nConcurrent replay.`
+      };
+      const [concurrentA, concurrentB] = await Promise.all([
+        fetch(`http://127.0.0.1:${port}/api/import`, {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer import-test-token",
+            "Content-Type": "application/json",
+            "Idempotency-Key": "content-safety-concurrent"
+          },
+          body: JSON.stringify(concurrentPayload)
+        }),
+        fetch(`http://127.0.0.1:${port}/api/import`, {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer import-test-token",
+            "Content-Type": "application/json",
+            "Idempotency-Key": "content-safety-concurrent"
+          },
+          body: JSON.stringify(concurrentPayload)
+        })
+      ]);
+      expect(concurrentA.status).toBe(200);
+      expect(concurrentB.status).toBe(200);
+      const concurrentBodyA = (await concurrentA.json()) as { artifact_id?: string; idempotent_replay?: boolean };
+      const concurrentBodyB = (await concurrentB.json()) as { artifact_id?: string; idempotent_replay?: boolean };
+      expect(concurrentBodyA.artifact_id).toBe(concurrentBodyB.artifact_id);
+      expect([concurrentBodyA.idempotent_replay, concurrentBodyB.idempotent_replay]).toContain(true);
+
+      const proposalPayload = {
+        title: "Needle Proposal",
+        body: "Use this proposal to prove idempotent propose replay.",
+        source_harness: "test-harness",
+        source_machine: "test-machine"
+      };
+      const proposalResponse = await fetch(`http://127.0.0.1:${port}/api/propose`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "content-safety-proposal"
+        },
+        body: JSON.stringify(proposalPayload)
+      });
+      expect(proposalResponse.status).toBe(200);
+      const proposed = (await proposalResponse.json()) as { proposal_path?: string };
+      expect(typeof proposed.proposal_path).toBe("string");
+      const proposalReplayResponse = await fetch(`http://127.0.0.1:${port}/api/propose`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "content-safety-proposal"
+        },
+        body: JSON.stringify(proposalPayload)
+      });
+      expect(proposalReplayResponse.status).toBe(200);
+      const replayedProposal = (await proposalReplayResponse.json()) as {
+        proposal_path?: string;
+        idempotent_replay?: boolean;
+      };
+      expect(replayedProposal.proposal_path).toBe(proposed.proposal_path);
+      expect(replayedProposal.idempotent_replay).toBe(true);
+      const proposalConflict = await fetch(`http://127.0.0.1:${port}/api/propose`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "content-safety-proposal"
+        },
+        body: JSON.stringify({ ...proposalPayload, body: "different proposal body" })
+      });
+      expect(proposalConflict.status).toBe(409);
+
+      await waitForCondition(async () => {
+        const response = await fetch(`http://127.0.0.1:${port}/search?format=json&q=Needle&limit=1000000&scope=bad`);
+        if (!response.ok) {
+          return false;
+        }
+        const payload = (await response.json()) as { results?: unknown[] };
+        return Array.isArray(payload.results) && payload.results.length > 0;
+      }, "search index refresh after import");
+      const searchResponse = await fetch(`http://127.0.0.1:${port}/search?format=json&q=Needle&limit=1000000&scope=bad`);
+      expect(searchResponse.status).toBe(200);
+      const searchPayload = (await searchResponse.json()) as {
+        limit: number;
+        scope: string;
+        results: Array<{ path: string; snippet: string }>;
+      };
+      expect(searchPayload.limit).toBe(50);
+      expect(searchPayload.scope).toBe("all");
+      expect(searchPayload.results.length).toBeGreaterThan(0);
+      const snippet = searchPayload.results.map((result) => result.snippet).join("\n");
+      expect(snippet).toContain("<mark>Needle</mark>");
+
+      const xssSearchResponse = await fetch(`http://127.0.0.1:${port}/search?format=json&q=onerror`);
+      expect(xssSearchResponse.status).toBe(200);
+      const xssSearchPayload = (await xssSearchResponse.json()) as {
+        results: Array<{ snippet: string }>;
+      };
+      const xssSnippet = xssSearchPayload.results.map((result) => result.snippet).join("\n");
+      expect(xssSnippet).not.toContain("<img src=x");
+      expect(xssSnippet).toContain("&lt;img");
+
+      const oddQuery = await fetch(`http://127.0.0.1:${port}/search?format=json&q=${encodeURIComponent('" OR *')}`);
+      expect(oddQuery.status).toBe(200);
+
+      const serveRoot = join(root, "shared-brain", "serve", "shared-brain");
+      await writeFile(join(serveRoot, "wiki", "LinkSafety.md"), "# LinkSafety\n\n[blocked](javascript:alert(1)) and [allowed](https://example.com/ok).\n");
+      const pageResponse = await fetch(`http://127.0.0.1:${port}/page/wiki/LinkSafety.md`);
+      expect(pageResponse.status).toBe(200);
+      expect(pageResponse.headers.get("x-content-type-options")).toBe("nosniff");
+      const pageHtml = await pageResponse.text();
+      expect(pageHtml).not.toContain('href="javascript:');
+      expect(pageHtml).toContain('href="https://example.com/ok"');
+
+      const sourcePort = 49_000 + Math.floor(Math.random() * 2_000);
+      sourceServer = Bun.serve({
+        hostname: "127.0.0.1",
+        port: sourcePort,
+        fetch() {
+          return new Response("<script>alert(1)</script><h1>Active</h1>", {
+            headers: { "content-type": "text/html; charset=utf-8" }
+          });
+        }
+      });
+      await fetch(`http://127.0.0.1:${sourcePort}/active.html`);
+      const htmlImport = await fetch(`http://127.0.0.1:${port}/api/import`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          title: "Active HTML",
+          url: `http://127.0.0.1:${sourcePort}/active.html`,
+          source_harness: "test-harness",
+          source_machine: "test-machine",
+          source_type: "url"
+        })
+      });
+      expect(htmlImport.status).toBe(200);
+      const htmlImportPayload = (await htmlImport.json()) as { touched_files?: string[] };
+      const activeRawPath = htmlImportPayload.touched_files?.find((path) => path.startsWith("raw/imported/") && path.endsWith(".html"));
+      expect(typeof activeRawPath).toBe("string");
+      await waitForCondition(async () => {
+        const response = await fetch(`http://127.0.0.1:${port}/raw/${repoPathUrl(activeRawPath!)}`);
+        return response.status === 200 && (response.headers.get("content-type") || "").includes("text/plain");
+      }, "raw active artifact to be available in serve clone");
+      const rawResponse = await fetch(`http://127.0.0.1:${port}/raw/${repoPathUrl(activeRawPath!)}`);
+      expect(rawResponse.status).toBe(200);
+      expect(rawResponse.headers.get("content-type") || "").toContain("text/plain");
+      expect(rawResponse.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(rawResponse.headers.get("content-disposition") || "").toContain("attachment");
+      expect(rawResponse.headers.get("content-disposition") || "").not.toContain('"bad');
+
+      const hiddenRaw = await fetch(`http://127.0.0.1:${port}/raw/.git/config`);
+      expect(hiddenRaw.status).toBe(403);
+      const derivedRaw = await fetch(`http://127.0.0.1:${port}/raw/derived/idempotency/import/example.json`);
+      expect(derivedRaw.status).toBe(403);
+      const hiddenPage = await fetch(`http://127.0.0.1:${port}/page/.git/config`);
+      expect(hiddenPage.status).toBe(403);
+
+      let fetchCount = 0;
+      sourceServer.stop(true);
+      sourceServer = Bun.serve({
+        hostname: "127.0.0.1",
+        port: sourcePort,
+        fetch() {
+          fetchCount += 1;
+          return new Response(`# URL replay ${fetchCount}`, {
+            headers: { "content-type": "text/markdown; charset=utf-8" }
+          });
+        }
+      });
+      await fetch(`http://127.0.0.1:${sourcePort}/url-replay.md`);
+      fetchCount = 0;
+      const urlReplayPayload = {
+        title: "URL replay",
+        url: `http://127.0.0.1:${sourcePort}/url-replay.md`,
+        source_harness: "test-harness",
+        source_machine: "test-machine",
+        source_type: "url"
+      };
+      const urlImport = await fetch(`http://127.0.0.1:${port}/api/import`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "url-replay"
+        },
+        body: JSON.stringify(urlReplayPayload)
+      });
+      expect(urlImport.status).toBe(200);
+      const urlReplay = await fetch(`http://127.0.0.1:${port}/api/import`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "url-replay"
+        },
+        body: JSON.stringify(urlReplayPayload)
+      });
+      expect(urlReplay.status).toBe(200);
+      expect(((await urlReplay.json()) as { idempotent_replay?: boolean }).idempotent_replay).toBe(true);
+      expect(fetchCount).toBe(1);
+    } finally {
+      sourceServer?.stop(true);
+      await stopBraind(proc);
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
 
 describe("public release hygiene", () => {
@@ -1435,9 +1817,55 @@ describe("public release hygiene", () => {
       );
       expectSuccess(queued);
       expect(`${queued.stdout}\n${queued.stderr}`).toContain("shared-brain write queued");
+      const queuedAgain = runBrainctl(
+        [
+          "import-text",
+          "--config",
+          configPath,
+          "--title",
+          "Queued note",
+          "--text",
+          "offline body",
+          "--source-harness",
+          "codex",
+          "--source-machine",
+          "client"
+        ],
+        env
+      );
+      expectSuccess(queuedAgain);
       const statusBefore = runBrainctl(["outbox", "status", "--config", configPath], env);
       expectSuccess(statusBefore);
       expect(statusBefore.stdout).toContain("queued=1");
+      const outboxRootLine = statusBefore.stdout.split(/\r?\n/).find((line) => line.startsWith("outbox="));
+      const outboxPath = outboxRootLine?.slice("outbox=".length);
+      expect(typeof outboxPath).toBe("string");
+      await writeFile(
+        join(outboxPath!, "legacy-timestamp-id.json"),
+        `${JSON.stringify(
+          {
+            id: "import-legacy-timestamp",
+            endpoint: "import",
+            url: `http://127.0.0.1:${port}`,
+            payload: {
+              title: "Queued note",
+              text: "offline body",
+              source_harness: "codex",
+              source_machine: "client",
+              source_type: "note",
+              tags: []
+            },
+            created_at: "2026-01-01T00:00:00.000Z",
+            source_machine: "client",
+            source_harness: "codex",
+            retry_count: 2,
+            idempotency_key: "legacy-json-stringify-key",
+            last_error: "legacy item"
+          },
+          null,
+          2
+        )}\n`
+      );
 
       const receivedPath = join(dir, "received.jsonl");
       const serverScript = join(dir, "server.ts");
@@ -1452,8 +1880,9 @@ describe("public release hygiene", () => {
           "  async fetch(req) {",
           "    if (new URL(req.url).pathname === '/health') return Response.json({ ok: true });",
           "    const payload = await req.json();",
+          "    const key = req.headers.get('idempotency-key');",
           "    const existing = await Bun.file(receivedPath).exists() ? await Bun.file(receivedPath).text() : '';",
-          "    await Bun.write(receivedPath, `${existing}${JSON.stringify(payload)}\\n`);",
+          "    await Bun.write(receivedPath, `${existing}${JSON.stringify({ payload, key })}\\n`);",
           "    return Response.json({ ok: true });",
           "  }",
           "});",
@@ -1480,12 +1909,279 @@ describe("public release hygiene", () => {
         const receivedText = await readFile(receivedPath, "utf8");
         received.push(...receivedText.trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>));
         expect(received).toHaveLength(1);
+        expect(received[0].key).toMatch(/^[a-f0-9]{64}$/);
+        expect(received[0].key).not.toBe("legacy-json-stringify-key");
         const statusAfter = runBrainctl(["outbox", "status", "--config", configPath], env);
         expectSuccess(statusAfter);
         expect(statusAfter.stdout).toContain("queued=0");
       } finally {
         server.kill();
         await server.exited;
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("outbox queues retryable brain write failures but rejects auth failures", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-outbox-status-"));
+    try {
+      const stateRoot = join(dir, "state");
+      const configPath = join(dir, "config.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  stateRoot: ${stateRoot}`,
+          "client:",
+          "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+
+      const retryablePort = 46_000 + Math.floor(Math.random() * 2_000);
+      const retryableScript = join(dir, "retryable-server.ts");
+      await writeFile(
+        retryableScript,
+        [
+          `Bun.serve({`,
+          `  hostname: "127.0.0.1",`,
+          `  port: ${retryablePort},`,
+          `  fetch() { return Response.json({ error: "try later" }, { status: 503 }); }`,
+          `});`,
+          `await new Promise(() => {});`,
+          ""
+        ].join("\n")
+      );
+      const retryableServer = Bun.spawn(["bun", "run", retryableScript], {
+        stdout: "pipe",
+        stderr: "pipe"
+      });
+      try {
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          try {
+            await fetch(`http://127.0.0.1:${retryablePort}/health`);
+            break;
+          } catch {
+            await Bun.sleep(25);
+          }
+        }
+        const retryable = runBrainctl(
+          [
+            "import-text",
+            "--config",
+            configPath,
+            "--title",
+            "Retryable note",
+            "--text",
+            "retryable body",
+            "--source-harness",
+            "codex",
+            "--source-machine",
+            "client"
+          ],
+          {
+            BRAIN_BASE_URL: `http://127.0.0.1:${retryablePort}`,
+            BRAIN_IMPORT_TOKEN: "outbox-token",
+            BRAINSTACK_BRAIN_WRITE_TIMEOUT_MS: "1000"
+          }
+        );
+        expectSuccess(retryable);
+        expect(`${retryable.stdout}\n${retryable.stderr}`).toContain("shared-brain write queued");
+        const status = runBrainctl(["outbox", "status", "--config", configPath]);
+        expectSuccess(status);
+        expect(status.stdout).toContain("queued=1");
+      } finally {
+        retryableServer.kill();
+        await retryableServer.exited;
+      }
+
+      const cleanStateRoot = join(dir, "auth-state");
+      const authConfigPath = join(dir, "auth-config.yaml");
+      await writeFile(
+        authConfigPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  stateRoot: ${cleanStateRoot}`,
+          "client:",
+          "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+      const authPort = 48_000 + Math.floor(Math.random() * 2_000);
+      const authScript = join(dir, "auth-server.ts");
+      await writeFile(
+        authScript,
+        [
+          `Bun.serve({`,
+          `  hostname: "127.0.0.1",`,
+          `  port: ${authPort},`,
+          `  fetch() { return Response.json({ error: "unauthorized" }, { status: 401 }); }`,
+          `});`,
+          `await new Promise(() => {});`,
+          ""
+        ].join("\n")
+      );
+      const authServer = Bun.spawn(["bun", "run", authScript], {
+        stdout: "pipe",
+        stderr: "pipe"
+      });
+      try {
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          try {
+            await fetch(`http://127.0.0.1:${authPort}/health`);
+            break;
+          } catch {
+            await Bun.sleep(25);
+          }
+        }
+        const rejected = runBrainctl(
+          [
+            "import-text",
+            "--config",
+            authConfigPath,
+            "--title",
+            "Auth note",
+            "--text",
+            "auth body",
+            "--source-harness",
+            "codex",
+            "--source-machine",
+            "client"
+          ],
+          {
+            BRAIN_BASE_URL: `http://127.0.0.1:${authPort}`,
+            BRAIN_IMPORT_TOKEN: "outbox-token",
+            BRAINSTACK_BRAIN_WRITE_TIMEOUT_MS: "1000"
+          }
+        );
+        expect(rejected.code).not.toBe(0);
+        expect(rejected.stderr).toContain("brain rejected import with HTTP 401");
+        const authStatus = runBrainctl(["outbox", "status", "--config", authConfigPath]);
+        expectSuccess(authStatus);
+        expect(authStatus.stdout).toContain("queued=0");
+      } finally {
+        authServer.kill();
+        await authServer.exited;
+      }
+
+      const legacyRejected = runBrainctl(
+        [
+          "import-text",
+          "--config",
+          authConfigPath,
+          "--title",
+          "Legacy token note",
+          "--text",
+          "legacy token body",
+          "--source-harness",
+          "codex",
+          "--source-machine",
+          "client"
+        ],
+        {
+          BRAIN_BASE_URL: `http://127.0.0.1:${authPort}`,
+          BRAIN_WRITE_TOKEN: "legacy-token"
+        }
+      );
+      expect(legacyRejected.code).not.toBe(0);
+      expect(legacyRejected.stderr).toContain("BRAIN_WRITE_TOKEN is no longer accepted");
+
+      const terminalStateRoot = join(dir, "terminal-state");
+      const terminalConfigPath = join(dir, "terminal-config.yaml");
+      await writeFile(
+        terminalConfigPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  stateRoot: ${terminalStateRoot}`,
+          "client:",
+          "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+      const terminalStatus = runBrainctl(["outbox", "status", "--config", terminalConfigPath], {
+        BRAIN_BASE_URL: `http://127.0.0.1:${authPort}`,
+        BRAIN_IMPORT_TOKEN: "outbox-token"
+      });
+      expectSuccess(terminalStatus);
+      const terminalRoot = terminalStatus.stdout.split(/\r?\n/).find((line) => line.startsWith("outbox="))?.slice("outbox=".length);
+      expect(typeof terminalRoot).toBe("string");
+      await mkdir(terminalRoot!, { recursive: true });
+      await writeFile(
+        join(terminalRoot!, "legacy-terminal.json"),
+        `${JSON.stringify(
+          {
+            id: "legacy-terminal",
+            endpoint: "import",
+            url: `http://127.0.0.1:${authPort}`,
+            payload: {
+              title: "Terminal note",
+              text: "terminal body",
+              source_harness: "codex",
+              source_machine: "client",
+              source_type: "note",
+              tags: []
+            },
+            created_at: "2026-01-01T00:00:00.000Z",
+            source_machine: "client",
+            source_harness: "codex",
+            retry_count: 0,
+            idempotency_key: "legacy-terminal-key",
+            last_error: null
+          },
+          null,
+          2
+        )}\n`
+      );
+      const terminalServer = Bun.spawn(["bun", "run", authScript], {
+        stdout: "pipe",
+        stderr: "pipe"
+      });
+      try {
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          try {
+            await fetch(`http://127.0.0.1:${authPort}/health`);
+            break;
+          } catch {
+            await Bun.sleep(25);
+          }
+        }
+        const terminalFlush = runBrainctl(["outbox", "flush", "--config", terminalConfigPath], {
+          BRAIN_BASE_URL: `http://127.0.0.1:${authPort}`,
+          BRAIN_IMPORT_TOKEN: "outbox-token",
+          BRAINSTACK_BRAIN_WRITE_TIMEOUT_MS: "1000"
+        });
+        expect(terminalFlush.code).not.toBe(0);
+        expect(terminalFlush.stdout).toContain("terminal_failures=1");
+        expect(terminalFlush.stderr).toContain("terminal write failures");
+        const terminalList = runBrainctl(["outbox", "list", "--config", terminalConfigPath], {
+          BRAIN_BASE_URL: `http://127.0.0.1:${authPort}`,
+          BRAIN_IMPORT_TOKEN: "outbox-token"
+        });
+        expectSuccess(terminalList);
+        expect(terminalList.stdout).toContain("status=terminal");
+        expect(terminalList.stdout).toContain("HTTP 401");
+      } finally {
+        terminalServer.kill();
+        await terminalServer.exited;
       }
     } finally {
       await rm(dir, { recursive: true, force: true });

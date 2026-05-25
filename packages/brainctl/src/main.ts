@@ -1392,6 +1392,20 @@ function sha256Hex(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(",")}}`;
+}
+
 async function installLocalClientBootstrap(cfg: BrainstackConfig): Promise<string[]> {
   const touched: string[] = [];
   const bootstrapRoot = join(cfg.paths.configRoot, "client-bootstrap");
@@ -1724,7 +1738,9 @@ async function testTelegramBotConfig(args: ParsedArgs): Promise<void> {
   }
   let response: Response;
   try {
-    response = await fetch(`https://api.telegram.org/bot${tokenValue.trim()}/getMe`);
+    response = await fetch(`https://api.telegram.org/bot${tokenValue.trim()}/getMe`, {
+      signal: AbortSignal.timeout(15_000)
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message.replaceAll(tokenValue.trim(), "[REDACTED_TELEGRAM_TOKEN]") : String(error);
     throw new Error(`provision blocked: Telegram getMe request failed: ${message}`);
@@ -2502,7 +2518,11 @@ function readEnvFile(path: string): Record<string, string> {
 function brainWriteConfig(cfg: BrainstackConfig): { baseUrl: string; token: string } {
   const env = readEnvFile(clientEnvPathAbs(cfg));
   const baseUrl = process.env.BRAIN_BASE_URL || env.BRAIN_BASE_URL || cfg.brain.publicBaseUrl;
-  const tokenValue = process.env.BRAIN_IMPORT_TOKEN || env.BRAIN_IMPORT_TOKEN || process.env.BRAIN_WRITE_TOKEN || "";
+  const tokenValue = process.env.BRAIN_IMPORT_TOKEN || env.BRAIN_IMPORT_TOKEN || "";
+  const legacyToken = process.env.BRAIN_WRITE_TOKEN || env.BRAIN_WRITE_TOKEN || "";
+  if (legacyToken && !tokenValue) {
+    throw new Error("BRAIN_WRITE_TOKEN is no longer accepted; set BRAIN_IMPORT_TOKEN for client writes and keep BRAIN_ADMIN_TOKEN only on the control host.");
+  }
   return { baseUrl, token: tokenValue };
 }
 
@@ -2555,34 +2575,83 @@ interface OutboxItem {
   retry_count: number;
   idempotency_key: string;
   last_error: string | null;
+  terminal_error?: string | null;
+}
+
+function outboxItemKey(endpoint: "import" | "propose", payload: Record<string, unknown>): string {
+  return sha256Hex(canonicalJson({ endpoint, payload }));
+}
+
+async function readOutboxItem(path: string): Promise<OutboxItem | null> {
+  try {
+    return JSON.parse(await readFile(path, "utf8")) as OutboxItem;
+  } catch {
+    return null;
+  }
+}
+
+async function findMatchingOutboxItem(root: string, endpoint: "import" | "propose", idempotencyKey: string): Promise<{ path: string; item: OutboxItem } | null> {
+  if (!existsSync(root)) {
+    return null;
+  }
+  for (const name of (await readdir(root)).filter((entry) => entry.endsWith(".json")).sort()) {
+    const path = join(root, name);
+    const item = await readOutboxItem(path);
+    if (!item || item.endpoint !== endpoint) {
+      continue;
+    }
+    const canonicalKey = outboxItemKey(item.endpoint, item.payload);
+    if (canonicalKey === idempotencyKey || item.idempotency_key === idempotencyKey) {
+      return { path, item };
+    }
+  }
+  return null;
 }
 
 async function queueOutboxItem(cfg: BrainstackConfig, item: Omit<OutboxItem, "id" | "created_at" | "retry_count" | "idempotency_key" | "last_error">, error: string): Promise<string> {
   const created = new Date().toISOString();
-  const idempotencyKey = sha256Hex(JSON.stringify({ endpoint: item.endpoint, payload: item.payload }));
-  const id = `${created.replace(/[:.]/g, "-")}-${idempotencyKey.slice(0, 16)}`;
+  const idempotencyKey = outboxItemKey(item.endpoint, item.payload);
+  const id = `${item.endpoint}-${idempotencyKey.slice(0, 32)}`;
   const root = outboxRoot(cfg);
   await ensureDir(root);
-  const path = join(root, `${id}.json`);
-  if (!existsSync(path)) {
-    await writeText(
-      path,
-      `${JSON.stringify(
-        {
-          ...item,
-          id,
-          created_at: created,
-          retry_count: 0,
-          idempotency_key: idempotencyKey,
-          last_error: error
-        } satisfies OutboxItem,
-        null,
-        2
-      )}\n`,
-      0o600
-    );
-  }
+  const stablePath = join(root, `${id}.json`);
+  const matched = (await findMatchingOutboxItem(root, item.endpoint, idempotencyKey)) || null;
+  const path = matched?.path || stablePath;
+  const existing = matched?.item || (existsSync(stablePath) ? await readOutboxItem(stablePath) : null);
+  await writeText(
+    path,
+    `${JSON.stringify(
+      {
+        ...item,
+        id,
+        created_at: existing?.created_at || created,
+        retry_count: existing?.retry_count || 0,
+        idempotency_key: idempotencyKey,
+        last_error: error
+      } satisfies OutboxItem,
+      null,
+      2
+    )}\n`,
+    0o600
+  );
   return path;
+}
+
+function brainWriteIdempotencyKey(endpoint: "import" | "propose", payload: Record<string, unknown>): string {
+  return sha256Hex(canonicalJson({ endpoint, payload }));
+}
+
+function normalizeOutboxItem(item: OutboxItem): OutboxItem {
+  const idempotencyKey = outboxItemKey(item.endpoint, item.payload);
+  return {
+    ...item,
+    id: `${item.endpoint}-${idempotencyKey.slice(0, 32)}`,
+    idempotency_key: idempotencyKey
+  };
+}
+
+function isRetryableBrainWriteStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
 async function postBrainWriteOrQueue(cfg: BrainstackConfig, endpoint: "import" | "propose", payload: Record<string, unknown>): Promise<void> {
@@ -2609,17 +2678,24 @@ async function postBrainWriteOrQueue(cfg: BrainstackConfig, endpoint: "import" |
       headers: {
         Authorization: `Bearer ${writeToken}`,
         "Content-Type": "application/json",
-        "Idempotency-Key": sha256Hex(JSON.stringify({ endpoint, payload }))
+        "Idempotency-Key": brainWriteIdempotencyKey(endpoint, payload)
       },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(brainWriteTimeoutMs())
     });
     if (!response.ok) {
-      throw new Error(`brain returned HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
+      const text = await response.text();
+      if (isRetryableBrainWriteStatus(response.status)) {
+        throw new Error(`brain returned HTTP ${response.status}: ${text.slice(0, 500)}`);
+      }
+      throw new Error(`brain rejected ${endpoint} with HTTP ${response.status}: ${text.slice(0, 500)}`);
     }
     console.log(`shared-brain ${endpoint} accepted`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (message.startsWith("brain rejected ")) {
+      throw new Error(message);
+    }
     const queued = await queueOutboxItem(
       cfg,
       {
@@ -2644,50 +2720,93 @@ async function listOutboxItems(cfg: BrainstackConfig): Promise<Array<{ path: str
   const items: Array<{ path: string; item: OutboxItem }> = [];
   for (const name of names) {
     const path = join(root, name);
-    items.push({ path, item: JSON.parse(await readFile(path, "utf8")) as OutboxItem });
+    const item = await readOutboxItem(path);
+    if (item) {
+      items.push({ path, item });
+    }
   }
   return items;
 }
 
-async function flushOutbox(cfg: BrainstackConfig): Promise<{ flushed: number; kept: number }> {
+async function coalesceOutboxItems(cfg: BrainstackConfig): Promise<void> {
+  const seen = new Map<string, { path: string; item: OutboxItem }>();
+  for (const entry of await listOutboxItems(cfg)) {
+    entry.item = normalizeOutboxItem(entry.item);
+    const key = entry.item.idempotency_key;
+    const prior = seen.get(key);
+    if (!prior) {
+      await writeText(entry.path, `${JSON.stringify(entry.item, null, 2)}\n`, 0o600);
+      seen.set(key, entry);
+      continue;
+    }
+    const keep = prior.path.endsWith(`${entry.item.endpoint}-${key.slice(0, 32)}.json`) ? prior : entry;
+    const drop = keep === prior ? entry : prior;
+    keep.item.retry_count = Math.max(keep.item.retry_count || 0, drop.item.retry_count || 0);
+    keep.item.created_at = [keep.item.created_at, drop.item.created_at].filter(Boolean).sort()[0] || keep.item.created_at;
+    keep.item.idempotency_key = key;
+    keep.item.last_error = keep.item.last_error || drop.item.last_error || null;
+    keep.item.terminal_error = keep.item.terminal_error || drop.item.terminal_error || null;
+    await writeText(keep.path, `${JSON.stringify(keep.item, null, 2)}\n`, 0o600);
+    await rm(drop.path, { force: true });
+    seen.set(key, keep);
+  }
+}
+
+async function flushOutbox(cfg: BrainstackConfig): Promise<{ flushed: number; kept: number; terminalFailures: number }> {
   const { token: writeToken } = brainWriteConfig(cfg);
+  await coalesceOutboxItems(cfg);
   const items = await listOutboxItems(cfg);
   let flushed = 0;
   let kept = 0;
+  let terminalFailures = 0;
   for (const { path, item } of items) {
-    const baseUrl = item.url || brainWriteConfig(cfg).baseUrl;
+    const normalizedItem = normalizeOutboxItem(item);
+    if (normalizedItem.id !== item.id || normalizedItem.idempotency_key !== item.idempotency_key) {
+      await writeText(path, `${JSON.stringify(normalizedItem, null, 2)}\n`, 0o600);
+    }
+    if (normalizedItem.terminal_error) {
+      terminalFailures += 1;
+      continue;
+    }
+    const baseUrl = normalizedItem.url || brainWriteConfig(cfg).baseUrl;
     if (!baseUrl || !writeToken) {
       kept += 1;
       continue;
     }
     try {
-      const response = await fetch(new URL(`/api/${item.endpoint}`, baseUrl).toString(), {
+      const response = await fetch(new URL(`/api/${normalizedItem.endpoint}`, baseUrl).toString(), {
         method: "POST",
         headers: {
           Authorization: `Bearer ${writeToken}`,
           "Content-Type": "application/json",
-          "Idempotency-Key": item.idempotency_key
+          "Idempotency-Key": normalizedItem.idempotency_key
         },
-        body: JSON.stringify(item.payload),
+        body: JSON.stringify(normalizedItem.payload),
         signal: AbortSignal.timeout(brainWriteTimeoutMs())
       });
-      if (response.ok || response.status === 409) {
+      if (response.ok) {
         await rm(path, { force: true });
         flushed += 1;
       } else {
-        item.retry_count += 1;
-        item.last_error = `HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`;
-        await writeText(path, `${JSON.stringify(item, null, 2)}\n`, 0o600);
-        kept += 1;
+        const responseText = await response.text();
+        normalizedItem.retry_count += 1;
+        normalizedItem.last_error = `HTTP ${response.status}: ${responseText.slice(0, 300)}`;
+        if (!isRetryableBrainWriteStatus(response.status)) {
+          normalizedItem.terminal_error = normalizedItem.last_error;
+          terminalFailures += 1;
+        } else {
+          kept += 1;
+        }
+        await writeText(path, `${JSON.stringify(normalizedItem, null, 2)}\n`, 0o600);
       }
     } catch (error) {
-      item.retry_count += 1;
-      item.last_error = error instanceof Error ? error.message : String(error);
-      await writeText(path, `${JSON.stringify(item, null, 2)}\n`, 0o600);
+      normalizedItem.retry_count += 1;
+      normalizedItem.last_error = error instanceof Error ? error.message : String(error);
+      await writeText(path, `${JSON.stringify(normalizedItem, null, 2)}\n`, 0o600);
       kept += 1;
     }
   }
-  return { flushed, kept };
+  return { flushed, kept, terminalFailures };
 }
 
 async function commandImportText(args: ParsedArgs): Promise<void> {
@@ -2732,11 +2851,34 @@ async function commandOutbox(args: ParsedArgs): Promise<void> {
       console.log(`queued=${items.length}`);
       return;
     case "list":
-      console.log(items.length ? items.map(({ item }) => `${item.id} ${item.endpoint} retries=${item.retry_count} ${item.source_machine}/${item.source_harness}`).join("\n") : "(empty)");
+      console.log(
+        items.length
+          ? items
+              .map(({ item }) => {
+                const normalized = normalizeOutboxItem(item);
+                const status = normalized.terminal_error ? "terminal" : normalized.last_error ? "queued-error" : "queued";
+                const detail = normalized.terminal_error || normalized.last_error;
+                return [
+                  normalized.id,
+                  normalized.endpoint,
+                  `status=${status}`,
+                  `retries=${normalized.retry_count}`,
+                  `source=${normalized.source_machine}/${normalized.source_harness}`,
+                  detail ? `error=${detail.replace(/\s+/g, " ").slice(0, 300)}` : null
+                ]
+                  .filter(Boolean)
+                  .join(" ");
+              })
+              .join("\n")
+          : "(empty)"
+      );
       return;
     case "flush": {
       const result = await flushOutbox(cfg);
-      console.log(`flushed=${result.flushed} kept=${result.kept}`);
+      console.log(`flushed=${result.flushed} kept=${result.kept} terminal_failures=${result.terminalFailures}`);
+      if (result.terminalFailures > 0) {
+        throw new Error("outbox flush encountered terminal write failures; inspect `brainctl outbox list` and purge or repair affected items");
+      }
       return;
     }
     case "purge":

@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync } from "node:fs";
+import { mkdir, readFile, readdir, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
 
 type FrontmatterValue = string | boolean | number | null | string[];
@@ -93,6 +95,7 @@ export interface HealthStatus {
   commit: string | null;
   indexed_docs: number;
   last_reindex_at: string | null;
+  indexed_commit: string | null;
   repo_root: string;
 }
 
@@ -121,10 +124,13 @@ export interface RepoPaths {
   logsPath: string;
   derivedDir: string;
   searchDbPath: string;
+  idempotencyDir: string;
   lockDir: string;
 }
 
 const COMMAND_CACHE = new Map<string, boolean>();
+const FTS_MARK_START = "\uE000";
+const FTS_MARK_END = "\uE001";
 const TEXT_EXTENSIONS = new Set([
   ".md",
   ".markdown",
@@ -186,6 +192,7 @@ export function getRepoPaths(explicit?: string): RepoPaths {
     logsPath: join(repoRoot, "logs", "log.md"),
     derivedDir: join(repoRoot, "derived"),
     searchDbPath: join(repoRoot, "derived", "search.sqlite"),
+    idempotencyDir: join(repoRoot, "derived", "idempotency"),
     lockDir: join(repoRoot, ".shared-brain.lock")
   };
 }
@@ -396,7 +403,28 @@ export function safeRepoPath(repoRoot: string, repoRelativePath: string): string
   if (!candidate.startsWith(normalizedRoot) && normalize(candidate) !== normalize(repoRoot)) {
     throw new Error(`Path escapes repo root: ${repoRelativePath}`);
   }
-  return candidate;
+  const realRoot = realpathSync(repoRoot);
+  const realRootWithSep = `${normalize(realRoot)}${sep}`;
+  let existingPath = candidate;
+  while (!existsSync(existingPath) && normalize(existingPath) !== normalize(repoRoot)) {
+    existingPath = dirname(existingPath);
+  }
+  const realExisting = realpathSync(existingPath);
+  if (!realExisting.startsWith(realRootWithSep) && normalize(realExisting) !== normalize(realRoot)) {
+    throw new Error(`Path escapes repo root via symlink: ${repoRelativePath}`);
+  }
+  if (existsSync(candidate)) {
+    const realCandidate = realpathSync(candidate);
+    if (!realCandidate.startsWith(realRootWithSep) && normalize(realCandidate) !== normalize(realRoot)) {
+      throw new Error(`Path escapes repo root via symlink: ${repoRelativePath}`);
+    }
+    return realCandidate;
+  }
+  const realCandidate = resolve(realExisting, relative(existingPath, candidate));
+  if (!realCandidate.startsWith(realRootWithSep) && normalize(realCandidate) !== normalize(realRoot)) {
+    throw new Error(`Path escapes repo root via symlink: ${repoRelativePath}`);
+  }
+  return realCandidate;
 }
 
 export function extractHeadings(markdown: string): string[] {
@@ -445,6 +473,21 @@ function normalizeTextSnippet(input: string, limit = 900): string {
   return input.replace(/\s+/g, " ").trim().slice(0, limit);
 }
 
+function htmlEscape(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function safeHighlightedSnippet(value: string): string {
+  return htmlEscape(value)
+    .replaceAll(FTS_MARK_START, "<mark>")
+    .replaceAll(FTS_MARK_END, "</mark>");
+}
+
 function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values.filter(Boolean)));
 }
@@ -457,8 +500,8 @@ async function commandExists(command: string): Promise<boolean> {
   if (COMMAND_CACHE.has(command)) {
     return COMMAND_CACHE.get(command) || false;
   }
-  const proc = Bun.spawnSync(["which", command], { stdout: "ignore", stderr: "ignore" });
-  const exists = proc.exitCode === 0;
+  const proc = Bun.spawn(["which", command], { stdout: "ignore", stderr: "ignore" });
+  const exists = (await proc.exited) === 0;
   COMMAND_CACHE.set(command, exists);
   return exists;
 }
@@ -471,6 +514,21 @@ function runCommand(args: string[], cwd: string, check = true): string {
     throw new Error(`${args.join(" ")} failed: ${stderr || stdout}`);
   }
   return stdout;
+}
+
+async function runCommandAsync(args: string[], cwd: string, check = true): Promise<string> {
+  const proc = Bun.spawn(args, { cwd, stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited
+  ]);
+  const normalizedStdout = stdout.trim();
+  const normalizedStderr = stderr.trim();
+  if (check && exitCode !== 0) {
+    throw new Error(`${args.join(" ")} failed: ${normalizedStderr || normalizedStdout}`);
+  }
+  return normalizedStdout;
 }
 
 export function syncWritableRepo(repoRoot: string): void {
@@ -494,6 +552,35 @@ export function syncWritableRepo(repoRoot: string): void {
   const base = runCommand(["git", "merge-base", "HEAD", "origin/main"], repoRoot);
   if (base === local) {
     runCommand(["git", "merge", "--ff-only", "origin/main"], repoRoot);
+    return;
+  }
+  if (base === remote) {
+    throw new Error(`Writable repo has unpushed commits; refusing API write until pushed or reset: ${repoRoot}`);
+  }
+  throw new Error(`Writable repo diverged from origin/main; reconcile manually before API writes: ${repoRoot}`);
+}
+
+export async function syncWritableRepoAsync(repoRoot: string): Promise<void> {
+  if (!existsSync(join(repoRoot, ".git"))) {
+    throw new Error(`Writable repo is not a git checkout: ${repoRoot}`);
+  }
+  const branch = await runCommandAsync(["git", "rev-parse", "--abbrev-ref", "HEAD"], repoRoot);
+  if (branch !== "main") {
+    throw new Error(`Writable repo must be on main before writes; found ${branch} in ${repoRoot}`);
+  }
+  const dirty = await runCommandAsync(["git", "status", "--porcelain"], repoRoot);
+  if (dirty.trim()) {
+    throw new Error(`Writable repo is dirty; refusing API write until cleaned: ${repoRoot}`);
+  }
+  await runCommandAsync(["git", "fetch", "origin", "main"], repoRoot);
+  const local = await runCommandAsync(["git", "rev-parse", "HEAD"], repoRoot);
+  const remote = await runCommandAsync(["git", "rev-parse", "origin/main"], repoRoot);
+  if (local === remote) {
+    return;
+  }
+  const base = await runCommandAsync(["git", "merge-base", "HEAD", "origin/main"], repoRoot);
+  if (base === local) {
+    await runCommandAsync(["git", "merge", "--ff-only", "origin/main"], repoRoot);
     return;
   }
   if (base === remote) {
@@ -648,7 +735,7 @@ async function normalizeArtifactFile(
     }
   } else if (extension === ".docx") {
     if (await commandExists("pandoc")) {
-      body = runCommand(["pandoc", rawAbsolutePath, "-t", "gfm"], paths.repoRoot, false) || "";
+      body = await runCommandAsync(["pandoc", rawAbsolutePath, "-t", "gfm"], paths.repoRoot, false) || "";
       if (!body.trim()) {
         status = "deferred";
         body = [
@@ -675,7 +762,7 @@ async function normalizeArtifactFile(
     }
   } else if (extension === ".pdf" || manifest.mime_type === "application/pdf") {
     if (await commandExists("pdftotext")) {
-      body = runCommand(["pdftotext", rawAbsolutePath, "-"], paths.repoRoot, false);
+      body = await runCommandAsync(["pdftotext", rawAbsolutePath, "-"], paths.repoRoot, false);
       if (!body.trim()) {
         status = "deferred";
         body = [
@@ -1074,13 +1161,34 @@ async function ensureProjectPage(repoRoot: string, title: string, sourceId: stri
 export async function rebuildIndex(repoRoot: string): Promise<{ indexedDocs: number; lastReindexAt: string }> {
   const paths = getRepoPaths(repoRoot);
   await ensureDir(paths.derivedDir);
-  if (existsSync(paths.searchDbPath)) {
-    await rm(paths.searchDbPath, { force: true });
-  }
-  const db = new Database(paths.searchDbPath);
+  const tempDbPath = join(paths.derivedDir, `search.sqlite.tmp-${process.pid}-${randomUUID()}`);
+  const removeSqliteSidecars = async (path: string) => {
+    await rm(`${path}-wal`, { force: true }).catch(() => undefined);
+    await rm(`${path}-shm`, { force: true }).catch(() => undefined);
+    await rm(`${path}-journal`, { force: true }).catch(() => undefined);
+  };
+  await rm(tempDbPath, { force: true }).catch(() => undefined);
+  await removeSqliteSidecars(tempDbPath);
+  const db = new Database(tempDbPath);
+  let committed = false;
+  const checkpointExistingIndex = () => {
+    if (!existsSync(paths.searchDbPath)) {
+      return;
+    }
+    const existing = new Database(paths.searchDbPath);
+    try {
+      existing.exec(`
+        PRAGMA wal_checkpoint(TRUNCATE);
+        PRAGMA journal_mode = DELETE;
+      `);
+    } finally {
+      existing.close();
+    }
+  };
   try {
     db.exec(`
-      PRAGMA journal_mode = WAL;
+      PRAGMA journal_mode = DELETE;
+      PRAGMA synchronous = FULL;
       CREATE TABLE documents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         path TEXT NOT NULL UNIQUE,
@@ -1156,7 +1264,9 @@ export async function rebuildIndex(repoRoot: string): Promise<{ indexedDocs: num
     const rawFiles = [
       ...(await listFiles(paths.normalizedDir)),
       ...(await listFiles(paths.importedDir)),
-      ...(await listFiles(paths.conversationsDir))
+      ...(await listFiles(paths.conversationsDir)),
+      ...(await listFiles(paths.proposalsPendingDir)),
+      ...(await listFiles(paths.proposalsAppliedDir))
     ]
       .filter((file, index, all) => all.indexOf(file) === index)
       .filter((file) => existsSync(file) && isTextLike(file, guessMimeFromPath(file)))
@@ -1167,7 +1277,11 @@ export async function rebuildIndex(repoRoot: string): Promise<{ indexedDocs: num
       const text = await readText(absolutePath);
       const title = findFirstHeading(text) || inferTitleFromPath(repoPath);
       const headings = extractHeadings(text).join("\n");
-      const type = repoPath.startsWith("raw/normalized/") ? "normalized-artifact" : "raw-artifact";
+      const type = repoPath.startsWith("raw/normalized/")
+        ? "normalized-artifact"
+        : repoPath.startsWith("proposals/")
+          ? "proposal"
+          : "raw-artifact";
       const updatedAt = (await stat(absolutePath)).mtime.toISOString().replace(/\.\d{3}Z$/, "Z");
       const result = insertDoc.run(repoPath, title, headings, text, "raw", type, "", "", updatedAt);
       insertFts.run(result.lastInsertRowid, repoPath, title, headings, text, type, "", "");
@@ -1175,11 +1289,30 @@ export async function rebuildIndex(repoRoot: string): Promise<{ indexedDocs: num
     }
 
     const lastReindexAt = isoNow();
+    const indexedCommit = await runCommandAsync(["git", "rev-parse", "HEAD"], repoRoot, false) || "";
     db.prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`).run("last_reindex_at", lastReindexAt);
     db.prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`).run("indexed_docs", String(indexedDocs));
+    db.prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`).run("indexed_commit", indexedCommit);
+    const integrity = db.query("PRAGMA integrity_check").get() as Record<string, unknown> | null;
+    if (!integrity || integrity.integrity_check !== "ok") {
+      throw new Error(`Search index integrity check failed: ${JSON.stringify(integrity)}`);
+    }
+    db.close();
+    checkpointExistingIndex();
+    await removeSqliteSidecars(paths.searchDbPath);
+    await rename(tempDbPath, paths.searchDbPath);
+    committed = true;
     return { indexedDocs, lastReindexAt };
   } finally {
-    db.close();
+    try {
+      db.close();
+    } catch {
+      // Already closed after a successful integrity check.
+    }
+    if (!committed) {
+      await rm(tempDbPath, { force: true }).catch(() => undefined);
+      await removeSqliteSidecars(tempDbPath);
+    }
   }
 }
 
@@ -1192,11 +1325,11 @@ function openDb(repoRoot: string): Database {
 }
 
 function ftsQuery(query: string): string {
-  return query
-    .trim()
-    .split(/\s+/)
-    .map((part) => `${part.replace(/"/g, '""')}*`)
-    .join(" ");
+  const terms = Array.from(query.matchAll(/[\p{L}\p{N}_]+/gu))
+    .map((match) => match[0].trim())
+    .filter((part) => part.length >= 2)
+    .slice(0, 12);
+  return terms.map((part) => `"${part.replace(/"/g, '""')}"*`).join(" ");
 }
 
 export async function searchIndex(
@@ -1205,6 +1338,12 @@ export async function searchIndex(
   scope: "wiki" | "raw" | "all" = "all",
   limit = 10
 ): Promise<SearchResult[]> {
+  const normalizedLimit = Math.min(Math.max(Math.trunc(limit) || 10, 1), 50);
+  const normalizedQuery = ftsQuery(query);
+  if (!normalizedQuery) {
+    return [];
+  }
+
   const db = openDb(repoRoot);
   try {
     const stmt = db.prepare(`
@@ -1215,7 +1354,7 @@ export async function searchIndex(
         d.type AS type,
         d.tags AS tags,
         d.source_ids AS source_ids,
-        snippet(documents_fts, 3, '<mark>', '</mark>', ' ... ', 20) AS snippet,
+        snippet(documents_fts, 3, char(57344), char(57345), ' ... ', 20) AS snippet,
         bm25(documents_fts, 10.0, 5.0, 3.0, 1.0, 1.0, 1.0, 1.0) AS score
       FROM documents_fts
       JOIN documents d ON d.id = documents_fts.rowid
@@ -1223,25 +1362,32 @@ export async function searchIndex(
       ORDER BY CASE WHEN d.scope = 'wiki' THEN 0 ELSE 1 END, score
       LIMIT ?
     `);
-    return stmt
-      .all(ftsQuery(query), scope, scope, limit)
-      .map((row) => row as Record<string, string | number>)
-      .map((row) => ({
-        path: String(row.path),
-        title: String(row.title),
-        scope: String(row.scope) as "wiki" | "raw",
-        type: String(row.type),
-        tags: String(row.tags || "")
-          .split(",")
-          .map((item) => item.trim())
-          .filter(Boolean),
-        source_ids: String(row.source_ids || "")
-          .split(",")
-          .map((item) => item.trim())
-          .filter(Boolean),
-        snippet: String(row.snippet || ""),
-        score: Number(row.score || 0)
-      }));
+    try {
+      return stmt
+        .all(normalizedQuery, scope, scope, normalizedLimit)
+        .map((row) => row as Record<string, string | number>)
+        .map((row) => ({
+          path: String(row.path),
+          title: String(row.title),
+          scope: String(row.scope) as "wiki" | "raw",
+          type: String(row.type),
+          tags: String(row.tags || "")
+            .split(",")
+            .map((item) => item.trim())
+            .filter(Boolean),
+          source_ids: String(row.source_ids || "")
+            .split(",")
+            .map((item) => item.trim())
+            .filter(Boolean),
+          snippet: safeHighlightedSnippet(String(row.snippet || "")),
+          score: Number(row.score || 0)
+        }));
+    } catch (error) {
+      if (error instanceof Error && /fts|match|syntax/i.test(error.message)) {
+        return [];
+      }
+      throw error;
+    }
   } finally {
     db.close();
   }
@@ -1264,6 +1410,7 @@ export async function getHealth(repoRoot: string): Promise<HealthStatus> {
   const paths = getRepoPaths(repoRoot);
   let indexedDocs = 0;
   let lastReindexAt: string | null = null;
+  let indexedCommit: string | null = null;
   if (existsSync(paths.searchDbPath)) {
     const db = new Database(paths.searchDbPath, { readonly: true });
     try {
@@ -1273,15 +1420,19 @@ export async function getHealth(repoRoot: string): Promise<HealthStatus> {
       const reindex = db.prepare(`SELECT value FROM meta WHERE key = 'last_reindex_at'`).get() as
         | { value: string }
         | undefined;
+      const commitRow = db.prepare(`SELECT value FROM meta WHERE key = 'indexed_commit'`).get() as
+        | { value: string }
+        | undefined;
       indexedDocs = Number(indexed?.value || 0);
       lastReindexAt = reindex?.value || null;
+      indexedCommit = commitRow?.value || null;
     } finally {
       db.close();
     }
   }
   let commit: string | null = null;
   try {
-    commit = runCommand(["git", "rev-parse", "HEAD"], repoRoot, false) || null;
+    commit = await runCommandAsync(["git", "rev-parse", "HEAD"], repoRoot, false) || null;
   } catch {
     commit = null;
   }
@@ -1290,6 +1441,7 @@ export async function getHealth(repoRoot: string): Promise<HealthStatus> {
     commit,
     indexed_docs: indexedDocs,
     last_reindex_at: lastReindexAt,
+    indexed_commit: indexedCommit,
     repo_root: repoRoot
   };
 }
@@ -1699,20 +1851,52 @@ export async function lintWiki(repoRoot: string): Promise<LintResult> {
 export async function withRepoLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
   const { lockDir } = getRepoPaths(repoRoot);
   const startedAt = Date.now();
+  const lockToken = randomUUID();
+  const lockHostname = hostname();
+  const lockStartedAt = isoNow();
+  const ownerPath = join(lockDir, `owner-${lockToken}.json`);
+  const tokenPath = join(lockDir, `release-${lockToken}`);
+  const ownerRecord = () => ({
+    token: lockToken,
+    pid: process.pid,
+    hostname: lockHostname,
+    started_at: lockStartedAt,
+    repo_root: repoRoot
+  });
+  const writeOwnerUnsafe = async () => writeText(ownerPath, `${JSON.stringify(ownerRecord(), null, 2)}\n`);
+  const readOwner = async (): Promise<Record<string, unknown> | null> => {
+    try {
+      return JSON.parse(await readText(ownerPath)) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  };
   while (true) {
     try {
       await mkdir(lockDir);
+      try {
+        await writeOwnerUnsafe();
+        await writeText(tokenPath, lockToken);
+      } catch (error) {
+        await rm(lockDir, { recursive: true, force: true });
+        throw error;
+      }
       break;
     } catch (error) {
-      if (existsSync(lockDir)) {
-        const info = await stat(lockDir);
-        if (Date.now() - info.mtimeMs > 60_000) {
-          await rm(lockDir, { recursive: true, force: true });
-          continue;
-        }
-      }
       if (Date.now() - startedAt > 30_000) {
-        throw new Error(`Timed out waiting for shared-brain repo lock at ${lockDir}`);
+        let owner = "unknown owner";
+        if (existsSync(lockDir)) {
+          const entries = await readdir(lockDir).catch(() => []);
+          const ownerEntry = entries.find((entry) => entry.startsWith("owner-") && entry.endsWith(".json"));
+          if (ownerEntry) {
+            owner = (await readText(join(lockDir, ownerEntry))).trim().slice(0, 500) || owner;
+          }
+          const info = await stat(lockDir);
+          if (!ownerEntry) {
+            owner = `owner metadata missing; lock mtime=${info.mtime.toISOString()}`;
+          }
+        }
+        throw new Error(`Timed out waiting for shared-brain repo lock at ${lockDir}; ${owner}. Brainstack does not auto-break repo locks; inspect the owner before removing a stale lock manually.`);
       }
       await Bun.sleep(200);
     }
@@ -1720,18 +1904,23 @@ export async function withRepoLock<T>(repoRoot: string, fn: () => Promise<T>): P
   try {
     return await fn();
   } finally {
-    await rm(lockDir, { recursive: true, force: true });
+    const owner = await readOwner();
+    if (owner?.token === lockToken && existsSync(tokenPath)) {
+      await rm(tokenPath, { force: true }).catch(() => undefined);
+      await rm(ownerPath, { force: true }).catch(() => undefined);
+      await rmdir(lockDir).catch(() => undefined);
+    }
   }
 }
 
 export async function ensureGitIdentity(repoRoot: string): Promise<void> {
-  const name = runCommand(["git", "config", "--get", "user.name"], repoRoot, false);
-  const email = runCommand(["git", "config", "--get", "user.email"], repoRoot, false);
+  const name = await runCommandAsync(["git", "config", "--get", "user.name"], repoRoot, false);
+  const email = await runCommandAsync(["git", "config", "--get", "user.email"], repoRoot, false);
   if (!name) {
-    runCommand(["git", "config", "user.name", "Shared Brain Organizer"], repoRoot);
+    await runCommandAsync(["git", "config", "user.name", "Shared Brain Organizer"], repoRoot);
   }
   if (!email) {
-    runCommand(["git", "config", "user.email", "shared-brain@brainstack.local"], repoRoot);
+    await runCommandAsync(["git", "config", "user.email", "shared-brain@brainstack.local"], repoRoot);
   }
 }
 
@@ -1741,14 +1930,14 @@ export async function gitCommitAndPush(repoRoot: string, touchedFiles: string[],
   if (!uniqueFiles.length) {
     return null;
   }
-  runCommand(["git", "add", "-A", "--", ...uniqueFiles], repoRoot);
-  const changed = runCommand(["git", "status", "--porcelain", "--", ...uniqueFiles], repoRoot, false);
+  await runCommandAsync(["git", "add", "-A", "--", ...uniqueFiles], repoRoot);
+  const changed = await runCommandAsync(["git", "status", "--porcelain", "--", ...uniqueFiles], repoRoot, false);
   if (!changed.trim()) {
     return null;
   }
-  runCommand(["git", "commit", "-m", message], repoRoot);
-  const commit = runCommand(["git", "rev-parse", "HEAD"], repoRoot);
-  runCommand(["git", "push", "origin", "HEAD:main"], repoRoot);
+  await runCommandAsync(["git", "commit", "-m", message], repoRoot);
+  const commit = await runCommandAsync(["git", "rev-parse", "HEAD"], repoRoot);
+  await runCommandAsync(["git", "push", "origin", "HEAD:main"], repoRoot);
   return commit;
 }
 

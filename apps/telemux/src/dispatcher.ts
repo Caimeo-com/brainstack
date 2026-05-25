@@ -25,6 +25,7 @@ import type { FactoryConfig } from "./config";
 import type { TelegramBot, TelegramTarget } from "./telegram";
 
 export type DispatchMode = "run" | "resume" | "loop";
+const MAX_QUEUED_CONTEXTS = 64;
 
 export interface DispatchResponse {
   accepted: boolean;
@@ -34,6 +35,7 @@ export interface DispatchResponse {
 export interface DispatchOptions {
   notifyAccepted?: boolean;
   notifyCompaction?: boolean;
+  allowQueue?: boolean;
   rawPrompt?: boolean;
   telegramInput?: TelegramInboundMessageInput | null;
   modelOverride?: string | null;
@@ -183,8 +185,17 @@ interface PreparedTelegramInput {
   imagePaths: string[];
 }
 
+interface QueuedTurn {
+  mode: DispatchMode;
+  contextSlug: string;
+  instruction: string;
+  replyTarget: TelegramTarget;
+  options: DispatchOptions;
+}
+
 export class Dispatcher {
   private readonly activeJobs = new Map<string, Promise<void>>();
+  private readonly queuedTurns = new Map<string, QueuedTurn[]>();
 
   constructor(
     private readonly config: FactoryConfig,
@@ -197,6 +208,61 @@ export class Dispatcher {
 
   isActive(slug: string): boolean {
     return this.activeJobs.has(slug);
+  }
+
+  private queueTurn(turn: QueuedTurn): boolean {
+    const existing = this.queuedTurns.get(turn.contextSlug) || [];
+    if (!existing.length && this.queuedTurns.size >= MAX_QUEUED_CONTEXTS) {
+      return false;
+    }
+    if (existing.length >= 5) {
+      return false;
+    }
+    existing.push(turn);
+    this.queuedTurns.set(turn.contextSlug, existing);
+    return true;
+  }
+
+  private startNextQueuedTurn(slug: string): void {
+    try {
+      const queue = this.queuedTurns.get(slug);
+      const next = queue?.shift();
+      if (!next) {
+        this.queuedTurns.delete(slug);
+        return;
+      }
+      if (queue && queue.length > 0) {
+        this.queuedTurns.set(slug, queue);
+      } else {
+        this.queuedTurns.delete(slug);
+      }
+
+      const context = this.db.getContextBySlug(next.contextSlug);
+      if (!context || context.state === "archived") {
+        void this.telegram.sendText(next.replyTarget, `${next.contextSlug} queued turn was skipped because the context is no longer active.`);
+        this.startNextQueuedTurn(slug);
+        return;
+      }
+
+      void this.dispatch(next.mode, context, next.instruction, next.replyTarget, {
+        ...next.options,
+        notifyAccepted: false
+      })
+        .then((response) => {
+          if (!response.accepted && response.message) {
+            return this.telegram.sendText(next.replyTarget, response.message);
+          }
+        })
+        .catch((error) => {
+          console.error(`queued turn failed to start for ${next.contextSlug}`, error);
+          void this.telegram.sendText(
+            next.replyTarget,
+            `${next.contextSlug} queued turn failed to start: ${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+    } catch (error) {
+      console.error(`queued turn failed to start for ${slug}`, error);
+    }
   }
 
   async withContextLock<T>(context: ContextRecord, run: () => Promise<T>): Promise<T> {
@@ -217,6 +283,7 @@ export class Dispatcher {
         this.activeJobs.delete(context.slug);
       }
       releaseLock();
+      this.startNextQueuedTurn(context.slug);
     }
   }
 
@@ -243,9 +310,24 @@ export class Dispatcher {
     }
 
     if (this.activeJobs.has(context.slug)) {
+      if (options.allowQueue === false) {
+        return {
+          accepted: false,
+          message: `${context.slug} already has an active job. Use /topicinfo or /tail.`
+        };
+      }
+      const queued = this.queueTurn({
+        mode,
+        contextSlug: context.slug,
+        instruction: trimmedInstruction,
+        replyTarget,
+        options
+      });
       return {
-        accepted: false,
-        message: `${context.slug} already has an active job. Use /topicinfo or /tail.`
+        accepted: queued,
+        message: queued
+          ? `${context.slug} is busy; queued this turn in memory for after the current run.`
+          : `${context.slug} already has an active job and its turn queue is full. Use /topicinfo or /tail.`
       };
     }
 
@@ -293,6 +375,7 @@ export class Dispatcher {
         this.activeJobs.delete(savedContext.slug);
       }
       releaseLock();
+      this.startNextQueuedTurn(savedContext.slug);
     });
 
     return {

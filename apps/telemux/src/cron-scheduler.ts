@@ -241,6 +241,7 @@ export class CronScheduler {
       },
       {
         notifyAccepted: false,
+        allowQueue: false,
         modelOverride: claimed.modelOverride,
         reasoningEffortOverride: claimed.reasoningEffortOverride,
         sourceLabel: `manual cron run ${claimed.id}`
@@ -499,6 +500,7 @@ export class CronScheduler {
       },
       {
         notifyAccepted: false,
+        allowQueue: false,
         modelOverride: claimed.modelOverride,
         reasoningEffortOverride: claimed.reasoningEffortOverride,
         sourceLabel: `scheduled cron ${claimed.id}`

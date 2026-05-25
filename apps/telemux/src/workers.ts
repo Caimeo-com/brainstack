@@ -19,6 +19,7 @@ export interface WorkerExecResult {
 
 const UPDATE_CHECK_CONCURRENCY = 4;
 const UPDATE_CHECK_MAX_TARGETS = 32;
+const CONTROL_EVENT_BUFFER_MAX_CHARS = 1024 * 1024;
 
 export interface BootstrapResult extends WorkerExecResult {
   kind: ContextKind;
@@ -204,6 +205,26 @@ function parseSessionId(output: string): string | null {
   }
 
   return null;
+}
+
+function appendBoundedOutput(current: string, chunk: string, maxBytes: number): string {
+  if (maxBytes <= 0) {
+    return "";
+  }
+  const combined = `${current}${chunk}`;
+  if (Buffer.byteLength(combined, "utf8") <= maxBytes) {
+    return combined;
+  }
+
+  const prefix = `[output truncated to last ${maxBytes} bytes]\n`;
+  const tailBudget = Math.max(0, maxBytes - Buffer.byteLength(prefix, "utf8"));
+  let start = Math.max(0, combined.length - maxBytes);
+  let tail = combined.slice(start);
+  while (Buffer.byteLength(tail, "utf8") > tailBudget && start < combined.length) {
+    start += 1;
+    tail = combined.slice(start);
+  }
+  return `${prefix}${tail}`;
 }
 
 function requiredHarnessFlags(harness: HarnessName): string[] {
@@ -723,25 +744,54 @@ wait "$harness_pid"
     }
 
     let stdoutBuffer = "";
-    let stdoutLineBuffer = "";
+    let stdoutControlLineBuffer = "";
     let seenSessionId: string | null = null;
     let seenCompaction = false;
+    const consumeControlEvents = async (chunk: string) => {
+      stdoutControlLineBuffer += chunk;
+      const bufferedDetected = parseSessionId(stdoutControlLineBuffer);
+      if (bufferedDetected && bufferedDetected !== seenSessionId) {
+        seenSessionId = bufferedDetected;
+        await options.onSessionId?.(bufferedDetected);
+      }
+      const lines = stdoutControlLineBuffer.split(/\r?\n/);
+      stdoutControlLineBuffer = lines.pop() || "";
+      if (stdoutControlLineBuffer.length > CONTROL_EVENT_BUFFER_MAX_CHARS) {
+        stdoutControlLineBuffer = stdoutControlLineBuffer.slice(-CONTROL_EVENT_BUFFER_MAX_CHARS);
+      }
+      for (const line of lines) {
+        const detected = parseSessionId(line);
+        if (detected && detected !== seenSessionId) {
+          seenSessionId = detected;
+          await options.onSessionId?.(detected);
+        }
+        if (!seenCompaction && lineLooksLikeCompactionEvent(line)) {
+          seenCompaction = true;
+          await options.onCompaction?.();
+        }
+      }
+    };
     const result = await this.runWorkerScript(worker, script, logPath, this.config.workerRunTimeoutSeconds, async (chunk) => {
-      stdoutBuffer += chunk;
-      const detected = parseSessionId(stdoutBuffer);
+      stdoutBuffer = appendBoundedOutput(stdoutBuffer, chunk, this.config.workerCaptureMaxBytes);
+      await consumeControlEvents(chunk);
+      const detected = parseSessionId(chunk);
       if (detected && detected !== seenSessionId) {
         seenSessionId = detected;
         await options.onSessionId?.(detected);
       }
-      stdoutLineBuffer += chunk;
-      const lines = stdoutLineBuffer.split(/\r?\n/);
-      stdoutLineBuffer = lines.pop() || "";
-      if (!seenCompaction && lines.some(lineLooksLikeCompactionEvent)) {
+      if (!seenCompaction && lineLooksLikeCompactionEvent(chunk)) {
         seenCompaction = true;
         await options.onCompaction?.();
       }
     });
-    if (!seenCompaction && lineLooksLikeCompactionEvent(stdoutLineBuffer)) {
+    if (stdoutControlLineBuffer) {
+      const detected = parseSessionId(stdoutControlLineBuffer);
+      if (detected && detected !== seenSessionId) {
+        seenSessionId = detected;
+        await options.onSessionId?.(detected);
+      }
+    }
+    if (!seenCompaction && lineLooksLikeCompactionEvent(stdoutControlLineBuffer)) {
       seenCompaction = true;
       await options.onCompaction?.();
     }
@@ -1303,7 +1353,8 @@ PY
 fi
 `;
 
-    const result = await this.runWorkerScript(worker, script, undefined, 20);
+    const artifactCaptureMaxBytes = Math.ceil(maxBytes * 1.5) + 256 * 1024;
+    const result = await this.runWorkerScript(worker, script, undefined, 20, undefined, artifactCaptureMaxBytes);
     if (!result.ok) {
       throw new Error(result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`);
     }
@@ -1758,7 +1809,8 @@ printf 'BRANCH=%s\\n' "$branch_name"
     script: string,
     logPath?: string,
     timeoutSeconds?: number,
-    onStdoutChunk?: (chunk: string) => Promise<void> | void
+    onStdoutChunk?: (chunk: string) => Promise<void> | void,
+    captureMaxBytes = this.config.workerCaptureMaxBytes
   ): Promise<WorkerExecResult> {
     const scriptToRun = worker.transport === "local" ? script : `${workerUserPathPrelude()}\n${script}`;
     switch (worker.transport) {
@@ -1770,7 +1822,8 @@ printf 'BRANCH=%s\\n' "$branch_name"
           "local",
           logPath,
           timeoutSeconds,
-          onStdoutChunk
+          onStdoutChunk,
+          captureMaxBytes
         );
       case "ssh":
         return this.spawnAndCapture(
@@ -1794,7 +1847,8 @@ printf 'BRANCH=%s\\n' "$branch_name"
           "ssh",
           logPath,
           timeoutSeconds,
-          onStdoutChunk
+          onStdoutChunk,
+          captureMaxBytes
         );
       case "tailscale-ssh":
         return this.spawnAndCapture(
@@ -1804,7 +1858,8 @@ printf 'BRANCH=%s\\n' "$branch_name"
           "tailscale-ssh",
           logPath,
           timeoutSeconds,
-          onStdoutChunk
+          onStdoutChunk,
+          captureMaxBytes
         );
     }
   }
@@ -1816,7 +1871,8 @@ printf 'BRANCH=%s\\n' "$branch_name"
     transport: string,
     logPath?: string,
     timeoutSeconds?: number,
-    onStdoutChunk?: (chunk: string) => Promise<void> | void
+    onStdoutChunk?: (chunk: string) => Promise<void> | void,
+    captureMaxBytes = this.config.workerCaptureMaxBytes
   ): Promise<WorkerExecResult> {
     const startedAt = Date.now();
     const fullArgs = args;
@@ -1843,8 +1899,8 @@ printf 'BRANCH=%s\\n' "$branch_name"
     proc.stdin.write(script);
     proc.stdin.end();
 
-    const stdoutPromise = this.collectStream(proc.stdout, logPath, "", onStdoutChunk);
-    const stderrPromise = this.collectStream(proc.stderr, logPath, "[stderr] ");
+    const stdoutPromise = this.collectStream(proc.stdout, logPath, "", onStdoutChunk, captureMaxBytes);
+    const stderrPromise = this.collectStream(proc.stderr, logPath, "[stderr] ", undefined, captureMaxBytes);
 
     const rawExitCode = await proc.exited;
     if (killTimer) {
@@ -1876,7 +1932,8 @@ printf 'BRANCH=%s\\n' "$branch_name"
     stream: ReadableStream<Uint8Array> | null | undefined,
     logPath: string | undefined,
     prefix: string,
-    onChunk?: (chunk: string) => Promise<void> | void
+    onChunk?: (chunk: string) => Promise<void> | void,
+    captureMaxBytes = this.config.workerCaptureMaxBytes
   ): Promise<string> {
     if (!stream) {
       return "";
@@ -1893,7 +1950,7 @@ printf 'BRANCH=%s\\n' "$branch_name"
       }
 
       const chunk = decoder.decode(value, { stream: true });
-      output += chunk;
+      output = appendBoundedOutput(output, chunk, captureMaxBytes);
 
       if (logPath) {
         await appendFile(logPath, prefix ? `${prefix}${chunk}` : chunk);
@@ -1906,7 +1963,7 @@ printf 'BRANCH=%s\\n' "$branch_name"
 
     const tail = decoder.decode();
     if (tail) {
-      output += tail;
+      output = appendBoundedOutput(output, tail, captureMaxBytes);
       if (logPath) {
         await appendFile(logPath, prefix ? `${prefix}${tail}` : tail);
       }

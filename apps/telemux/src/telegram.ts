@@ -246,6 +246,14 @@ export class TelegramBot {
     return Boolean(this.config.telegramBotToken);
   }
 
+  private apiTimeoutMs(): number {
+    return this.config.telegramApiTimeoutMs || 15_000;
+  }
+
+  private fileTransferTimeoutMs(): number {
+    return this.config.telegramFileTransferTimeoutMs || 60_000;
+  }
+
   async sendText(target: TelegramTarget, text: string): Promise<void> {
     if (!this.isConfigured()) {
       return;
@@ -315,7 +323,9 @@ export class TelegramBot {
 
     let response: Response;
     try {
-      response = await fetch(`https://api.telegram.org/file/bot${this.config.telegramBotToken}/${filePath}`);
+      response = await fetch(`https://api.telegram.org/file/bot${this.config.telegramBotToken}/${filePath}`, {
+        signal: AbortSignal.timeout(this.fileTransferTimeoutMs())
+      });
     } catch (error) {
       throw new Error(`telegram file download request failed: ${compactError(error)}`);
     }
@@ -451,11 +461,15 @@ export class TelegramBot {
 
     while (this.running) {
       try {
-        const updates = await this.api<TelegramUpdate[]>("getUpdates", {
-          offset: nextOffset > 0 ? nextOffset + 1 : undefined,
-          timeout: this.config.telegramPollTimeoutSeconds,
-          allowed_updates: ["message"]
-        });
+        const updates = await this.api<TelegramUpdate[]>(
+          "getUpdates",
+          {
+            offset: nextOffset > 0 ? nextOffset + 1 : undefined,
+            timeout: this.config.telegramPollTimeoutSeconds,
+            allowed_updates: ["message"]
+          },
+          this.config.telegramPollTimeoutSeconds * 1000 + 5_000
+        );
 
         for (const update of updates) {
           nextOffset = update.update_id;
@@ -504,7 +518,7 @@ export class TelegramBot {
     return knownChatIds.length === 1 ? knownChatIds[0] : null;
   }
 
-  private async api<T>(method: string, payload: Record<string, unknown>): Promise<T> {
+  private async api<T>(method: string, payload: Record<string, unknown>, timeoutMs = this.apiTimeoutMs()): Promise<T> {
     let response: Response;
     try {
       response = await fetch(`https://api.telegram.org/bot${this.config.telegramBotToken}/${method}`, {
@@ -512,7 +526,8 @@ export class TelegramBot {
         headers: {
           "content-type": "application/json"
         },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(timeoutMs)
       });
     } catch (error) {
       throw new Error(`telegram api ${method} request failed: ${compactError(error)}`);
@@ -526,7 +541,8 @@ export class TelegramBot {
     try {
       response = await fetch(`https://api.telegram.org/bot${this.config.telegramBotToken}/${method}`, {
         method: "POST",
-        body: payload
+        body: payload,
+        signal: AbortSignal.timeout(this.fileTransferTimeoutMs())
       });
     } catch (error) {
       throw new Error(`telegram api ${method} multipart request failed: ${compactError(error)}`);

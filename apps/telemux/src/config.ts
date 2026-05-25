@@ -39,8 +39,11 @@ export interface FactoryConfig {
   telegramControlChatId: number | null;
   allowedTelegramUserId: number;
   telegramPollTimeoutSeconds: number;
+  telegramApiTimeoutMs: number;
+  telegramFileTransferTimeoutMs: number;
   cronPollIntervalSeconds: number;
   workerRunTimeoutSeconds: number;
+  workerCaptureMaxBytes: number;
   localMachine: string;
   workersFilePath?: string | null;
   workersFileExplicit?: boolean;
@@ -78,7 +81,7 @@ function readNumber(env: NodeJS.ProcessEnv, name: string, fallback: number): num
   }
 
   const value = Number(raw);
-  return Number.isFinite(value) ? value : fallback;
+  return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 function readOptionalNumber(env: NodeJS.ProcessEnv, name: string): number | null {
@@ -282,8 +285,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
     telegramControlChatId: readOptionalNumber(env, "FACTORY_TELEGRAM_CONTROL_CHAT_ID"),
     allowedTelegramUserId: readNumber(env, "FACTORY_ALLOWED_TELEGRAM_USER_ID", 0),
     telegramPollTimeoutSeconds: readNumber(env, "FACTORY_TELEGRAM_POLL_TIMEOUT_SECONDS", 30),
+    telegramApiTimeoutMs: readNumber(env, "FACTORY_TELEGRAM_API_TIMEOUT_MS", 15_000),
+    telegramFileTransferTimeoutMs: readNumber(env, "FACTORY_TELEGRAM_FILE_TRANSFER_TIMEOUT_MS", 60_000),
     cronPollIntervalSeconds: readNumber(env, "FACTORY_CRON_POLL_INTERVAL_SECONDS", 30),
     workerRunTimeoutSeconds: readNumber(env, "FACTORY_WORKER_RUN_TIMEOUT_SECONDS", 21600),
+    workerCaptureMaxBytes: readNumber(env, "FACTORY_WORKER_CAPTURE_MAX_BYTES", 256 * 1024),
     localMachine,
     workersFilePath: workerSource.path,
     workersFileExplicit: workerSource.explicit,

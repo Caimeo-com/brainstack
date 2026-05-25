@@ -247,7 +247,7 @@ test("sendChatAction targets the correct Telegram thread", async () => {
 });
 
 test("getFile requests Telegram file metadata and downloadFile fetches the file bytes", async () => {
-  const calls: Array<{ url: string; method: string; body?: string }> = [];
+  const calls: Array<{ url: string; method: string; body?: string; hasSignal: boolean }> = [];
   const originalFetch = globalThis.fetch;
 
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -255,7 +255,8 @@ test("getFile requests Telegram file metadata and downloadFile fetches the file 
     calls.push({
       url,
       method: init?.method || "GET",
-      body: typeof init?.body === "string" ? init.body : undefined
+      body: typeof init?.body === "string" ? init.body : undefined,
+      hasSignal: Boolean(init?.signal)
     });
 
     if (url.endsWith("/getFile")) {
@@ -320,8 +321,10 @@ test("getFile requests Telegram file metadata and downloadFile fetches the file 
     expect(calls[0]?.url).toBe("https://api.telegram.org/bottest-token/getFile");
     expect(calls[0]?.method).toBe("POST");
     expect(calls[0]?.body).toContain("\"file_id\":\"abc123\"");
+    expect(calls[0]?.hasSignal).toBe(true);
     expect(calls[1]?.url).toBe("https://api.telegram.org/file/bottest-token/photos/test.jpg");
     expect(calls[1]?.method).toBe("GET");
+    expect(calls[1]?.hasSignal).toBe(true);
 
     globalThis.fetch = (async () =>
       new Response(new TextEncoder().encode("large body"), {
