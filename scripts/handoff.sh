@@ -264,6 +264,9 @@ bun test packages/brainctl/test/brainctl.test.ts -t "braind escapes search snipp
 bun test packages/brainctl/test/brainctl.test.ts -t "worker SSH trust" \
   > "$bundle_dir/command-outputs/ssh-trust-lock-recovery-test.txt" 2>&1
 
+bun test apps/telemux/test/phase1.test.ts -t "SSH accept-new trust mode" \
+  > "$bundle_dir/command-outputs/ssh-accept-new-dispatch-refusal-test.txt" 2>&1
+
 bun test packages/brainctl/test/brainctl.test.ts -t "outbox moves repeated HTTP 425" \
   > "$bundle_dir/command-outputs/outbox-425-terminal-test.txt" 2>&1
 
@@ -309,7 +312,7 @@ cp "$bundle_dir/command-outputs/multi-brain-profiles-test.txt" "$bundle_dir/comm
 cp "$bundle_dir/command-outputs/multi-brain-profiles-test.txt" "$bundle_dir/command-outputs/remember-company-default.txt"
 cp "$bundle_dir/command-outputs/multi-brain-profiles-test.txt" "$bundle_dir/command-outputs/remember-cross-brain-warning.txt"
 cp "$bundle_dir/command-outputs/bootstrap-client-custom-path.txt" "$bundle_dir/command-outputs/harness-guidance-fresh.txt"
-cp "$bundle_dir/command-outputs/harness-guidance-existing-file.txt" "$bundle_dir/command-outputs/doctor-harness-guidance.txt"
+cp "$bundle_dir/command-outputs/brainctl-doctor-workers.txt" "$bundle_dir/command-outputs/doctor-harness-guidance.txt"
 cp "$bundle_dir/command-outputs/outbox-hardening-test.txt" "$bundle_dir/command-outputs/outbox-permissions.txt"
 cp "$bundle_dir/command-outputs/outbox-hardening-test.txt" "$bundle_dir/command-outputs/outbox-corrupt-item.txt"
 cp "$bundle_dir/command-outputs/outbox-large-payload-test.txt" "$bundle_dir/command-outputs/outbox-large-compressed.txt"
@@ -524,18 +527,19 @@ cat > "$bundle_dir/CLAIMS_AND_PROOF.md" <<'EOF'
 | Worker harness execution is override-capable and path-neutral for remote workers. | `command-outputs/worker-harness-path-neutral-test.txt` |
 | Stuck idempotent writes graduate to explicit operator review instead of endless retry. | `command-outputs/idempotency-recovery-test.txt` |
 | Worker SSH trust defaults to pinned mode and lock recovery is token-guarded. | `command-outputs/ssh-trust-lock-recovery-test.txt` |
+| Telemux dispatch refuses bootstrap-only SSH `accept-new` mode unless explicitly enabled. | `command-outputs/ssh-accept-new-dispatch-refusal-test.txt` |
 | Repeated HTTP 425 outbox flushes become terminal operator-review failures. | `command-outputs/outbox-425-terminal-test.txt` |
 | `brainctl doctor` explains trusted-tailnet posture and fails accidental non-loopback binds. | `command-outputs/security-posture-doctor-test.txt` |
 | Project-triggered multi-brain context supports profiles, clone/pull, allow rules, source labels, and cross-brain refusal. | `command-outputs/multi-brain-profiles-test.txt` |
 | Repo-local `.brainstack.yaml` cannot point reads/clones at arbitrary local paths unless those paths are trusted in profiles. | `command-outputs/multi-brain-repo-local-safety-test.txt` |
-| Multi-brain context/search/remember proof files map one-to-one to the validation checklist. | `command-outputs/context-default-repo.txt`, `command-outputs/context-project-first-noninteractive.txt`, `command-outputs/context-project-after-approval.txt`, `command-outputs/search-source-labelled.txt`, `command-outputs/remember-personal-default.txt`, `command-outputs/remember-company-default.txt`, `command-outputs/remember-cross-brain-warning.txt` |
-| Harness bootstrap guidance uses repo-scoped `brainctl context/search/remember` and does not silently overwrite existing files. | `command-outputs/harness-guidance-fresh.txt`, `command-outputs/harness-guidance-existing-file.txt`, `command-outputs/doctor-harness-guidance.txt` |
+| Multi-brain context/search/remember checklist aliases are backed by the combined multi-brain regression transcript. | `command-outputs/context-default-repo.txt`, `command-outputs/context-project-first-noninteractive.txt`, `command-outputs/context-project-after-approval.txt`, `command-outputs/search-source-labelled.txt`, `command-outputs/remember-personal-default.txt`, `command-outputs/remember-company-default.txt`, `command-outputs/remember-cross-brain-warning.txt` |
+| Harness bootstrap guidance uses repo-scoped `brainctl context/search/remember`, does not silently overwrite existing files, and doctor reports guidance state. | `command-outputs/harness-guidance-fresh.txt`, `command-outputs/harness-guidance-existing-file.txt`, `command-outputs/doctor-harness-guidance.txt` |
 | Slow URL import preparation does not occupy the serialized repo mutation slot. | `command-outputs/write-gate-narrowing-test.txt` |
 | Outbox permissions, corrupt entries, and symlink namespace handling are covered. | `command-outputs/outbox-hardening-test.txt` |
-| Outbox checklist proof files cover permissions, corrupt items, large compressed payloads, hard-cap refusal, and log redaction/no raw payload output. | `command-outputs/outbox-permissions.txt`, `command-outputs/outbox-corrupt-item.txt`, `command-outputs/outbox-large-compressed.txt`, `command-outputs/outbox-hard-cap-refusal.txt`, `command-outputs/outbox-log-redaction-proof.txt` |
+| Outbox checklist aliases are backed by the focused outbox hardening and large-payload transcripts. | `command-outputs/outbox-permissions.txt`, `command-outputs/outbox-corrupt-item.txt`, `command-outputs/outbox-large-compressed.txt`, `command-outputs/outbox-hard-cap-refusal.txt`, `command-outputs/outbox-log-redaction-proof.txt` |
 | Large outbox payloads warn/compress and over-cap payloads fail rather than truncate. | `command-outputs/outbox-large-payload-test.txt` |
-| Idempotency checklist proof files cover preflight retry, post-side-effect review, and duplicate success replay. | `command-outputs/idempotency-preflight-retry.txt`, `command-outputs/idempotency-post-side-effect-review.txt`, `command-outputs/idempotency-duplicate-success.txt` |
-| Search freshness warnings are surfaced in CLI and UI-related coverage. | `command-outputs/search-stale-cli.txt`, `command-outputs/search-stale-ui-snippet.txt`, `command-outputs/search-fresh-after-reindex.txt` |
+| Idempotency checklist aliases are backed by focused preflight/recovery/content-safety transcripts. | `command-outputs/idempotency-preflight-retry.txt`, `command-outputs/idempotency-post-side-effect-review.txt`, `command-outputs/idempotency-duplicate-success.txt` |
+| Search freshness warnings are surfaced in CLI and UI-related combined coverage. | `command-outputs/search-stale-cli.txt`, `command-outputs/search-stale-ui-snippet.txt`, `command-outputs/search-fresh-after-reindex.txt` |
 | Durable Telegram queued-turn restart behavior is covered. | `command-outputs/telegram-durable-queue-test.txt` |
 | Worker PATH cache behavior is covered with the same fingerprint contract as doctor/dispatch. | `command-outputs/worker-path-cache.txt` |
 | Durable telemux SQLite state is private even under permissive process umask. | `command-outputs/telemux-private-state-test.txt` |
@@ -574,6 +578,8 @@ cat <<EOF
 ## Exact Changed Files
 
 See \`CHANGES.txt\` for the base commit, head commit, changed files, and diff stat.
+
+The \`source/\` tree is the tracked HEAD archive after handoff path/private-literal sanitization. Use the Product HEAD commit in \`MANIFEST.txt\` as the canonical exact source identity.
 
 ## Claims And Proof
 
@@ -622,6 +628,7 @@ Shared brain HEAD: $shared_head
 Factory workspace HEAD: $factory_head
 Pass notes included: $([ -n "$notes_file" ] && echo yes || echo no)
 Source representation: source/
+Source tree note: source/ contains tracked HEAD after handoff path/private-literal sanitization; Product HEAD is the canonical source identity.
 Secrets included: no
 Binaries included: no
 EOF
@@ -672,6 +679,7 @@ required_command_outputs=(
   "worker-harness-path-neutral-test.txt"
   "idempotency-recovery-test.txt"
   "ssh-trust-lock-recovery-test.txt"
+  "ssh-accept-new-dispatch-refusal-test.txt"
   "outbox-425-terminal-test.txt"
   "outbox-queue-flush-smoke.txt"
 )
@@ -685,12 +693,19 @@ done
 find "$bundle_dir" -type d -empty -delete
 
 sanitize_handoff_text() {
+  text_files() {
+    find "$bundle_dir" -type f -print0 | while IFS= read -r -d '' file; do
+      if [ ! -s "$file" ] || LC_ALL=C grep -Iq . "$file"; then
+        printf '%s\0' "$file"
+      fi
+    done
+  }
   while IFS= read -r -d '' file; do
     perl -0pi \
       -e "s#/Users/[A-Za-z0-9._-]+#/Users/operator#g;" \
       -e "s#/home/(?!operator\\b|factory\\b|brainstack\\b)[A-Za-z0-9._-]+#/home/operator#g;" \
       "$file"
-  done < <(find "$bundle_dir" -type f \( -name '*.txt' -o -name '*.md' -o -name '*.yaml' -o -name '*.json' -o -name '*.toml' \) -print0)
+  done < <(text_files)
   local substitutions_file="${BRAINSTACK_HANDOFF_PRIVATE_SUBSTITUTIONS_FILE:-$repo_root/.handoff-private-substitutions}"
   if [ -f "$substitutions_file" ]; then
     while IFS='=' read -r literal replacement; do
@@ -700,7 +715,7 @@ sanitize_handoff_text() {
       fi
       while IFS= read -r -d '' file; do
         BRAINSTACK_SUB_LITERAL="$literal" BRAINSTACK_SUB_REPLACEMENT="$replacement" perl -0pi -e 'BEGIN { $literal = $ENV{"BRAINSTACK_SUB_LITERAL"}; $replacement = $ENV{"BRAINSTACK_SUB_REPLACEMENT"}; } s/\Q$literal\E/$replacement/g;' "$file"
-      done < <(find "$bundle_dir" -type f \( -name '*.txt' -o -name '*.md' -o -name '*.yaml' -o -name '*.json' -o -name '*.toml' \) -print0)
+      done < <(text_files)
     done < "$substitutions_file"
   fi
 }
@@ -737,7 +752,11 @@ if find "$bundle_dir" -type l -print -quit | grep -q .; then
 fi
 
 local_hygiene_hits="$(
-  rg -n \
+  rg --hidden --no-ignore \
+    -g '!**/.git/**' \
+    -g '!**/node_modules/**' \
+    -g '!**/dist/**' \
+    -n \
     -P -e '/Users/(?!operator\b)[A-Za-z0-9._-]+' \
     -e '/home/(?!operator\b|factory\b|brainstack\b)[A-Za-z0-9._-]+' \
     -e 'migration-from-current-[A-Za-z0-9._-]+\.md' \
@@ -752,7 +771,11 @@ fi
 scan_secret_detector() {
   detector="$1"
   pattern="$2"
-  rg -n -e "$pattern" "$bundle_dir" 2>/dev/null \
+  rg --hidden --no-ignore \
+    -g '!**/.git/**' \
+    -g '!**/node_modules/**' \
+    -g '!**/dist/**' \
+    -n -e "$pattern" "$bundle_dir" 2>/dev/null \
     | awk -F: -v detector="$detector" '{print $1 ":" $2 ": [REDACTED " detector "]"}' \
     || true
 }

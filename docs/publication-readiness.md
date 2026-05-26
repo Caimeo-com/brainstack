@@ -54,6 +54,6 @@ cd ~/brainstack
 scripts/handoff.sh --mode forensic --out /tmp
 ```
 
-The handoff script uses exactly one source representation, `source/`, generated from `git archive` at `HEAD`. It excludes compiled binaries, `dist/`, `.git`, dependency trees, Bun cache, env files, private keys, tokens, empty directories, and Finder/macOS junk. It fails if secrets-looking patterns are found before zipping.
+The handoff script uses exactly one review source representation, `source/`, generated from `git archive` at `HEAD` and then redacted for local paths/private literals before zipping. The exact source identity is the Product HEAD commit in `MANIFEST.txt`; the bundled `source/` tree is for portable review context, not byte-for-byte release provenance. It excludes compiled binaries, `dist/`, `.git`, dependency trees, Bun cache, env files, private keys, tokens, empty directories, and Finder/macOS junk. It fails if secrets-looking patterns are found before zipping.
 
 Every review handoff should include `CHANGES.txt` for the exact base-to-head delta and `CLAIMS_AND_PROOF.md` for a short claim-to-evidence map. Use `--notes` for pass-specific context so a fresh-context reviewer does not have to infer what the bundle is proving.

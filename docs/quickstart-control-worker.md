@@ -59,7 +59,7 @@ bun run packages/brainctl/src/main.ts trust-worker --config ~/.config/brainstack
 bun run packages/brainctl/src/main.ts doctor --config ~/.config/brainstack/brainstack.yaml --workers
 ```
 
-The generated worker entry uses `sshTrustMode: pinned`. Temporary `sshTrustMode: accept-new` is allowed only for an explicit bootstrap window; it will be reported as a warning by doctor.
+The generated worker entry uses `sshTrustMode: pinned`. Temporary `sshTrustMode: accept-new` is allowed only for an explicit bootstrap window. Doctor fails it unless `BRAINSTACK_ALLOW_ACCEPT_NEW_DOCTOR=true`, and telemux dispatch fails it unless `BRAINSTACK_ALLOW_ACCEPT_NEW_DISPATCH=true`; do not leave those overrides set after enrollment.
 
 The worker transport default is normal OpenSSH over Tailscale:
 

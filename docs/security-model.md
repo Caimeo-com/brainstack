@@ -6,7 +6,7 @@
 
 Normal OpenSSH over Tailscale is the default worker transport. Tailscale SSH is disabled by default.
 
-OpenSSH worker trust is pinned by default after bootstrap. `brainctl trust-worker --config ~/.config/brainstack/brainstack.yaml --worker <name>` records the worker host key in Brainstack's product known-hosts file, and telemux dispatch then uses `StrictHostKeyChecking=yes`. `sshTrustMode: accept-new` exists only as an explicit bootstrap/canary escape hatch; switch back to `sshTrustMode: pinned` before treating the worker as enrolled.
+OpenSSH worker trust is pinned by default after bootstrap. `brainctl trust-worker --config ~/.config/brainstack/brainstack.yaml --worker <name>` records the worker host key in Brainstack's product known-hosts file, and telemux dispatch then uses `StrictHostKeyChecking=yes`. `sshTrustMode: accept-new` exists only as an explicit bootstrap/canary escape hatch: `brainctl doctor --workers` refuses remote probes unless `BRAINSTACK_ALLOW_ACCEPT_NEW_DOCTOR=true`, and telemux dispatch refuses runs unless `BRAINSTACK_ALLOW_ACCEPT_NEW_DISPATCH=true`. Switch back to `sshTrustMode: pinned` before treating the worker as enrolled.
 
 ## Tailscale Policy Shape
 

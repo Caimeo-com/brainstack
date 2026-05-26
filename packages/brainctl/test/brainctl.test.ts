@@ -808,7 +808,7 @@ describe("brainctl install safety", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 });
 
 describe("braind write safety", () => {
@@ -992,6 +992,34 @@ describe("braind write safety", () => {
     }
   });
 
+  test("lint rejects request bodies before mutation", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-lint-body-cap-"));
+    const port = 44_000 + Math.floor(Math.random() * 1_000);
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const root = await createSingleNodeInstall(dir);
+      proc = await startBraind(root, port, { BRAIN_MAX_JSON_BYTES: "8" });
+      const response = await fetch(`http://127.0.0.1:${port}/api/lint`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer admin-test-token",
+          "Content-Type": "application/json"
+        },
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("0123456789abcdef"));
+            controller.close();
+          }
+        })
+      });
+      expect(response.status).toBe(413);
+      expect(await response.text()).toContain("lint does not accept a request body");
+    } finally {
+      await stopBraind(proc);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("fresh install homepage does not render dead default page links", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-home-links-"));
     const port = 39_000 + Math.floor(Math.random() * 5_000);
@@ -1093,6 +1121,27 @@ describe("braind write safety", () => {
     });
     expect(blocked.code).not.toBe(0);
     expect(blocked.stderr).toContain("BRAIN_SECURITY_POSTURE=local requires BRAIN_BIND to be loopback");
+
+    const padded = runCommand(["bun", "run", SERVER], {
+      env: {
+        BRAIN_IMPORT_TOKEN: "import-test-token",
+        BRAIN_ADMIN_TOKEN: "admin-test-token",
+        BRAIN_SECURITY_POSTURE: " Local ",
+        BRAIN_BIND: "0.0.0.0"
+      }
+    });
+    expect(padded.code).not.toBe(0);
+    expect(padded.stderr).toContain("BRAIN_SECURITY_POSTURE=local requires BRAIN_BIND to be loopback");
+
+    const unknown = runCommand(["bun", "run", SERVER], {
+      env: {
+        BRAIN_IMPORT_TOKEN: "import-test-token",
+        BRAIN_ADMIN_TOKEN: "admin-test-token",
+        BRAIN_SECURITY_POSTURE: "public"
+      }
+    });
+    expect(unknown.code).not.toBe(0);
+    expect(unknown.stderr).toContain("Unsupported BRAIN_SECURITY_POSTURE");
   });
 
   test("pre-mutation idempotent import failures can be retried with the same key", async () => {
@@ -1653,6 +1702,11 @@ describe("braind write safety", () => {
       expect(healthResponse.status).toBe(200);
       const health = (await healthResponse.json()) as Record<string, unknown>;
       expect(health).toEqual({ ok: true, service: "braind", version: "0.1.0" });
+      const readyResponse = await fetch(`http://127.0.0.1:${port}/readyz`);
+      expect([200, 503]).toContain(readyResponse.status);
+      const ready = (await readyResponse.json()) as Record<string, unknown>;
+      expect(ready).toMatchObject({ ok: true, service: "braind", version: "0.1.0" });
+      expect(ready).toHaveProperty("search_ready");
       const adminHealthResponse = await fetch(`http://127.0.0.1:${port}/admin/health`, {
         headers: { Authorization: "Bearer admin-test-token" }
       });
@@ -2103,6 +2157,84 @@ describe("public release hygiene", () => {
       }
     }
   });
+
+  test("handoff script scans tracked hidden files for token-shaped secrets before zipping", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainstack-handoff-secret-fixture-"));
+    try {
+      const binDir = join(dir, "bin");
+      await mkdir(join(dir, "scripts"), { recursive: true });
+      await mkdir(join(dir, "docs"), { recursive: true });
+      await mkdir(join(dir, "packages", "client-bootstrap"), { recursive: true });
+      await mkdir(binDir, { recursive: true });
+      await writeFile(join(dir, "scripts", "handoff.sh"), await readFile(join(PRODUCT_ROOT, "scripts", "handoff.sh"), "utf8"));
+      await chmod(join(dir, "scripts", "handoff.sh"), 0o755);
+      await writeFile(
+        join(binDir, "bun"),
+        [
+          "#!/usr/bin/env bash",
+          "set -eu",
+          "if [ \"${1:-}\" = test ]; then echo '1 pass'; exit 0; fi",
+          "if [ \"${1:-}\" = --version ]; then echo 'Bun fake'; exit 0; fi",
+          "if [ \"${1:-}\" = run ]; then",
+          "  shift",
+          "  case \"${1:-}\" in",
+          "    build:brainctl) echo 'build ok'; exit 0 ;;",
+          "    *.ts) echo 'server fake'; sleep 0.2; exit 0 ;;",
+          "    *brainctl*)",
+          "      previous=''",
+          "      for arg in \"$@\"; do",
+          "        if [ \"$previous\" = --out ]; then",
+          "          case \"$arg\" in",
+          "            *.yaml) mkdir -p \"$(dirname \"$arg\")\"; echo 'schema_version: 1' > \"$arg\" ;;",
+          "            *) mkdir -p \"$arg\"; echo generated > \"$arg/README.txt\" ;;",
+          "          esac",
+          "        fi",
+          "        previous=\"$arg\"",
+          "      done",
+          "      echo \"brainctl fake $*\"",
+          "      exit 0",
+          "      ;;",
+          "  esac",
+          "fi",
+          "echo \"bun fake $*\"",
+          ""
+        ].join("\n")
+      );
+      await chmod(join(binDir, "bun"), 0o755);
+      await writeFile(join(dir, "package.json"), "{\"scripts\":{\"build:brainctl\":\"echo build\"}}\n");
+      await writeFile(join(dir, "README.md"), "Brainstack runs on trusted private networks.\n");
+      await writeFile(join(dir, "docs", "security-postures.md"), "It defaults to a trusted private mesh, does not require read tokens, and says: Do not expose trusted-tailnet mode to the public internet.\n");
+      await writeFile(join(dir, "docs", "tailscale-exposure.md"), "Use brainctl expose tailscale with tailscale serve.\n");
+      await writeFile(join(dir, "docs", "multi-brain.md"), "project config uses .brainstack.yaml and profiles.yaml. Sections are not hard security boundaries; they are retrieval boundaries.\n");
+      await writeFile(join(dir, "docs", "outbox-security.md"), "Outbox payloads are sensitive plaintext by default. No queued payload is silently truncated. Future server-sealed mode is documented.\n");
+      await writeFile(join(dir, "docs", "diagrams.md"), "```mermaid\ngraph TD\nA-->B\n```\n");
+      await writeFile(join(dir, "packages", "client-bootstrap", "claude-user-CLAUDE.md"), "Use brainctl search --repo . and brainctl remember --repo .\n");
+      const fakeToken = "ghp_" + "A".repeat(24);
+      await writeFile(join(dir, ".hidden-token"), `${fakeToken}\n`);
+      expectSuccess(runCommand(["git", "init"], { cwd: dir }));
+      expectSuccess(runCommand(["git", "config", "user.email", "test@example.invalid"], { cwd: dir }));
+      expectSuccess(runCommand(["git", "config", "user.name", "Test"], { cwd: dir }));
+      expectSuccess(runCommand(["git", "add", "."], { cwd: dir }));
+      expectSuccess(runCommand(["git", "commit", "-m", "fixture"], { cwd: dir }));
+
+      const out = join(dir, "out");
+      await mkdir(out, { recursive: true });
+      const refusal = runCommand(["bash", "scripts/handoff.sh", "--out", out], {
+        cwd: dir,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`,
+          BRAINSTACK_HANDOFF_UTC: "20260525T000000Z"
+        }
+      });
+      expect(refusal.code).not.toBe(0);
+      expect(refusal.stderr).toContain("handoff refused: secrets-looking patterns detected");
+      expect(refusal.stderr).toContain("[REDACTED github-token]");
+      expect(refusal.stderr).not.toContain(fakeToken);
+      expect(await Bun.file(join(out, "handoff-20260525T000000Z.zip")).exists()).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   test("generated client bootstrap remains generic", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-client-generic-"));
@@ -2696,6 +2828,14 @@ describe("public release hygiene", () => {
       const dryRun = runBrainctl(["expose", "tailscale", "--config", configPath, "--dry-run"]);
       expectSuccess(dryRun);
       expect(dryRun.stdout).toContain("brain-control.tailnet.invalid:443");
+
+      await writeFile(
+        configPath,
+        (await readFile(configPath, "utf8")).replace("bindHost: 127.0.0.1", "bindHost: 0.0.0.0")
+      );
+      const nonLoopbackApply = runBrainctl(["expose", "tailscale", "--config", configPath, "--apply"]);
+      expect(nonLoopbackApply.code).not.toBe(0);
+      expect(nonLoopbackApply.stderr).toContain("requires trusted-tailnet braind to bind loopback");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -2744,6 +2884,85 @@ describe("public release hygiene", () => {
       expect(badExposure.code).not.toBe(0);
       expect(badExposure.stderr).toContain("Expected none, tailscale-serve, vpn, or manual");
     } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 12_000);
+
+  test("doctor reports braind readiness separately from liveness", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-readyz-doctor-"));
+    const port = 39_000 + Math.floor(Math.random() * 2_000);
+    let server: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const binDir = join(dir, "bin");
+      const serverScript = join(dir, "readyz-server.ts");
+      await mkdir(binDir, { recursive: true });
+      await writeFile(
+        join(binDir, "codex"),
+        "#!/usr/bin/env sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'codex fake\\n'; exit 0; fi\nprintf '%s\\n' '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --output-last-message'\n"
+      );
+      await writeFile(join(binDir, "tailscale"), "#!/usr/bin/env sh\nif [ \"${1:-}\" = \"status\" ]; then echo 'offline' >&2; exit 1; fi\nprintf 'tailscale fake\\n'\n");
+      await chmod(join(binDir, "codex"), 0o755);
+      await chmod(join(binDir, "tailscale"), 0o755);
+      await writeFile(
+        serverScript,
+        [
+          `const port = ${port};`,
+          "Bun.serve({",
+          "  hostname: '127.0.0.1',",
+          "  port,",
+          "  fetch(req) {",
+          "    const path = new URL(req.url).pathname;",
+          "    if (path === '/healthz') return Response.json({ ok: true, service: 'braind' });",
+          "    if (path === '/readyz') return Response.json({ ok: false, service: 'braind', search_ready: false, pending_reindex: { present: true } }, { status: 503 });",
+          "    return Response.json({ error: 'not found' }, { status: 404 });",
+          "  }",
+          "});",
+          "await new Promise(() => {});",
+          ""
+        ].join("\n")
+      );
+      server = Bun.spawn(["bun", "run", serverScript], { stdout: "ignore", stderr: "ignore" });
+      await waitForCondition(async () => {
+        try {
+          return (await fetch(`http://127.0.0.1:${port}/healthz`)).ok;
+        } catch {
+          return false;
+        }
+      }, "readyz fixture server");
+      const configPath = join(dir, "config.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: brain-control",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          "brain:",
+          `  port: ${port}`,
+          "  publicBaseUrl: https://brain-control.example.ts.net",
+          "security:",
+          "  posture: trusted-tailnet",
+          "  bindHost: 127.0.0.1",
+          "telemux:",
+          "  enabled: false",
+          ""
+        ].join("\n")
+      );
+      const result = runBrainctl(["doctor", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1"
+      });
+      expectSuccess(result);
+      expect(result.stdout).toContain("PASS [health] braind-healthz: HTTP 200");
+      expect(result.stdout).toContain("WARN [health] braind-readyz: HTTP 503 search_ready=false pending_reindex=true");
+    } finally {
+      if (server) {
+        server.kill();
+        await server.exited;
+      }
       await rm(dir, { recursive: true, force: true });
     }
   }, 12_000);
@@ -2807,6 +3026,12 @@ describe("public release hygiene", () => {
 
       const allow = runBrainctl(["allow", "repo", "--repo", repo, "--brain", "personal", "--always", "--config", configPath, "--root", root]);
       expectSuccess(allow);
+      const missingDecision = runBrainctl(["allow", "repo", "--repo", repo, "--brain", "personal", "--config", configPath, "--root", root]);
+      expect(missingDecision.code).not.toBe(0);
+      expect(missingDecision.stderr).toContain("requires exactly one of --always, --once, or --deny");
+      const multipleDecision = runBrainctl(["allow", "repo", "--repo", repo, "--brain", "personal", "--once", "--always", "--config", configPath, "--root", root]);
+      expect(multipleDecision.code).not.toBe(0);
+      expect(multipleDecision.stderr).toContain("requires exactly one of --always, --once, or --deny");
       const rulesPath = join(root, "config", "allow-rules.json");
       expect((await stat(rulesPath)).mode & 0o777).toBe(0o600);
 
@@ -3094,6 +3319,7 @@ describe("public release hygiene", () => {
 
       const workClone = join(dir, "clones", "lindy");
       const personalClone = join(dir, "clones", "personal");
+      const journalClone = join(dir, "clones", "journal");
       const disabledClone = join(dir, "clones", "disabled");
       await writeFile(
         join(root, "config", "profiles.yaml"),
@@ -3106,6 +3332,10 @@ describe("public release hygiene", () => {
           "  personal:",
           `    remote: ${personalRemote}`,
           `    localClone: ${personalClone}`,
+          "    classification: personal",
+          "  journal:",
+          `    remote: ${personalRemote}`,
+          `    localClone: ${journalClone}`,
           "    classification: personal",
           "  lindy:",
           `    remote: ${workRemote}`,
@@ -3123,6 +3353,7 @@ describe("public release hygiene", () => {
           "    brains:",
           "      - lindy",
           "      - personal",
+          "      - journal",
           "      - disabled",
           "      - urlonly",
           "    personal:",
@@ -3133,6 +3364,7 @@ describe("public release hygiene", () => {
           "      read: false",
           "    writeDefault: lindy",
           "    crossBrainWrites:",
+          "      personalToWork: ask",
           "      personalToLindy: ask",
           "      lindyToPersonal: never",
           ""
@@ -3145,6 +3377,7 @@ describe("public release hygiene", () => {
       expectSuccess(firstContext);
       expect(firstContext.stdout).toContain("[allowed] lindy");
       expect(firstContext.stdout).toContain("[blocked] personal");
+      expect(firstContext.stdout).toContain("[blocked] journal");
       expect(firstContext.stdout).toContain("[blocked] disabled");
       expect(firstContext.stdout).toContain("blocked: disabled has read=false/never");
       expect(firstContext.stdout).toContain("[allowed] urlonly");
@@ -3152,6 +3385,7 @@ describe("public release hygiene", () => {
       expect(firstContext.stdout).toContain("brainctl allow repo");
       expect(await Bun.file(join(workClone, "wiki", "Runbook.md")).exists()).toBe(true);
       expect(await Bun.file(join(personalClone, "shared", "work-safe", "Debug.md")).exists()).toBe(false);
+      expect(await Bun.file(join(journalClone, "shared", "work-safe", "Debug.md")).exists()).toBe(false);
       expect(await Bun.file(join(disabledClone, "wiki", "Runbook.md")).exists()).toBe(false);
 
       const allow = runBrainctl(["allow", "repo", "--repo", repo, "--brain", "personal", "--sections", "shared/work-safe", "--always", "--config", configPath, "--root", root]);
@@ -3188,6 +3422,64 @@ describe("public release hygiene", () => {
       expect(rememberPersonalFromWork.stderr).toContain("recent lindy sources into personal");
       expect(rememberPersonalFromWork.stderr).toContain("policy is never");
 
+      const weakeningRepo = join(dir, "projects", "lindy", "weakening");
+      await mkdir(weakeningRepo, { recursive: true });
+      await writeFile(
+        join(weakeningRepo, ".brainstack.yaml"),
+        [
+          "brains:",
+          "  - id: personal",
+          `    remote: ${personalRemote}`,
+          `    localClone: ${personalClone}`,
+          "    classification: work",
+          "    read: true",
+          "crossBrainWrites:",
+          "  personalToLindy: allow",
+          ""
+        ].join("\n")
+      );
+      const weakeningContext = runBrainctl(["context", "--repo", weakeningRepo, "--config", configPath, "--root", root, "--no-sync"]);
+      expect(weakeningContext.code).not.toBe(0);
+      expect(weakeningContext.stderr).toContain("cannot weaken trusted profile policy ask to allow");
+
+      const genericWeakeningRepo = join(dir, "projects", "lindy", "generic-weakening");
+      await mkdir(genericWeakeningRepo, { recursive: true });
+      await writeFile(
+        join(genericWeakeningRepo, ".brainstack.yaml"),
+        [
+          "brains:",
+          "  - id: urlonly",
+          "    url: http://127.0.0.1:9",
+          "    classification: work",
+          "    read: true",
+          "crossBrainWrites:",
+          "  personalToUrlonly: allow",
+          ""
+        ].join("\n")
+      );
+      const genericWeakeningContext = runBrainctl(["context", "--repo", genericWeakeningRepo, "--config", configPath, "--root", root, "--no-sync"]);
+      expect(genericWeakeningContext.code).not.toBe(0);
+      expect(genericWeakeningContext.stderr).toContain("cannot weaken trusted generic profile policy personalToWork=ask to allow");
+
+      const classifiedWeakeningRepo = join(dir, "projects", "lindy", "classified-weakening");
+      await mkdir(classifiedWeakeningRepo, { recursive: true });
+      await writeFile(
+        join(classifiedWeakeningRepo, ".brainstack.yaml"),
+        [
+          "brains:",
+          "  - id: journal",
+          "    read: true",
+          "  - id: lindy",
+          "    read: true",
+          "crossBrainWrites:",
+          "  journalToLindy: allow",
+          ""
+        ].join("\n")
+      );
+      const classifiedWeakeningContext = runBrainctl(["context", "--repo", classifiedWeakeningRepo, "--config", configPath, "--root", root, "--no-sync"]);
+      expect(classifiedWeakeningContext.code).not.toBe(0);
+      expect(classifiedWeakeningContext.stderr).toContain("cannot weaken trusted/effective profile policy ask for journal->lindy to allow");
+
       const overrideRepo = join(dir, "projects", "lindy", "override");
       await mkdir(overrideRepo, { recursive: true });
       await writeFile(
@@ -3205,6 +3497,62 @@ describe("public release hygiene", () => {
       const overrideContext = runBrainctl(["context", "--repo", overrideRepo, "--config", configPath, "--root", root, "--no-sync"]);
       expectSuccess(overrideContext);
       expect(overrideContext.stdout).toContain("write_default=personal");
+      expect(overrideContext.stdout).toContain("- [blocked] personal (personal)");
+
+      const hostileRemoteRepo = join(dir, "projects", "local-remote");
+      await mkdir(hostileRemoteRepo, { recursive: true });
+      await writeFile(
+        join(hostileRemoteRepo, ".brainstack.yaml"),
+        [
+          "brains:",
+          "  - id: stolen",
+          `    remote: ${personalRemote}`,
+          "    sections: [wiki]",
+          ""
+        ].join("\n")
+      );
+      const hostileRemote = runBrainctl(["context", "--repo", hostileRemoteRepo, "--config", configPath, "--root", root, "--no-sync"]);
+      expect(hostileRemote.code).not.toBe(0);
+      expect(hostileRemote.stderr).toContain("cannot set local git remote");
+
+      for (const [name, remote] of [
+        ["127-short", "ssh://127.1/tmp/shared-brain.git"],
+        ["mapped-loopback", "ssh://[::ffff:127.0.0.1]/tmp/shared-brain.git"],
+        ["localhost-dot", "ssh://localhost./tmp/shared-brain.git"]
+      ] as const) {
+        const repoWithLoopbackRemote = join(dir, "projects", name);
+        await mkdir(repoWithLoopbackRemote, { recursive: true });
+        await writeFile(
+          join(repoWithLoopbackRemote, ".brainstack.yaml"),
+          [
+            "brains:",
+            `  - id: ${name}`,
+            `    remote: ${remote}`,
+            "    sections: [wiki]",
+            ""
+          ].join("\n")
+        );
+        const loopbackRemote = runBrainctl(["context", "--repo", repoWithLoopbackRemote, "--config", configPath, "--root", root, "--no-sync"]);
+        expect(loopbackRemote.code).not.toBe(0);
+        expect(loopbackRemote.stderr).toContain("cannot set local git remote");
+      }
+
+      const escapedCloneRepo = join(dir, "projects", "escaped-clone");
+      await mkdir(escapedCloneRepo, { recursive: true });
+      await writeFile(
+        join(escapedCloneRepo, ".brainstack.yaml"),
+        [
+          "brains:",
+          "  - id: escaped",
+          `    localClone: ${root}/state/brain-clones/../escaped`,
+          "    url: http://127.0.0.1:9",
+          "    sections: [wiki]",
+          ""
+        ].join("\n")
+      );
+      const escapedClone = runBrainctl(["context", "--repo", escapedCloneRepo, "--config", configPath, "--root", root, "--no-sync"]);
+      expect(escapedClone.code).not.toBe(0);
+      expect(escapedClone.stderr).toContain("cannot set localClone/localPath/path outside");
 
       const dotRepo = join(dir, "projects", "dotty");
       await mkdir(dotRepo, { recursive: true });
@@ -3221,6 +3569,22 @@ describe("public release hygiene", () => {
       const dotContext = runBrainctl(["context", "--repo", dotRepo, "--config", configPath, "--root", root, "--no-sync"]);
       expectSuccess(dotContext);
       expect(dotContext.stdout).toContain(`path=${join(root, "state", "brain-clones", `brain-${sha256Text("..").slice(0, 16)}`)}`);
+
+      const reservedIdRepo = join(dir, "projects", "reserved-id");
+      await mkdir(reservedIdRepo, { recursive: true });
+      await writeFile(
+        join(reservedIdRepo, ".brainstack.yaml"),
+        [
+          "brains:",
+          "  - id: cross:personal->work",
+          "    url: http://127.0.0.1:9",
+          "    classification: work",
+          ""
+        ].join("\n")
+      );
+      const reservedIdContext = runBrainctl(["context", "--repo", reservedIdRepo, "--config", configPath, "--root", root, "--no-sync"]);
+      expect(reservedIdContext.code).not.toBe(0);
+      expect(reservedIdContext.stderr).toContain("reserved prefix cross:");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -3951,6 +4315,35 @@ describe("public release hygiene", () => {
       expect(await Bun.file(join(stateRoot, "outbox")).exists()).toBe(false);
       expect(existsSync(outsideParent)).toBe(true);
 
+      const realStateRoot = join(dir, "real-state-root");
+      const stateRootSymlink = join(dir, "state-root-symlink");
+      const symlinkStateConfig = join(dir, "symlink-state-config.yaml");
+      await mkdir(realStateRoot, { recursive: true });
+      await symlink(realStateRoot, stateRootSymlink);
+      await writeFile(
+        symlinkStateConfig,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  stateRoot: ${stateRootSymlink}`,
+          "client:",
+          "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+      const ancestorSymlinkStatus = runBrainctl(["outbox", "status", "--config", symlinkStateConfig], env);
+      expectSuccess(ancestorSymlinkStatus);
+      expect(ancestorSymlinkStatus.stdout).toContain("corrupt=1");
+      const ancestorSymlinkList = runBrainctl(["outbox", "list", "--config", symlinkStateConfig], env);
+      expectSuccess(ancestorSymlinkList);
+      expect(ancestorSymlinkList.stdout).toContain("CORRUPT state-root-symlink");
+      expect(ancestorSymlinkList.stdout).toContain("outbox path ancestor is a symlink");
+
       const fileStateRoot = join(dir, "file-state-root");
       const fileStateConfig = join(dir, "file-state-config.yaml");
       await writeFile(fileStateRoot, "not a directory\n");
@@ -4118,7 +4511,7 @@ describe("public release hygiene", () => {
       await mkdir(binDir, { recursive: true });
       await writeFile(
         join(binDir, "codex"),
-        "#!/usr/bin/env sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'codex-cli 0.133.0\\n'; exit 0; fi\nprintf '%s\\n' '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check'\n"
+        "#!/usr/bin/env sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'codex-cli 0.133.0\\n'; exit 0; fi\nprintf '%s\\n' '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --output-last-message'\n"
       );
       await writeFile(
         join(binDir, "claude"),
@@ -4154,6 +4547,25 @@ describe("public release hygiene", () => {
       expect(result.stdout).toContain("codex-cli 0.134.0-1 -> 0.135.0-1");
       expect(result.stdout).toContain("manual_update_commands:");
       expect(result.stdout).toContain("selected harness:");
+
+      await writeFile(
+        join(binDir, "codex"),
+        "#!/usr/bin/env sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'codex-cli missing-output\\n'; exit 0; fi\nprintf '%s\\n' '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check'\n"
+      );
+      await chmod(join(binDir, "codex"), 0o755);
+      const missingOutputFlag = runBrainctl(["updates", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1",
+        BRAINSTACK_UPDATE_PROBE_COMMANDS: "none"
+      });
+      expectSuccess(missingOutputFlag);
+      expect(missingOutputFlag.stdout).toContain("FAIL codex-harness: codex-cli missing-output; missing required CLI surface: --output-last-message");
+
+      await writeFile(
+        join(binDir, "codex"),
+        "#!/usr/bin/env sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'codex-cli 0.133.0\\n'; exit 0; fi\nprintf '%s\\n' '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --output-last-message'\n"
+      );
+      await chmod(join(binDir, "codex"), 0o755);
 
       const noUpdates = runBrainctl(["updates", "--config", configPath], {
         PATH: `${binDir}:${process.env.PATH || ""}`,
@@ -4212,7 +4624,7 @@ describe("public release hygiene", () => {
         [
           "#!/usr/bin/env sh",
           "if [ \"${1:-}\" = \"--version\" ]; then printf 'codex-cli partial\\n'; exit 0; fi",
-          "printf '%s\\n' '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check'",
+          "printf '%s\\n' '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --output-last-message'",
           "sleep 5",
           ""
         ].join("\n")
@@ -4279,7 +4691,7 @@ describe("public release hygiene", () => {
       );
       await writeFile(
         join(binDir, "codex"),
-        "#!/usr/bin/env sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'codex fake\\n'; exit 0; fi\nprintf '%s\\n' '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check'\n"
+        "#!/usr/bin/env sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'codex fake\\n'; exit 0; fi\nprintf '%s\\n' '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --output-last-message'\n"
       );
       await writeFile(join(binDir, "tailscale"), "#!/usr/bin/env sh\nexit 0\n");
       await chmod(join(binDir, "codex"), 0o755);
@@ -4451,14 +4863,55 @@ describe("public release hygiene", () => {
       );
 
       const result = runBrainctl(["doctor", "--config", configPath, "--workers"], {
-        PATH: `${controlBin}:${process.env.PATH || ""}`
+        PATH: `${controlBin}:${process.env.PATH || ""}`,
+        CODEX_HOME: join(dir, "remote-codex-home"),
+        BRAINSTACK_ALLOW_ACCEPT_NEW_DOCTOR: "true"
       });
       expectSuccess(result);
       expect(result.stdout).toContain("WARN [workers] worker:worker1:ssh-trust: bootstrap trust mode accept-new");
       expect(result.stdout).toContain("PASS [workers] worker:worker1");
+      expect(result.stdout).toContain("harness=codex");
+      expect(result.stdout).toContain("model=default");
+      expect(result.stdout).toContain("effort=default");
       expect(result.stdout).toContain(`PASS [workers] worker:worker1:cmd:bun: ${join(remoteBin, "bun")}; bun remote fake`);
       expect(result.stdout).toContain(`PASS [workers] worker:worker1:cmd:tailscale: ${join(remoteBin, "tailscale")}; tailscale remote fake`);
       expect(result.stdout).toContain("PASS [workers] worker:worker1:harness-compat");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("worker doctor refuses accept-new SSH trust without explicit bootstrap override", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-worker-accept-new-refusal-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: brain-control",
+          "  user: operator",
+          "telemux:",
+          "  enabled: true",
+          "  workers:",
+          "    - name: worker1",
+          "      transport: ssh",
+          "      sshTarget: worker1.example",
+          "      sshUser: operator",
+          "      sshTrustMode: accept-new",
+          ""
+        ].join("\n")
+      );
+
+      const result = runBrainctl(["doctor", "--config", configPath, "--workers"], {
+        BRAINSTACK_ALLOW_ACCEPT_NEW_DOCTOR: "0"
+      });
+      expect(result.code).toBe(1);
+      expect(result.stdout).toContain("FAIL [workers] worker:worker1:ssh-trust: bootstrap trust mode accept-new");
+      expect(result.stdout).toContain("Refusing remote doctor probes under TOFU");
+      expect(result.stdout).not.toContain("PASS [workers] worker:worker1");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -4492,6 +4945,9 @@ describe("public release hygiene", () => {
           "version=codex fake",
           "flag:--dangerously-bypass-approvals-and-sandbox=ok",
           "flag:--skip-git-repo-check=ok",
+          "flag:--output-last-message=ok",
+          "model=gpt-test",
+          "effort=high",
           "deep=skipped",
           "EOF",
           ""
@@ -4550,7 +5006,7 @@ describe("public release hygiene", () => {
       });
       expectSuccess(trusted);
       expect(trusted.stdout).toContain("PASS [workers] worker:worker2:ssh-trust: pinned host key present for [worker2.example]:2222");
-      expect(trusted.stdout).toContain("PASS [workers] worker:worker2: reachable via ssh; codex bin=/usr/bin/codex");
+      expect(trusted.stdout).toContain("PASS [workers] worker:worker2: reachable via ssh; harness=codex bin=/usr/bin/codex model=gpt-test effort=high");
       const capturedArgs = await readFile(argsCapture, "utf8");
       expect(capturedArgs).toContain("-p 2222");
       expect(capturedArgs).toContain("operator@worker2.example");

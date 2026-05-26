@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
@@ -109,10 +109,15 @@ export function outboxItemId(endpoint: BrainEndpoint, idempotencyKey: string): s
 }
 
 async function unsafeOutboxPath(path: string): Promise<{ path: string; error: string } | null> {
-  const MAX_OUTBOX_TRUST_BOUNDARY_DEPTH = 4;
   const absolute = resolve(path);
   let current = absolute;
-  for (let depth = 0; depth < MAX_OUTBOX_TRUST_BOUNDARY_DEPTH; depth += 1) {
+  const seen = new Set<string>();
+  while (true) {
+    current = resolve(current);
+    if (seen.has(current)) {
+      return { path: current, error: "outbox path ancestor symlink loop" };
+    }
+    seen.add(current);
     const info = await lstat(current).catch(() => null);
     if (!info) {
       const parent = dirname(current);
@@ -123,7 +128,15 @@ async function unsafeOutboxPath(path: string): Promise<{ path: string; error: st
       continue;
     }
     if (info.isSymbolicLink()) {
-      return { path: current, error: "outbox path ancestor is a symlink" };
+      if (info.uid !== 0) {
+        return { path: current, error: "outbox path ancestor is a symlink" };
+      }
+      const linkTarget = await readlink(current).catch(() => "");
+      if (!linkTarget) {
+        return { path: current, error: "outbox path ancestor symlink target cannot be read" };
+      }
+      current = resolve(dirname(current), linkTarget);
+      continue;
     }
     if (!info.isDirectory()) {
       return { path: current, error: "outbox path ancestor is not a directory" };

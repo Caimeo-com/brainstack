@@ -75,7 +75,7 @@ Worker provisioning does not require passwordless sudo by default. Add `--requir
 
 Provisioning and doctor checks do not install packages or silently change sudo/harness policy. They stop with remediation text if Bun, Git, OpenSSH, Tailscale, Codex, Claude, required passwordless sudo, or required harness bypass behavior is missing. `brainctl doctor --workers` resolves every configured worker through the worker user's shell PATH and reports required worker tool paths/versions, so non-interactive SSH PATH drift is visible. Use `brainctl doctor --deep` when you want to repeat the expensive harness sudo proof after installation.
 
-`doctor --workers` also verifies OpenSSH pinned host trust for non-local workers. Missing pinned host keys are a setup failure. `sshTrustMode: accept-new` is accepted only as an explicit bootstrap mode and is reported as a warning.
+`doctor --workers` also verifies OpenSSH pinned host trust for non-local workers. Missing pinned host keys are a setup failure. `sshTrustMode: accept-new` is bootstrap-only and fails doctor by default; set `BRAINSTACK_ALLOW_ACCEPT_NEW_DOCTOR=true` only for a deliberate first enrollment probe, then run `brainctl trust-worker` and switch back to `sshTrustMode: pinned`.
 
 ## Telemux Trust Boundary
 

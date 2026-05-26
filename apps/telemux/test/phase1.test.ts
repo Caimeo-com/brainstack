@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -20,6 +20,18 @@ import {
 } from "../src/telegram-attachments";
 import type { TelegramMessage, TelegramTarget } from "../src/telegram";
 import { WorkerService } from "../src/workers";
+
+const originalSkipUserPathResolve = process.env.BRAINSTACK_SKIP_USER_PATH_RESOLVE;
+const originalPath = process.env.PATH;
+
+afterEach(() => {
+  process.env.PATH = originalPath;
+  if (originalSkipUserPathResolve === undefined) {
+    delete process.env.BRAINSTACK_SKIP_USER_PATH_RESOLVE;
+  } else {
+    process.env.BRAINSTACK_SKIP_USER_PATH_RESOLVE = originalSkipUserPathResolve;
+  }
+});
 
 class FakeTelegram {
   readonly sent: Array<{ target: TelegramTarget; text: string }> = [];
@@ -525,6 +537,15 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
 
   const previousPath = process.env.PATH || "";
   process.env.PATH = `${binDir}:${previousPath}`;
+  if ("BRAINSTACK_SKIP_USER_PATH_RESOLVE" in envOverrides) {
+    if (envOverrides.BRAINSTACK_SKIP_USER_PATH_RESOLVE) {
+      process.env.BRAINSTACK_SKIP_USER_PATH_RESOLVE = envOverrides.BRAINSTACK_SKIP_USER_PATH_RESOLVE;
+    } else {
+      delete process.env.BRAINSTACK_SKIP_USER_PATH_RESOLVE;
+    }
+  } else {
+    process.env.BRAINSTACK_SKIP_USER_PATH_RESOLVE = "1";
+  }
 
   const selectedHarness = envOverrides.FACTORY_HARNESS || "codex";
   const config = loadConfig({
@@ -573,6 +594,19 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
     telegram,
     commands
   };
+}
+
+function clearPendingTextTimers(fixture: Awaited<ReturnType<typeof createFixture>>): void {
+  const pendingText = (fixture.commands as unknown as { pendingText: Map<string, { timer: ReturnType<typeof setTimeout> }> }).pendingText;
+  for (const pending of pendingText.values()) {
+    clearTimeout(pending.timer);
+  }
+  pendingText.clear();
+}
+
+function setPendingTextGenerationForTest(fixture: Awaited<ReturnType<typeof createFixture>>, key: string, generationId: string): void {
+  const rawDb = (fixture.db as unknown as { db: { query: (sql: string) => { run: (...args: unknown[]) => unknown } } }).db;
+  rawDb.query("UPDATE pending_text_prompts SET generation_id = ? WHERE key = ?").run(generationId, key);
 }
 
 test("telemux state database and runtime roots are private under permissive umask", async () => {
@@ -953,6 +987,7 @@ test("dispatcher reserves context locks before asynchronous setup can race", asy
     await waitFor(async () => (await readFile(join(context!.worktreePath, ".factory", "fake-turn-count"), "utf8")) === "2");
   } finally {
     process.env.PATH = fixture.previousPath;
+    clearPendingTextTimers(fixture);
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 10_000);
@@ -987,6 +1022,7 @@ test("dispatcher can reject busy turns instead of accepting volatile queue entri
     await waitFor(async () => (await readFile(join(context!.worktreePath, ".factory", "fake-turn-count"), "utf8")) === "1");
   } finally {
     process.env.PATH = fixture.previousPath;
+    clearPendingTextTimers(fixture);
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 10_000);
@@ -1017,6 +1053,7 @@ test("dispatcher drains queued turns after lock-only jobs finish", async () => {
     await waitFor(async () => (await readFile(join(context!.worktreePath, ".factory", "fake-turn-count"), "utf8")) === "1");
   } finally {
     process.env.PATH = fixture.previousPath;
+    clearPendingTextTimers(fixture);
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 10_000);
@@ -1046,6 +1083,7 @@ test("dispatcher preserves Telegram user id on durable queued turns", async () =
     await lockDone;
   } finally {
     process.env.PATH = fixture.previousPath;
+    clearPendingTextTimers(fixture);
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 10_000);
@@ -1083,6 +1121,7 @@ test("dispatcher rehydrates queued turn user id from the durable column when opt
     dispatcherInternals.dispatch = originalDispatch;
   } finally {
     process.env.PATH = fixture.previousPath;
+    clearPendingTextTimers(fixture);
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 10_000);
@@ -1924,7 +1963,9 @@ test("update-check reports known but unconfigured machines instead of silently o
       host: worker.name,
       transport: worker.transport,
       exitCode: 0,
-      stdout: "ok",
+      stdout: worker.name === "worker1"
+        ? "runtime_harness=claude\nruntime_harness_bin=/remote/bin/claude\nruntime_model=opus\nruntime_effort=n/a\nok"
+        : "ok",
       stderr: "",
       durationMs: 1,
       commandLabel: "update-check"
@@ -1934,6 +1975,10 @@ test("update-check reports known but unconfigured machines instead of silently o
     workerInternals.runUpdateCheckProbe = originalProbe;
     expect(result.ok).toBe(true);
     expect(result.stdout).toContain("## seen-only");
+    expect(result.stdout).toContain("## worker1");
+    expect(result.stdout).toContain("- harness: claude");
+    expect(result.stdout).toContain("- harness_bin: /remote/bin/claude");
+    expect(result.stdout).toContain("- model: opus");
     expect(result.stdout).toContain("skipped: known machine has no configured worker entry for update-check");
     expect(result.commandLabel).toContain("seen-only");
   } finally {
@@ -2664,12 +2709,14 @@ test("worker harness selection supports worker and context overrides without con
       const capture = join(tmpdir(), `telemux-ssh-capture-${Date.now()}.sh`);
       const cachedCapture = join(tmpdir(), `telemux-ssh-cached-capture-${Date.now()}.sh`);
       const argsCapture = join(tmpdir(), `telemux-ssh-args-${Date.now()}.txt`);
+  const previousSkipPathResolve = process.env.BRAINSTACK_SKIP_USER_PATH_RESOLVE;
   const fixture = await createFixture({
     FACTORY_HARNESS: "codex",
     TEST_CONTROL_WORKER_HARNESS: "claude"
   });
 
   try {
+    process.env.BRAINSTACK_SKIP_USER_PATH_RESOLVE = "1";
     await fixture.commands.handleMessage(telegramMessage("/newctx workerharness control scratch", 69));
     await fixture.commands.handleMessage(telegramMessage("Worker default should choose Claude.", 69));
     await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Claude reply turn 1 for workerharness.")));
@@ -2729,10 +2776,44 @@ test("worker harness selection supports worker and context overrides without con
     } finally {
       delete process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT;
       delete process.env.FACTORY_TEST_CAPTURE_SSH_ARGS;
+      if (previousSkipPathResolve === undefined) {
+        delete process.env.BRAINSTACK_SKIP_USER_PATH_RESOLVE;
+      } else {
+        process.env.BRAINSTACK_SKIP_USER_PATH_RESOLVE = previousSkipPathResolve;
+      }
     process.env.PATH = fixture.previousPath;
       await rm(capture, { force: true });
       await rm(cachedCapture, { force: true });
       await rm(argsCapture, { force: true });
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("SSH accept-new trust mode is bootstrap-only and refused for worker dispatch", async () => {
+  const fixture = await createFixture();
+  const previousAllowAcceptNew = process.env.BRAINSTACK_ALLOW_ACCEPT_NEW_DISPATCH;
+
+  try {
+    process.env.BRAINSTACK_ALLOW_ACCEPT_NEW_DISPATCH = "0";
+    const workers = JSON.parse(await readFile(fixture.workersFile, "utf8")) as Array<Record<string, unknown>>;
+    workers[1] = {
+      ...workers[1],
+      sshTrustMode: "accept-new"
+    };
+    await writeFile(fixture.workersFile, `${JSON.stringify(workers, null, 2)}\n`);
+
+    await fixture.commands.handleMessage(telegramMessage("/newctx bootstrap-trust worker1 host", 69));
+    const context = fixture.db.getContextBySlug("bootstrap-trust");
+    expect(context?.state).toBe("error");
+    expect(context?.lastError).toContain("sshTrustMode=accept-new");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Pin the host key with brainctl trust-worker");
+  } finally {
+    if (previousAllowAcceptNew === undefined) {
+      delete process.env.BRAINSTACK_ALLOW_ACCEPT_NEW_DISPATCH;
+    } else {
+      process.env.BRAINSTACK_ALLOW_ACCEPT_NEW_DISPATCH = previousAllowAcceptNew;
+    }
+    process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 15_000);
@@ -2758,10 +2839,69 @@ test("SSH workers with explicit ports use the port for dispatch without leaking 
   }
 }, 15_000);
 
+test("worker shell PATH fallback escalates when timeout is unavailable and the login shell ignores TERM", async () => {
+  const capture = join(tmpdir(), `telemux-ssh-path-fallback-${Date.now()}.sh`);
+  const fixture = await createFixture();
+
+  try {
+    process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT = capture;
+    await fixture.workers.probeWorker("worker1");
+    const capturedScript = await readFile(capture, "utf8");
+    const startMarker = 'if [ -z "${BRAINSTACK_SKIP_USER_PATH_RESOLVE:-}" ]; then';
+    const endMarker = "  unset __brainstack_detected_path\nfi";
+    const start = capturedScript.indexOf(startMarker);
+    const end = capturedScript.indexOf(endMarker, start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const pathPrelude = capturedScript.slice(start, end + endMarker.length);
+
+    const binDir = join(fixture.root, "path-fallback-bin");
+    const logPath = join(fixture.root, "path-fallback-shell.log");
+    const fakeShell = join(binDir, "fake-login-shell");
+    await mkdir(binDir, { recursive: true });
+    await makeExecutable(
+      join(binDir, "sed"),
+      "#!/bin/sh\nwhile IFS= read -r _line; do :; done\n"
+    );
+    await makeExecutable(
+      join(binDir, "tail"),
+      "#!/bin/sh\nlast=''\nwhile IFS= read -r line; do last=\"$line\"; done\n[ -n \"$last\" ] && printf '%s\\n' \"$last\"\n"
+    );
+    await makeExecutable(join(binDir, "sleep"), "#!/bin/sh\nexec /bin/sleep 0.05\n");
+    await makeExecutable(
+      fakeShell,
+      `#!/bin/sh
+printf 'started=%s\\n' "$$" >> ${JSON.stringify(logPath)}
+trap 'printf "term=%s\\n" "$$" >> ${JSON.stringify(logPath)}' TERM
+while :; do :; done
+`
+    );
+
+    const result = Bun.spawnSync(["/bin/bash", "-c", `${pathPrelude}\nprintf 'PATH_AFTER=%s\\n' "$PATH"\n`], {
+      env: {
+        PATH: binDir,
+        SHELL: fakeShell
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 8_000
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString()).toContain(`PATH_AFTER=${binDir}`);
+    expect(await readFile(logPath, "utf8")).toContain("term=");
+  } finally {
+    delete process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT;
+    process.env.PATH = fixture.previousPath;
+    await rm(capture, { force: true });
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 12_000);
+
 test("local worker resolves harness through BRAINSTACK_WORKER_PATH when service PATH is minimal", async () => {
   const fixture = await createFixture({
     FACTORY_CODEX_BIN: "codex",
-    FACTORY_HARNESS_BIN: "codex"
+    FACTORY_HARNESS_BIN: "codex",
+    BRAINSTACK_SKIP_USER_PATH_RESOLVE: ""
   });
   const previousPath = process.env.PATH;
   const previousWorkerPath = process.env.BRAINSTACK_WORKER_PATH;
@@ -2898,6 +3038,209 @@ test("Telegram text coalescing keeps pending text durable when dispatch setup fa
     (fixture.commands as unknown as { dispatcher: unknown }).dispatcher = originalDispatcher;
   } finally {
     process.env.PATH = fixture.previousPath;
+    clearPendingTextTimers(fixture);
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("Telegram text recovery persists legacy blank generations before accepted dispatch", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "30"
+  });
+  const key = `4242:70:${TEST_ALLOWED_TELEGRAM_USER_ID}`;
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx legacygen control scratch", 70));
+    fixture.db.upsertPendingText({
+      key,
+      contextSlug: "legacygen",
+      chatId: 4242,
+      threadId: 70,
+      userId: TEST_ALLOWED_TELEGRAM_USER_ID,
+      partsJson: JSON.stringify(["legacy pending text"]),
+      generationId: "legacy-seed"
+    });
+    setPendingTextGenerationForTest(fixture, key, "");
+
+    fixture.commands.recoverPendingText();
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for legacygen.")));
+
+    expect(fixture.db.listPendingText()).toHaveLength(0);
+    const prompt = await readFile(join(fixture.factoryRoot, "scratch", "legacygen", ".factory", "control-plane.prompt.md"), "utf8");
+    expect(prompt.match(/legacy pending text/g)).toHaveLength(1);
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("Telegram text recovery does not duplicate legacy blank generations after dispatch refusal", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "30"
+  });
+  const key = `4242:70:${TEST_ALLOWED_TELEGRAM_USER_ID}`;
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx legacyrefuse control scratch", 70));
+    const originalDispatcher = (fixture.commands as unknown as { dispatcher: unknown }).dispatcher;
+    (fixture.commands as unknown as { dispatcher: { dispatch: () => Promise<{ accepted: boolean; message: string }> } }).dispatcher = {
+      dispatch: async () => ({ accepted: false, message: "synthetic refusal" })
+    };
+    fixture.db.upsertPendingText({
+      key,
+      contextSlug: "legacyrefuse",
+      chatId: 4242,
+      threadId: 70,
+      userId: TEST_ALLOWED_TELEGRAM_USER_ID,
+      partsJson: JSON.stringify(["legacy retry text"]),
+      generationId: "legacy-seed"
+    });
+    setPendingTextGenerationForTest(fixture, key, "");
+
+    fixture.commands.recoverPendingText();
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("synthetic refusal")));
+
+    const pending = fixture.db.listPendingText();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.generationId).not.toBe("");
+    expect(JSON.parse(pending[0]!.partsJson)).toEqual(["legacy retry text"]);
+    (fixture.commands as unknown as { dispatcher: unknown }).dispatcher = originalDispatcher;
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    clearPendingTextTimers(fixture);
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("Telegram text coalescing preserves older text when newer text arrives before refusal completes", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "30"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx coalescerace control scratch", 70));
+    const originalDispatcher = (fixture.commands as unknown as { dispatcher: unknown }).dispatcher;
+    let releaseDispatch: (() => void) | null = null;
+    let dispatchStarted = false;
+    (fixture.commands as unknown as { dispatcher: { dispatch: () => Promise<{ accepted: boolean; message: string }> } }).dispatcher = {
+      dispatch: async () => {
+        dispatchStarted = true;
+        await new Promise<void>((resolve) => {
+          releaseDispatch = resolve;
+        });
+        return { accepted: false, message: "synthetic refusal" };
+      }
+    };
+
+    await fixture.commands.handleMessage(telegramMessage("older text", 70));
+    await waitFor(() => dispatchStarted);
+    await fixture.commands.handleMessage(telegramMessage("newer text", 70));
+    releaseDispatch?.();
+    (fixture.commands as unknown as { dispatcher: unknown }).dispatcher = originalDispatcher;
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("synthetic refusal")));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for coalescerace.")));
+
+    const pending = fixture.db.listPendingText();
+    expect(pending).toHaveLength(0);
+    const prompt = await readFile(join(fixture.factoryRoot, "scratch", "coalescerace", ".factory", "control-plane.prompt.md"), "utf8");
+    expect(prompt).toContain("older text\n\nnewer text");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("Telegram text coalescing does not merge a failed older flush into a newer context", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "30"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx coalesceold control scratch", 70));
+    const originalDispatcher = (fixture.commands as unknown as { dispatcher: unknown }).dispatcher;
+    let releaseDispatch: (() => void) | null = null;
+    let dispatchStarted = false;
+    (fixture.commands as unknown as { dispatcher: { dispatch: () => Promise<{ accepted: boolean; message: string }> } }).dispatcher = {
+      dispatch: async () => {
+        dispatchStarted = true;
+        await new Promise<void>((resolve) => {
+          releaseDispatch = resolve;
+        });
+        return { accepted: false, message: "synthetic refusal" };
+      }
+    };
+
+    await fixture.commands.handleMessage(telegramMessage("older text", 70));
+    await waitFor(() => dispatchStarted);
+    const key = "4242:70:123456789";
+    fixture.db.upsertPendingText({
+      key,
+      contextSlug: "coalescenew",
+      chatId: 4242,
+      threadId: 70,
+      userId: TEST_ALLOWED_TELEGRAM_USER_ID,
+      partsJson: JSON.stringify(["older text"])
+    });
+    releaseDispatch?.();
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("synthetic refusal")));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("newer text for another context remains queued")));
+
+    const pending = fixture.db.listPendingText();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.contextSlug).toBe("coalescenew");
+    expect(JSON.parse(pending[0]!.partsJson)).toEqual(["older text"]);
+    (fixture.commands as unknown as { dispatcher: unknown }).dispatcher = originalDispatcher;
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    clearPendingTextTimers(fixture);
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("Telegram text coalescing does not delete a newer identical generation after old dispatch accepts", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "30"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx coalesceacceptold control scratch", 70));
+    const originalDispatcher = (fixture.commands as unknown as { dispatcher: unknown }).dispatcher;
+    let releaseDispatch: (() => void) | null = null;
+    let dispatchStarted = false;
+    let dispatchDone = false;
+    (fixture.commands as unknown as { dispatcher: { dispatch: () => Promise<{ accepted: boolean; message: string }> } }).dispatcher = {
+      dispatch: async () => {
+        dispatchStarted = true;
+        await new Promise<void>((resolve) => {
+          releaseDispatch = resolve;
+        });
+        dispatchDone = true;
+        return { accepted: true, message: "" };
+      }
+    };
+
+    await fixture.commands.handleMessage(telegramMessage("same text", 70));
+    await waitFor(() => dispatchStarted);
+    const key = "4242:70:123456789";
+    fixture.db.upsertPendingText({
+      key,
+      contextSlug: "coalesceacceptnew",
+      chatId: 4242,
+      threadId: 70,
+      userId: TEST_ALLOWED_TELEGRAM_USER_ID,
+      partsJson: JSON.stringify(["same text"])
+    });
+    releaseDispatch?.();
+    await waitFor(() => dispatchDone);
+
+    const pending = fixture.db.listPendingText();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.contextSlug).toBe("coalesceacceptnew");
+    expect(JSON.parse(pending[0]!.partsJson)).toEqual(["same text"]);
+    (fixture.commands as unknown as { dispatcher: unknown }).dispatcher = originalDispatcher;
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    clearPendingTextTimers(fixture);
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 10_000);
@@ -2944,6 +3287,7 @@ test("Telegram text coalescing keeps pending text durable when dispatch refuses 
     await releaseLock;
   } finally {
     process.env.PATH = fixture.previousPath;
+    clearPendingTextTimers(fixture);
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 10_000);
@@ -2994,6 +3338,7 @@ test("Telegram text coalescing flushes before buffers grow without bound", async
 
     const pendingText = (fixture.commands as unknown as { pendingText: Map<string, { parts: string[] }> }).pendingText;
     expect([...pendingText.values()][0]?.parts).toEqual(["part 25"]);
+    expect(fixture.db.getPendingText(`4242:73:${TEST_ALLOWED_TELEGRAM_USER_ID}`)?.partsJson).toBe(JSON.stringify(["part 25"]));
 
     await fixture.commands.handleMessage(telegramMessage("/topicinfo", 73));
     await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 2 for coalesce-cap.")));
@@ -3018,7 +3363,7 @@ test("Telegram text coalescing caps the number of pending buffers", async () => 
       enqueue(context, `pending ${index}`, { chatId: 4242, threadId: 10_000 + index }, TEST_ALLOWED_TELEGRAM_USER_ID);
     }
 
-    const pendingText = (fixture.commands as unknown as { pendingText: Map<string, { timer: Timer }> }).pendingText;
+    const pendingText = (fixture.commands as unknown as { pendingText: Map<string, { timer: ReturnType<typeof setTimeout> }> }).pendingText;
     expect(pendingText.size).toBeLessThanOrEqual(100);
     await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for coalesce-map-cap.")));
     for (const pending of pendingText.values()) {

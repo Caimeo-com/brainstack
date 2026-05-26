@@ -139,14 +139,27 @@ if [ -z "\${BRAINSTACK_SKIP_USER_PATH_RESOLVE:-}" ]; then
   __brainstack_detected_path=""
   if [ -n "\${BRAINSTACK_WORKER_PATH:-}" ]; then
     __brainstack_detected_path="$BRAINSTACK_WORKER_PATH"
-  elif [ -n "\${harness_bin:-}" ] && command -v "$harness_bin" >/dev/null 2>&1; then
-    __brainstack_detected_path=""
   elif [ -n "\${SHELL:-}" ] && [ -x "$SHELL" ]; then
     __brainstack_detected_path="$(
       if command -v timeout >/dev/null 2>&1; then
         timeout 5s "$SHELL" -lic 'printf "__BRAINSTACK_PATH__%s\\n" "$PATH"' 2>/dev/null
       else
-        "$SHELL" -lic 'printf "__BRAINSTACK_PATH__%s\\n" "$PATH"' 2>/dev/null
+        "$SHELL" -lic 'printf "__BRAINSTACK_PATH__%s\\n" "$PATH"' 2>/dev/null &
+        __brainstack_path_pid=$!
+        __brainstack_path_elapsed=0
+        while kill -0 "$__brainstack_path_pid" 2>/dev/null; do
+          if [ "$__brainstack_path_elapsed" -ge 5 ]; then
+            kill "$__brainstack_path_pid" 2>/dev/null || true
+            sleep 1
+            if kill -0 "$__brainstack_path_pid" 2>/dev/null; then
+              kill -9 "$__brainstack_path_pid" 2>/dev/null || true
+            fi
+            break
+          fi
+          sleep 1
+          __brainstack_path_elapsed=$((__brainstack_path_elapsed + 1))
+        done
+        wait "$__brainstack_path_pid" 2>/dev/null || true
       fi | sed -n 's/.*__BRAINSTACK_PATH__//p' | tail -n 1
     )"
   fi
@@ -157,6 +170,10 @@ if [ -z "\${BRAINSTACK_SKIP_USER_PATH_RESOLVE:-}" ]; then
   unset __brainstack_detected_path
 fi
 `.trim();
+}
+
+function truthyEnv(value: string | undefined): boolean {
+  return ["1", "true", "yes", "on"].includes((value || "").trim().toLowerCase());
 }
 
 function sshTrustArgs(config: FactoryConfig, worker: FactoryWorkerConfig): string[] {
@@ -245,6 +262,19 @@ function probeField(output: string, key: string): string | null {
   return output.match(new RegExp(`^${escaped}=([^\\n]*)$`, "m"))?.[1]?.trim() || null;
 }
 
+function runtimeFromUpdateOutput(output: string): { harness: HarnessName; harnessBin: string; model: string; effort: string } | null {
+  const harness = probeField(output, "runtime_harness");
+  if (harness !== "codex" && harness !== "claude") {
+    return null;
+  }
+  return {
+    harness,
+    harnessBin: probeField(output, "runtime_harness_bin") || harness,
+    model: probeField(output, "runtime_model") || "default",
+    effort: probeField(output, "runtime_effort") || (harness === "claude" ? "n/a" : "default")
+  };
+}
+
 function eventLooksLikeCompaction(value: unknown): boolean {
   if (!value || typeof value !== "object") {
     return false;
@@ -317,7 +347,7 @@ function appendBoundedOutput(current: string, chunk: string, maxBytes: number): 
 
 function requiredHarnessFlags(harness: HarnessName): string[] {
   return harness === "codex"
-    ? ["--dangerously-bypass-approvals-and-sandbox", "--output-last-message"]
+    ? ["--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--output-last-message"]
     : ["--dangerously-skip-permissions", "--permission-mode", "--output-format"];
 }
 
@@ -800,7 +830,7 @@ else
   if ${shouldResume ? "true" : "false"}; then
     codex_args+=(resume)
   fi
-  codex_args+=(--json --output-last-message "$last_message_tmp" --dangerously-bypass-approvals-and-sandbox)
+  codex_args+=(--json --skip-git-repo-check --output-last-message "$last_message_tmp" --dangerously-bypass-approvals-and-sandbox)
   if ((\${#model_args[@]})); then
     codex_args+=("\${model_args[@]}")
   fi
@@ -1058,6 +1088,7 @@ wait "$harness_pid"
 
   private buildUpdateCheckProbeScript(worker: FactoryWorkerConfig): string {
     const productRoot = worker.localExecution ? this.config.projectRoot : "~/brainstack";
+    const harness = this.resolveHarness(worker);
     return `
 set -uo pipefail
 expand_home_path() {
@@ -1067,6 +1098,35 @@ expand_home_path() {
     *) printf '%s\\n' "$1" ;;
   esac
 }
+
+harness=${quoteSh(harness.family)}
+harness_bin=${quoteSh(harness.bin)}
+${workerUserPathPrelude()}
+
+brainstack_config_value() {
+  key="$1"
+  file="$2"
+  [ -f "$file" ] || return 0
+  awk -v key="$key" 'BEGIN { in_section=0 } /^[[:space:]]*\\[/ { in_section=1 } in_section == 0 { pattern="^[[:space:]]*" key "[[:space:]]*="; if ($0 ~ pattern) { sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]*#.*/, ""); gsub(/^[[:space:]\"]+|[[:space:]\"]+$/, ""); print; exit } }' "$file" || true
+}
+
+if command -v "$harness_bin" >/dev/null 2>&1; then
+  resolved_harness_bin="$(command -v "$harness_bin")"
+else
+  resolved_harness_bin="$harness_bin"
+fi
+printf 'runtime_harness=%s\\n' "$harness"
+printf 'runtime_harness_bin=%s\\n' "$resolved_harness_bin"
+if [ "$harness" = codex ]; then
+  codex_config="\${CODEX_HOME:-$HOME/.codex}/config.toml"
+  model_config="$(brainstack_config_value model "$codex_config")"
+  effort_config="$(brainstack_config_value model_reasoning_effort "$codex_config")"
+  printf 'runtime_model=%s\\n' "\${model_config:-default}"
+  printf 'runtime_effort=%s\\n' "\${effort_config:-default}"
+else
+  printf 'runtime_model=default\\n'
+  printf 'runtime_effort=n/a\\n'
+fi
 
 run_readonly() {
   per_command_timeout="\${BRAINSTACK_UPDATE_PROBE_TIMEOUT_SECONDS:-20}"
@@ -1136,13 +1196,20 @@ fi
     ];
 
     for (const result of results) {
+      const body = `${result.stdout}${result.stderr ? `\n${result.stderr}` : ""}`.trim();
+      const runtime = runtimeFromUpdateOutput(body) || this.describeWorkerRuntime(result.host, result.host === context.machine ? context : undefined);
       lines.push(`## ${result.host}`, "");
       lines.push(`- status: ${result.ok ? "ok" : "failed"}`);
       lines.push(`- transport: ${result.transport}`);
+      if (runtime) {
+        lines.push(`- harness: ${runtime.harness}`);
+        lines.push(`- harness_bin: ${runtime.harnessBin}`);
+        lines.push(`- model: ${runtime.model}`);
+        lines.push(`- effort: ${runtime.effort}`);
+      }
       lines.push(`- exit: ${result.exitCode}`);
       lines.push(`- duration_ms: ${result.durationMs}`);
       lines.push("");
-      const body = `${result.stdout}${result.stderr ? `\n${result.stderr}` : ""}`.trim();
       lines.push(body ? body : "(no output)");
       lines.push("");
     }
@@ -1968,10 +2035,23 @@ printf 'BRANCH=%s\\n' "$branch_name"
     harnessOverride?: { family: HarnessName; bin: string }
   ): Promise<WorkerExecResult> {
     const harness = harnessOverride || this.resolveHarness(worker);
+    if (worker.transport === "ssh" && worker.sshTrustMode === "accept-new" && !truthyEnv(process.env.BRAINSTACK_ALLOW_ACCEPT_NEW_DISPATCH)) {
+      return {
+        ok: false,
+        host: worker.name,
+        transport: worker.transport,
+        exitCode: 78,
+        stdout: "",
+        stderr: `worker ${worker.name} uses sshTrustMode=accept-new, which is bootstrap-only. Pin the host key with brainctl trust-worker and set sshTrustMode: pinned before dispatch.`,
+        durationMs: 0,
+        commandLabel: "ssh trust refused"
+      };
+    }
     const cachedPath = usePathCache && worker.transport !== "local" ? await this.cachedWorkerPath(worker, harness) : null;
     const cachePrelude = cachedPath ? `BRAINSTACK_WORKER_PATH=${quoteSh(cachedPath)}\nexport BRAINSTACK_WORKER_PATH\n` : "";
     const uncachedPrelude = usePathCache ? "" : "unset BRAINSTACK_WORKER_PATH\n";
-    const scriptToRun = worker.transport === "local" ? script : `${uncachedPrelude}${cachePrelude}${workerUserPathPrelude()}\n${script}`;
+    const harnessPrelude = `harness=${quoteSh(harness.family)}\nharness_bin=${quoteSh(harness.bin)}\n`;
+    const scriptToRun = worker.transport === "local" ? `${harnessPrelude}${script}` : `${uncachedPrelude}${cachePrelude}${harnessPrelude}${workerUserPathPrelude()}\n${script}`;
     switch (worker.transport) {
       case "local":
         return this.spawnAndCapture(

@@ -23,7 +23,6 @@ import {
   lintWiki,
   parseFrontmatter,
   readPage,
-  rebuildIndex,
   resolveInternalLinkPath,
   safeRepoPath,
   searchIndex,
@@ -88,8 +87,24 @@ const importToken = readTokenEnv("BRAIN_IMPORT_TOKEN");
 const adminToken = readTokenEnv("BRAIN_ADMIN_TOKEN");
 const host = process.env.BRAIN_BIND || "127.0.0.1";
 const port = Number(process.env.BRAIN_PORT || 8080);
-const securityPosture = process.env.BRAIN_SECURITY_POSTURE || "trusted-tailnet";
-const trustedExposure = process.env.BRAIN_TRUSTED_EXPOSURE || "none";
+function normalizeSecurityPosture(value: string | undefined): "local" | "trusted-tailnet" | "guarded" {
+  const normalized = (value || "trusted-tailnet").trim().toLowerCase();
+  if (normalized === "local" || normalized === "trusted-tailnet" || normalized === "guarded") {
+    return normalized;
+  }
+  throw new Error(`Unsupported BRAIN_SECURITY_POSTURE=${value}; expected local, trusted-tailnet, or guarded.`);
+}
+
+function normalizeTrustedExposure(value: string | undefined): "none" | "tailscale-serve" | "vpn" | "manual" {
+  const normalized = (value || "none").trim().toLowerCase();
+  if (normalized === "none" || normalized === "tailscale-serve" || normalized === "vpn" || normalized === "manual") {
+    return normalized;
+  }
+  throw new Error(`Unsupported BRAIN_TRUSTED_EXPOSURE=${value}; expected none, tailscale-serve, vpn, or manual.`);
+}
+
+const securityPosture = normalizeSecurityPosture(process.env.BRAIN_SECURITY_POSTURE);
+const trustedExposure = normalizeTrustedExposure(process.env.BRAIN_TRUSTED_EXPOSURE);
 const configuredMaxImportBytes = Number(process.env.BRAIN_MAX_IMPORT_BYTES || "");
 const maxImportBytes =
   Number.isFinite(configuredMaxImportBytes) && configuredMaxImportBytes > 0
@@ -171,7 +186,10 @@ const maxSearchLimit = 50;
 const reindexWorkerPath = join(import.meta.dir, "reindex-worker.ts");
 const pendingReindexPath = join(repoRoot, "derived", "search-reindex-needed.json");
 let searchRefreshPromise: Promise<void> | null = null;
+let searchRefreshRequested = false;
 let searchRefreshRequestedCommit: string | null = null;
+let searchRefreshGeneration = 0;
+let searchRefreshMarkerWritePromise: Promise<void> | null = null;
 let activeWriteRequests = 0;
 let activeImportPreparations = 0;
 const writeRateEvents = new Map<string, number[]>();
@@ -198,15 +216,22 @@ async function currentRepoCommit(root: string): Promise<string | null> {
 }
 
 async function ensureFreshStartupIndex(): Promise<void> {
+  const pending = await latestPendingReindexMarker();
+  if (pending) {
+    searchRefreshGeneration = Math.max(searchRefreshGeneration, Number(pending.marker.generation || 0));
+    queueSearchRefresh(typeof pending.marker.commit === "string" ? pending.marker.commit : null);
+    return;
+  }
   const health = existsSync(join(repoRoot, "derived", "search.sqlite")) ? await getHealth(repoRoot) : null;
   const currentCommit = await currentRepoCommit(repoRoot);
   if (!health || (currentCommit && health.indexed_commit !== currentCommit)) {
-    await rebuildIndex(repoRoot);
+    queueSearchRefresh(currentCommit);
+    return;
   }
   await rm(pendingReindexPath, { force: true }).catch(() => undefined);
 }
 
-await ensureFreshStartupIndex();
+let startupIndexPromise: Promise<void> | null = null;
 
 function htmlEscape(value: string): string {
   return value
@@ -596,27 +621,38 @@ async function idempotencyLockStatuses(idempotencyDir: string): Promise<Array<Re
   return locks;
 }
 
+async function latestPendingReindexMarker(): Promise<{ path: string; marker: Record<string, unknown>; mtimeMs: number } | null> {
+  const [info, marker] = await Promise.all([
+    stat(pendingReindexPath).catch(() => null),
+    readJsonFile<Record<string, unknown>>(pendingReindexPath)
+  ]);
+  if (!info || !marker) {
+    return null;
+  }
+  return { path: pendingReindexPath, marker, mtimeMs: info.mtime.getTime() };
+}
+
 async function pendingReindexStatus(): Promise<Record<string, unknown>> {
-  if (!existsSync(pendingReindexPath)) {
+  const latest = await latestPendingReindexMarker();
+  if (!latest) {
     return { present: false, path: pendingReindexPath };
   }
-  const info = await stat(pendingReindexPath);
   return {
     present: true,
-    path: pendingReindexPath,
-    age_ms: Math.max(0, Date.now() - info.mtime.getTime()),
-    marker: await readJsonFile<Record<string, unknown>>(pendingReindexPath)
+    path: latest.path,
+    age_ms: Math.max(0, Date.now() - latest.mtimeMs),
+    marker: latest.marker
   };
 }
 
 async function publicPendingReindexStatus(): Promise<Record<string, unknown>> {
-  if (!existsSync(pendingReindexPath)) {
+  const latest = await latestPendingReindexMarker();
+  if (!latest) {
     return { present: false };
   }
-  const info = await stat(pendingReindexPath);
   return {
     present: true,
-    age_ms: Math.max(0, Date.now() - info.mtime.getTime())
+    age_ms: Math.max(0, Date.now() - latest.mtimeMs)
   };
 }
 
@@ -641,6 +677,19 @@ function minimalHealth(): Record<string, unknown> {
     ok: true,
     service: "braind",
     version: "0.1.0"
+  };
+}
+
+async function readinessHealth(): Promise<Record<string, unknown>> {
+  const pending = await publicPendingReindexStatus();
+  const searchIndexPath = join(repoRoot, "derived", "search.sqlite");
+  const searchReady = existsSync(searchIndexPath) && !pending.present && !searchRefreshPromise && !startupIndexPromise;
+  return {
+    ...minimalHealth(),
+    ready: searchReady,
+    search_ready: searchReady,
+    search_refreshing: Boolean(searchRefreshPromise || startupIndexPromise),
+    pending_reindex: pending
   };
 }
 
@@ -1060,6 +1109,22 @@ function requireContentLength(request: Request, maxBytes: number, label: string)
     reject(411, `${label} requires content-length`);
   }
   assertContentLength(request, maxBytes, label);
+}
+
+function assertNoRequestBody(request: Request, label: string): void {
+  const rawLength = request.headers.get("content-length");
+  if (rawLength) {
+    const length = Number(rawLength);
+    if (!Number.isFinite(length) || length < 0) {
+      reject(400, `${label} has invalid content-length`);
+    }
+    if (length > 0) {
+      reject(413, `${label} does not accept a request body`);
+    }
+  }
+  if (!rawLength && request.body) {
+    reject(413, `${label} does not accept a request body`);
+  }
 }
 
 async function readRequestBytesCapped(request: Request, label: string, maxBytes: number): Promise<Uint8Array> {
@@ -1555,8 +1620,7 @@ async function runReindexWorker(root: string): Promise<{ indexedDocs: number; la
 
 async function performSearchRefresh(commit: string | null): Promise<Record<string, unknown>> {
   return await withRepoLock(repoRoot, async () => {
-    const targetCommit = searchRefreshRequestedCommit || commit;
-    searchRefreshRequestedCommit = null;
+    const targetCommit = commit;
     if (targetCommit && repoRoot !== writeRepoRoot && existsSync(join(repoRoot, ".git"))) {
       const branch = await runGit(["rev-parse", "--abbrev-ref", "HEAD"], repoRoot) || "main";
       for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -1578,28 +1642,56 @@ async function performSearchRefresh(commit: string | null): Promise<Record<strin
   });
 }
 
-async function recordPendingSearchRefresh(commit: string | null, error: string): Promise<void> {
+async function recordPendingSearchRefresh(commit: string | null, error: string, generation: number): Promise<void> {
   await writeJsonFile(pendingReindexPath, {
     commit,
     error,
+    generation,
     updated_at: isoNow()
   });
 }
 
+async function clearPendingSearchRefreshIfCurrent(generation: number): Promise<void> {
+  const pending = await latestPendingReindexMarker();
+  const pendingGeneration = Number(pending?.marker.generation || 0);
+  if (!pending || pendingGeneration <= generation) {
+    await rm(pendingReindexPath, { force: true }).catch(() => undefined);
+  }
+}
+
 function queueSearchRefresh(commit: string | null): Record<string, unknown> {
-  searchRefreshRequestedCommit = commit || searchRefreshRequestedCommit;
-  void recordPendingSearchRefresh(searchRefreshRequestedCommit, "queued").catch(() => undefined);
+  searchRefreshGeneration += 1;
+  const generation = searchRefreshGeneration;
+  searchRefreshRequested = true;
+  if (commit) {
+    searchRefreshRequestedCommit = commit;
+  }
+  searchRefreshMarkerWritePromise = recordPendingSearchRefresh(searchRefreshRequestedCommit, "queued", generation);
+  void searchRefreshMarkerWritePromise.catch(() => undefined);
   if (!searchRefreshPromise) {
     searchRefreshPromise = (async () => {
-      while (searchRefreshRequestedCommit !== null) {
+      while (searchRefreshRequested) {
         const targetCommit = searchRefreshRequestedCommit;
+        const targetGeneration = searchRefreshGeneration;
+        const markerWrite = searchRefreshMarkerWritePromise;
+        searchRefreshRequested = false;
         searchRefreshRequestedCommit = null;
         try {
-          const latestCommit = searchRefreshRequestedCommit || targetCommit;
-          await performSearchRefresh(latestCommit);
-          await rm(pendingReindexPath, { force: true }).catch(() => undefined);
+          await markerWrite?.catch(() => undefined);
+          await performSearchRefresh(targetCommit);
+          if (!searchRefreshRequested) {
+            await clearPendingSearchRefreshIfCurrent(targetGeneration);
+          }
         } catch (error) {
-          await recordPendingSearchRefresh(searchRefreshRequestedCommit || targetCommit, error instanceof Error ? error.message : String(error)).catch(() => undefined);
+          if (searchRefreshRequested || searchRefreshGeneration > targetGeneration) {
+            await searchRefreshMarkerWritePromise?.catch(() => undefined);
+            const pending = await latestPendingReindexMarker().catch(() => null);
+            const pendingGeneration = Number(pending?.marker.generation || 0);
+            if (searchRefreshRequested || pendingGeneration > targetGeneration) {
+              continue;
+            }
+          }
+          await recordPendingSearchRefresh(targetCommit, error instanceof Error ? error.message : String(error), targetGeneration).catch(() => undefined);
           break;
         }
       }
@@ -1607,13 +1699,14 @@ function queueSearchRefresh(commit: string | null): Record<string, unknown> {
       searchRefreshPromise = null;
     });
   }
-  return { ok: true, queued: true, target_commit: commit };
+  return { ok: true, queued: true, target_commit: commit || searchRefreshRequestedCommit || null };
 }
 
 async function retryPendingSearchRefresh(): Promise<void> {
-  const pending = await readJsonFile<{ commit?: string | null }>(pendingReindexPath);
+  const pending = await latestPendingReindexMarker();
   if (pending && !searchRefreshPromise) {
-    queueSearchRefresh(pending.commit || null);
+    searchRefreshGeneration = Math.max(searchRefreshGeneration, Number(pending.marker.generation || 0));
+    queueSearchRefresh(typeof pending.marker.commit === "string" ? pending.marker.commit : null);
   }
 }
 
@@ -1629,7 +1722,18 @@ const searchRefreshRetryTimer = setInterval(() => {
 if (typeof searchRefreshRetryTimer === "object" && searchRefreshRetryTimer && "unref" in searchRefreshRetryTimer) {
   (searchRefreshRetryTimer as { unref: () => void }).unref();
 }
-void retryPendingSearchRefresh().catch(() => undefined);
+
+startupIndexPromise = ensureFreshStartupIndex().catch(async (error) => {
+  await recordPendingSearchRefresh(
+    await currentRepoCommit(repoRoot).catch(() => null),
+    error instanceof Error ? error.message : String(error),
+    searchRefreshGeneration
+  ).catch(() => undefined);
+  console.error("startup search index refresh failed", error);
+});
+startupIndexPromise.finally(() => {
+  startupIndexPromise = null;
+}).catch(() => undefined);
 
 async function writeImport(
   input: Parameters<typeof createImportedArtifact>[1],
@@ -2069,6 +2173,10 @@ const server = Bun.serve({
       if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
         return json(minimalHealth());
       }
+      if (request.method === "GET" && (url.pathname === "/ready" || url.pathname === "/readyz")) {
+        const health = await readinessHealth();
+        return json(health, health.ready === true ? 200 : 503);
+      }
       if (request.method === "GET" && (url.pathname === "/admin/health" || url.pathname === "/health/deep")) {
         assertAdminAuth(request);
         return json(await operationalHealth());
@@ -2127,7 +2235,7 @@ const server = Bun.serve({
       if (request.method === "POST" && url.pathname === "/api/lint") {
         assertAdminAuth(request);
         assertWriteRateLimit(request, "admin", "lint", null);
-        assertContentLength(request, maxJsonBytes, "Lint request body");
+        assertNoRequestBody(request, "lint");
         return json(
           await withMutationGate(async () => {
             const result = await withRepoLock(writeRepoRoot, async () => {

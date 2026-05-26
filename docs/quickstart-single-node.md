@@ -98,7 +98,9 @@ Do not enable Funnel for the shared brain unless you explicitly intend public in
 bun run packages/brainctl/src/main.ts doctor --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts updates --config ~/.config/brainstack/brainstack.yaml
 curl -fsS http://127.0.0.1:8080/healthz
+curl -fsS http://127.0.0.1:8080/readyz
 curl -fsS https://brain-control.example.ts.net/healthz
+curl -fsS https://brain-control.example.ts.net/readyz
 systemctl --user status braind.service --no-pager
 journalctl --user -u braind.service -n 100 --no-pager
 ```

@@ -79,6 +79,7 @@ export interface PendingTextRecord {
   threadId: number | null;
   userId: number | null;
   partsJson: string;
+  generationId: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -400,6 +401,7 @@ export class FactoryDb {
         thread_id INTEGER,
         user_id INTEGER,
         parts_json TEXT NOT NULL,
+        generation_id TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -427,6 +429,7 @@ export class FactoryDb {
     this.ensureColumn("workers", "ssh_user", "ssh_user TEXT");
     this.ensureColumn("workers", "last_seen_at", "last_seen_at TEXT");
     this.ensureColumn("cron_jobs", "runner", "runner TEXT");
+    this.ensureColumn("pending_text_prompts", "generation_id", "generation_id TEXT NOT NULL DEFAULT ''");
   }
 
   countQueuedContexts(): number {
@@ -470,21 +473,25 @@ export class FactoryDb {
     threadId: number | null;
     userId: number | null;
     partsJson: string;
-  }): void {
+    generationId?: string;
+  }): string {
     const now = nowIso();
+    const generationId = input.generationId || randomUUID();
     this.db
       .query(`
-        INSERT INTO pending_text_prompts (key, context_slug, chat_id, thread_id, user_id, parts_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO pending_text_prompts (key, context_slug, chat_id, thread_id, user_id, parts_json, generation_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(key) DO UPDATE SET
           context_slug = excluded.context_slug,
           chat_id = excluded.chat_id,
           thread_id = excluded.thread_id,
           user_id = excluded.user_id,
           parts_json = excluded.parts_json,
+          generation_id = excluded.generation_id,
           updated_at = excluded.updated_at
       `)
-      .run(input.key, input.contextSlug, input.chatId, input.threadId, input.userId, input.partsJson, now, now);
+      .run(input.key, input.contextSlug, input.chatId, input.threadId, input.userId, input.partsJson, generationId, now, now);
+    return generationId;
   }
 
   getPendingText(key: string): PendingTextRecord | null {
@@ -497,6 +504,7 @@ export class FactoryDb {
           threadId: row.thread_id === null || row.thread_id === undefined ? null : Number(row.thread_id),
           userId: row.user_id === null || row.user_id === undefined ? null : Number(row.user_id),
           partsJson: String(row.parts_json || "[]"),
+          generationId: String(row.generation_id || ""),
           createdAt: String(row.created_at),
           updatedAt: String(row.updated_at)
         }
@@ -512,6 +520,22 @@ export class FactoryDb {
 
   deletePendingText(key: string): void {
     this.db.query("DELETE FROM pending_text_prompts WHERE key = ?").run(key);
+  }
+
+  deletePendingTextIfGenerationMatch(key: string, generationId: string): boolean {
+    const result = this.db.query("DELETE FROM pending_text_prompts WHERE key = ? AND generation_id = ?").run(key, generationId);
+    return Number(result.changes || 0) > 0;
+  }
+
+  assignPendingTextGenerationIfBlank(key: string, generationId: string): string | null {
+    const now = nowIso();
+    const result = this.db
+      .query("UPDATE pending_text_prompts SET generation_id = ?, updated_at = ? WHERE key = ? AND generation_id = ''")
+      .run(generationId, now, key);
+    if (Number(result.changes || 0) > 0) {
+      return generationId;
+    }
+    return this.getPendingText(key)?.generationId || null;
   }
 
   countQueuedTurnsForContext(contextSlug: string): number {

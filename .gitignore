@@ -21,3 +21,4 @@ tmp/
 *.tgz
 handoff-*.zip
 handoff-*.zip.sha256
+handoff-*/

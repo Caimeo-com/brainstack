@@ -1,4 +1,5 @@
 import { deliverAttachmentRequests, formatAttachmentDeliveryIssues } from "./attachment-delivery";
+import { randomUUID } from "node:crypto";
 import {
   CODEX_MODE_PRESETS,
   formatCodexRuntimeOverrides,
@@ -7,7 +8,7 @@ import {
   parseCodexReasoningEffort
 } from "./codex-runtime";
 import { CronManager } from "./cron-manager";
-import { ContextRecord, FactoryDb } from "./db";
+import { ContextRecord, FactoryDb, type PendingTextRecord } from "./db";
 import { ContextService, nextRecommendedAction, normalizeSlug } from "./contexts";
 import { Dispatcher } from "./dispatcher";
 import { CronJobDraft, CronJobRecord, CronSchedule, normalizeCronSchedule, scheduleSummary } from "./cron-jobs";
@@ -172,6 +173,7 @@ interface PendingTextPrompt {
   userId: number | null;
   contextSlug: string;
   parts: string[];
+  generationId: string;
   timer: Timer;
   createdAt: number;
 }
@@ -1321,6 +1323,94 @@ export class CommandHandler {
     return `${target.chatId}:${target.threadId ?? "none"}:${userId ?? "unknown"}`;
   }
 
+  private pendingTextTimer(target: TelegramTarget, userId: number | null, delayMs = this.config.textCoalesceMs): ReturnType<typeof setTimeout> {
+    return setTimeout(() => void this.flushPendingText(target, userId).catch((error) => this.reportPendingTextFlushError(target, error)), delayMs);
+  }
+
+  private pendingTextGenerationFor(stored: PendingTextRecord): string {
+    if (stored.generationId) {
+      return stored.generationId;
+    }
+    const generationId = randomUUID();
+    return this.db.assignPendingTextGenerationIfBlank(stored.key, generationId) || generationId;
+  }
+
+  private restorePendingTextForRetry(pending: PendingTextPrompt, flushedPartsJson: string): "restored" | "preserved-newer" {
+    const rawStored = this.db.getPendingText(pending.key);
+    const stored = rawStored
+      ? {
+          ...rawStored,
+          generationId: this.pendingTextGenerationFor(rawStored)
+        }
+      : null;
+    if (!stored) {
+      pending.timer = this.pendingTextTimer(pending.target, pending.userId);
+      this.db.upsertPendingText({
+        key: pending.key,
+        contextSlug: pending.contextSlug,
+        chatId: pending.target.chatId,
+        threadId: pending.target.threadId,
+        userId: pending.userId,
+        partsJson: flushedPartsJson,
+        generationId: pending.generationId
+      });
+      this.pendingText.set(pending.key, pending);
+      return "restored";
+    }
+    if (stored.generationId === pending.generationId && stored.contextSlug === pending.contextSlug) {
+      pending.timer = this.pendingTextTimer(pending.target, pending.userId);
+      this.pendingText.set(pending.key, pending);
+      return "restored";
+    }
+
+    let storedParts: string[] = [];
+    try {
+      const parsed = JSON.parse(stored.partsJson) as unknown;
+      storedParts = Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+    } catch {
+      storedParts = [];
+    }
+
+    const currentPending = this.pendingText.get(pending.key);
+    if (stored.contextSlug !== pending.contextSlug) {
+      if (!currentPending) {
+        this.pendingText.set(pending.key, {
+          key: stored.key,
+          target: { chatId: stored.chatId, threadId: stored.threadId },
+          userId: stored.userId,
+          contextSlug: stored.contextSlug,
+          parts: storedParts,
+          generationId: stored.generationId,
+          createdAt: Date.parse(stored.createdAt) || Date.now(),
+          timer: this.pendingTextTimer({ chatId: stored.chatId, threadId: stored.threadId }, stored.userId)
+        });
+      }
+      return "preserved-newer";
+    }
+    if (currentPending) {
+      clearTimeout(currentPending.timer);
+    }
+    const mergedParts = [...pending.parts, ...storedParts];
+    const restored: PendingTextPrompt = {
+      ...pending,
+      parts: mergedParts,
+      generationId: randomUUID(),
+      createdAt: Math.min(pending.createdAt, Date.parse(stored.createdAt) || pending.createdAt),
+      timer: this.pendingTextTimer(pending.target, pending.userId)
+    };
+    this.db.upsertPendingText({
+      key: restored.key,
+      contextSlug: restored.contextSlug,
+      chatId: restored.target.chatId,
+      threadId: restored.target.threadId,
+      userId: restored.userId,
+      partsJson: JSON.stringify(restored.parts),
+      generationId: restored.generationId
+    });
+    this.pendingText.set(restored.key, restored);
+    return "restored";
+  }
+
   private enqueuePendingText(context: ContextRecord, text: string, target: TelegramTarget, userId: number | null): void {
     const key = this.pendingKey(target, userId);
     const existing = this.pendingText.get(key);
@@ -1331,13 +1421,15 @@ export class CommandHandler {
       } else {
         clearTimeout(existing.timer);
         existing.parts.push(text);
+        existing.generationId = randomUUID();
         this.db.upsertPendingText({
           key,
           contextSlug: existing.contextSlug,
           chatId: existing.target.chatId,
           threadId: existing.target.threadId,
           userId: existing.userId,
-          partsJson: JSON.stringify(existing.parts)
+          partsJson: JSON.stringify(existing.parts),
+          generationId: existing.generationId
         });
         existing.timer = setTimeout(() => void this.flushPendingText(target, userId).catch((error) => this.reportPendingTextFlushError(target, error)), this.config.textCoalesceMs);
         return;
@@ -1352,6 +1444,7 @@ export class CommandHandler {
       userId,
       contextSlug: context.slug,
       parts: [text],
+      generationId: randomUUID(),
       createdAt: Date.now(),
       timer: setTimeout(() => void this.flushPendingText(target, userId).catch((error) => this.reportPendingTextFlushError(target, error)), this.config.textCoalesceMs)
     };
@@ -1362,7 +1455,8 @@ export class CommandHandler {
       chatId: target.chatId,
       threadId: target.threadId,
       userId,
-      partsJson: JSON.stringify(pending.parts)
+      partsJson: JSON.stringify(pending.parts),
+      generationId: pending.generationId
     });
   }
 
@@ -1383,6 +1477,7 @@ export class CommandHandler {
     if (!pending) {
       const stored = this.db.getPendingText(key);
       if (stored) {
+        const generationId = this.pendingTextGenerationFor(stored);
         let parts: string[] = [];
         try {
           const parsed = JSON.parse(stored.partsJson) as unknown;
@@ -1396,6 +1491,7 @@ export class CommandHandler {
           userId: stored.userId,
           contextSlug: stored.contextSlug,
           parts,
+          generationId,
           createdAt: Date.parse(stored.createdAt) || Date.now(),
           timer: setTimeout(() => undefined, 0)
         };
@@ -1406,9 +1502,11 @@ export class CommandHandler {
     }
     clearTimeout(pending.timer);
     this.pendingText.delete(key);
+    const flushedPartsJson = JSON.stringify(pending.parts);
+    const flushedGenerationId = pending.generationId;
     const context = this.contexts.getContextBySlug(pending.contextSlug);
     if (!context || context.state === "archived") {
-      this.db.deletePendingText(key);
+      this.db.deletePendingTextIfGenerationMatch(key, flushedGenerationId);
       return;
     }
     const prompt = pending.parts.join("\n\n");
@@ -1416,7 +1514,7 @@ export class CommandHandler {
       console.log(`coalesced ${pending.parts.length} Telegram text messages for ${context.slug}`);
     }
     if (await this.maybeSendArtifactsFromPlainText(context, prompt, pending.target)) {
-      this.db.deletePendingText(key);
+      this.db.deletePendingTextIfGenerationMatch(key, flushedGenerationId);
       return;
     }
     try {
@@ -1425,23 +1523,32 @@ export class CommandHandler {
         userId: pending.userId
       });
       if (response.accepted) {
-        this.db.deletePendingText(key);
+        this.db.deletePendingTextIfGenerationMatch(key, flushedGenerationId);
       } else {
-        this.pendingText.set(key, pending);
+        const restoreStatus = this.restorePendingTextForRetry(pending, flushedPartsJson);
+        if (restoreStatus === "preserved-newer") {
+          await this.telegram.sendText(
+            pending.target,
+            "Pending Telegram text was not dispatched; newer text for another context remains queued, so please resend the older text."
+          );
+        }
       }
       if (response.message) {
         await this.telegram.sendText(pending.target, response.message);
       }
     } catch (error) {
-      this.pendingText.set(key, pending);
-      await this.reportPendingTextFlushError(pending.target, error);
+      const restoreStatus = this.restorePendingTextForRetry(pending, flushedPartsJson);
+      await this.reportPendingTextFlushError(pending.target, error, restoreStatus === "restored");
     }
   }
 
-  private async reportPendingTextFlushError(target: TelegramTarget, error: unknown): Promise<void> {
+  private async reportPendingTextFlushError(target: TelegramTarget, error: unknown, restored = true): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
     console.error("pending Telegram text flush failed", error);
-    await this.telegram.sendText(target, `Pending Telegram text was not dispatched and remains queued for retry: ${message}`);
+    const status = restored
+      ? "Pending Telegram text was not dispatched and remains queued for retry"
+      : "Pending Telegram text was not dispatched; newer text for another context remains queued, so please resend the older text";
+    await this.telegram.sendText(target, `${status}: ${message}`);
   }
 
   recoverPendingText(): void {
@@ -1449,6 +1556,7 @@ export class CommandHandler {
       if (this.pendingText.has(stored.key)) {
         continue;
       }
+      const generationId = this.pendingTextGenerationFor(stored);
       let parts: string[] = [];
       try {
         const parsed = JSON.parse(stored.partsJson) as unknown;
@@ -1477,6 +1585,7 @@ export class CommandHandler {
         userId: stored.userId,
         contextSlug: stored.contextSlug,
         parts,
+        generationId,
         createdAt,
         timer: setTimeout(() => void this.flushPendingText(target, stored.userId).catch((error) => this.reportPendingTextFlushError(target, error)), Math.max(1, this.config.textCoalesceMs))
       });
