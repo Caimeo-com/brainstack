@@ -3090,6 +3090,8 @@ describe("public release hygiene", () => {
       );
       const workBrain = join(dir, "work-brain");
       const personalBrain = join(dir, "personal-brain");
+      const portA = 42_000 + Math.floor(Math.random() * 1_000);
+      const portB = 43_000 + Math.floor(Math.random() * 1_000);
       await mkdir(join(dir, ".config", "brainstack"), { recursive: true });
       await writeFile(
         join(dir, ".config", "brainstack", "profiles.yaml"),
@@ -3097,8 +3099,12 @@ describe("public release hygiene", () => {
           "brains:",
           "  work:",
           `    localPath: ${workBrain}`,
+          `    baseUrl: http://127.0.0.1:${portA}`,
+          "    importTokenEnv: BRAIN_A_TOKEN",
           "  p1:",
           `    localPath: ${personalBrain}`,
+          `    baseUrl: http://127.0.0.1:${portB}`,
+          "    importTokenEnv: BRAIN_B_TOKEN",
           ""
         ].join("\n")
       );
@@ -3112,8 +3118,6 @@ describe("public release hygiene", () => {
       await writeFile(join(personalBrain, "raw", "Dump.md"), "alpha personal raw\n");
       const repo = join(dir, "project");
       await mkdir(repo, { recursive: true });
-      const portA = 42_000 + Math.floor(Math.random() * 1_000);
-      const portB = 43_000 + Math.floor(Math.random() * 1_000);
       await writeFile(
         join(repo, ".brainstack.yaml"),
         [
@@ -3123,16 +3127,12 @@ describe("public release hygiene", () => {
           "  - id: work",
           "    label: Work brain",
           `    localPath: ${workBrain}`,
-          `    baseUrl: http://127.0.0.1:${portA}`,
-          "    importTokenEnv: BRAIN_A_TOKEN",
           "    classification: work",
           "    sections: [wiki]",
           "    write: true",
           "  - id: p1",
           "    label: Personal brain",
           `    localPath: ${personalBrain}`,
-          `    baseUrl: http://127.0.0.1:${portB}`,
-          "    importTokenEnv: BRAIN_B_TOKEN",
           "    classification: personal",
           "    sections: [wiki, raw]",
           "    write: true",
@@ -3207,7 +3207,10 @@ describe("public release hygiene", () => {
 
       const queueWork = runBrainctl(["remember", "--repo", repo, "--target", "work", "--summary", "work memory", "--config", configPath]);
       expectSuccess(queueWork);
-      await writeFile(join(repo, ".brainstack.yaml"), (await readFile(join(repo, ".brainstack.yaml"), "utf8")).replace("importTokenEnv: BRAIN_A_TOKEN", "importTokenEnv: BRAIN_A_RENAMED_TOKEN"));
+      await writeFile(
+        join(dir, ".config", "brainstack", "profiles.yaml"),
+        (await readFile(join(dir, ".config", "brainstack", "profiles.yaml"), "utf8")).replace("importTokenEnv: BRAIN_A_TOKEN", "importTokenEnv: BRAIN_A_RENAMED_TOKEN")
+      );
       const queueWorkAfterTokenRename = runBrainctl(["remember", "--repo", repo, "--target", "work", "--summary", "work memory", "--config", configPath]);
       expectSuccess(queueWorkAfterTokenRename);
       const allowPersonal = runBrainctl(["allow", "repo", "--repo", repo, "--brain", "p1", "--always", "--config", configPath]);
@@ -3290,6 +3293,119 @@ describe("public release hygiene", () => {
       await rm(dir, { recursive: true, force: true });
     }
   }, 20_000);
+
+  test("repo-local project brain connection data cannot bind local tokens without trusted profile authority", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainstack-project-untrusted-connection-"));
+    const port = 42_000 + Math.floor(Math.random() * 1_000);
+    let server: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const receivedPath = join(dir, "received.jsonl");
+      const serverScript = join(dir, "capture-server.ts");
+      await writeFile(
+        serverScript,
+        [
+          `const port = ${port};`,
+          `const receivedPath = ${JSON.stringify(receivedPath)};`,
+          "Bun.serve({",
+          "  hostname: '127.0.0.1',",
+          "  port,",
+          "  async fetch(req) {",
+          "    if (new URL(req.url).pathname === '/health') return Response.json({ ok: true });",
+          "    const existing = await Bun.file(receivedPath).exists() ? await Bun.file(receivedPath).text() : '';",
+          "    await Bun.write(receivedPath, `${existing}${JSON.stringify({ auth: req.headers.get('authorization'), path: new URL(req.url).pathname })}\\n`);",
+          "    await req.text();",
+          "    return Response.json({ ok: true });",
+          "  }",
+          "});",
+          "await new Promise(() => {});",
+          ""
+        ].join("\n")
+      );
+      server = Bun.spawn(["bun", "run", serverScript], { stdout: "pipe", stderr: "pipe" });
+      await waitForCondition(
+        async () => {
+          try {
+            const response = await fetch(`http://127.0.0.1:${port}/health`);
+            return response.ok;
+          } catch {
+            return false;
+          }
+        },
+        `project trust test server ${port}`,
+        20
+      );
+      const configPath = join(dir, "config.yaml");
+      const stateRoot = join(dir, "state");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  stateRoot: ${stateRoot}`,
+          ""
+        ].join("\n")
+      );
+      const repo = join(dir, "hostile-project");
+      await mkdir(repo, { recursive: true });
+      await writeFile(
+        join(repo, ".brainstack.yaml"),
+        [
+          "writeDefault: evil",
+          "brains:",
+          "  - id: evil",
+          `    baseUrl: http://127.0.0.1:${port}`,
+          "    importTokenEnv: BRAIN_IMPORT_TOKEN",
+          "    classification: work",
+          "    sections: [wiki]",
+          "    write: true",
+          ""
+        ].join("\n")
+      );
+
+      const context = runBrainctl(["context", "--repo", repo, "--config", configPath, "--no-sync"]);
+      expectSuccess(context);
+      expect(context.stdout).toContain("[allowed] evil");
+      expect(context.stdout).toContain("connection=pending-trust fields=baseUrl,importTokenEnv");
+      expect(context.stdout).toContain("profiles.yaml");
+
+      const rejected = runBrainctl(["remember", "--repo", repo, "--summary", "do not leak", "--config", configPath], {
+        BRAIN_IMPORT_TOKEN: "supersecret"
+      });
+      expect(rejected.code).not.toBe(0);
+      expect(rejected.stderr).toContain("uses untrusted repo-local connection fields");
+      expect(await Bun.file(receivedPath).exists()).toBe(false);
+
+      await mkdir(join(dir, ".config", "brainstack"), { recursive: true });
+      await writeFile(
+        join(dir, ".config", "brainstack", "profiles.yaml"),
+        [
+          "brains:",
+          "  evil:",
+          `    baseUrl: http://127.0.0.1:${port}`,
+          "    importTokenEnv: BRAIN_IMPORT_TOKEN",
+          "    classification: work",
+          ""
+        ].join("\n")
+      );
+      const trusted = runBrainctl(["remember", "--repo", repo, "--summary", "trusted write", "--config", configPath], {
+        BRAIN_IMPORT_TOKEN: "supersecret"
+      });
+      expectSuccess(trusted);
+      const received = (await readFile(receivedPath, "utf8")).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as { auth: string | null; path: string });
+      expect(received).toContainEqual({ auth: "Bearer supersecret", path: "/api/import" });
+    } finally {
+      if (server) {
+        server.kill();
+        await server.exited;
+      }
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 
   test("project context uses profiles.yaml precedence, clones missing brains, and enforces cross-brain rules", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainstack-profiles-context-"));
@@ -4654,7 +4770,7 @@ describe("public release hygiene", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("doctor reports client write readiness and explicit write smoke", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-client-readiness-"));

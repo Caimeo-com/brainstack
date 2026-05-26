@@ -3137,6 +3137,8 @@ interface ProjectBrain {
   gitRemote: string;
   baseUrl: string;
   importTokenEnv: string;
+  connectionTrusted: boolean;
+  untrustedConnectionFields?: string[];
   sections: string[];
   sectionsRestricted?: boolean;
   readMode?: "allow" | "ask-once" | "ask-always" | "never";
@@ -3381,6 +3383,14 @@ function projectBrainRemoteSpec(entry: Record<string, unknown>): string {
   return stringAt(entry, "gitRemote", stringAt(entry, "remote", stringAt(entry, "remoteSsh", "")));
 }
 
+function projectBrainBaseUrlSpec(entry: Record<string, unknown>): string {
+  return stringAt(entry, "baseUrl", stringAt(entry, "url", ""));
+}
+
+function projectBrainImportTokenEnvSpec(entry: Record<string, unknown>): string {
+  return stringAt(entry, "importTokenEnv", "");
+}
+
 function projectBrainOverrides(raw: Record<string, unknown>, id: string): Record<string, unknown> {
   const value = raw[id];
   if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -3407,6 +3417,16 @@ function withTrustedGitRemote(entry: Record<string, unknown>, trustedSource: Rec
   return spec ? { ...entry, __brainstackTrustedGitRemote: spec } : entry;
 }
 
+function withTrustedBrainConnection(entry: Record<string, unknown>, trustedSource: Record<string, unknown>): Record<string, unknown> {
+  const baseUrl = projectBrainBaseUrlSpec(trustedSource);
+  const importTokenEnv = projectBrainImportTokenEnvSpec(trustedSource);
+  return {
+    ...entry,
+    ...(baseUrl ? { __brainstackTrustedBaseUrl: baseUrl } : {}),
+    ...(importTokenEnv ? { __brainstackTrustedImportTokenEnv: importTokenEnv } : {})
+  };
+}
+
 function trustedClassificationFor(id: string, trusted: Record<string, unknown>): string {
   if (!Object.keys(trusted).length) {
     return "";
@@ -3422,7 +3442,8 @@ function mergeTrustedProjectBrain(id: string, entry: Record<string, unknown>, gl
   const trustedClassification = trustedClassificationFor(id, trustedBase);
   const withLocalPath = withTrustedLocalPath(withTrustedLocalPath(merged, cfg, globalRaw), cfg, profileOverride);
   const withRemote = withTrustedGitRemote(withTrustedGitRemote(withLocalPath, globalRaw), profileOverride);
-  return trustedClassification ? { ...withRemote, __brainstackTrustedClassification: trustedClassification } : withRemote;
+  const withConnection = withTrustedBrainConnection(withTrustedBrainConnection(withRemote, globalRaw), profileOverride);
+  return trustedClassification ? { ...withConnection, __brainstackTrustedClassification: trustedClassification } : withConnection;
 }
 
 function policyRank(value: string | undefined): number {
@@ -3656,13 +3677,22 @@ function normalizeProjectBrainEntry(entry: Record<string, unknown>, cfg: Brainst
   }
   const label = stringAt(entry, "label", id);
   const write = normalizeProjectBrainWrite(entry.write, "propose-only");
-  const baseUrl = stringAt(entry, "baseUrl", stringAt(entry, "url", id === "default" ? cfg.brain.publicBaseUrl : ""));
-  const importTokenEnv = stringAt(entry, "importTokenEnv", id === "default" ? "BRAIN_IMPORT_TOKEN" : "");
+  const rawBaseUrl = projectBrainBaseUrlSpec(entry);
+  const rawImportTokenEnv = projectBrainImportTokenEnvSpec(entry);
+  const trustedBaseUrl = stringAt(entry, "__brainstackTrustedBaseUrl", id === "default" ? cfg.brain.publicBaseUrl : "");
+  const trustedImportTokenEnv = stringAt(entry, "__brainstackTrustedImportTokenEnv", id === "default" ? "BRAIN_IMPORT_TOKEN" : "");
+  const baseUrl = rawBaseUrl || trustedBaseUrl;
+  const importTokenEnv = rawImportTokenEnv || trustedImportTokenEnv;
   const gitRemote = projectBrainRemoteSpec(entry);
   const trustedGitRemote = stringAt(entry, "__brainstackTrustedGitRemote", "");
   if (gitRemote && gitRemote !== trustedGitRemote && isLocalGitRemote(gitRemote)) {
     throw new Error(`Repo-local project brain config for ${id} cannot set local git remote ${gitRemote}. Define trusted local remotes in ${profilesPath(cfg)}.`);
   }
+  const untrustedConnectionFields = [
+    rawBaseUrl && rawBaseUrl !== trustedBaseUrl ? "baseUrl" : "",
+    rawImportTokenEnv && rawImportTokenEnv !== trustedImportTokenEnv ? "importTokenEnv" : "",
+    gitRemote && gitRemote !== trustedGitRemote ? "gitRemote" : ""
+  ].filter(Boolean);
   const rawClassification = classifyProjectBrain(id, label, entry.classification);
   const trustedClassification = stringAt(entry, "__brainstackTrustedClassification", "") as ProjectBrain["classification"] | "";
   if ("sections" in entry && !Array.isArray(entry.sections)) {
@@ -3678,6 +3708,8 @@ function normalizeProjectBrainEntry(entry: Record<string, unknown>, cfg: Brainst
     gitRemote,
     baseUrl,
     importTokenEnv,
+    connectionTrusted: untrustedConnectionFields.length === 0,
+    untrustedConnectionFields,
     sections,
     readMode: normalizeProjectReadMode("read" in entry ? entry.read : "mode" in entry ? entry.mode : undefined, "allow"),
     write
@@ -3704,6 +3736,7 @@ function projectBrainsFromRaw(raw: Record<string, unknown>, cfg: BrainstackConfi
         gitRemote: cfg.client.remoteSsh,
         baseUrl: cfg.brain.publicBaseUrl,
         importTokenEnv: "BRAIN_IMPORT_TOKEN",
+        connectionTrusted: true,
         sections: ["wiki", "raw", "proposals"],
         write: "propose-only"
       }
@@ -3845,6 +3878,9 @@ async function resolveProjectContext(cfg: BrainstackConfig, repoInput: string | 
 }
 
 async function maybeSyncBrainClone(brain: ProjectBrain): Promise<string> {
+  if (!brain.connectionTrusted) {
+    return "pending-trust";
+  }
   if (!gitExists(brain.localPath)) {
     if (!brain.gitRemote) {
       return "missing";
@@ -3855,6 +3891,14 @@ async function maybeSyncBrainClone(brain: ProjectBrain): Promise<string> {
   }
   const result = run(["git", "pull", "--ff-only"], { cwd: brain.localPath, check: false, timeoutMs: 20_000 });
   return result.code === 0 ? "synced" : `stale: ${(result.stderr || result.stdout).trim().slice(0, 160)}`;
+}
+
+function untrustedBrainConnectionFields(brain: ProjectBrain): string {
+  return brain.untrustedConnectionFields?.length ? brain.untrustedConnectionFields.join(",") : "connection";
+}
+
+function projectBrainTrustInstruction(cfg: BrainstackConfig, brain: ProjectBrain): string {
+  return `define matching connection fields for ${brain.id} in ${profilesPath(cfg)} before Brainstack uses repo-local URL/token/remote data`;
 }
 
 async function commandContext(args: ParsedArgs): Promise<void> {
@@ -3868,7 +3912,7 @@ async function commandContext(args: ParsedArgs): Promise<void> {
   const allowedIds = new Set(resolved.allowedBrains.map((brain) => brain.id));
   for (const brain of resolved.brains) {
     const allowed = allowedIds.has(brain.id);
-    const status = sync && allowed ? await maybeSyncBrainClone(brain) : gitExists(brain.localPath) ? "local" : "missing";
+    const status = !brain.connectionTrusted ? "pending-trust" : sync && allowed ? await maybeSyncBrainClone(brain) : gitExists(brain.localPath) ? "local" : "missing";
     brainRows.push({ ...brain, allowed, status });
   }
   if (hasFlag(args, "json")) {
@@ -3892,6 +3936,10 @@ async function commandContext(args: ParsedArgs): Promise<void> {
     console.log(`  freshness=${brain.status}`);
     console.log(`  read=${brain.readMode || "allow"} sections=${readScope}`);
     console.log(`  write=${writeLabel}`);
+    if (!brain.connectionTrusted) {
+      console.log(`  connection=pending-trust fields=${untrustedBrainConnectionFields(brain)}`);
+      console.log(`  trust with: ${projectBrainTrustInstruction(cfg, brain)}`);
+    }
   }
   for (const brain of resolved.deniedBrains) {
     const sectionFlag = brain.sections.length ? ` --sections ${shellSingleQuote(brain.sections.join(","))}` : "";
@@ -4062,6 +4110,11 @@ async function commandRemember(args: ParsedArgs): Promise<void> {
   }
   if (target.write === "false") {
     throw new Error(`target brain ${targetId} is read-only in project context`);
+  }
+  if (!target.connectionTrusted) {
+    throw new Error(
+      `target brain ${targetId} uses untrusted repo-local connection fields (${untrustedBrainConnectionFields(target)}); ${projectBrainTrustInstruction(cfg, target)}.`
+    );
   }
   const session = existsSync(resolved.sessionPath) ? (JSON.parse(readFileSync(resolved.sessionPath, "utf8")) as Record<string, unknown>) : {};
   const recentSources = Array.isArray(session.recent_sources) ? session.recent_sources : [];
@@ -4463,6 +4516,34 @@ async function coalesceOutboxItems(cfg: BrainstackConfig): Promise<void> {
   }
 }
 
+async function queuedProjectDestinationTrustError(
+  cfg: BrainstackConfig,
+  item: OutboxItem,
+  payload: Record<string, unknown>,
+  baseUrl: string
+): Promise<string | null> {
+  const repo = typeof payload.related_repo === "string" ? payload.related_repo : "";
+  if (!repo || !item.brain_id || !item.import_token_env) {
+    return null;
+  }
+  try {
+    const resolved = await resolveProjectContext(cfg, repo);
+    const brain = resolved.brains.find((candidate) => candidate.id === item.brain_id);
+    if (!brain) {
+      return `queued project write target ${item.brain_id} is no longer configured for ${repo}`;
+    }
+    if (!brain.connectionTrusted) {
+      return `queued project write target ${item.brain_id} has untrusted repo-local connection fields (${untrustedBrainConnectionFields(brain)}); ${projectBrainTrustInstruction(cfg, brain)}`;
+    }
+    if (brain.baseUrl !== baseUrl || brain.importTokenEnv !== item.import_token_env) {
+      return `queued project write target ${item.brain_id} no longer matches trusted connection data for ${repo}`;
+    }
+    return null;
+  } catch (error) {
+    return `queued project write target ${item.brain_id} cannot be trusted: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
 async function flushOutbox(cfg: BrainstackConfig): Promise<{ flushed: number; kept: number; terminalFailures: number; corrupt: number }> {
   let scans = await scanAllOutboxes(cfg);
   const corrupt = scans.reduce((sum, scan) => sum + scan.corrupt.length, 0);
@@ -4487,6 +4568,14 @@ async function flushOutbox(cfg: BrainstackConfig): Promise<{ flushed: number; ke
       continue;
     }
     const baseUrl = normalizedItem.url || brainWriteConfig(cfg).baseUrl;
+    const trustError = await queuedProjectDestinationTrustError(cfg, normalizedItem, payload, baseUrl);
+    if (trustError) {
+      normalizedItem.terminal_error = trustError;
+      normalizedItem.last_error = trustError;
+      await writeOutboxItem(path, normalizedItem);
+      terminalFailures += 1;
+      continue;
+    }
     const writeToken = normalizedItem.import_token_env ? resolveClientEnvValue(cfg, normalizedItem.import_token_env) : brainWriteConfig(cfg).token;
     if (!baseUrl || !writeToken) {
       kept += 1;
