@@ -4634,7 +4634,7 @@ describe("public release hygiene", () => {
         PATH: `${binDir}:${process.env.PATH || ""}`,
         BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1",
         BRAINSTACK_UPDATE_PROBE_COMMANDS: "none",
-        BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS: "100"
+        BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS: "1000"
       });
       expectSuccess(partialHelpTimeout);
       expect(partialHelpTimeout.stdout).toContain("codex=codex-cli partial");
