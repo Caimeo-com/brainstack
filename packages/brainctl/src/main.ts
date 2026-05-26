@@ -3129,10 +3129,13 @@ function brainWriteConfig(cfg: BrainstackConfig): { baseUrl: string; token: stri
   return { baseUrl, token: tokenValue };
 }
 
+type ProjectBrainClassification = "work" | "personal" | "neutral";
+type ProjectBrainWriteMode = "true" | "propose-only" | "false";
+
 interface ProjectBrain {
   id: string;
   label: string;
-  classification: "work" | "personal" | "neutral";
+  classification: ProjectBrainClassification;
   localPath: string;
   gitRemote: string;
   baseUrl: string;
@@ -3142,7 +3145,10 @@ interface ProjectBrain {
   sections: string[];
   sectionsRestricted?: boolean;
   readMode?: "allow" | "ask-once" | "ask-always" | "never";
-  write: "true" | "propose-only" | "false";
+  write: ProjectBrainWriteMode;
+  requestedWrite?: ProjectBrainWriteMode;
+  writeTrusted?: boolean;
+  writeDowngraded?: boolean;
 }
 
 interface ResolvedProjectContext {
@@ -3217,9 +3223,9 @@ function normalizeProjectReadMode(value: unknown, fallback: ProjectBrain["readMo
 }
 
 function applyTrustedClassification(
-  trusted: ProjectBrain["classification"] | "",
-  actual: ProjectBrain["classification"]
-): ProjectBrain["classification"] {
+  trusted: ProjectBrainClassification | "",
+  actual: ProjectBrainClassification
+): ProjectBrainClassification {
   if (trusted === "personal") {
     return "personal";
   }
@@ -3229,14 +3235,18 @@ function applyTrustedClassification(
   return actual;
 }
 
-function classifyProjectBrain(id: string, label: string, explicit?: unknown): ProjectBrain["classification"] {
-  if (typeof explicit === "string") {
-    const normalized = explicit.trim().toLowerCase();
-    if (normalized === "work" || normalized === "personal" || normalized === "neutral") {
-      return normalized;
-    }
-    throw new Error(`Unsupported project brain classification: ${explicit}`);
+function normalizeProjectBrainClassification(value: unknown): ProjectBrainClassification | "" {
+  if (typeof value !== "string") {
+    return "";
   }
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "work" || normalized === "personal" || normalized === "neutral") {
+    return normalized;
+  }
+  throw new Error(`Unsupported project brain classification: ${value}`);
+}
+
+function inferredProjectBrainClassification(id: string, label: string): ProjectBrainClassification {
   const text = `${id} ${label}`;
   if (/personal|private|journal|health|family|finance/i.test(text)) {
     return "personal";
@@ -3245,6 +3255,56 @@ function classifyProjectBrain(id: string, label: string, explicit?: unknown): Pr
     return "work";
   }
   return "neutral";
+}
+
+function classifyProjectBrain(id: string, label: string, explicit?: unknown): ProjectBrainClassification {
+  const explicitClassification = normalizeProjectBrainClassification(explicit);
+  const inferred = inferredProjectBrainClassification(id, label);
+  if (!explicitClassification) {
+    return inferred;
+  }
+  if (inferred === "personal") {
+    return "personal";
+  }
+  if (inferred === "work") {
+    return explicitClassification === "personal" ? "personal" : "work";
+  }
+  return explicitClassification;
+}
+
+function trustedProjectBrainWrite(trustedSource: Record<string, unknown>): ProjectBrainWriteMode | "" {
+  return "write" in trustedSource ? normalizeProjectBrainWrite(trustedSource.write, "propose-only") : "";
+}
+
+function withTrustedProjectBrainWrite(entry: Record<string, unknown>, trustedSource: Record<string, unknown>): Record<string, unknown> {
+  const spec = trustedProjectBrainWrite(trustedSource);
+  return spec ? { ...entry, __brainstackTrustedWrite: spec } : entry;
+}
+
+function projectBrainWriteRank(value: ProjectBrainWriteMode): number {
+  switch (value) {
+    case "false":
+      return 0;
+    case "propose-only":
+      return 1;
+    case "true":
+      return 2;
+  }
+}
+
+function effectiveProjectBrainWrite(entry: Record<string, unknown>, requested: ProjectBrainWriteMode): {
+  write: ProjectBrainWriteMode;
+  writeTrusted: boolean;
+  writeDowngraded: boolean;
+} {
+  const trustedWrite = stringAt(entry, "__brainstackTrustedWrite", "") as ProjectBrainWriteMode | "";
+  const ceiling = trustedWrite || "propose-only";
+  const write = projectBrainWriteRank(requested) > projectBrainWriteRank(ceiling) ? ceiling : requested;
+  return {
+    write,
+    writeTrusted: requested !== "true" || trustedWrite === "true",
+    writeDowngraded: write !== requested
+  };
 }
 
 function isLoopbackHost(value: string): boolean {
@@ -3443,7 +3503,8 @@ function mergeTrustedProjectBrain(id: string, entry: Record<string, unknown>, gl
   const withLocalPath = withTrustedLocalPath(withTrustedLocalPath(merged, cfg, globalRaw), cfg, profileOverride);
   const withRemote = withTrustedGitRemote(withTrustedGitRemote(withLocalPath, globalRaw), profileOverride);
   const withConnection = withTrustedBrainConnection(withTrustedBrainConnection(withRemote, globalRaw), profileOverride);
-  return trustedClassification ? { ...withConnection, __brainstackTrustedClassification: trustedClassification } : withConnection;
+  const withWrite = withTrustedProjectBrainWrite(withTrustedProjectBrainWrite(withConnection, globalRaw), profileOverride);
+  return trustedClassification ? { ...withWrite, __brainstackTrustedClassification: trustedClassification } : withWrite;
 }
 
 function policyRank(value: string | undefined): number {
@@ -3635,24 +3696,24 @@ function safeBrainCloneName(id: string): string {
   return safe && safe !== "." && safe !== ".." && !safe.startsWith(".") ? safe : `brain-${sha256Hex(id).slice(0, 16)}`;
 }
 
-function localCloneForProfileBrain(entry: Record<string, unknown>, cfg: BrainstackConfig, id: string): string {
+function computedProjectBrainLocalPath(cfg: BrainstackConfig, id: string): string {
+  if (id === "default") {
+    return clientLocalPathAbs(cfg);
+  }
+  return join(cfg.paths.stateRoot, "brain-clones", safeBrainCloneName(id));
+}
+
+function localCloneForProfileBrain(entry: Record<string, unknown>, cfg: BrainstackConfig, id: string): { localPath: string; untrustedField?: string } {
   const explicit = projectBrainLocalPathSpec(entry);
   if (explicit) {
     const resolvedPath = absWithHome(explicit, cfg.paths.home);
     const trustedPath = stringAt(entry, "__brainstackTrustedLocalPath", "");
     if (trustedPath && resolvedPath === trustedPath) {
-      return resolvedPath;
+      return { localPath: resolvedPath };
     }
-    const managedRoot = resolve(cfg.paths.stateRoot, "brain-clones");
-    if (resolvedPath.startsWith(`${managedRoot}${sep}`)) {
-      return resolvedPath;
-    }
-    throw new Error(`Repo-local project brain config for ${id} cannot set localClone/localPath/path outside ${managedRoot}. Define trusted local paths in ${profilesPath(cfg)}.`);
+    return { localPath: computedProjectBrainLocalPath(cfg, id), untrustedField: "localPath" };
   }
-  if (id === "default") {
-    return clientLocalPathAbs(cfg);
-  }
-  return join(cfg.paths.stateRoot, "brain-clones", safeBrainCloneName(id));
+  return { localPath: computedProjectBrainLocalPath(cfg, id) };
 }
 
 function projectReadSections(entry: Record<string, unknown>): string[] {
@@ -3676,7 +3737,8 @@ function normalizeProjectBrainEntry(entry: Record<string, unknown>, cfg: Brainst
     throw new Error(`Invalid project brain config for ${id}: brain ids cannot use reserved prefix cross:.`);
   }
   const label = stringAt(entry, "label", id);
-  const write = normalizeProjectBrainWrite(entry.write, "propose-only");
+  const requestedWrite = normalizeProjectBrainWrite(entry.write, "propose-only");
+  const writeState = effectiveProjectBrainWrite(entry, requestedWrite);
   const rawBaseUrl = projectBrainBaseUrlSpec(entry);
   const rawImportTokenEnv = projectBrainImportTokenEnvSpec(entry);
   const trustedBaseUrl = stringAt(entry, "__brainstackTrustedBaseUrl", id === "default" ? cfg.brain.publicBaseUrl : "");
@@ -3688,10 +3750,12 @@ function normalizeProjectBrainEntry(entry: Record<string, unknown>, cfg: Brainst
   if (gitRemote && gitRemote !== trustedGitRemote && isLocalGitRemote(gitRemote)) {
     throw new Error(`Repo-local project brain config for ${id} cannot set local git remote ${gitRemote}. Define trusted local remotes in ${profilesPath(cfg)}.`);
   }
+  const localPathResolution = localCloneForProfileBrain(entry, cfg, id);
   const untrustedConnectionFields = [
     rawBaseUrl && rawBaseUrl !== trustedBaseUrl ? "baseUrl" : "",
     rawImportTokenEnv && rawImportTokenEnv !== trustedImportTokenEnv ? "importTokenEnv" : "",
-    gitRemote && gitRemote !== trustedGitRemote ? "gitRemote" : ""
+    gitRemote && gitRemote !== trustedGitRemote ? "gitRemote" : "",
+    localPathResolution.untrustedField || ""
   ].filter(Boolean);
   const rawClassification = classifyProjectBrain(id, label, entry.classification);
   const trustedClassification = stringAt(entry, "__brainstackTrustedClassification", "") as ProjectBrain["classification"] | "";
@@ -3704,7 +3768,7 @@ function normalizeProjectBrainEntry(entry: Record<string, unknown>, cfg: Brainst
     id,
     label,
     classification: applyTrustedClassification(trustedClassification, rawClassification),
-    localPath: localCloneForProfileBrain(entry, cfg, id),
+    localPath: localPathResolution.localPath,
     gitRemote,
     baseUrl,
     importTokenEnv,
@@ -3712,7 +3776,10 @@ function normalizeProjectBrainEntry(entry: Record<string, unknown>, cfg: Brainst
     untrustedConnectionFields,
     sections,
     readMode: normalizeProjectReadMode("read" in entry ? entry.read : "mode" in entry ? entry.mode : undefined, "allow"),
-    write
+    write: writeState.write,
+    requestedWrite,
+    writeTrusted: writeState.writeTrusted,
+    writeDowngraded: writeState.writeDowngraded
   };
 }
 
@@ -3898,7 +3965,7 @@ function untrustedBrainConnectionFields(brain: ProjectBrain): string {
 }
 
 function projectBrainTrustInstruction(cfg: BrainstackConfig, brain: ProjectBrain): string {
-  return `define matching connection fields for ${brain.id} in ${profilesPath(cfg)} before Brainstack uses repo-local URL/token/remote data`;
+  return `define matching connection fields for ${brain.id} in ${profilesPath(cfg)} before Brainstack uses repo-local URL/token/remote/path data`;
 }
 
 async function commandContext(args: ParsedArgs): Promise<void> {
@@ -3908,13 +3975,19 @@ async function commandContext(args: ParsedArgs): Promise<void> {
     resolved = await resolveProjectContext(cfg, resolved.repo);
   }
   const sync = args.flags["no-sync"] === undefined;
-  const brainRows = [];
+  const brainRows: Array<ProjectBrain & { allowed: boolean; allowedByPolicy: boolean; status: string; displayState: "allowed" | "blocked" | "pending-trust" }> = [];
   const allowedIds = new Set(resolved.allowedBrains.map((brain) => brain.id));
+  const syncStatus: Record<string, string> = {};
   for (const brain of resolved.brains) {
-    const allowed = allowedIds.has(brain.id);
+    const allowedByPolicy = allowedIds.has(brain.id);
+    const allowed = allowedByPolicy && brain.connectionTrusted;
     const status = !brain.connectionTrusted ? "pending-trust" : sync && allowed ? await maybeSyncBrainClone(brain) : gitExists(brain.localPath) ? "local" : "missing";
-    brainRows.push({ ...brain, allowed, status });
+    syncStatus[brain.id] = status;
+    const displayState = !brain.connectionTrusted ? "pending-trust" : allowedByPolicy ? "allowed" : "blocked";
+    brainRows.push({ ...brain, allowed, allowedByPolicy, status, displayState });
   }
+  const contextSources = sessionSourcesFromBrains(resolved.allowedBrains.filter((brain) => brain.connectionTrusted), syncStatus);
+  await updateProjectSession(resolved, { recent_context_sources: contextSources });
   if (hasFlag(args, "json")) {
     console.log(JSON.stringify({ repo: resolved.repo, configPath: resolved.configPath, writeDefault: resolved.writeDefault, crossBrainWrites: resolved.crossBrainWrites, brains: brainRows }, null, 2));
     return;
@@ -3931,11 +4004,20 @@ async function commandContext(args: ParsedArgs): Promise<void> {
   for (const brain of brainRows) {
     const readScope = brain.sections.length ? brain.sections.join(",") : "all local sections";
     const writeLabel = brain.id === resolved.writeDefault ? `${brain.write} default` : brain.write;
-    console.log(`- [${brain.allowed ? "allowed" : "blocked"}] ${brain.id} (${brain.classification})`);
+    console.log(`- [${brain.displayState}] ${brain.id} (${brain.classification})`);
     console.log(`  path=${brain.localPath}`);
     console.log(`  freshness=${brain.status}`);
     console.log(`  read=${brain.readMode || "allow"} sections=${readScope}`);
-    console.log(`  write=${writeLabel}`);
+    if (brain.writeDowngraded) {
+      const defaultNote = brain.id === resolved.writeDefault ? " (default)" : "";
+      if (brain.requestedWrite === "true" && brain.write === "propose-only") {
+        console.log(`  write=${brain.write} pending profile trust; repo-local write:true ignored until trusted${defaultNote}`);
+      } else {
+        console.log(`  write=${brain.write} profile trust restricts repo-local write:${brain.requestedWrite || "propose-only"}${defaultNote}`);
+      }
+    } else {
+      console.log(`  write=${writeLabel}`);
+    }
     if (!brain.connectionTrusted) {
       console.log(`  connection=pending-trust fields=${untrustedBrainConnectionFields(brain)}`);
       console.log(`  trust with: ${projectBrainTrustInstruction(cfg, brain)}`);
@@ -3952,7 +4034,7 @@ async function commandContext(args: ParsedArgs): Promise<void> {
   console.log("");
   console.log("Use `brainctl search --repo . \"query\"` for labelled retrieval.");
   console.log("Use `brainctl remember --repo . --summary \"...\"` for import/propose writes.");
-  console.log("Preserve source labels when reasoning across multiple brains. Do not manually clone, pull, or POST unless explicitly instructed.");
+  console.log("Preserve source labels when reasoning across multiple brains. Pending-trust brains must not be used or searched until trusted. Do not manually clone, pull, or POST unless explicitly instructed.");
 }
 
 function searchLocalBrain(brain: ProjectBrain, query: string): Array<{ brain: string; label: string; classification: string; path: string; line: number; text: string }> {
@@ -4039,36 +4121,20 @@ function crossBrainPolicyRule(
   return "allow";
 }
 
-async function writeProjectSession(resolved: ResolvedProjectContext, data: Record<string, unknown>): Promise<void> {
-  await ensureDir(dirname(resolved.sessionPath));
-  await writeText(resolved.sessionPath, `${JSON.stringify({ ...data, repo: resolved.repo, updated_at: new Date().toISOString() }, null, 2)}\n`, 0o600);
+function sessionSourcesFromBrains(brains: ProjectBrain[], syncStatus: Record<string, string> = {}): Array<Record<string, string>> {
+  return brains.map((brain) => ({
+    id: brain.id,
+    label: brain.label,
+    classification: brain.classification,
+    sync_status: syncStatus[brain.id] || "not-synced"
+  }));
 }
 
-async function commandSearch(args: ParsedArgs): Promise<void> {
-  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
-  const query = (flag(args, "query") || args.positional.join(" ")).trim();
-  if (!query) {
-    throw new Error("search requires a query");
-  }
-  const resolved = await resolveProjectContext(cfg, flag(args, "repo"));
-  if (hasFlag(args, "wait-fresh")) {
-    const deadline = Date.now() + 30_000;
-    while (Date.now() < deadline) {
-      const pending = resolved.allowedBrains.filter((brain) => existsSync(join(brain.localPath, "derived", "search-reindex-needed.json")));
-      if (!pending.length) {
-        break;
-      }
-      await Bun.sleep(500);
-    }
-  }
-  const syncStatus: Record<string, string> = {};
-  if (args.flags["no-sync"] === undefined) {
-    for (const brain of resolved.allowedBrains) {
-      syncStatus[brain.id] = await maybeSyncBrainClone(brain);
-    }
-  }
-  const results = resolved.allowedBrains.flatMap((brain) => searchLocalBrain(brain, query));
-  const recentSources = [
+function sessionSourcesFromSearchResults(
+  results: Array<{ brain: string; label: string; classification: string }>,
+  syncStatus: Record<string, string>
+): Array<Record<string, string>> {
+  return [
     ...new Map(
       results.map((item) => [
         item.brain,
@@ -4081,19 +4147,71 @@ async function commandSearch(args: ParsedArgs): Promise<void> {
       ])
     ).values()
   ];
-  await writeProjectSession(resolved, { recent_search: query, recent_sources: recentSources });
-  for (const brain of resolved.allowedBrains) {
+}
+
+function readProjectSession(resolved: ResolvedProjectContext): Record<string, unknown> {
+  if (!existsSync(resolved.sessionPath)) {
+    return {};
+  }
+  try {
+    return JSON.parse(readFileSync(resolved.sessionPath, "utf8")) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+async function writeProjectSession(resolved: ResolvedProjectContext, data: Record<string, unknown>): Promise<void> {
+  await ensureDir(dirname(resolved.sessionPath));
+  await writeText(resolved.sessionPath, `${JSON.stringify({ ...data, repo: resolved.repo, updated_at: new Date().toISOString() }, null, 2)}\n`, 0o600);
+}
+
+async function updateProjectSession(resolved: ResolvedProjectContext, data: Record<string, unknown>): Promise<void> {
+  await writeProjectSession(resolved, { ...readProjectSession(resolved), ...data });
+}
+
+async function commandSearch(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const query = (flag(args, "query") || args.positional.join(" ")).trim();
+  if (!query) {
+    throw new Error("search requires a query");
+  }
+  const resolved = await resolveProjectContext(cfg, flag(args, "repo"));
+  const pendingTrustBrains = resolved.allowedBrains.filter((brain) => !brain.connectionTrusted);
+  const searchableBrains = resolved.allowedBrains.filter((brain) => brain.connectionTrusted);
+  if (hasFlag(args, "wait-fresh")) {
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      const pending = searchableBrains.filter((brain) => existsSync(join(brain.localPath, "derived", "search-reindex-needed.json")));
+      if (!pending.length) {
+        break;
+      }
+      await Bun.sleep(500);
+    }
+  }
+  const syncStatus: Record<string, string> = {};
+  if (args.flags["no-sync"] === undefined) {
+    for (const brain of searchableBrains) {
+      syncStatus[brain.id] = await maybeSyncBrainClone(brain);
+    }
+  }
+  const results = searchableBrains.flatMap((brain) => searchLocalBrain(brain, query));
+  const recentSources = sessionSourcesFromSearchResults(results, syncStatus);
+  await updateProjectSession(resolved, { recent_search: query, recent_sources: recentSources });
+  for (const brain of pendingTrustBrains) {
+    console.warn(`WARN [${brain.id}] skipped pending-trust brain; ${projectBrainTrustInstruction(cfg, brain)}.`);
+  }
+  for (const brain of searchableBrains) {
     if (existsSync(join(brain.localPath, "derived", "search-reindex-needed.json"))) {
       console.warn(`WARN [${brain.id}] search index refresh pending; local results may be stale.`);
     }
   }
   if (hasFlag(args, "json")) {
-    console.log(JSON.stringify({ query, sync_status: syncStatus, results }, null, 2));
-    await consumeOnceAllowRules(cfg, resolved.repo, resolved.allowedBrains.map((brain) => brain.id));
+    console.log(JSON.stringify({ query, sync_status: syncStatus, skipped_pending_trust: pendingTrustBrains.map((brain) => brain.id), results }, null, 2));
+    await consumeOnceAllowRules(cfg, resolved.repo, searchableBrains.map((brain) => brain.id));
     return;
   }
   console.log(results.length ? results.map((item) => `[${item.brain} / ${item.path}:${item.line}] ${item.text}`).join("\n") : "(no local matches)");
-  await consumeOnceAllowRules(cfg, resolved.repo, resolved.allowedBrains.map((brain) => brain.id));
+  await consumeOnceAllowRules(cfg, resolved.repo, searchableBrains.map((brain) => brain.id));
 }
 
 async function commandRemember(args: ParsedArgs): Promise<void> {
@@ -4116,8 +4234,14 @@ async function commandRemember(args: ParsedArgs): Promise<void> {
       `target brain ${targetId} uses untrusted repo-local connection fields (${untrustedBrainConnectionFields(target)}); ${projectBrainTrustInstruction(cfg, target)}.`
     );
   }
-  const session = existsSync(resolved.sessionPath) ? (JSON.parse(readFileSync(resolved.sessionPath, "utf8")) as Record<string, unknown>) : {};
-  const recentSources = Array.isArray(session.recent_sources) ? session.recent_sources : [];
+  const session = readProjectSession(resolved);
+  const recentSearchSources = Array.isArray(session.recent_sources) ? session.recent_sources : [];
+  const recentContextSources = Array.isArray(session.recent_context_sources) ? session.recent_context_sources : [];
+  const recentSources = [
+    ...new Map(
+      [...recentSearchSources, ...recentContextSources].map((source) => [sourceRecordId(source), source])
+    ).values()
+  ].filter((source) => sourceRecordId(source));
   const crossBrainSources = recentSources
     .map((source) => ({
       id: sourceRecordId(source),
@@ -4160,6 +4284,7 @@ async function commandRemember(args: ParsedArgs): Promise<void> {
     source_type: "remember",
     related_repo: resolved.repo,
     recent_sources: recentSources,
+    recent_context_sources: recentContextSources,
     tags: ["remember", target.id]
   }, {
     baseUrl: target.baseUrl,
@@ -4534,6 +4659,12 @@ async function queuedProjectDestinationTrustError(
     }
     if (!brain.connectionTrusted) {
       return `queued project write target ${item.brain_id} has untrusted repo-local connection fields (${untrustedBrainConnectionFields(brain)}); ${projectBrainTrustInstruction(cfg, brain)}`;
+    }
+    if (item.endpoint === "import" && brain.write !== "true") {
+      return `queued project write target ${item.brain_id} is no longer trusted for direct import; current write mode is ${brain.write}`;
+    }
+    if (item.endpoint === "propose" && brain.write === "false") {
+      return `queued project write target ${item.brain_id} is now read-only`;
     }
     if (brain.baseUrl !== baseUrl || brain.importTokenEnv !== item.import_token_env) {
       return `queued project write target ${item.brain_id} no longer matches trusted connection data for ${repo}`;

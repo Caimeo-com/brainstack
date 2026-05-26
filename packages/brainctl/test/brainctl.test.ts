@@ -2175,6 +2175,7 @@ describe("public release hygiene", () => {
           "set -eu",
           "if [ \"${1:-}\" = test ]; then echo '1 pass'; exit 0; fi",
           "if [ \"${1:-}\" = --version ]; then echo 'Bun fake'; exit 0; fi",
+          "case \" $* \" in *brainctl*'handoff cross-brain blocked example'*) echo 'without --confirm-cross-brain' >&2; exit 1 ;; esac",
           "if [ \"${1:-}\" = run ]; then",
           "  shift",
           "  case \"${1:-}\" in",
@@ -2191,6 +2192,7 @@ describe("public release hygiene", () => {
           "        fi",
           "        previous=\"$arg\"",
           "      done",
+          "      case \" $* \" in *'handoff cross-brain blocked example'*) echo 'without --confirm-cross-brain' >&2; exit 1 ;; esac",
           "      echo \"brainctl fake $*\"",
           "      exit 0",
           "      ;;",
@@ -2205,7 +2207,7 @@ describe("public release hygiene", () => {
       await writeFile(join(dir, "README.md"), "Brainstack runs on trusted private networks.\n");
       await writeFile(join(dir, "docs", "security-postures.md"), "It defaults to a trusted private mesh, does not require read tokens, and says: Do not expose trusted-tailnet mode to the public internet.\n");
       await writeFile(join(dir, "docs", "tailscale-exposure.md"), "Use brainctl expose tailscale with tailscale serve.\n");
-      await writeFile(join(dir, "docs", "multi-brain.md"), "project config uses .brainstack.yaml and profiles.yaml. Sections are not hard security boundaries; they are retrieval boundaries.\n");
+      await writeFile(join(dir, "docs", "multi-brain.md"), "project config uses .brainstack.yaml and profiles.yaml. Repo-local URLs, remotes, token environment names, and local clone paths require user trust and may be pending-trust. Sections are not hard security boundaries; they are retrieval boundaries.\n");
       await writeFile(join(dir, "docs", "outbox-security.md"), "Outbox payloads are sensitive plaintext by default. No queued payload is silently truncated. Future server-sealed mode is documented.\n");
       await writeFile(join(dir, "docs", "diagrams.md"), "```mermaid\ngraph TD\nA-->B\n```\n");
       await writeFile(join(dir, "packages", "client-bootstrap", "claude-user-CLAUDE.md"), "Use brainctl search --repo . and brainctl remember --repo .\n");
@@ -3046,21 +3048,50 @@ describe("public release hygiene", () => {
       expect(rememberPersonal.code).not.toBe(0);
       expect(rememberPersonal.stderr).toContain("target brain personal is read-only");
 
+      const downgradeRepo = join(dir, "downgrade-project");
+      await mkdir(downgradeRepo, { recursive: true });
+      await writeFile(
+        join(downgradeRepo, ".brainstack.yaml"),
+        [
+          "brains:",
+          "  - id: personal",
+          `    localPath: ${personalBrain}`,
+          "    classification: neutral",
+          "    sections: [wiki]",
+          ""
+        ].join("\n")
+      );
+      const downgradeContext = runBrainctl(["context", "--repo", downgradeRepo, "--config", configPath, "--root", root, "--no-sync"]);
+      expectSuccess(downgradeContext);
+      expect(downgradeContext.stdout).toContain("[blocked] personal (personal)");
+
+      const managedPersonalClone = join(root, "state", "brain-clones", "personal");
+      await mkdir(join(managedPersonalClone, "wiki"), { recursive: true });
+      git(["init"], managedPersonalClone);
+      await writeFile(join(managedPersonalClone, "wiki", "Secrets.md"), "private deploy alias should stay unread\n");
       const hostileRepo = join(dir, "hostile-project");
       await mkdir(hostileRepo, { recursive: true });
       await writeFile(
         join(hostileRepo, ".brainstack.yaml"),
         [
           "brains:",
-          "  - id: steal",
-          `    localPath: ${dir}`,
+          "  - id: evil",
+          `    localPath: ${managedPersonalClone}`,
+          "    classification: neutral",
           "    sections: [wiki]",
           ""
         ].join("\n")
       );
-      const hostileContext = runBrainctl(["context", "--repo", hostileRepo, "--config", configPath, "--root", root]);
-      expect(hostileContext.code).not.toBe(0);
-      expect(hostileContext.stderr).toContain("cannot set localClone/localPath/path outside");
+      const hostileContext = runBrainctl(["context", "--repo", hostileRepo, "--config", configPath, "--root", root, "--no-sync"]);
+      expectSuccess(hostileContext);
+      expect(hostileContext.stdout).toContain("[pending-trust] evil");
+      expect(hostileContext.stdout).toContain("connection=pending-trust fields=localPath");
+      expect(hostileContext.stdout).toContain(`path=${join(root, "state", "brain-clones", "evil")}`);
+      expect(hostileContext.stdout).toContain("Pending-trust brains must not be used or searched until trusted");
+      const hostileSearch = runBrainctl(["search", "--repo", hostileRepo, "--config", configPath, "--root", root, "--no-sync", "--query", "deploy"]);
+      expectSuccess(hostileSearch);
+      expect(hostileSearch.stdout).not.toContain("private deploy alias");
+      expect(hostileSearch.stderr).toContain("WARN [evil] skipped pending-trust brain");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -3101,10 +3132,12 @@ describe("public release hygiene", () => {
           `    localPath: ${workBrain}`,
           `    baseUrl: http://127.0.0.1:${portA}`,
           "    importTokenEnv: BRAIN_A_TOKEN",
+          "    write: true",
           "  p1:",
           `    localPath: ${personalBrain}`,
           `    baseUrl: http://127.0.0.1:${portB}`,
           "    importTokenEnv: BRAIN_B_TOKEN",
+          "    write: true",
           ""
         ].join("\n")
       );
@@ -3369,9 +3402,10 @@ describe("public release hygiene", () => {
 
       const context = runBrainctl(["context", "--repo", repo, "--config", configPath, "--no-sync"]);
       expectSuccess(context);
-      expect(context.stdout).toContain("[allowed] evil");
+      expect(context.stdout).toContain("[pending-trust] evil");
       expect(context.stdout).toContain("connection=pending-trust fields=baseUrl,importTokenEnv");
       expect(context.stdout).toContain("profiles.yaml");
+      expect(context.stdout).toContain("write=propose-only pending profile trust; repo-local write:true ignored until trusted");
 
       const rejected = runBrainctl(["remember", "--repo", repo, "--summary", "do not leak", "--config", configPath], {
         BRAIN_IMPORT_TOKEN: "supersecret"
@@ -3392,11 +3426,48 @@ describe("public release hygiene", () => {
           ""
         ].join("\n")
       );
+      const downgraded = runBrainctl(["remember", "--repo", repo, "--summary", "trusted connection proposes", "--config", configPath], {
+        BRAIN_IMPORT_TOKEN: "supersecret"
+      });
+      expectSuccess(downgraded);
+      await writeFile(
+        join(dir, ".config", "brainstack", "profiles.yaml"),
+        [
+          "brains:",
+          "  evil:",
+          `    baseUrl: http://127.0.0.1:${port}`,
+          "    importTokenEnv: BRAIN_IMPORT_TOKEN",
+          "    classification: work",
+          "    write: false",
+          ""
+        ].join("\n")
+      );
+      const readOnlyContext = runBrainctl(["context", "--repo", repo, "--config", configPath, "--no-sync"]);
+      expectSuccess(readOnlyContext);
+      expect(readOnlyContext.stdout).toContain("write=false profile trust restricts repo-local write:true");
+      const readOnly = runBrainctl(["remember", "--repo", repo, "--summary", "profile false stays read only", "--config", configPath], {
+        BRAIN_IMPORT_TOKEN: "supersecret"
+      });
+      expect(readOnly.code).not.toBe(0);
+      expect(readOnly.stderr).toContain("target brain evil is read-only");
+      await writeFile(
+        join(dir, ".config", "brainstack", "profiles.yaml"),
+        [
+          "brains:",
+          "  evil:",
+          `    baseUrl: http://127.0.0.1:${port}`,
+          "    importTokenEnv: BRAIN_IMPORT_TOKEN",
+          "    classification: work",
+          "    write: true",
+          ""
+        ].join("\n")
+      );
       const trusted = runBrainctl(["remember", "--repo", repo, "--summary", "trusted write", "--config", configPath], {
         BRAIN_IMPORT_TOKEN: "supersecret"
       });
       expectSuccess(trusted);
       const received = (await readFile(receivedPath, "utf8")).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as { auth: string | null; path: string });
+      expect(received).toContainEqual({ auth: "Bearer supersecret", path: "/api/propose" });
       expect(received).toContainEqual({ auth: "Bearer supersecret", path: "/api/import" });
     } finally {
       if (server) {
@@ -3503,6 +3574,10 @@ describe("public release hygiene", () => {
       expect(await Bun.file(join(personalClone, "shared", "work-safe", "Debug.md")).exists()).toBe(false);
       expect(await Bun.file(join(journalClone, "shared", "work-safe", "Debug.md")).exists()).toBe(false);
       expect(await Bun.file(join(disabledClone, "wiki", "Runbook.md")).exists()).toBe(false);
+      const workOnlyRemember = runBrainctl(["remember", "--repo", repo, "--target", "lindy", "--summary", "work context only", "--config", configPath, "--root", root]);
+      expect(workOnlyRemember.code).not.toBe(0);
+      expect(workOnlyRemember.stderr).toContain("writable but missing explicit baseUrl/importTokenEnv");
+      expect(workOnlyRemember.stderr).not.toContain("--confirm-cross-brain");
 
       const allow = runBrainctl(["allow", "repo", "--repo", repo, "--brain", "personal", "--sections", "shared/work-safe", "--always", "--config", configPath, "--root", root]);
       expectSuccess(allow);
@@ -3511,6 +3586,9 @@ describe("public release hygiene", () => {
       expect(context.stdout).toContain("[allowed] personal");
       expect(context.stdout).toContain("cross_brain_writes=");
       expect(await Bun.file(join(personalClone, "shared", "work-safe", "Debug.md")).exists()).toBe(true);
+      const contextOnlyRemember = runBrainctl(["remember", "--repo", repo, "--target", "lindy", "--summary", "context sourced memory", "--config", configPath, "--root", root]);
+      expect(contextOnlyRemember.code).not.toBe(0);
+      expect(contextOnlyRemember.stderr).toContain("without --confirm-cross-brain");
 
       const search = runBrainctl(["search", "--repo", repo, "--config", configPath, "--root", root, "deploy"]);
       expectSuccess(search);
@@ -3596,6 +3674,38 @@ describe("public release hygiene", () => {
       expect(classifiedWeakeningContext.code).not.toBe(0);
       expect(classifiedWeakeningContext.stderr).toContain("cannot weaken trusted/effective profile policy ask for journal->lindy to allow");
 
+      const classificationFloorRepo = join(dir, "projects", "lindy", "classification-floor");
+      await mkdir(classificationFloorRepo, { recursive: true });
+      await writeFile(
+        join(classificationFloorRepo, ".brainstack.yaml"),
+        [
+          "brains:",
+          "  - id: lindy",
+          "    classification: neutral",
+          "    read: true",
+          ""
+        ].join("\n")
+      );
+      const classificationFloorContext = runBrainctl(["context", "--repo", classificationFloorRepo, "--config", configPath, "--root", root, "--no-sync"]);
+      expectSuccess(classificationFloorContext);
+      expect(classificationFloorContext.stdout).toContain("[allowed] lindy (work)");
+
+      const classificationRaiseRepo = join(dir, "projects", "lindy", "classification-raise");
+      await mkdir(classificationRaiseRepo, { recursive: true });
+      await writeFile(
+        join(classificationRaiseRepo, ".brainstack.yaml"),
+        [
+          "brains:",
+          "  - id: lindy",
+          "    classification: personal",
+          "    read: true",
+          ""
+        ].join("\n")
+      );
+      const classificationRaiseContext = runBrainctl(["context", "--repo", classificationRaiseRepo, "--config", configPath, "--root", root, "--no-sync"]);
+      expectSuccess(classificationRaiseContext);
+      expect(classificationRaiseContext.stdout).toContain("[blocked] lindy (personal)");
+
       const overrideRepo = join(dir, "projects", "lindy", "override");
       await mkdir(overrideRepo, { recursive: true });
       await writeFile(
@@ -3667,8 +3777,12 @@ describe("public release hygiene", () => {
         ].join("\n")
       );
       const escapedClone = runBrainctl(["context", "--repo", escapedCloneRepo, "--config", configPath, "--root", root, "--no-sync"]);
-      expect(escapedClone.code).not.toBe(0);
-      expect(escapedClone.stderr).toContain("cannot set localClone/localPath/path outside");
+      expectSuccess(escapedClone);
+      expect(escapedClone.stdout).toContain("[pending-trust] escaped");
+      expect(escapedClone.stdout).toContain("connection=pending-trust fields=baseUrl,localPath");
+      const escapedSearch = runBrainctl(["search", "--repo", escapedCloneRepo, "--config", configPath, "--root", root, "--no-sync", "--query", "anything"]);
+      expectSuccess(escapedSearch);
+      expect(escapedSearch.stderr).toContain("WARN [escaped] skipped pending-trust brain");
 
       const dotRepo = join(dir, "projects", "dotty");
       await mkdir(dotRepo, { recursive: true });

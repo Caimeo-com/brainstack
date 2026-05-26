@@ -1,6 +1,6 @@
 # Project Context And Multi-Brain Use
 
-Brainstack has a small project-triggered context surface so a harness can discover the right brains from the repository it is working in. Project config can live in a repo-local `.brainstack.yaml` and user-level defaults can live in `profiles.yaml`.
+Brainstack has a small project-triggered context surface so a harness can discover the right brains from the repository it is working in. Project config can live in a repo-local `.brainstack.yaml` and user-level defaults can live in `profiles.yaml`. Repo-local config declares intent; user-level profiles are what trust concrete URLs, remotes, token environment names, and local clone paths.
 
 Before substantial repo work, run:
 
@@ -51,7 +51,28 @@ crossBrainWrites:
   lindyToPersonal: never
 ```
 
-`url` is accepted as the write API base URL. `baseUrl` is also accepted for older configs. `remote` or `gitRemote` lets `brainctl context` clone missing local brains and pull existing clones. Repo-local `.brainstack.yaml` files are not trusted to point at arbitrary local filesystem paths; explicit `localClone` / `localPath` values should live in `~/.config/brainstack/profiles.yaml`, or use Brainstack's managed clone root under state.
+`url` is accepted as the write API base URL. `baseUrl` is also accepted for older configs. `remote` or `gitRemote` lets `brainctl context` clone missing local brains and pull existing clones after those exact fields are trusted in `~/.config/brainstack/profiles.yaml`. Repo-local `.brainstack.yaml` files are not trusted to bind URLs, token environment names, remotes, or explicit `localClone` / `localPath` / `path` values on their own, even when a path points under Brainstack's managed clone root. Until a matching profile entry exists, `brainctl context` marks the brain `[pending-trust]`, `brainctl search` skips it, and `brainctl remember` refuses to write to it.
+
+Repo-local `write: true` also declares intent only. Direct `/api/import` writes are active only when the matching user-level profile entry says `write: true`; otherwise the effective mode is downgraded to `propose-only` and `context` prints the downgrade.
+
+To trust a repo-local brain today, add the concrete fields to `~/.config/brainstack/profiles.yaml`:
+
+```yaml
+brains:
+  lindy:
+    url: https://lindy-brain.example.ts.net
+    importTokenEnv: BRAIN_IMPORT_TOKEN
+    remote: operator@brain-control:/home/operator/shared-brain/lindy.git
+    localClone: ~/shared-brain/lindy
+    classification: work
+    write: true
+```
+
+Then rerun:
+
+```bash
+brainctl context --repo .
+```
 
 Section names are path prefixes inside the local clone. They are retrieval boundaries, not hard security boundaries. If a harness has shell access to the clone, it can read files directly.
 

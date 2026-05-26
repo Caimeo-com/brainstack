@@ -346,6 +346,8 @@ cp "$bundle_dir/command-outputs/worker-harness-path-neutral-test.txt" "$bundle_d
   assert_doc_contains docs/multi-brain.md "project config" "project config activates multi-brain behavior"
   assert_doc_contains docs/multi-brain.md "\\.brainstack\\.yaml" "repo-local project config filename is documented"
   assert_doc_contains docs/multi-brain.md "profiles\\.yaml" "profiles config is documented"
+  assert_doc_contains docs/multi-brain.md "pending-trust" "pending-trust repo-local connection posture is documented"
+  assert_doc_contains docs/multi-brain.md "URL/token/remote/path|URLs, remotes, token environment names, and local clone paths" "repo-local concrete connection fields require user trust"
   assert_doc_contains docs/multi-brain.md "not hard security boundaries" "sections are not hard security boundaries"
   assert_doc_contains docs/multi-brain.md "retrieval boundaries" "sections are retrieval boundaries"
   assert_doc_contains docs/outbox-security.md "plaintext by default|sensitive" "outbox payloads are sensitive plaintext by default"
@@ -354,6 +356,127 @@ cp "$bundle_dir/command-outputs/worker-harness-path-neutral-test.txt" "$bundle_d
   assert_doc_contains packages/client-bootstrap/claude-user-CLAUDE.md "brainctl search --repo \\." "Claude bootstrap uses repo-scoped search"
   assert_doc_contains packages/client-bootstrap/claude-user-CLAUDE.md "brainctl remember --repo \\." "Claude bootstrap uses repo-scoped remember"
 } > "$bundle_dir/command-outputs/docs-presence.txt" 2>&1
+
+multi_brain_smoke_root="$(mktemp -d "${out_dir}/brainstack-handoff-multibrain.XXXXXX")"
+multi_brain_config="$multi_brain_smoke_root/config.yaml"
+multi_brain_repo="$multi_brain_smoke_root/repo"
+multi_brain_work="$multi_brain_smoke_root/brains/lindy"
+multi_brain_personal="$multi_brain_smoke_root/brains/personal"
+mkdir -p "$multi_brain_repo" "$multi_brain_work/wiki" "$multi_brain_personal/wiki"
+cat > "$multi_brain_config" <<YAML
+schema_version: 1
+profile: client-macos
+machine:
+  name: client
+  user: operator
+paths:
+  home: $multi_brain_smoke_root/home
+  stateRoot: $multi_brain_smoke_root/state
+client:
+  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git
+YAML
+git -C "$multi_brain_work" init -q
+git -C "$multi_brain_personal" init -q
+printf '%s\n' "handoff deploy checklist from lindy" > "$multi_brain_work/wiki/Runbook.md"
+printf '%s\n' "handoff personal deployment note" > "$multi_brain_personal/wiki/Journal.md"
+cat > "$multi_brain_repo/.brainstack.yaml" <<YAML
+writeDefault: lindy
+brains:
+  - id: lindy
+    label: Lindy work brain
+    baseUrl: http://127.0.0.1:9
+    importTokenEnv: BRAIN_IMPORT_TOKEN
+    localPath: $multi_brain_work
+    classification: work
+    sections: [wiki]
+    write: true
+  - id: personal
+    label: Personal brain
+    localPath: $multi_brain_personal
+    classification: personal
+    sections: [wiki]
+    read: true
+    write: propose-only
+crossBrainWrites:
+  personalToLindy: ask
+YAML
+
+bun run packages/brainctl/src/main.ts context \
+  --repo "$multi_brain_repo" \
+  --config "$multi_brain_config" \
+  --root "$multi_brain_smoke_root" \
+  --no-sync \
+  > "$bundle_dir/command-outputs/context-pending-trust-cli.txt" 2>&1
+
+mkdir -p "$multi_brain_smoke_root/config"
+cat > "$multi_brain_smoke_root/config/profiles.yaml" <<YAML
+brains:
+  lindy:
+    baseUrl: http://127.0.0.1:9
+    importTokenEnv: BRAIN_IMPORT_TOKEN
+    localPath: $multi_brain_work
+    classification: work
+    write: true
+  personal:
+    localPath: $multi_brain_personal
+    classification: personal
+YAML
+
+bun run packages/brainctl/src/main.ts allow repo \
+  --repo "$multi_brain_repo" \
+  --brain personal \
+  --sections wiki \
+  --always \
+  --config "$multi_brain_config" \
+  --root "$multi_brain_smoke_root" \
+  > "$bundle_dir/command-outputs/context-personal-allow-cli.txt" 2>&1
+
+bun run packages/brainctl/src/main.ts context \
+  --repo "$multi_brain_repo" \
+  --config "$multi_brain_config" \
+  --root "$multi_brain_smoke_root" \
+  --no-sync \
+  > "$bundle_dir/command-outputs/context-after-trust-cli.txt" 2>&1
+
+bun run packages/brainctl/src/main.ts search \
+  --repo "$multi_brain_repo" \
+  --config "$multi_brain_config" \
+  --root "$multi_brain_smoke_root" \
+  --no-sync \
+  --query handoff \
+  > "$bundle_dir/command-outputs/search-source-labelled-cli.txt" 2>&1
+
+set +e
+bun run packages/brainctl/src/main.ts remember \
+  --repo "$multi_brain_repo" \
+  --target lindy \
+  --summary "handoff cross-brain blocked example" \
+  --config "$multi_brain_config" \
+  --root "$multi_brain_smoke_root" \
+  > "$bundle_dir/command-outputs/remember-cross-brain-blocked-cli.txt" 2>&1
+remember_blocked_code=$?
+set -e
+printf 'exit=%s\n' "$remember_blocked_code" >> "$bundle_dir/command-outputs/remember-cross-brain-blocked-cli.txt"
+if [ "$remember_blocked_code" -eq 0 ]; then
+  echo "handoff refused: expected cross-brain remember example to fail before confirmation" >&2
+  exit 1
+fi
+
+bun run packages/brainctl/src/main.ts remember \
+  --repo "$multi_brain_repo" \
+  --target lindy \
+  --summary "handoff cross-brain confirmed example" \
+  --confirm-cross-brain \
+  --config "$multi_brain_config" \
+  --root "$multi_brain_smoke_root" \
+  > "$bundle_dir/command-outputs/remember-cross-brain-confirmed-cli.txt" 2>&1
+
+bun run packages/brainctl/src/main.ts outbox list \
+  --config "$multi_brain_config" \
+  --root "$multi_brain_smoke_root" \
+  > "$bundle_dir/command-outputs/outbox-list-cli.txt" 2>&1
+
+rm -rf "$multi_brain_smoke_root"
 
 cp docs/diagrams.md "$bundle_dir/generated/diagrams.md"
 
@@ -532,6 +655,7 @@ cat > "$bundle_dir/CLAIMS_AND_PROOF.md" <<'EOF'
 | `brainctl doctor` explains trusted-tailnet posture and fails accidental non-loopback binds. | `command-outputs/security-posture-doctor-test.txt` |
 | Project-triggered multi-brain context supports profiles, clone/pull, allow rules, source labels, and cross-brain refusal. | `command-outputs/multi-brain-profiles-test.txt` |
 | Repo-local `.brainstack.yaml` cannot point reads/clones at arbitrary local paths unless those paths are trusted in profiles. | `command-outputs/multi-brain-repo-local-safety-test.txt` |
+| Human-facing multi-brain CLI flows have real stdout/stderr examples for pending trust, trusted context, labelled search, cross-brain refusal, confirmed queueing, and outbox listing. | `command-outputs/context-pending-trust-cli.txt`, `command-outputs/context-after-trust-cli.txt`, `command-outputs/search-source-labelled-cli.txt`, `command-outputs/remember-cross-brain-blocked-cli.txt`, `command-outputs/remember-cross-brain-confirmed-cli.txt`, `command-outputs/outbox-list-cli.txt` |
 | Multi-brain context/search/remember checklist aliases are backed by the combined multi-brain regression transcript. | `command-outputs/context-default-repo.txt`, `command-outputs/context-project-first-noninteractive.txt`, `command-outputs/context-project-after-approval.txt`, `command-outputs/search-source-labelled.txt`, `command-outputs/remember-personal-default.txt`, `command-outputs/remember-company-default.txt`, `command-outputs/remember-cross-brain-warning.txt` |
 | Harness bootstrap guidance uses repo-scoped `brainctl context/search/remember`, does not silently overwrite existing files, and doctor reports guidance state. | `command-outputs/harness-guidance-fresh.txt`, `command-outputs/harness-guidance-existing-file.txt`, `command-outputs/doctor-harness-guidance.txt` |
 | Slow URL import preparation does not occupy the serialized repo mutation slot. | `command-outputs/write-gate-narrowing-test.txt` |
@@ -647,6 +771,12 @@ required_command_outputs=(
   "context-project-first-noninteractive.txt"
   "context-project-after-approval.txt"
   "search-source-labelled.txt"
+  "context-pending-trust-cli.txt"
+  "context-after-trust-cli.txt"
+  "search-source-labelled-cli.txt"
+  "remember-cross-brain-blocked-cli.txt"
+  "remember-cross-brain-confirmed-cli.txt"
+  "outbox-list-cli.txt"
   "remember-personal-default.txt"
   "remember-company-default.txt"
   "remember-cross-brain-warning.txt"
