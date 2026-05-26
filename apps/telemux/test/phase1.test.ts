@@ -2867,7 +2867,7 @@ test("worker shell PATH fallback escalates when timeout is unavailable and the l
       join(binDir, "tail"),
       "#!/bin/sh\nlast=''\nwhile IFS= read -r line; do last=\"$line\"; done\n[ -n \"$last\" ] && printf '%s\\n' \"$last\"\n"
     );
-    await makeExecutable(join(binDir, "sleep"), "#!/bin/sh\nexec /bin/sleep 0.05\n");
+    await makeExecutable(join(binDir, "sleep"), "#!/bin/sh\nexec /bin/sleep 0.2\n");
     await makeExecutable(
       fakeShell,
       `#!/bin/sh
@@ -2888,6 +2888,13 @@ while :; do :; done
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout.toString()).toContain(`PATH_AFTER=${binDir}`);
+    await waitFor(async () => {
+      try {
+        return (await readFile(logPath, "utf8")).includes("term=");
+      } catch {
+        return false;
+      }
+    });
     expect(await readFile(logPath, "utf8")).toContain("term=");
   } finally {
     delete process.env.FACTORY_TEST_CAPTURE_SSH_SCRIPT;
