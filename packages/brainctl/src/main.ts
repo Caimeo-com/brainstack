@@ -2153,6 +2153,7 @@ async function commandInit(args: ParsedArgs): Promise<void> {
   await ensureDir(cfg.paths.configRoot);
   await ensureDir(cfg.paths.stateRoot);
   await ensureDir(cfg.paths.systemdUserRoot);
+  await writeFileMap(join(cfg.paths.configRoot, "client-bootstrap"), clientBootstrapFiles(cfg));
   if (runsBraind(cfg)) {
     const seedMode: SeedMode = hasFlag(args, "force-seed") ? "force" : hasFlag(args, "seed-missing") ? "missing" : "empty-only";
     await ensureGitRepoLayout(cfg, "fresh", seedMode);
@@ -2183,6 +2184,8 @@ async function applyRuntime(cfg: BrainstackConfig): Promise<string[]> {
   await ensureDir(cfg.paths.configRoot);
   await ensureDir(cfg.paths.stateRoot);
   await ensureDir(cfg.paths.systemdUserRoot);
+  await writeFileMap(join(cfg.paths.configRoot, "client-bootstrap"), clientBootstrapFiles(cfg));
+  touched.push(join(cfg.paths.configRoot, "client-bootstrap"));
   if (runsBraind(cfg)) {
     await ensureGitRepoLayout(cfg, "runtime", "empty-only");
     await writeText(join(cfg.paths.configRoot, "braind.runtime.env"), braindRuntimeEnv(cfg), 0o644);
@@ -2380,32 +2383,46 @@ async function harnessGuidanceChecks(cfg: BrainstackConfig): Promise<DoctorCheck
   const claudeInclude = `@${join(bootstrapRoot, "claude-user-CLAUDE.md")}`;
   const cursorRule = join(cfg.paths.home, ".cursor", "rules", "shared-brain.md");
   const guidanceNeedle = "brainctl context --repo .";
+  const codexRelevant = cfg.harness.name === "codex" || existsSync(codexAgents) || existsSync(codexInclude);
+  const claudeRelevant = cfg.harness.name === "claude" || existsSync(claudeFile);
 
-  if (!existsSync(codexInclude)) {
-    checks.push(check("WARN", "guidance", "codex-bootstrap-include", `${codexInclude} missing`, "Run brainctl init or render-client-bootstrap."));
-  }
-  if (existsSync(codexAgents)) {
-    const info = await lstat(codexAgents).catch(() => null);
-    const target = info?.isSymbolicLink() ? await readlink(codexAgents).catch(() => "") : "";
-    const text = info?.isSymbolicLink() ? "" : readFileSync(codexAgents, "utf8");
-    checks.push(
-      target === codexInclude || text.includes(guidanceNeedle)
-        ? check("PASS", "guidance", "codex-agents", target === codexInclude ? `symlinked to ${codexInclude}` : "contains Brainstack context guidance")
-        : check("WARN", "guidance", "codex-agents", `${codexAgents} exists but Brainstack guidance was not detected`, `Append: cat ${codexInclude} >> ${codexAgents}`)
-    );
-  } else {
-    checks.push(check("WARN", "guidance", "codex-agents", `${codexAgents} missing`, "Run brainctl init or merge the generated client bootstrap guidance."));
+  if (codexRelevant) {
+    if (!existsSync(codexInclude)) {
+      checks.push(
+        check(
+          "WARN",
+          "guidance",
+          "codex-bootstrap-include",
+          `${codexInclude} missing`,
+          `Run brainctl init or brainctl bootstrap-client --out ${bootstrapRoot}.`
+        )
+      );
+    }
+    if (existsSync(codexAgents)) {
+      const info = await lstat(codexAgents).catch(() => null);
+      const target = info?.isSymbolicLink() ? await readlink(codexAgents).catch(() => "") : "";
+      const text = info?.isSymbolicLink() ? "" : readFileSync(codexAgents, "utf8");
+      checks.push(
+        target === codexInclude || text.includes(guidanceNeedle)
+          ? check("PASS", "guidance", "codex-agents", target === codexInclude ? `symlinked to ${codexInclude}` : "contains Brainstack context guidance")
+          : check("WARN", "guidance", "codex-agents", `${codexAgents} exists but Brainstack guidance was not detected`, `Append: cat ${codexInclude} >> ${codexAgents}`)
+      );
+    } else {
+      checks.push(check("WARN", "guidance", "codex-agents", `${codexAgents} missing`, "Run brainctl init or merge the generated client bootstrap guidance."));
+    }
   }
 
-  if (existsSync(claudeFile)) {
-    const text = readFileSync(claudeFile, "utf8");
-    checks.push(
-      text.includes(claudeInclude) || text.includes(guidanceNeedle)
-        ? check("PASS", "guidance", "claude", "contains Brainstack context guidance")
-        : check("WARN", "guidance", "claude", `${claudeFile} exists but Brainstack guidance was not detected`, `Add this line: ${claudeInclude}`)
-    );
-  } else {
-    checks.push(check("WARN", "guidance", "claude", `${claudeFile} missing`, "Run brainctl init or merge the generated client bootstrap guidance."));
+  if (claudeRelevant) {
+    if (existsSync(claudeFile)) {
+      const text = readFileSync(claudeFile, "utf8");
+      checks.push(
+        text.includes(claudeInclude) || text.includes(guidanceNeedle)
+          ? check("PASS", "guidance", "claude", "contains Brainstack context guidance")
+          : check("WARN", "guidance", "claude", `${claudeFile} exists but Brainstack guidance was not detected`, `Add this line: ${claudeInclude}`)
+      );
+    } else {
+      checks.push(check("WARN", "guidance", "claude", `${claudeFile} missing`, "Run brainctl init or merge the generated client bootstrap guidance."));
+    }
   }
 
   if (existsSync(cursorRule)) {

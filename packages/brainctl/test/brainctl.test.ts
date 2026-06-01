@@ -702,6 +702,45 @@ describe("brainctl install safety", () => {
     }
   });
 
+  test("control init renders client bootstrap files for guidance checks", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-control-bootstrap-"));
+    try {
+      const home = join(dir, "home");
+      const configRoot = join(home, ".config", "brainstack");
+      const stateRoot = join(home, ".local", "state", "brainstack");
+      const configPath = join(dir, "control.yaml");
+      await mkdir(home, { recursive: true });
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "harness:",
+          "  name: codex",
+          "machine:",
+          "  name: brain-control",
+          "  user: operator",
+          "paths:",
+          `  home: ${home}`,
+          `  configRoot: ${configRoot}`,
+          `  stateRoot: ${stateRoot}`,
+          "telemux:",
+          "  enabled: false",
+          "client:",
+          "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+
+      expectSuccess(runBrainctl(["init", "--profile", "control", "--config", configPath]));
+      expect(await Bun.file(join(configRoot, "client-bootstrap", "codex-shared-brain.include.md")).exists()).toBe(true);
+      expect(await Bun.file(join(configRoot, "client-bootstrap", "claude-user-CLAUDE.md")).exists()).toBe(true);
+      expect(await Bun.file(join(home, ".claude", "CLAUDE.md")).exists()).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("worker init prints exact manual merge instructions when user agent files already exist", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-worker-existing-agent-files-"));
     try {
@@ -2889,6 +2928,43 @@ describe("public release hygiene", () => {
       await rm(dir, { recursive: true, force: true });
     }
   }, 12_000);
+
+  test("doctor skips missing guidance for unused harnesses", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-guidance-doctor-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "harness:",
+          "  name: codex",
+          "machine:",
+          "  name: client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          "client:",
+          "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+
+      const missingClaude = runBrainctl(["doctor", "--config", configPath]);
+      expectSuccess(missingClaude);
+      expect(missingClaude.stdout).toContain("WARN [guidance] codex-agents:");
+      expect(missingClaude.stdout).not.toContain("[guidance] claude");
+
+      await mkdir(join(dir, ".claude"), { recursive: true });
+      await writeFile(join(dir, ".claude", "CLAUDE.md"), "# Existing Claude\n");
+      const existingClaude = runBrainctl(["doctor", "--config", configPath]);
+      expectSuccess(existingClaude);
+      expect(existingClaude.stdout).toContain("WARN [guidance] claude:");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 
   test("doctor reports braind readiness separately from liveness", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-readyz-doctor-"));
