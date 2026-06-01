@@ -20,7 +20,7 @@ export PATH="$HOME/.bun/bin:$PATH"
 
 Install and authenticate the selected harness, usually Codex or Claude, before running Brainstack provisioning. Brainstack only verifies the harness; it does not create harness accounts or permission-bypass settings.
 
-On a macOS client using a compiled `brainctl` binary, Bun and a Brainstack source checkout are not prerequisites. Install Git, SSH, Tailscale for the current tailnet workflow, and the selected harness, then use `docs/quickstart-client-macos.md`. Bun remains required for control, worker, and single-node machines because those profiles run Brainstack services from source.
+On a macOS client using a compiled `brainctl` binary, Bun and a Brainstack source checkout are not prerequisites. Install Git, SSH, Tailscale for the current tailnet workflow, and the selected harness, then use `docs/quickstart-client-macos.md`. For the lowest-friction path, create a control-host invite with `brainctl invite create` and run the printed one-line installer on the Mac. The compiled binary embeds client bootstrap templates and public Codex skills. Bun remains required for control, worker, and single-node machines because those profiles run Brainstack services from source.
 
 Do not reboot remote encrypted machines as part of setup. If a host uses disk encryption that needs a local unlock, keep all setup to service/package starts and user-level changes.
 
@@ -32,7 +32,7 @@ cd ~/brainstack
 bun install --frozen-lockfile
 ```
 
-For control, worker, and single-node installs this source checkout remains required because generated services point at the product repo. For macOS client-only installs, the compiled binary embeds the client bootstrap templates and can skip this section.
+For control, worker, and single-node installs this source checkout remains required because generated services point at the product repo. For macOS client-only installs, the compiled binary embeds the client bootstrap templates and portable skills and can skip this section.
 
 ## Worker Install
 
@@ -70,6 +70,12 @@ bun run packages/brainctl/src/main.ts updates --config ~/.config/brainstack/brai
 
 `--write-smoke` is intentionally mutating: it posts a small import artifact through `/api/import`. Run it when proving write readiness, not as a routine health check.
 
+If this machine uses Codex skills, install the public Brainstack bundle:
+
+```bash
+bun run packages/brainctl/src/main.ts skills install --target codex --profile worker
+```
+
 ## Control Host Install
 
 ```bash
@@ -84,6 +90,12 @@ bun run packages/brainctl/src/main.ts provision \
 bun run packages/brainctl/src/main.ts init --profile control --config ~/.config/brainstack/brainstack.yaml
 loginctl enable-linger "$USER"
 systemctl --user daemon-reload
+```
+
+If this control host also runs Codex as an operator harness, install the operator skill bundle:
+
+```bash
+bun run packages/brainctl/src/main.ts skills install --target codex --profile operator
 ```
 
 Fill `~/.config/brainstack/telemux.secrets.env` before starting telemux:

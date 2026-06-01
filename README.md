@@ -27,6 +27,7 @@ bun run packages/brainctl/src/main.ts expose tailscale --config examples/control
 bun run packages/brainctl/src/main.ts context --repo .
 bun run packages/brainctl/src/main.ts search --repo . "runbook"
 bun run packages/brainctl/src/main.ts outbox status --config examples/client-macos.yaml
+bun run packages/brainctl/src/main.ts skills install --target codex --profile client --dry-run
 bun run packages/brainctl/src/main.ts upgrade --profile control --config examples/control.yaml
 bun run packages/brainctl/src/main.ts destroy --config ~/.config/brainstack/brainstack.yaml --dry-run
 ```
@@ -42,7 +43,26 @@ cd ~/brainstack
 bun build packages/brainctl/src/main.ts --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --outfile dist/brainctl
 ```
 
-The deterministic flags prevent the compiled binary from implicitly loading local `.env` or `bunfig.toml` files from the release machine. The compiled CLI embeds the `packages/client-bootstrap` assets, so `client-macos` provisioning, doctor, init, and `bootstrap-client` can run from the binary without a Brainstack source checkout or Bun installed on that Mac. A binary client still needs Git, SSH, Tailscale for the current tailnet workflow, and the selected harness CLI. Control, worker, and single-node profiles still require Bun because generated services run the product source under Bun.
+The deterministic flags prevent the compiled binary from implicitly loading local `.env` or `bunfig.toml` files from the release machine. The compiled CLI embeds the `packages/client-bootstrap` assets and `packages/skills`, so `client-macos` provisioning, doctor, init, `bootstrap-client`, and `skills install` can run from the binary without a Brainstack source checkout or Bun installed on that Mac. A binary client still needs Git, SSH, Tailscale for the current tailnet workflow, and the selected harness CLI. Control, worker, and single-node profiles still require Bun because generated services run the product source under Bun.
+
+For a frictionless client install, generate a private invite on the control host:
+
+```bash
+brainctl invite create \
+  --config ~/.config/brainstack/brainstack.yaml \
+  --import-token-file ~/brain-import-token.txt \
+  --control-ssh operator@brain-control \
+  --ssh-known-hosts-file ~/.config/brainstack/control_ssh_known_hosts
+```
+
+Then run the release installer on the client machine after publishing release assets:
+
+```bash
+RELEASE_TAG=vX.Y.Z
+curl -fsSL "https://github.com/Caimeo-com/brainstack/releases/download/$RELEASE_TAG/install.sh" | sh
+```
+
+Paste the printed invite when prompted. The installer only downloads and verifies `brainctl`; enrollment, config rendering, token installation, client bootstrap, and post-install doctor checks live in the versioned CLI. See [`docs/install-one-line.md`](./docs/install-one-line.md).
 
 Generated source-run services also invoke Bun with `--no-env-file` and load explicit `*.runtime.env` plus operator-owned `*.secrets.env` files. This keeps service behavior deterministic instead of depending on whichever `.env` happens to exist near the product repo.
 
@@ -57,6 +77,7 @@ Private journaling should use an explicit separate repo/service/token boundary. 
 
 Start with the quickstart docs in `docs/`.
 See [`docs/fresh-machine-install.md`](./docs/fresh-machine-install.md) for bootstrapping a new control, worker, or client machine from prerequisites through `doctor`.
+See [`docs/portable-skills.md`](./docs/portable-skills.md) for installing Brainstack's public Codex skill/runbook bundle.
 See [`docs/diagrams.md`](./docs/diagrams.md) for the read/write/outbox, Telegram coalescing, and control/client/worker topology diagrams.
 See [`docs/routines.md`](./docs/routines.md) for scheduled routines, built-in update checks, brain-curator setup, and daily check-ins.
 See [`docs/security-postures.md`](./docs/security-postures.md), [`docs/tailscale-exposure.md`](./docs/tailscale-exposure.md), [`docs/multi-brain.md`](./docs/multi-brain.md), and [`docs/outbox-security.md`](./docs/outbox-security.md) for the current posture, exposure, project-context, and outbox boundaries.

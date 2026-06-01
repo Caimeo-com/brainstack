@@ -6,6 +6,24 @@ The smooth client path is a current-platform compiled `brainctl` binary. It does
 
 ## Binary-First Install
 
+If the control host has a current `brainctl`, prefer an invite:
+
+```bash
+brainctl invite create \
+  --config ~/.config/brainstack/brainstack.yaml \
+  --import-token-file ~/brain-import-token.txt \
+  --control-ssh operator@brain-control \
+  --ssh-known-hosts-file ~/.config/brainstack/control_ssh_known_hosts
+```
+
+Run the printed command on the Mac after the selected release exists, then paste the printed invite at the prompt. The installer keeps the invite out of `brainctl` argv by writing it to a private temporary file and calling `brainctl enroll --invite-file ...`; enrollment writes `~/.config/brainstack/brainstack.yaml`, installs pinned SSH host keys when embedded, clones the shared brain, installs harness guidance, and runs doctor unless `--skip-doctor` is passed to the installer.
+
+`--ssh-known-hosts-file` should contain the control SSH host pin for the `--control-ssh` target. Extra entries are ignored; a file with no matching control-host pin is rejected.
+
+For scripted setup, save the invite to a `chmod 600` file and pass `--invite-file /path/to/invite.txt`. Avoid `--invite bs1_...` on shared machines because token-bearing invites can otherwise land in shell history or process listings.
+
+Manual binary-first install remains useful for custom configs:
+
 ```bash
 brainctl provision \
   --profile client-macos \
@@ -30,6 +48,24 @@ chmod 600 ~/brain-import-token.txt
 BRAIN_IMPORT_TOKEN_FILE=~/brain-import-token.txt \
   ./install-client.sh
 ```
+
+## Install Agent Skills
+
+Brainstack also ships public Codex skills with the CLI. They are generic product runbooks for shared-brain usage, client discipline, file relay, and operator workflows; they do not contain private machine topology.
+
+On an enrolled client:
+
+```bash
+brainctl skills install --target codex --profile client
+```
+
+On an operator or control-host machine:
+
+```bash
+brainctl skills install --target codex --profile operator
+```
+
+Use `--dry-run` to inspect the files first. Keep exact hostnames, local service paths, and Telegram routing details in a private local overlay skill, not in the public Brainstack package.
 
 ## Client Env
 
@@ -66,9 +102,9 @@ brainctl telegram send-file \
   --caption "Report from my Mac"
 ```
 
-If `client.remoteSsh` is configured, `--via` can be omitted. The command streams the local file over SSH, invokes `apps/telemux/src/send-file.ts` on the control host, and lets telemux read its own `telemux.runtime.env` plus `telemux.secrets.env`. The default target is `FACTORY_TELEGRAM_CONTROL_CHAT_ID`; use `--context SLUG` to send into an existing bound telemux topic. Files are rejected locally and remotely if they are symlinks, directories, over 45 MiB by default, or look like secrets unless `--allow-sensitive` is explicitly supplied.
+If invite enrollment configured `client.telegramVia` and `client.telegramRemoteRepo`, `--via` and `--remote-repo` can be omitted. The command streams the local file over SSH, invokes `apps/telemux/src/send-file.ts` on the control host, and lets telemux read its own `telemux.runtime.env` plus `telemux.secrets.env`. The default target is `FACTORY_TELEGRAM_CONTROL_CHAT_ID`; use `--context SLUG` to send into an existing bound telemux topic. Files are rejected locally and remotely if they are symlinks, directories, over 45 MiB by default, or look like secrets unless `--allow-sensitive` is explicitly supplied.
 
-SSH trust is pinned by default through `~/.config/brainstack/ssh_known_hosts` from the client config root. Run `brainctl trust-worker` or otherwise install the control host key first, or use `--known-hosts FILE` for a custom pin file. `--ssh-trust accept-new` is a bootstrap escape hatch only; it uses OpenSSH TOFU semantics and should be replaced with a pinned host key before routine use. Use `--display-name NAME` to change the Telegram filename and `--max-bytes N` for a smaller explicit cap.
+SSH trust is pinned by default through `~/.config/brainstack/ssh_known_hosts` from the client config root. Invites can embed the control host pin; otherwise run `brainctl trust-worker` or install the control host key first, or use `--known-hosts FILE` for a custom pin file. `--ssh-trust accept-new` is a bootstrap escape hatch only; it uses OpenSSH TOFU semantics and should be replaced with a pinned host key before routine use. Use `--display-name NAME` to change the Telegram filename and `--max-bytes N` for a smaller explicit cap.
 
 ## Harness Instructions
 

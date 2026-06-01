@@ -587,6 +587,31 @@ describe("brainctl install safety", () => {
       expect(await Bun.file(join(out, "install-client.sh")).exists()).toBe(true);
       expect(await readFile(join(out, "client.env.example"), "utf8")).toContain("BRAIN_BASE_URL=https://brain-control.example.ts.net");
       expect(await readFile(join(out, "install-client.sh"), "utf8")).toContain("git clone \"$REMOTE\" \"$TARGET_ABS\"");
+
+      const skillRoot = join(dir, "codex-skills");
+      const skillInstall = runCommand([binary, "skills", "install", "--profile", "client", "--dir", skillRoot], {
+        cwd: dir,
+        env: noBunEnv
+      });
+      expectSuccess(skillInstall);
+      expect(skillInstall.stdout).toContain("skills installed: target=codex");
+      expect(await readFile(join(skillRoot, "brainstack", "SKILL.md"), "utf8")).toContain("brainctl telegram send-file");
+      expect(await readFile(join(skillRoot, "shared-brain-client", "SKILL.md"), "utf8")).toContain("Never request or store the admin ingest token");
+
+      const skillDryRun = runCommand([binary, "skills", "install", "--profile", "operator", "--dir", join(dir, "dry-skills"), "--dry-run"], {
+        cwd: dir,
+        env: noBunEnv
+      });
+      expectSuccess(skillDryRun);
+      expect(skillDryRun.stdout).toContain("dry-run skills install plan");
+      expect(await Bun.file(join(dir, "dry-skills", "brainstack", "SKILL.md")).exists()).toBe(false);
+
+      const missingSkillValue = runCommand([binary, "skills", "install", "--skill"], {
+        cwd: dir,
+        env: noBunEnv
+      });
+      expect(missingSkillValue.code).not.toBe(0);
+      expect(missingSkillValue.stderr).toContain("--skill requires a value");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -5732,6 +5757,345 @@ describe("public release hygiene", () => {
     }
   });
 
+  test("invite create and enroll perform one-line client bootstrap without leaking the import token", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-invite-enroll-"));
+    try {
+      const home = join(dir, "home");
+      const binDir = join(dir, "bin");
+      const configRoot = join(home, ".config", "brainstack");
+      await mkdir(binDir, { recursive: true });
+      await mkdir(configRoot, { recursive: true });
+      const tokenPath = join(dir, "brain-import-token.txt");
+      await writeFile(tokenPath, "import-token-value\n");
+      await chmod(tokenPath, 0o600);
+      await mkdir(join(home, ".config"), { recursive: true });
+      const clientEnvPath = join(home, ".config", "shared-brain.env");
+      await writeFile(clientEnvPath, "BRAIN_IMPORT_TOKEN=\n");
+      await chmod(clientEnvPath, 0o644);
+      const knownHostsPath = join(configRoot, "ssh_known_hosts");
+      await writeFile(
+        knownHostsPath,
+        [
+          "control.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeBrainstackControlKeyForTestsOnly",
+          "other-worker.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeOtherWorkerKeyForTestsOnly",
+          ""
+        ].join("\n")
+      );
+
+      await writeFile(
+        join(binDir, "git"),
+        [
+          "#!/usr/bin/env bash",
+          "set -euo pipefail",
+          "if [ \"${1:-}\" = clone ]; then mkdir -p \"$3/.git\"; exit 0; fi",
+          "if [ \"${1:-}\" = --version ]; then echo 'git fake'; exit 0; fi",
+          "exit 0",
+          ""
+        ].join("\n")
+      );
+      for (const name of ["ssh", "tailscale", "codex"]) {
+        await writeFile(join(binDir, name), "#!/usr/bin/env sh\nif [ \"${1:-}\" = --version ]; then echo '" + name + " fake'; fi\nexit 0\n");
+        await chmod(join(binDir, name), 0o755);
+      }
+      await chmod(join(binDir, "git"), 0o755);
+
+      const controlConfig = join(dir, "control.yaml");
+      await writeFile(
+        controlConfig,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "harness:",
+          "  name: codex",
+          "  bin: codex",
+          "machine:",
+          "  name: control",
+          "  user: operator",
+          "  sshUser: operator",
+          "  hostname: control.example",
+          "paths:",
+          `  home: ${home}`,
+          `  productRepo: ${join(home, "brainstack")}`,
+          `  configRoot: ${configRoot}`,
+          "brain:",
+          "  publicBaseUrl: https://control.example.ts.net:8443/brain",
+          "client:",
+          "  remoteSsh: operator@control.example:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+
+      const created = runBrainctl(
+        [
+          "invite",
+          "create",
+          "--config",
+          controlConfig,
+          "--import-token-file",
+          tokenPath,
+          "--ssh-known-hosts-file",
+          knownHostsPath,
+          "--install-url",
+          "https://example.invalid/brainstack/install.sh",
+          "--json"
+        ],
+        { HOME: home, USER: "operator", PATH: `${binDir}:${process.env.PATH || ""}`, BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1" }
+      );
+      expectSuccess(created);
+      expect(created.stdout).not.toContain("import-token-value");
+      const inviteResult = JSON.parse(created.stdout);
+      expect(String(inviteResult.invite).startsWith("bs1_")).toBe(true);
+      expect(inviteResult.installCommand).toContain("https://example.invalid/brainstack/install.sh");
+      expect(inviteResult.includesImportToken).toBe(true);
+      expect(inviteResult.includesSshKnownHosts).toBe(true);
+      const decoded = JSON.parse(Buffer.from(String(inviteResult.invite).slice("bs1_".length), "base64url").toString("utf8"));
+      expect(decoded.importToken).toBe("import-token-value");
+      expect(decoded.control.remoteRepo).toBe(join(home, "brainstack"));
+      expect(decoded.control.sshTarget).toBe("operator@control.example");
+      expect(decoded.control.sshKnownHosts).toEqual(["control.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeBrainstackControlKeyForTestsOnly"]);
+
+      const clientConfig = join(dir, "client.yaml");
+      const enrolled = runBrainctl(["enroll", "--invite", inviteResult.invite, "--config", clientConfig, "--skip-doctor"], {
+        HOME: home,
+        USER: "operator",
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1"
+      });
+      expectSuccess(enrolled);
+      expect(enrolled.stdout).not.toContain("import-token-value");
+      expect(enrolled.stderr).not.toContain("import-token-value");
+      const configText = await readFile(clientConfig, "utf8");
+      expect(configText).toContain("profile: client-macos");
+      expect(configText).toContain("tailnetHost: control.example.ts.net");
+      expect(configText).not.toContain("tailnetHost: control.example.ts.net:8443/brain");
+      expect(configText).toContain("telegramVia: operator@control.example");
+      expect(configText).toContain(`telegramRemoteRepo: ${join(home, "brainstack")}`);
+      expect(await readFile(join(configRoot, "ssh_known_hosts"), "utf8")).toContain("control.example ssh-ed25519");
+      expect(await readFile(clientEnvPath, "utf8")).toContain("BRAIN_IMPORT_TOKEN=import-token-value");
+      expect((await stat(clientEnvPath)).mode & 0o777).toBe(0o600);
+      expect((await readdir(configRoot)).filter((name) => name.includes(".invite-import-token")).length).toBe(0);
+      expect((await stat(join(home, "shared-brain", ".git"))).isDirectory()).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("invite create does not embed import tokens unless explicitly requested", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-invite-no-token-"));
+    try {
+      const configPath = join(dir, "control.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: control",
+          "  user: operator",
+          "  sshUser: operator",
+          "  hostname: control.example",
+          "paths:",
+          `  home: ${dir}`,
+          "brain:",
+          "  publicBaseUrl: https://control.example.ts.net",
+          "client:",
+          "  remoteSsh: operator@control.example:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+      const result = runBrainctl(["invite", "create", "--config", configPath, "--json"], {
+        HOME: dir,
+        USER: "operator",
+        BRAIN_IMPORT_TOKEN: "must-not-be-embedded"
+      });
+      expectSuccess(result);
+      const payload = JSON.parse(result.stdout);
+      expect(payload.includesImportToken).toBe(false);
+      const decoded = JSON.parse(Buffer.from(String(payload.invite).slice("bs1_".length), "base64url").toString("utf8"));
+      expect(decoded.importToken).toBeUndefined();
+      expect(result.stdout).not.toContain("must-not-be-embedded");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("invite create fails loudly for explicit missing SSH host pins", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-invite-missing-known-hosts-"));
+    try {
+      const configPath = join(dir, "control.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: control",
+          "  user: operator",
+          "  sshUser: operator",
+          "  hostname: control.example",
+          "paths:",
+          `  home: ${dir}`,
+          "brain:",
+          "  publicBaseUrl: https://control.example.ts.net",
+          "client:",
+          "  remoteSsh: operator@control.example:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+      const result = runBrainctl(["invite", "create", "--config", configPath, "--ssh-known-hosts-file", join(dir, "missing_known_hosts"), "--json"], {
+        HOME: dir,
+        USER: "operator"
+      });
+      expect(result.code).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("ssh known-hosts invite source not found");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("invite create filters known-host pins to the selected control SSH target", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-invite-known-host-filter-"));
+    try {
+      const configPath = join(dir, "control.yaml");
+      const knownHostsPath = join(dir, "known_hosts");
+      await writeFile(
+        knownHostsPath,
+        [
+          "unrelated.example ssh-ed25519 AAAAUnrelatedKeyForTestsOnly",
+          "[control.example]:2222 ssh-ed25519 AAAAControlKeyForTestsOnly",
+          ""
+        ].join("\n")
+      );
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: control",
+          "  user: operator",
+          "  sshUser: operator",
+          "  hostname: control.example",
+          "paths:",
+          `  home: ${dir}`,
+          "brain:",
+          "  publicBaseUrl: https://control.example.ts.net",
+          "client:",
+          "  remoteSsh: operator@control.example:2222:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+      const result = runBrainctl(["invite", "create", "--config", configPath, "--ssh-known-hosts-file", knownHostsPath, "--json"], {
+        HOME: dir,
+        USER: "operator"
+      });
+      expectSuccess(result);
+      const payload = JSON.parse(result.stdout);
+      const decoded = JSON.parse(Buffer.from(String(payload.invite).slice("bs1_".length), "base64url").toString("utf8"));
+      expect(decoded.control.sshTarget).toBe("operator@control.example:2222");
+      expect(decoded.control.sshKnownHosts).toEqual(["[control.example]:2222 ssh-ed25519 AAAAControlKeyForTestsOnly"]);
+
+      const noMatch = runBrainctl(["invite", "create", "--config", configPath, "--control-ssh", "operator@missing.example", "--ssh-known-hosts-file", knownHostsPath, "--json"], {
+        HOME: dir,
+        USER: "operator"
+      });
+      expect(noMatch.code).not.toBe(0);
+      expect(`${noMatch.stdout}\n${noMatch.stderr}`).toContain("has no entry for missing.example");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("enroll rejects conflicting SSH host pins from invites", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-invite-conflicting-known-hosts-"));
+    try {
+      const home = join(dir, "home");
+      const binDir = join(dir, "bin");
+      const configRoot = join(home, ".config", "brainstack");
+      await mkdir(binDir, { recursive: true });
+      await mkdir(configRoot, { recursive: true });
+      for (const name of ["git", "ssh", "tailscale", "codex"]) {
+        await writeFile(join(binDir, name), "#!/usr/bin/env sh\nexit 0\n");
+        await chmod(join(binDir, name), 0o755);
+      }
+      await writeFile(join(configRoot, "ssh_known_hosts"), "control.example ssh-ed25519 AAAAExistingDifferentKey\n");
+      const invitePayload = {
+        schema_version: 1,
+        type: "brainstack-client-invite",
+        created_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        profile: "client-macos",
+        brain: {
+          publicBaseUrl: "https://control.example.ts.net",
+          remoteSsh: "operator@control.example:/home/operator/shared-brain/bare/shared-brain.git"
+        },
+        control: {
+          sshTarget: "operator@control.example",
+          remoteRepo: "/home/operator/brainstack",
+          sshKnownHosts: ["control.example ssh-ed25519 AAAAInviteDifferentKey"]
+        },
+        client: {
+          localPath: "~/shared-brain",
+          envPath: "~/.config/shared-brain.env"
+        },
+        harness: {
+          name: "codex",
+          bin: "codex"
+        }
+      };
+      const invite = `bs1_${Buffer.from(JSON.stringify(invitePayload)).toString("base64url")}`;
+      const result = runBrainctl(["enroll", "--invite", invite, "--config", join(dir, "client.yaml"), "--skip-init", "--skip-doctor"], {
+        HOME: home,
+        USER: "operator",
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1"
+      });
+      expect(result.code).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("invite SSH host pin conflicts");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("enroll rejects option-shaped control SSH targets from invites", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-invite-unsafe-ssh-target-"));
+    try {
+      const invitePayload = {
+        schema_version: 1,
+        type: "brainstack-client-invite",
+        created_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        profile: "client-macos",
+        brain: {
+          publicBaseUrl: "https://control.example.ts.net",
+          remoteSsh: "operator@control.example:/home/operator/shared-brain/bare/shared-brain.git"
+        },
+        control: {
+          sshTarget: "-oProxyCommand=touch /tmp/nope",
+          remoteRepo: "/home/operator/brainstack",
+          sshKnownHosts: []
+        },
+        client: {
+          localPath: "~/shared-brain",
+          envPath: "~/.config/shared-brain.env"
+        },
+        harness: {
+          name: "codex",
+          bin: "codex"
+        }
+      };
+      const invite = `bs1_${Buffer.from(JSON.stringify(invitePayload)).toString("base64url")}`;
+      const result = runBrainctl(["enroll", "--invite", invite, "--config", join(dir, "client.yaml"), "--skip-init", "--skip-doctor"], {
+        HOME: dir,
+        USER: "operator"
+      });
+      expect(result.code).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("safe bare SSH host");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("client env examples do not expose admin token slots", async () => {
     const staticEnv = await readFile(join(PRODUCT_ROOT, "packages", "client-bootstrap", "client.env.example"), "utf8");
     expect(staticEnv).not.toContain("BRAIN_ADMIN_TOKEN");
@@ -5755,6 +6119,65 @@ describe("public release hygiene", () => {
     for (const text of [packageJson, releaseScript]) {
       expect(text).toContain("--no-compile-autoload-dotenv");
       expect(text).toContain("--no-compile-autoload-bunfig");
+    }
+    expect(releaseScript).toContain("darwin-arm64");
+    expect(releaseScript).toContain("darwin-x64");
+    expect(releaseScript).toContain("dist/install.sh");
+    expect(releaseScript).toContain("manifest.json");
+    const installScript = await readFile(join(PRODUCT_ROOT, "scripts", "install.sh"), "utf8");
+    expect(installScript).toContain("sha256sum");
+    expect(installScript).toContain("shasum -a 256");
+    expect(installScript).toContain("openssl dgst -sha256");
+    expect(installScript).toContain("--invite-file");
+    expect(installScript).toContain("refusing non-HTTPS download URL");
+    expect(installScript).toContain("--allow-unsafe-invite");
+    expect(installScript).toContain("raw invites in argv/env can leak");
+  });
+
+  test("install script verifies local release checksum before installing", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainstack-install-script-smoke-"));
+    try {
+      const releaseDir = join(dir, "release");
+      const binDir = join(dir, "bin");
+      await mkdir(releaseDir, { recursive: true });
+      const os = process.platform === "darwin" ? "darwin" : process.platform === "linux" ? "linux" : "unsupported";
+      const arch = process.arch === "arm64" ? "arm64" : "x64";
+      if (os === "unsupported") {
+        return;
+      }
+      const asset = `brainctl-${os}-${arch}`;
+      const assetBody = "#!/usr/bin/env sh\necho fake brainctl\n";
+      await writeFile(join(releaseDir, asset), assetBody);
+      await writeFile(join(releaseDir, `${asset}.sha256`), `${sha256Text(assetBody)}  ${asset}\n`);
+
+      const installed = runCommand(
+        ["sh", "scripts/install.sh", "--base-url", `file://${releaseDir}`, "--bin-dir", binDir, "--skip-enroll"],
+        {
+          cwd: PRODUCT_ROOT,
+          env: {
+            BRAINSTACK_INSTALL_ALLOW_INSECURE: "1",
+            HOME: join(dir, "home")
+          }
+        }
+      );
+      expectSuccess(installed);
+      expect(await readFile(join(binDir, "brainctl"), "utf8")).toBe(assetBody);
+
+      await writeFile(join(releaseDir, `${asset}.sha256`), `${"0".repeat(64)}  ${asset}\n`);
+      const mismatch = runCommand(
+        ["sh", "scripts/install.sh", "--base-url", `file://${releaseDir}`, "--bin-dir", join(dir, "bad-bin"), "--skip-enroll"],
+        {
+          cwd: PRODUCT_ROOT,
+          env: {
+            BRAINSTACK_INSTALL_ALLOW_INSECURE: "1",
+            HOME: join(dir, "home")
+          }
+        }
+      );
+      expect(mismatch.code).not.toBe(0);
+      expect(`${mismatch.stdout}\n${mismatch.stderr}`).toContain("checksum mismatch");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 

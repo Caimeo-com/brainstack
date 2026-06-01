@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { isIP } from "node:net";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -28,6 +28,10 @@ import claudeHooksExample from "../../client-bootstrap/claude-hooks-example.json
 import cursorUserRule from "../../client-bootstrap/cursor-user-rule.md" with { type: "text" };
 import sshConfigFragmentExample from "../../client-bootstrap/ssh_config_fragment.example" with { type: "text" };
 import installClientScript from "../../client-bootstrap/install-client.sh" with { type: "text" };
+import portableBrainCuratorSkill from "../../skills/brain-curator/SKILL.md" with { type: "text" };
+import portableBrainstackSkill from "../../skills/brainstack/SKILL.md" with { type: "text" };
+import portableRemoteMachineOpsSkill from "../../skills/remote-machine-ops/SKILL.md" with { type: "text" };
+import portableSharedBrainClientSkill from "../../skills/shared-brain-client/SKILL.md" with { type: "text" };
 
 type Profile = "single-node" | "control" | "worker" | "client-macos" | "private-journal";
 const SUPPORTED_PROFILES: Profile[] = ["single-node", "control", "worker", "client-macos"];
@@ -162,12 +166,46 @@ interface BrainstackConfig {
     localPath: string;
     envPath: string;
     remoteSsh: string;
+    telegramRemoteRepo: string;
+    telegramVia: string;
   };
+}
+
+interface BrainstackClientInvite {
+  schema_version: 1;
+  type: typeof CLIENT_INVITE_TYPE;
+  created_at: string;
+  expires_at: string;
+  profile: "client-macos";
+  brain: {
+    publicBaseUrl: string;
+    remoteSsh: string;
+  };
+  control: {
+    sshTarget: string;
+    remoteRepo: string;
+    sshKnownHosts: string[];
+  };
+  client: {
+    localPath: string;
+    envPath: string;
+  };
+  harness: {
+    name: HarnessName;
+    bin: string;
+  };
+  importToken?: string;
 }
 
 const PRODUCT_ROOT = resolve(import.meta.dir, "..", "..", "..");
 const TELEGRAM_SEND_DEFAULT_MAX_BYTES = 45 * 1024 * 1024;
 const TELEGRAM_SEND_SENSITIVE_FILE_PATTERN = /(?:^|[./_-])(?:id_rsa|id_ed25519|authorized_keys|known_hosts|token|secret|passwd|shadow|keyring)(?:$|[./_-])/i;
+const CLIENT_INVITE_PREFIX = "bs1_";
+const CLIENT_INVITE_TYPE = "brainstack-client-invite";
+const CLIENT_INVITE_MAX_CHARS = 128 * 1024;
+const CLIENT_INVITE_KNOWN_HOSTS_MAX_ENTRIES = 128;
+const CLIENT_INVITE_KNOWN_HOSTS_MAX_LINE_BYTES = 4096;
+const DEFAULT_INSTALL_URL = "https://github.com/Caimeo-com/brainstack/releases/latest/download/install.sh";
 const CLIENT_BOOTSTRAP_TEMPLATE_NAMES = [
   "client.env.example",
   "codex-shared-brain.include.md",
@@ -188,6 +226,20 @@ const CLIENT_BOOTSTRAP_TEMPLATES: Record<ClientBootstrapTemplateName, string> = 
   "cursor-user-rule.md": cursorUserRule,
   "ssh_config_fragment.example": sshConfigFragmentExample,
   "install-client.sh": installClientScript
+};
+const PORTABLE_SKILLS = {
+  "brain-curator": portableBrainCuratorSkill,
+  brainstack: portableBrainstackSkill,
+  "remote-machine-ops": portableRemoteMachineOpsSkill,
+  "shared-brain-client": portableSharedBrainClientSkill
+} as const;
+type PortableSkillName = keyof typeof PORTABLE_SKILLS;
+type PortableSkillProfile = "client" | "operator" | "control" | "worker";
+const PORTABLE_SKILL_PROFILES: Record<PortableSkillProfile, PortableSkillName[]> = {
+  client: ["shared-brain-client", "brainstack"],
+  operator: ["brainstack", "brain-curator", "remote-machine-ops", "shared-brain-client"],
+  control: ["brainstack", "brain-curator", "remote-machine-ops"],
+  worker: ["shared-brain-client", "remote-machine-ops"]
 };
 const ALLOWED_TOP_LEVEL_CONFIG_KEYS = new Set([
   "schema_version",
@@ -218,6 +270,10 @@ function usage(): string {
   brainctl restore --backup DIR_OR_TGZ --target DIR [--apply]
   brainctl render --config brainstack.yaml --profile ... --out DIR
   brainctl bootstrap-client --profile client-macos --config brainstack.yaml --out DIR
+  brainctl skills install [--target codex] [--profile client|operator|control|worker] [--skill NAME|--all] [--dir DIR] [--dry-run]
+  brainctl skills list
+  brainctl invite create --config brainstack.yaml [--import-token-file FILE|--import-token-env ENV] [--ssh-known-hosts-file FILE] [--control-ssh SSH_TARGET] [--control-repo PATH] [--expires-hours N] [--install-url URL] [--json]
+  brainctl enroll --invite bs1_...|--invite-file FILE|- [--config brainstack.yaml] [--skip-init] [--skip-doctor] [--force]
   brainctl join-worker --config brainstack.yaml --worker WORKER_HOST [--ssh-user USER] [--out DIR]
   brainctl trust-worker --config brainstack.yaml --worker WORKER_NAME [--host HOST] [--dry-run]
   brainctl worker-cache status|clear --config brainstack.yaml [worker|--all]
@@ -247,6 +303,19 @@ function parseArgs(argv: string[]): ParsedArgs {
       positional.push(item);
       continue;
     }
+    const equalsIndex = item.indexOf("=");
+    if (equalsIndex > 2) {
+      const key = item.slice(2, equalsIndex);
+      const value = item.slice(equalsIndex + 1);
+      if (flags[key] === undefined) {
+        flags[key] = value;
+      } else if (Array.isArray(flags[key])) {
+        (flags[key] as string[]).push(value);
+      } else {
+        flags[key] = [String(flags[key]), value];
+      }
+      continue;
+    }
     const key = item.slice(2);
     const next = rest[index + 1];
     if (!next || next.startsWith("--")) {
@@ -271,6 +340,17 @@ function flag(args: ParsedArgs, key: string): string | undefined {
     return value[value.length - 1];
   }
   return typeof value === "string" ? value : undefined;
+}
+
+function flagValues(args: ParsedArgs, key: string): string[] {
+  const value = args.flags[key];
+  if (value === true) {
+    throw new Error(`--${key} requires a value`);
+  }
+  if (value === undefined) {
+    return [];
+  }
+  return (Array.isArray(value) ? value : [value]).flatMap((entry) => entry.split(",").map((item) => item.trim()).filter(Boolean));
 }
 
 function hasFlag(args: ParsedArgs, key: string): boolean {
@@ -776,7 +856,9 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
     client: {
       localPath: stringAt(client, "localPath", "~/shared-brain"),
       envPath: stringAt(client, "envPath", "~/.config/shared-brain.env"),
-      remoteSsh: stringAt(client, "remoteSsh", remoteSsh)
+      remoteSsh: stringAt(client, "remoteSsh", remoteSsh),
+      telegramRemoteRepo: stringAt(client, "telegramRemoteRepo", "~/brainstack"),
+      telegramVia: stringAt(client, "telegramVia", "")
     }
   };
   cfg.telemux.workers = workerInputs.map((entry) => normalizeWorkerConfig(entry, cfg));
@@ -861,16 +943,76 @@ async function ensureDir(path: string): Promise<void> {
 }
 
 async function writeText(path: string, text: string, mode?: number): Promise<void> {
-  await ensureDir(dirname(path));
-  await writeFile(path, text, "utf8");
-  if (mode !== undefined) {
-    await chmod(path, mode);
+  const dir = dirname(path);
+  await ensureDir(dir);
+  if (mode === undefined) {
+    await writeFile(path, text, "utf8");
+    return;
   }
+  if (existsSync(path)) {
+    const existing = await lstat(path);
+    if (existing.isSymbolicLink() || !existing.isFile()) {
+      throw new Error(`refusing to overwrite non-regular file: ${path}`);
+    }
+  }
+  const tempPath = join(dir, `.${basename(path)}.${process.pid}.${Date.now()}.tmp`);
+  const handle = await open(tempPath, "wx", mode);
+  try {
+    await handle.writeFile(text, "utf8");
+    await handle.close();
+    await chmod(tempPath, mode);
+    await rename(tempPath, path);
+  } catch (error) {
+    try {
+      await handle.close();
+    } catch {
+      // ignore close failures while preserving the original write error
+    }
+    await rm(tempPath, { force: true });
+    throw error;
+  }
+}
+
+async function readExistingPrivateText(path: string): Promise<string> {
+  if (!existsSync(path)) {
+    return "";
+  }
+  const info = await lstat(path);
+  if (info.isSymbolicLink() || !info.isFile()) {
+    throw new Error(`refusing to read non-regular private file: ${path}`);
+  }
+  if ((info.mode & 0o077) !== 0) {
+    await chmod(path, 0o600);
+  }
+  return await readFile(path, "utf8");
+}
+
+async function writePrivateText(path: string, text: string): Promise<void> {
+  await writeText(path, text, 0o600);
+}
+
+async function writePrivateIfMissing(path: string, text: string): Promise<boolean> {
+  if (existsSync(path)) {
+    const info = await lstat(path);
+    if (info.isSymbolicLink() || !info.isFile()) {
+      throw new Error(`refusing to use non-regular private file: ${path}`);
+    }
+    if ((info.mode & 0o077) !== 0) {
+      await chmod(path, 0o600);
+    }
+    return false;
+  }
+  await writePrivateText(path, text);
+  return true;
 }
 
 async function writeIfMissing(path: string, text: string, mode?: number): Promise<boolean> {
   if (existsSync(path)) {
     return false;
+  }
+  if (mode === 0o600) {
+    await writePrivateText(path, text);
+    return true;
   }
   await writeText(path, text, mode);
   return true;
@@ -896,7 +1038,7 @@ async function setEnvIfBlank(path: string, key: string, value: string): Promise<
   if (!value.trim()) {
     return false;
   }
-  const existing = existsSync(path) ? await readFile(path, "utf8") : "";
+  const existing = await readExistingPrivateText(path);
   const lines = existing.split(/\r?\n/);
   let changed = false;
   let found = false;
@@ -914,13 +1056,15 @@ async function setEnvIfBlank(path: string, key: string, value: string): Promise<
   if (!found) {
     if (next.length && next[next.length - 1] !== "") {
       next.push(`${key}=${value}`);
+    } else if (next.length) {
+      next[next.length - 1] = `${key}=${value}`;
     } else {
-      next.splice(Math.max(0, next.length - 1), 0, `${key}=${value}`);
+      next.push(`${key}=${value}`);
     }
     changed = true;
   }
   if (changed) {
-    await writeText(path, `${next.join("\n").replace(/\n+$/, "")}\n`, 0o600);
+    await writePrivateText(path, `${next.join("\n").replace(/\n+$/, "")}\n`);
   }
   return changed;
 }
@@ -928,6 +1072,216 @@ async function setEnvIfBlank(path: string, key: string, value: string): Promise<
 function token(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   return `bs_${Buffer.from(bytes).toString("base64url")}`;
+}
+
+function encodeClientInvite(invite: BrainstackClientInvite): string {
+  return `${CLIENT_INVITE_PREFIX}${Buffer.from(JSON.stringify(invite)).toString("base64url")}`;
+}
+
+function httpUrlHostname(input: string, label: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(input);
+  } catch {
+    throw new Error(`${label} must be an http(s) URL with a hostname`);
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(`${label} must use http or https`);
+  }
+  if (!parsed.hostname) {
+    throw new Error(`${label} must include a hostname`);
+  }
+  return parsed.hostname;
+}
+
+function validateInviteSshTarget(input: string, label: string): string {
+  const value = input.trim();
+  if (!value) {
+    throw new Error(`${label} must not be empty`);
+  }
+  if (value.startsWith("-") || /[\s/\u0000-\u001f\u007f]/.test(value) || value.endsWith("@")) {
+    throw new Error(`${label} must be a safe bare SSH host or user@host target`);
+  }
+  const match = value.match(/^(?:(?<user>[A-Za-z0-9._~-]+)@)?(?<host>\[[^\]\s/]+\]|[A-Za-z0-9._~-]+)(?::(?<port>[0-9]+))?$/);
+  if (!match?.groups?.host) {
+    throw new Error(`${label} must be a safe bare SSH host or user@host target`);
+  }
+  if (match.groups.user?.startsWith("-") || match.groups.host.startsWith("-")) {
+    throw new Error(`${label} must not contain option-shaped user or host values`);
+  }
+  if (match.groups.port !== undefined) {
+    const port = Number(match.groups.port);
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+      throw new Error(`${label} port must be between 1 and 65535`);
+    }
+  }
+  return value;
+}
+
+function inviteBareHost(input: string, label: string): string {
+  const value = input.trim();
+  if (!value) {
+    throw new Error(`${label} must not be empty`);
+  }
+  if (/^https?:\/\//i.test(value)) {
+    return httpUrlHostname(value, label);
+  }
+  if (value.includes("/")) {
+    return httpUrlHostname(`https://${value}`, label);
+  }
+  if (value.startsWith("[") || /^[^:]+:\d+$/.test(value)) {
+    try {
+      const parsed = new URL(`ssh://${value}`);
+      if (parsed.hostname) {
+        return parsed.hostname;
+      }
+    } catch {
+      // Fall through to the raw value and let the SSH-target validator reject if needed.
+    }
+  }
+  return value;
+}
+
+interface KnownHostEntry {
+  hosts: string[];
+  keyType: string;
+  key: string;
+}
+
+function parseKnownHostEntry(line: string): KnownHostEntry | null {
+  const parts = line.trim().split(/\s+/);
+  let index = 0;
+  if (parts[index]?.startsWith("@")) {
+    index += 1;
+  }
+  if (parts.length - index < 3) {
+    return null;
+  }
+  const hosts = parts[index].split(",").map((host) => host.trim()).filter(Boolean);
+  const keyType = parts[index + 1];
+  const key = parts[index + 2];
+  if (!hosts.length || !keyType || !key) {
+    return null;
+  }
+  return { hosts, keyType, key };
+}
+
+function knownHostMatchesLookup(hostPattern: string, lookup: string): boolean {
+  if (hostPattern === lookup) {
+    return true;
+  }
+  if (hostPattern.includes("*") || hostPattern.includes("?") || hostPattern.startsWith("|")) {
+    return false;
+  }
+  return false;
+}
+
+function knownHostLineMatchesLookup(line: string, lookup: string): boolean {
+  const parsed = parseKnownHostEntry(line);
+  return Boolean(parsed?.hosts.some((host) => knownHostMatchesLookup(host, lookup)));
+}
+
+function controlKnownHostsLookup(sshTarget: string): string {
+  return workerSshKnownHostsLookup(telegramControlWorker(sshTarget));
+}
+
+function filterKnownHostsForSshTarget(entries: string[], sshTarget: string): string[] {
+  const lookup = controlKnownHostsLookup(sshTarget);
+  return entries.filter((line) => knownHostLineMatchesLookup(line, lookup));
+}
+
+function sanitizeInviteKnownHosts(entries: unknown[], sourceLabel: string): string[] {
+  if (entries.length > CLIENT_INVITE_KNOWN_HOSTS_MAX_ENTRIES) {
+    throw new Error(`${sourceLabel} contains too many SSH known-host entries`);
+  }
+  const clean: string[] = [];
+  for (const raw of entries) {
+    const line = String(raw).trim();
+    if (!line) {
+      continue;
+    }
+    if (/[\r\n\u0000]/.test(line)) {
+      throw new Error(`${sourceLabel} contains an SSH known-host entry with control characters`);
+    }
+    if (Buffer.byteLength(line, "utf8") > CLIENT_INVITE_KNOWN_HOSTS_MAX_LINE_BYTES) {
+      throw new Error(`${sourceLabel} contains an oversized SSH known-host entry`);
+    }
+    if (/PRIVATE KEY|BEGIN\s+[A-Z ]*KEY/i.test(line)) {
+      throw new Error(`${sourceLabel} contains private-key-looking material`);
+    }
+    if (!parseKnownHostEntry(line)) {
+      throw new Error(`${sourceLabel} contains an invalid SSH known-host entry`);
+    }
+    clean.push(line);
+  }
+  return [...new Set(clean)];
+}
+
+function decodeClientInvite(input: string): BrainstackClientInvite {
+  const trimmed = input.trim();
+  if (!trimmed.startsWith(CLIENT_INVITE_PREFIX)) {
+    throw new Error(`invite must start with ${CLIENT_INVITE_PREFIX}`);
+  }
+  if (trimmed.length > CLIENT_INVITE_MAX_CHARS) {
+    throw new Error("invite is too large");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(trimmed.slice(CLIENT_INVITE_PREFIX.length), "base64url").toString("utf8"));
+  } catch {
+    throw new Error("invite is not valid base64url JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("invite payload must be an object");
+  }
+  const invite = parsed as Partial<BrainstackClientInvite>;
+  if (invite.schema_version !== 1 || invite.type !== CLIENT_INVITE_TYPE || invite.profile !== "client-macos") {
+    throw new Error("invite has an unsupported schema, type, or profile");
+  }
+  if (!invite.brain || !invite.control || !invite.client || !invite.harness) {
+    throw new Error("invite is missing required sections");
+  }
+  if (!invite.brain.publicBaseUrl || !invite.brain.remoteSsh || !invite.control.sshTarget || !invite.control.remoteRepo) {
+    throw new Error("invite is missing required connection values");
+  }
+  const publicBaseUrl = String(invite.brain.publicBaseUrl);
+  httpUrlHostname(publicBaseUrl, "invite brain.publicBaseUrl");
+  const controlSshTarget = validateInviteSshTarget(String(invite.control.sshTarget), "invite control.sshTarget");
+  const expiresAt = Date.parse(String(invite.expires_at || ""));
+  if (!Number.isFinite(expiresAt)) {
+    throw new Error("invite has an invalid expires_at value");
+  }
+  if (expiresAt < Date.now()) {
+    throw new Error(`invite expired at ${invite.expires_at}`);
+  }
+  const harnessName = normalizeHarness(invite.harness.name);
+  return {
+    schema_version: 1,
+    type: CLIENT_INVITE_TYPE,
+    created_at: String(invite.created_at || ""),
+    expires_at: String(invite.expires_at),
+    profile: "client-macos",
+    brain: {
+      publicBaseUrl,
+      remoteSsh: String(invite.brain.remoteSsh)
+    },
+    control: {
+      sshTarget: controlSshTarget,
+      remoteRepo: String(invite.control.remoteRepo),
+      sshKnownHosts: Array.isArray(invite.control.sshKnownHosts)
+        ? sanitizeInviteKnownHosts(invite.control.sshKnownHosts, "invite control.sshKnownHosts")
+        : []
+    },
+    client: {
+      localPath: String(invite.client.localPath || "~/shared-brain"),
+      envPath: String(invite.client.envPath || "~/.config/shared-brain.env")
+    },
+    harness: {
+      name: harnessName,
+      bin: String(invite.harness.bin || harnessName)
+    },
+    importToken: typeof invite.importToken === "string" && invite.importToken.trim() ? invite.importToken.trim() : undefined
+  };
 }
 
 function compareVersions(a: string, b: string): number {
@@ -1670,7 +2024,10 @@ function canonicalJson(value: unknown): string {
     .join(",")}}`;
 }
 
-async function installLocalClientBootstrap(cfg: BrainstackConfig, options: { importTokenFile?: string } = {}): Promise<string[]> {
+async function installLocalClientBootstrap(cfg: BrainstackConfig, options: { importTokenFile?: string; importToken?: string } = {}): Promise<string[]> {
+  if (options.importTokenFile && options.importToken !== undefined) {
+    throw new Error("client bootstrap accepts either an import token file or an in-memory import token, not both");
+  }
   const touched: string[] = [];
   const bootstrapRoot = join(cfg.paths.configRoot, "client-bootstrap");
   const bootstrapFiles = clientBootstrapFiles(cfg);
@@ -1699,7 +2056,10 @@ async function installLocalClientBootstrap(cfg: BrainstackConfig, options: { imp
   if (await writeIfMissing(envPath, bootstrapFiles["client.env.example"], 0o600)) {
     touched.push(envPath);
   }
-  const importToken = await readEnvSecretOrFile("BRAIN_IMPORT_TOKEN", "BRAIN_IMPORT_TOKEN_FILE", options.importTokenFile);
+  const importToken =
+    options.importToken !== undefined
+      ? options.importToken.trim()
+      : await readEnvSecretOrFile("BRAIN_IMPORT_TOKEN", "BRAIN_IMPORT_TOKEN_FILE", options.importTokenFile);
   if (await setEnvIfBlank(envPath, "BRAIN_IMPORT_TOKEN", importToken)) {
     if (!touched.includes(envPath)) {
       touched.push(envPath);
@@ -2095,7 +2455,9 @@ function buildProvisionConfig(profile: Profile, harness: { name: HarnessName; bi
     client: {
       localPath,
       envPath: "~/.config/shared-brain.env",
-      remoteSsh: sharedBrainRemote
+      remoteSsh: sharedBrainRemote,
+      telegramRemoteRepo: flag(args, "telegram-remote-repo") || flag(args, "control-repo") || "~/brainstack",
+      telegramVia: flag(args, "telegram-via") || flag(args, "control-ssh") || ""
     }
   };
 }
@@ -2243,7 +2605,7 @@ async function ensureGitRepoLayout(cfg: BrainstackConfig, mode: "fresh" | "runti
   await writeText(join(cfg.repos.bare, "hooks", "pre-receive"), preReceiveHook(), 0o755);
 }
 
-async function commandInit(args: ParsedArgs): Promise<void> {
+async function commandInit(args: ParsedArgs, options: { importToken?: string } = {}): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
   if (hasFlag(args, "dry-run")) {
     const out = flag(args, "out") || join(tmpdir(), `brainstack-init-render-${cfg.profile}-${Date.now()}`);
@@ -2270,7 +2632,10 @@ async function commandInit(args: ParsedArgs): Promise<void> {
     await writeText(join(cfg.paths.systemdUserRoot, "telemux.service"), telemuxService(cfg));
   }
   if (cfg.profile === "worker" || cfg.profile === "client-macos") {
-    const touched = await installLocalClientBootstrap(cfg, { importTokenFile: requireFlagValue(args, "import-token-file") });
+    const touched = await installLocalClientBootstrap(cfg, {
+      importTokenFile: requireFlagValue(args, "import-token-file"),
+      importToken: options.importToken
+    });
     console.log(`client bootstrap touched: ${touched.length ? touched.join(", ") : "(none)"}`);
   }
   await writeFileMap(join(cfg.paths.stateRoot, "rendered"), renderFiles(cfg));
@@ -4910,6 +5275,369 @@ function parsePositiveIntegerFlag(args: ParsedArgs, key: string, fallback: numbe
   return value;
 }
 
+function inviteControlSshTarget(cfg: BrainstackConfig, args: ParsedArgs): string {
+  const explicit = requireFlagValue(args, "control-ssh") || requireFlagValue(args, "via");
+  if (explicit) {
+    return validateInviteSshTarget(explicit, "invite control SSH target");
+  }
+  const remoteTarget = sshTargetFromRemoteSsh(cfg.client.remoteSsh || cfg.repos.remoteSsh);
+  if (remoteTarget) {
+    return validateInviteSshTarget(remoteTarget, "invite control SSH target from client remote");
+  }
+  const host = inviteBareHost(cfg.tailscale.tailnetHost || cfg.machine.hostname || cfg.machine.name, "invite control host");
+  if (!host.trim()) {
+    throw new Error("invite create requires a control host: pass --control-ssh, configure client.remoteSsh, or fill tailscale.tailnetHost, machine.hostname, or machine.name");
+  }
+  const user = cfg.machine.sshUser || cfg.machine.user;
+  return validateInviteSshTarget(user ? `${user}@${host}` : host, "invite control SSH target");
+}
+
+async function readInviteKnownHosts(args: ParsedArgs, cfg: BrainstackConfig, controlSshTarget: string): Promise<string[]> {
+  const explicit = requireFlagValue(args, "ssh-known-hosts-file") || requireFlagValue(args, "known-hosts");
+  const input = explicit || join(cfg.paths.configRoot, "ssh_known_hosts");
+  const path = absWithHome(input, cfg.paths.home);
+  if (!existsSync(path)) {
+    if (explicit) {
+      throw new Error(`ssh known-hosts invite source not found: ${path}`);
+    }
+    return [];
+  }
+  const info = await lstat(path);
+  if (info.isSymbolicLink() || !info.isFile()) {
+    throw new Error(`ssh known-hosts invite source must be a regular non-symlink file: ${path}`);
+  }
+  if (info.size > 64 * 1024) {
+    throw new Error(`ssh known-hosts invite source is too large: ${path}`);
+  }
+  const lines = (await readFile(path, "utf8"))
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+  const clean = sanitizeInviteKnownHosts(lines, `ssh known-hosts invite source ${path}`);
+  const matching = filterKnownHostsForSshTarget(clean, controlSshTarget);
+  if (explicit && !matching.length) {
+    throw new Error(`ssh known-hosts invite source ${path} has no entry for ${controlKnownHostsLookup(controlSshTarget)}`);
+  }
+  return matching;
+}
+
+async function inviteImportToken(args: ParsedArgs): Promise<string | undefined> {
+  const filePath = requireFlagValue(args, "import-token-file");
+  const envName = requireFlagValue(args, "import-token-env");
+  if (filePath && envName) {
+    throw new Error("invite create accepts either --import-token-file or --import-token-env, not both");
+  }
+  if (filePath) {
+    const value = await readEnvSecretOrFile("BRAIN_IMPORT_TOKEN", "BRAIN_IMPORT_TOKEN_FILE", filePath);
+    if (!value) {
+      throw new Error("--import-token-file did not contain a token");
+    }
+    return value;
+  }
+  if (envName) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName)) {
+      throw new Error("--import-token-env must be an environment variable name");
+    }
+    const value = process.env[envName]?.trim();
+    if (!value) {
+      throw new Error(`--import-token-env ${envName} is empty or unset`);
+    }
+    return value;
+  }
+  return undefined;
+}
+
+function inviteInstallCommand(installUrl: string): string {
+  return `curl -fsSL ${shellSingleQuote(installUrl)} | sh`;
+}
+
+async function commandInviteCreate(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile") || "control", flag(args, "root"));
+  const expiresHours = parsePositiveIntegerFlag(args, "expires-hours", 24);
+  const createdAt = new Date();
+  const expiresAt = new Date(createdAt.getTime() + expiresHours * 60 * 60 * 1000);
+  const harnessName = normalizeHarness(requireFlagValue(args, "harness") || cfg.harness.name);
+  const controlSshTarget = inviteControlSshTarget(cfg, args);
+  const invitePayload: BrainstackClientInvite = {
+    schema_version: 1,
+    type: CLIENT_INVITE_TYPE,
+    created_at: createdAt.toISOString(),
+    expires_at: expiresAt.toISOString(),
+    profile: "client-macos",
+    brain: {
+      publicBaseUrl: requireFlagValue(args, "brain-base-url") || cfg.brain.publicBaseUrl,
+      remoteSsh: requireFlagValue(args, "brain-remote") || cfg.client.remoteSsh || cfg.repos.remoteSsh
+    },
+    control: {
+      sshTarget: controlSshTarget,
+      remoteRepo: requireFlagValue(args, "control-repo") || requireFlagValue(args, "remote-repo") || cfg.paths.productRepo,
+      sshKnownHosts: await readInviteKnownHosts(args, cfg, controlSshTarget)
+    },
+    client: {
+      localPath: requireFlagValue(args, "client-local-path") || cfg.client.localPath || "~/shared-brain",
+      envPath: requireFlagValue(args, "client-env-path") || cfg.client.envPath || "~/.config/shared-brain.env"
+    },
+    harness: {
+      name: harnessName,
+      bin: requireFlagValue(args, "harness-bin") || harnessName
+    }
+  };
+  const importToken = await inviteImportToken(args);
+  if (importToken) {
+    invitePayload.importToken = importToken;
+  }
+  if (!invitePayload.brain.publicBaseUrl) {
+    throw new Error("invite create requires brain.publicBaseUrl in config or --brain-base-url");
+  }
+  if (!invitePayload.brain.remoteSsh) {
+    throw new Error("invite create requires client.remoteSsh in config or --brain-remote");
+  }
+  const invite = encodeClientInvite(invitePayload);
+  const installUrl = requireFlagValue(args, "install-url") || DEFAULT_INSTALL_URL;
+  const installCommand = inviteInstallCommand(installUrl);
+  if (hasFlag(args, "json")) {
+    console.log(
+      JSON.stringify(
+        {
+          invite,
+          installCommand,
+          expiresAt: invitePayload.expires_at,
+          includesImportToken: Boolean(importToken),
+          includesSshKnownHosts: invitePayload.control.sshKnownHosts.length > 0
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
+  console.log(installCommand);
+  console.log("");
+  console.log("Paste this invite when the installer prompts for it:");
+  console.log(invite);
+  console.log("");
+  console.log(`expires: ${invitePayload.expires_at}`);
+  console.log(`import token embedded: ${importToken ? "yes" : "no"}`);
+  console.log(`ssh host pin embedded: ${invitePayload.control.sshKnownHosts.length ? "yes" : "no"}`);
+  if (importToken) {
+    console.log("treat the invite as a bearer secret; avoid putting it in shell history or shared logs.");
+  }
+}
+
+async function commandInvite(args: ParsedArgs): Promise<void> {
+  const subcommand = args.positional[0] || "help";
+  switch (subcommand) {
+    case "create":
+      return await commandInviteCreate(args);
+    case "help":
+    case "--help":
+    case "-h":
+      console.log("Usage: brainctl invite create --config brainstack.yaml [--import-token-file FILE|--import-token-env ENV] [--ssh-known-hosts-file FILE] [--control-ssh SSH_TARGET] [--control-repo PATH] [--expires-hours N] [--install-url URL] [--json]");
+      return;
+    default:
+      throw new Error(`Unknown invite command: ${subcommand}`);
+  }
+}
+
+function buildEnrollConfig(invite: BrainstackClientInvite, args: ParsedArgs): Record<string, unknown> {
+  const user = process.env.USER || "operator";
+  const home = abs(requireFlagValue(args, "home") || process.env.HOME || ".");
+  const machineName = requireFlagValue(args, "machine") || discoveredMachineName();
+  return {
+    schema_version: CONFIG_SCHEMA_VERSION,
+    profile: "client-macos",
+    runtime: {
+      bunBin: "bun"
+    },
+    harness: {
+      name: invite.harness.name,
+      bin: invite.harness.bin
+    },
+    machine: {
+      name: machineName,
+      user,
+      role: "client-macos",
+      sshUser: user,
+      hostname: machineName
+    },
+    paths: {
+      home,
+      productRepo: "~/brainstack",
+      sharedBrainRoot: invite.client.localPath,
+      privateBrainRoot: "~/private-brain",
+      stateRoot: "~/.local/state/brainstack",
+      configRoot: "~/.config/brainstack",
+      systemdUserRoot: "~/.config/systemd/user"
+    },
+    security: {
+      posture: "trusted-tailnet",
+      bindHost: "127.0.0.1",
+      trustedExposure: "none"
+    },
+    brain: {
+      bind: "127.0.0.1",
+      port: 8080,
+      publicBaseUrl: invite.brain.publicBaseUrl,
+      largeFileThresholdBytes: 10 * 1024 * 1024,
+      enableTelemux: false
+    },
+    telemux: {
+      enabled: false,
+      dashboardHost: "127.0.0.1",
+      dashboardPort: 8787,
+      localMachine: machineName,
+      workers: []
+    },
+    tailscale: {
+      tailnetHost: httpUrlHostname(invite.brain.publicBaseUrl, "invite brain.publicBaseUrl"),
+      controlTag: "tag:brain",
+      workerTag: "tag:brain-worker",
+      advertiseTags: [],
+      enableSsh: false
+    },
+    client: {
+      localPath: invite.client.localPath,
+      envPath: invite.client.envPath,
+      remoteSsh: invite.brain.remoteSsh,
+      telegramRemoteRepo: invite.control.remoteRepo,
+      telegramVia: invite.control.sshTarget
+    }
+  };
+}
+
+async function writeEnrollConfig(configPath: string, rendered: string, force: boolean): Promise<void> {
+  if (existsSync(configPath)) {
+    const existing = await readFile(configPath, "utf8");
+    if (existing === rendered) {
+      return;
+    }
+    if (!force) {
+      throw new Error(`refusing to overwrite existing config ${configPath}; rerun enroll with --force if this invite should replace it`);
+    }
+  }
+  await writeText(configPath, rendered, 0o600);
+}
+
+async function installInviteKnownHosts(cfg: BrainstackConfig, entries: string[]): Promise<boolean> {
+  const clean = sanitizeInviteKnownHosts(entries, "invite control.sshKnownHosts");
+  if (!clean.length) {
+    return false;
+  }
+  const path = join(cfg.paths.configRoot, "ssh_known_hosts");
+  const existingRaw = (await readExistingPrivateText(path))
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+  const existing = sanitizeInviteKnownHosts(existingRaw, `${path}`);
+  const seenKeys = new Map<string, { key: string; line: string }>();
+  for (const line of existing) {
+    const parsed = parseKnownHostEntry(line);
+    if (!parsed) {
+      continue;
+    }
+    for (const host of parsed.hosts) {
+      seenKeys.set(`${host}\u0000${parsed.keyType}`, { key: parsed.key, line });
+    }
+  }
+  for (const line of clean) {
+    const parsed = parseKnownHostEntry(line);
+    if (!parsed) {
+      continue;
+    }
+    for (const host of parsed.hosts) {
+      const key = `${host}\u0000${parsed.keyType}`;
+      const previous = seenKeys.get(key);
+      if (previous && previous.key !== parsed.key) {
+        throw new Error(`invite SSH host pin conflicts with existing known_hosts entry for ${host} ${parsed.keyType}; resolve ${path} manually before enrolling`);
+      }
+      seenKeys.set(key, { key: parsed.key, line });
+    }
+  }
+  const merged = [...new Set([...existing, ...clean])];
+  await writeText(path, `${merged.join("\n")}\n`, 0o600);
+  return merged.length !== existing.length;
+}
+
+async function readStdinText(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function readInviteFile(path: string): Promise<string> {
+  if (path === "-") {
+    return await readStdinText();
+  }
+  const absolute = abs(path);
+  const info = await lstat(absolute);
+  if (info.isSymbolicLink() || !info.isFile()) {
+    throw new Error(`--invite-file must point to a regular non-symlink file: ${absolute}`);
+  }
+  if (info.size > CLIENT_INVITE_MAX_CHARS) {
+    throw new Error(`--invite-file is too large: ${absolute}`);
+  }
+  if ((info.mode & 0o077) !== 0) {
+    throw new Error(`--invite-file must not be group/world accessible; run chmod 600 ${shellSingleQuote(absolute)}`);
+  }
+  return await readFile(absolute, "utf8");
+}
+
+async function commandEnroll(args: ParsedArgs): Promise<void> {
+  if (hasFlag(args, "help") || args.positional[0] === "help" || args.positional[0] === "-h" || args.positional[0] === "--help") {
+    console.log("Usage: brainctl enroll --invite bs1_...|--invite-file FILE|- [--config brainstack.yaml] [--skip-init] [--skip-doctor] [--force]");
+    return;
+  }
+  const inviteInput = requireFlagValue(args, "invite");
+  const inviteFile = requireFlagValue(args, "invite-file");
+  const inviteEnv = process.env.BRAINSTACK_INVITE?.trim();
+  const inviteSources = [inviteInput, inviteFile, inviteEnv].filter((value) => value !== undefined && value !== "");
+  if (inviteSources.length > 1) {
+    throw new Error("enroll accepts only one invite source: --invite, --invite-file, or BRAINSTACK_INVITE");
+  }
+  const rawInvite =
+    inviteInput ||
+    (inviteFile ? await readInviteFile(inviteFile) : "") ||
+    inviteEnv ||
+    "";
+  const invite = decodeClientInvite(rawInvite);
+  ensureProvisionPrereqs("client-macos");
+  const harnessPath = commandPath(invite.harness.bin) || commandPath(invite.harness.name);
+  if (!harnessPath) {
+    throw new Error(`enroll blocked: invited harness ${invite.harness.bin} is missing.\n${installHint(invite.harness.name)}`);
+  }
+
+  const configPath = abs(requireFlagValue(args, "config") || "~/.config/brainstack/brainstack.yaml");
+  const rendered = stringifySimpleYaml(buildEnrollConfig(invite, args));
+  await writeEnrollConfig(configPath, rendered, hasFlag(args, "force"));
+  const cfg = await loadConfig(configPath, "client-macos", flag(args, "root"));
+  const installedKnownHosts = await installInviteKnownHosts(cfg, invite.control.sshKnownHosts);
+  if (!installedKnownHosts && invite.control.sshKnownHosts.length === 0) {
+    console.log("ssh host pin not embedded; Telegram file send will need a pinned known-hosts file before routine use.");
+  }
+
+  const overrideTokenFile = requireFlagValue(args, "import-token-file");
+
+  if (!hasFlag(args, "skip-init")) {
+    const initFlags: Record<string, string | boolean | string[]> = {
+      config: configPath,
+      profile: "client-macos"
+    };
+    if (overrideTokenFile) {
+      initFlags["import-token-file"] = overrideTokenFile;
+    }
+    await commandInit({ command: "init", positional: [], flags: initFlags }, { importToken: overrideTokenFile ? undefined : invite.importToken });
+  }
+
+  if (!hasFlag(args, "skip-doctor")) {
+    await commandDoctor({ command: "doctor", positional: [], flags: { config: configPath, profile: "client-macos" } });
+  }
+  console.log(`enrolled client with config: ${configPath}`);
+  console.log(`control ssh: ${invite.control.sshTarget}`);
+  console.log(`control repo: ${invite.control.remoteRepo}`);
+}
+
 function sanitizeTelegramSendFileName(value: string): string {
   const cleaned = basename(value)
     .replace(/[\u0000-\u001f\u007f]/g, "_")
@@ -4973,11 +5701,11 @@ function sshTargetFromRemoteSsh(remote: string): string | null {
 }
 
 function telegramControlSshTarget(cfg: BrainstackConfig, args: ParsedArgs): string {
-  const via = requireFlagValue(args, "via") || process.env.BRAINSTACK_TELEGRAM_VIA?.trim() || sshTargetFromRemoteSsh(cfg.client.remoteSsh);
+  const via = requireFlagValue(args, "via") || process.env.BRAINSTACK_TELEGRAM_VIA?.trim() || cfg.client.telegramVia || sshTargetFromRemoteSsh(cfg.client.remoteSsh);
   if (!via) {
     throw new Error("telegram send-file requires --via SSH_TARGET or client.remoteSsh in config");
   }
-  return via;
+  return validateInviteSshTarget(via, "telegram control SSH target");
 }
 
 function normalizeControlSshTrustMode(value: string | undefined): ControlSshTrustMode | null {
@@ -5136,7 +5864,7 @@ async function commandTelegramSendFile(args: ParsedArgs): Promise<void> {
   const localFile = await validateTelegramSendLocalFile(filePath, displayName, maxBytes, allowSensitive);
   const via = telegramControlSshTarget(cfg, args);
   const worker = telegramControlWorker(via);
-  const remoteRepo = requireFlagValue(args, "remote-repo") || process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() || "~/brainstack";
+  const remoteRepo = requireFlagValue(args, "remote-repo") || process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() || cfg.client.telegramRemoteRepo || "~/brainstack";
   const remoteScript = telegramRemoteSendScript({
     remoteRepo,
     displayName: localFile.fileName,
@@ -5742,6 +6470,91 @@ async function commandBootstrapClient(args: ParsedArgs): Promise<void> {
   console.log(`client bootstrap files rendered to ${abs(out)}`);
 }
 
+function portableSkillNames(): PortableSkillName[] {
+  return Object.keys(PORTABLE_SKILLS) as PortableSkillName[];
+}
+
+function normalizePortableSkillProfile(value: string | undefined): PortableSkillProfile {
+  const normalized = (value || "client").trim().toLowerCase();
+  if (normalized === "client" || normalized === "operator" || normalized === "control" || normalized === "worker") {
+    return normalized;
+  }
+  throw new Error(`Unsupported skills profile: ${value}. Expected client, operator, control, or worker.`);
+}
+
+function normalizePortableSkillName(value: string): PortableSkillName {
+  if (portableSkillNames().includes(value as PortableSkillName)) {
+    return value as PortableSkillName;
+  }
+  throw new Error(`Unknown portable skill: ${value}. Available: ${portableSkillNames().join(", ")}`);
+}
+
+function selectedPortableSkills(args: ParsedArgs): PortableSkillName[] {
+  if (hasFlag(args, "all")) {
+    return portableSkillNames();
+  }
+  const explicit = flagValues(args, "skill").map(normalizePortableSkillName);
+  if (explicit.length) {
+    return [...new Set(explicit)];
+  }
+  return PORTABLE_SKILL_PROFILES[normalizePortableSkillProfile(requireFlagValue(args, "profile"))];
+}
+
+function portableSkillInstallRoot(args: ParsedArgs): string {
+  const target = (requireFlagValue(args, "target") || "codex").trim().toLowerCase();
+  if (target !== "codex") {
+    throw new Error(`Unsupported skills target: ${target}. Only codex is supported today.`);
+  }
+  const explicitDir = requireFlagValue(args, "dir") || requireFlagValue(args, "out");
+  if (explicitDir) {
+    return abs(explicitDir);
+  }
+  const codexHome = process.env.CODEX_HOME ? abs(process.env.CODEX_HOME) : process.env.HOME ? join(process.env.HOME, ".codex") : "";
+  if (!codexHome) {
+    throw new Error("Cannot locate Codex home; set CODEX_HOME or pass --dir.");
+  }
+  return join(codexHome, "skills");
+}
+
+async function commandSkills(args: ParsedArgs): Promise<void> {
+  const subcommand = args.positional[0] || "help";
+  switch (subcommand) {
+    case "list":
+      console.log("portable skills:");
+      for (const name of portableSkillNames()) {
+        console.log(`  ${name}`);
+      }
+      console.log("profiles:");
+      for (const [profile, skills] of Object.entries(PORTABLE_SKILL_PROFILES)) {
+        console.log(`  ${profile}: ${skills.join(", ")}`);
+      }
+      return;
+    case "install": {
+      const root = portableSkillInstallRoot(args);
+      const skills = selectedPortableSkills(args);
+      const dryRun = hasFlag(args, "dry-run");
+      const written: string[] = [];
+      for (const name of skills) {
+        const skillPath = join(root, name, "SKILL.md");
+        written.push(skillPath);
+        if (!dryRun) {
+          await writeText(skillPath, `${PORTABLE_SKILLS[name].trimEnd()}\n`);
+        }
+      }
+      console.log(`${dryRun ? "dry-run skills install plan" : "skills installed"}: target=codex root=${root}`);
+      console.log(written.map((path) => `  ${path}`).join("\n"));
+      return;
+    }
+    case "help":
+    case "--help":
+    case "-h":
+      console.log("Usage: brainctl skills install [--target codex] [--profile client|operator|control|worker] [--skill NAME|--all] [--dir DIR] [--dry-run]\n       brainctl skills list");
+      return;
+    default:
+      throw new Error(`Unknown skills subcommand: ${subcommand}`);
+  }
+}
+
 async function commandJoinWorker(args: ParsedArgs): Promise<void> {
   const worker = flag(args, "worker") || args.positional[0];
   if (!worker) {
@@ -6297,6 +7110,12 @@ async function main(): Promise<void> {
       return await commandRender(args);
     case "bootstrap-client":
       return await commandBootstrapClient(args);
+    case "skills":
+      return await commandSkills(args);
+    case "invite":
+      return await commandInvite(args);
+    case "enroll":
+      return await commandEnroll(args);
     case "join-worker":
       return await commandJoinWorker(args);
     case "trust-worker":

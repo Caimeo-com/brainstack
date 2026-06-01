@@ -6,6 +6,7 @@
 *.token
 node_modules/
 .bun/
+*.bun-build
 .DS_Store
 __MACOSX/
 dist/
@@ -13,6 +14,8 @@ build/
 coverage/
 tmp/
 .brainstack-render/
+.playwright-mcp/
+brainstack-control-host-mobile.png
 .handoff-private-substitutions
 .factory/
 *.sqlite

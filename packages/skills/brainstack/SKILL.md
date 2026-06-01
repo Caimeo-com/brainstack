@@ -14,6 +14,7 @@ Use this skill when working on the Brainstack product repo, a Brainstack control
 - Keep product code separate from shared-brain content. Product code lives in `apps/`, `packages/`, `infra/`, `examples/`, `docs/`, and `scripts/`.
 - Do not install Bun, Git, OpenSSH, Tailscale, Codex, or Claude from Brainstack commands unless the user explicitly asks. Brainstack checks prerequisites and prints install hints.
 - Never print tokens, SSH private keys, Telegram bot tokens, or real env file values. Report presence, path, shape, and health only.
+- Treat Brainstack as the shared-memory/control product first. macOS install smoothness, Telegram, and worker delegation are supporting surfaces, not the core value proposition.
 
 ## Local Values
 
@@ -28,6 +29,27 @@ Expect machine-specific values to come from local env, shell config, SSH config,
 - `BRAINSTACK_BOT_TOKEN_ENV`: name of the env var that contains the Telegram bot token.
 
 If a required value is missing and cannot be discovered from config, ask the user for that value instead of guessing IPs, users, keys, tokens, or chat ids.
+
+## Installing This Skill Bundle
+
+Public Brainstack skills are versioned product artifacts under `packages/skills`; they are not shared-brain content. Install them into Codex with:
+
+```bash
+brainctl skills install --target codex --profile client
+brainctl skills install --target codex --profile operator
+```
+
+Use `client` for ordinary enrolled machines and `operator` for admins who operate control hosts, workers, curation, and recovery. Use `--skill NAME` for explicit installs, `--all` for every public skill, `--dir DIR` for a custom Codex skills root, and `--dry-run` before writing.
+
+Keep public skills generic. Private topology, exact hostnames, operator usernames, service paths, Telegram chat ids, and local runbook exceptions belong in a private overlay skill outside `packages/skills`.
+
+## Install And Enrollment Flow
+
+- Control hosts are source-run today: clone Brainstack, install Bun deps, run `brainctl provision`, inspect config, run `brainctl init`, enable user services, and verify with `brainctl doctor`.
+- Client machines should use invites when available: the control host runs `brainctl invite create`, the client runs the release installer, pastes the private invite, and `brainctl enroll` writes config, bootstrap guidance, optional tokens, SSH pins, and doctor output.
+- Token-bearing invites are bearer secrets. Prefer private files or prompts over putting `bs1_...` values in shell history, chat logs, process argv, or issue trackers.
+- The public installer is only a downloader/checksum shim. Setup policy stays in `brainctl enroll` so retries and audits use versioned product code.
+- Standalone client binaries must embed client bootstrap templates and portable skills. Do not add source-tree-relative reads for assets required by released binaries.
 
 ## Control Host Health
 
@@ -55,6 +77,23 @@ When Telegram stops responding:
 - Check `/whoami`, `/workers`, `/updates`, `/topicinfo`, `/context`, `/usage`, and `/tail` from the bound Telegram topic once the service is consuming updates again. `/workers` should show each worker's harness, model, thinking effort, and `sudo=ok|fail|missing|n/a`; `/updates` should run the same all-worker deterministic update-check used by the built-in routine.
 - Normal Telegram topic resumes should not emit "Dispatched resume" acknowledgements. Expect the typing heartbeat, optional `Compacting thread…`, and then the final result. Use `/compact` only for Codex-backed contexts with an existing session; Claude should report that manual compact is unsupported.
 - Restart `telemux.service` only after recording the current failure evidence, unless the user explicitly requests a blind restart.
+
+## Telegram File Relay
+
+Use `brainctl telegram send-file` when an enrolled machine needs to send a local file to the operator through Telegram:
+
+```bash
+brainctl telegram send-file --config "$BRAINSTACK_CONFIG" --file ./artifact.zip --caption "artifact from client"
+```
+
+Expected shape:
+
+- The client streams bytes over the configured control-host SSH path.
+- The control host runs Brainstack's telemux send-file helper from its local product repo.
+- Telegram bot tokens and chat defaults stay on the control host in telemux env files; clients should not store bot tokens.
+- Invites can embed the control SSH target, remote product repo, and pinned known-hosts data so routine sends do not need ad hoc `scp`, bot tokens, or `accept-new` trust.
+- Local and remote guards should reject symlinks, directories, oversize files, and source or display names that look like secrets unless the user explicitly passes `--allow-sensitive`.
+- Prefer context slugs for bound telemux topics when available; otherwise use the configured control chat defaults. Do not print chat ids unless the user asks for routing diagnostics.
 
 ## Worker Canary
 
