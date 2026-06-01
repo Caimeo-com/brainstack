@@ -67,6 +67,8 @@ See [`docs/security-postures.md`](./docs/security-postures.md), [`docs/tailscale
 
 Client import/propose writes can queue into `~/.local/state/brainstack/outbox/<brain-id>/` when the brain is unreachable. Use `brainctl outbox status|list|flush|purge|purge-corrupt`; flush replays only import/propose payloads and never mutates canonical wiki pages offline.
 
+Mac clients can send local files to mobile through the control host's telemux bot with `brainctl telegram send-file`. The file streams over SSH to the control host, telemux uses its local Telegram env, and the bot token never needs to exist on the client.
+
 Security defaults are explicit in config:
 
 ```yaml

@@ -5323,6 +5323,146 @@ describe("public release hygiene", () => {
     }
   }, 15_000);
 
+  test("telegram send-file streams local file over SSH with control-host trust and no Telegram secrets", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-telegram-send-file-"));
+    try {
+      const binDir = join(dir, "bin");
+      const configRoot = join(dir, "config");
+      await mkdir(binDir, { recursive: true });
+      await mkdir(configRoot, { recursive: true });
+      const filePath = join(dir, "mobile-report.txt");
+      const uploadedPath = join(dir, "uploaded.txt");
+      const argsCapture = join(dir, "ssh-args.txt");
+      await writeFile(filePath, "hello telegram mobile\n");
+      await writeFile(join(configRoot, "ssh_known_hosts"), "control.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeBrainstackControlKeyForTestsOnly\n");
+
+      const fakeSsh = join(binDir, "ssh");
+      await writeFile(
+        fakeSsh,
+        [
+          "#!/usr/bin/env bash",
+          "set -euo pipefail",
+          `printf '<%s>\\n' "$@" > '${argsCapture}'`,
+          `cat > '${uploadedPath}'`,
+          "cat <<'JSON'",
+          '{"ok":true,"fileName":"mobile-report.txt","sizeBytes":22,"mimeType":"text/plain","kind":"document","target":{"mode":"control","contextSlug":null,"chatId":-100111,"threadId":null},"deleted":true}',
+          "JSON",
+          ""
+        ].join("\n")
+      );
+      await chmod(fakeSsh, 0o755);
+
+      const configPath = join(dir, "client.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: mac-client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  configRoot: ${configRoot}`,
+          "client:",
+          "  remoteSsh: operator@control.example:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+
+      const result = runBrainctl(
+        [
+          "telegram",
+          "send-file",
+          "--config",
+          configPath,
+          "--file",
+          filePath,
+          "--caption",
+          "mobile caption",
+          "--remote-repo",
+          "~/brainstack",
+          "--json"
+        ],
+        {
+          PATH: `${binDir}:${process.env.PATH || ""}`,
+          FACTORY_TELEGRAM_BOT_TOKEN: "must-not-leak"
+        }
+      );
+
+      expectSuccess(result);
+      expect(JSON.parse(result.stdout).fileName).toBe("mobile-report.txt");
+      expect(await readFile(uploadedPath, "utf8")).toBe("hello telegram mobile\n");
+      const sshArgs = await readFile(argsCapture, "utf8");
+      expect(sshArgs).toContain("BatchMode=yes");
+      expect(sshArgs).toContain("ConnectTimeout=8");
+      expect(sshArgs).toContain("StrictHostKeyChecking=yes");
+      expect(sshArgs).toContain(`UserKnownHostsFile=${join(configRoot, "ssh_known_hosts")}`);
+      expect(sshArgs).toContain("operator@control.example");
+      expect(sshArgs).toContain("<bash -lc '");
+      expect(sshArgs).not.toContain("\n<bash>\n<-lc>\n");
+      expect(sshArgs).toContain("apps/telemux/src/send-file.ts");
+      expect(sshArgs).toContain("--display-name");
+      expect(sshArgs).toContain("mobile-report.txt");
+      expect(sshArgs).not.toContain("must-not-leak");
+      expect(result.stdout).not.toContain("must-not-leak");
+      expect(result.stderr).not.toContain("must-not-leak");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("telegram send-file rejects unsafe local files before opening SSH", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-telegram-send-file-unsafe-"));
+    try {
+      const binDir = join(dir, "bin");
+      await mkdir(binDir, { recursive: true });
+      const fakeSsh = join(binDir, "ssh");
+      await writeFile(
+        fakeSsh,
+        [
+          "#!/usr/bin/env bash",
+          "echo should-not-run >&2",
+          "exit 99",
+          ""
+        ].join("\n")
+      );
+      await chmod(fakeSsh, 0o755);
+      const safePath = join(dir, "safe.txt");
+      const tokenPath = join(dir, "secret-token.txt");
+      const linkPath = join(dir, "safe-link.txt");
+      await writeFile(safePath, "safe");
+      await writeFile(tokenPath, "token");
+      await symlink(safePath, linkPath);
+
+      const env = { PATH: `${binDir}:${process.env.PATH || ""}` };
+      const symlinkResult = runBrainctl(["telegram", "send-file", "--file", linkPath, "--via", "operator@control.example"], env);
+      expect(symlinkResult.code).toBe(1);
+      expect(symlinkResult.stderr).toContain("refusing to send symlink");
+      expect(symlinkResult.stderr).not.toContain("should-not-run");
+
+      const sensitiveResult = runBrainctl(["telegram", "send-file", "--file", tokenPath, "--via", "operator@control.example"], env);
+      expect(sensitiveResult.code).toBe(1);
+      expect(sensitiveResult.stderr).toContain("sensitive-looking file name");
+      expect(sensitiveResult.stderr).not.toContain("should-not-run");
+
+      const sensitiveDisplayResult = runBrainctl(
+        ["telegram", "send-file", "--file", tokenPath, "--display-name", "notes.txt", "--via", "operator@control.example"],
+        env
+      );
+      expect(sensitiveDisplayResult.code).toBe(1);
+      expect(sensitiveDisplayResult.stderr).toContain("sensitive-looking file name");
+      expect(sensitiveDisplayResult.stderr).not.toContain("should-not-run");
+
+      const sizeResult = runBrainctl(["telegram", "send-file", "--file", safePath, "--via", "operator@control.example", "--max-bytes", "1"], env);
+      expect(sizeResult.code).toBe(1);
+      expect(sizeResult.stderr).toContain("file too large");
+      expect(sizeResult.stderr).not.toContain("should-not-run");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("worker doctor refuses accept-new SSH trust without explicit bootstrap override", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-worker-accept-new-refusal-"));
     try {

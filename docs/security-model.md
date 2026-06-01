@@ -103,6 +103,8 @@ Telemux only delivers requested artifacts from the active workspace by default. 
 
 `/shred` is the operator cleanup path for artifacts. It deletes only regular files addressed by relative artifact paths inside the active context workspace, then removes matching lines from `.factory/ARTIFACTS.md` and updates the context cache. Absolute paths, home-relative paths, parent traversal, directories, and paths escaping the workspace through symlinks are rejected. Despite the name, this is an unlink/delete operation, not a guaranteed secure overwrite on SSDs or journaled filesystems.
 
+`brainctl telegram send-file` is the client-to-control outbound file path. It validates a local regular file, streams it over SSH to a temporary control-host file, and runs a one-shot telemux sender under the control host's own runtime and secrets env. Telegram bot tokens remain control-host local. The default target is the configured control chat; context delivery requires an existing bound telemux context, and arbitrary `--chat-id` use is an explicit operator escape hatch. SSH is pinned by default through Brainstack's known-hosts file; `--ssh-trust accept-new` is only a bootstrap escape hatch. Symlinks, directories, oversized files, and sensitive-looking source or display names are rejected unless the operator deliberately opts into the sensitive-name override.
+
 ## Private Journal Boundary
 
 Personal/private journaling should use a separate repo/service/token boundary:

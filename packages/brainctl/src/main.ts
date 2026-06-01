@@ -3,7 +3,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { isIP } from "node:net";
-import { dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { hostname, tmpdir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import {
@@ -36,6 +36,7 @@ type HarnessName = "codex" | "claude";
 type DestroyScope = "control" | "worker" | "client" | "all";
 type CheckStatus = "PASS" | "WARN" | "FAIL";
 type WorkerSshTrustMode = "pinned" | "accept-new";
+type ControlSshTrustMode = WorkerSshTrustMode | "default";
 type SecurityPosture = "local" | "trusted-tailnet" | "guarded";
 type TrustedExposure = "none" | "tailscale-serve" | "vpn" | "manual";
 
@@ -165,6 +166,8 @@ interface BrainstackConfig {
 }
 
 const PRODUCT_ROOT = resolve(import.meta.dir, "..", "..", "..");
+const TELEGRAM_SEND_DEFAULT_MAX_BYTES = 45 * 1024 * 1024;
+const TELEGRAM_SEND_SENSITIVE_FILE_PATTERN = /(?:^|[./_-])(?:id_rsa|id_ed25519|authorized_keys|known_hosts|token|secret|passwd|shadow|keyring)(?:$|[./_-])/i;
 const CLIENT_BOOTSTRAP_TEMPLATE_NAMES = [
   "client.env.example",
   "codex-shared-brain.include.md",
@@ -221,6 +224,7 @@ function usage(): string {
   brainctl repo-lock status|clear --config brainstack.yaml [--repo write|serve] [--path LOCK_DIR] [--yes] [--token LOCK_TOKEN] [--force] [--min-age-ms MS]
   brainctl locks status|clear --config brainstack.yaml [--repo write|serve] [--path LOCK_DIR] [--yes] [--token LOCK_TOKEN] [--force] [--min-age-ms MS]
   brainctl rotate-token --kind import|admin|telegram-placeholder --config brainstack.yaml [--env FILE]
+  brainctl telegram send-file --file PATH [--config brainstack.yaml] [--via SSH_TARGET] [--remote-repo PATH] [--caption TEXT] [--context SLUG|--chat-id ID] [--thread-id ID] [--kind document|photo] [--max-bytes N] [--allow-sensitive] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default] [--json]
   brainctl import-text --config brainstack.yaml --title TITLE --text TEXT --source-harness HARNESS --source-machine MACHINE [--source-type note]
   brainctl propose --config brainstack.yaml --title TITLE --body BODY
   brainctl context --repo PATH [--config brainstack.yaml] [--json] [--sync|--no-sync]
@@ -804,6 +808,52 @@ function run(args: string[], options: { cwd?: string; env?: Record<string, strin
     throw new Error(`${args.join(" ")} failed\n${stderr || stdout}`);
   }
   return { code, stdout, stderr, timedOut };
+}
+
+async function runWithStdinFile(args: string[], filePath: string, options: { cwd?: string; env?: Record<string, string>; maxBytes?: number } = {}) {
+  const proc = Bun.spawn(args, {
+    cwd: options.cwd || process.cwd(),
+    env: { ...process.env, ...(options.env || {}) },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe"
+  });
+  const stdoutPromise = new Response(proc.stdout).text();
+  const stderrPromise = new Response(proc.stderr).text();
+  let inputError: unknown = null;
+
+  try {
+    const reader = Bun.file(filePath).stream().getReader();
+    let totalBytes = 0;
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        break;
+      }
+      totalBytes += chunk.value.byteLength;
+      if (options.maxBytes !== undefined && totalBytes > options.maxBytes) {
+        throw new Error(`file grew beyond max bytes while streaming: ${totalBytes} bytes > ${options.maxBytes}`);
+      }
+      proc.stdin.write(chunk.value);
+    }
+    await proc.stdin.flush();
+  } catch (error) {
+    inputError = error;
+    proc.kill();
+  } finally {
+    try {
+      proc.stdin.end();
+    } catch {
+      // Process may have exited before stdin was closed.
+    }
+  }
+
+  const [code, stdout, stderr] = await Promise.all([proc.exited, stdoutPromise, stderrPromise]);
+  return {
+    code,
+    stdout,
+    stderr: inputError ? [stderr, inputError instanceof Error ? inputError.message : String(inputError)].filter(Boolean).join("\n") : stderr
+  };
 }
 
 async function ensureDir(path: string): Promise<void> {
@@ -4836,6 +4886,317 @@ async function flushOutbox(cfg: BrainstackConfig): Promise<{ flushed: number; ke
   return { flushed, kept, terminalFailures, corrupt };
 }
 
+function parseIntegerFlag(args: ParsedArgs, key: string): number | null {
+  const raw = requireFlagValue(args, key);
+  if (raw === undefined) {
+    return null;
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`--${key} must be an integer`);
+  }
+  return value;
+}
+
+function parsePositiveIntegerFlag(args: ParsedArgs, key: string, fallback: number): number {
+  const raw = requireFlagValue(args, key);
+  if (raw === undefined) {
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`--${key} must be a positive integer`);
+  }
+  return value;
+}
+
+function sanitizeTelegramSendFileName(value: string): string {
+  const cleaned = basename(value)
+    .replace(/[\u0000-\u001f\u007f]/g, "_")
+    .replace(/[/:\\]/g, "_")
+    .trim();
+  return cleaned || "brainstack-file";
+}
+
+function isSensitiveTelegramFileName(value: string): boolean {
+  const normalized = sanitizeTelegramSendFileName(value).toLowerCase();
+  return (
+    normalized.startsWith(".") ||
+    normalized === ".env" ||
+    normalized.endsWith(".env") ||
+    normalized.endsWith(".pem") ||
+    normalized.endsWith(".key") ||
+    TELEGRAM_SEND_SENSITIVE_FILE_PATTERN.test(normalized)
+  );
+}
+
+async function validateTelegramSendLocalFile(filePath: string, displayName: string | undefined, maxBytes: number, allowSensitive: boolean): Promise<{ absolutePath: string; fileName: string; sizeBytes: number }> {
+  const absolutePath = abs(filePath);
+  const info = await lstat(absolutePath);
+  if (info.isSymbolicLink()) {
+    throw new Error(`refusing to send symlink: ${absolutePath}`);
+  }
+  if (!info.isFile()) {
+    throw new Error(`not a regular file: ${absolutePath}`);
+  }
+  if (info.size > maxBytes) {
+    throw new Error(`file too large: ${info.size} bytes > ${maxBytes}`);
+  }
+
+  const sourceFileName = sanitizeTelegramSendFileName(basename(absolutePath));
+  const fileName = sanitizeTelegramSendFileName(displayName || basename(absolutePath));
+  if (!allowSensitive && (isSensitiveTelegramFileName(sourceFileName) || isSensitiveTelegramFileName(fileName))) {
+    throw new Error(`refusing to send sensitive-looking file name: ${sourceFileName}${fileName !== sourceFileName ? ` as ${fileName}` : ""}; rerun with --allow-sensitive if intentional`);
+  }
+
+  return { absolutePath, fileName, sizeBytes: info.size };
+}
+
+function sshTargetFromRemoteSsh(remote: string): string | null {
+  const trimmed = remote.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (trimmed.startsWith("ssh://")) {
+    try {
+      const parsed = new URL(trimmed);
+      const user = decodeURIComponent(parsed.username || "");
+      const host = parsed.hostname.includes(":") ? `[${parsed.hostname}]` : parsed.hostname;
+      return `${user ? `${user}@` : ""}${host}${parsed.port ? `:${parsed.port}` : ""}`;
+    } catch {
+      return null;
+    }
+  }
+
+  const match = trimmed.match(/^((?:[^@/\s]+@)?(?:\[[^\]]+\]|[^:/\s]+)(?::\d+)?):.+$/);
+  return match?.[1] || null;
+}
+
+function telegramControlSshTarget(cfg: BrainstackConfig, args: ParsedArgs): string {
+  const via = requireFlagValue(args, "via") || process.env.BRAINSTACK_TELEGRAM_VIA?.trim() || sshTargetFromRemoteSsh(cfg.client.remoteSsh);
+  if (!via) {
+    throw new Error("telegram send-file requires --via SSH_TARGET or client.remoteSsh in config");
+  }
+  return via;
+}
+
+function normalizeControlSshTrustMode(value: string | undefined): ControlSshTrustMode | null {
+  if (value === undefined) {
+    return null;
+  }
+  if (value === "pinned" || value === "accept-new" || value === "default") {
+    return value;
+  }
+  throw new Error("--ssh-trust must be pinned, accept-new, or default");
+}
+
+function telegramControlWorker(via: string): BrainstackWorkerConfig {
+  return {
+    name: "control",
+    transport: "ssh",
+    sshTarget: via,
+    sshUser: null,
+    managedRepoRoot: "",
+    managedHostRoot: "",
+    managedScratchRoot: ""
+  };
+}
+
+function telegramKnownHostsPath(cfg: BrainstackConfig, args: ParsedArgs): string {
+  const knownHostsInput = requireFlagValue(args, "known-hosts") || process.env.BRAINSTACK_TELEGRAM_KNOWN_HOSTS?.trim();
+  return knownHostsInput ? absWithHome(knownHostsInput, cfg.paths.home) : join(cfg.paths.configRoot, "ssh_known_hosts");
+}
+
+function telegramSshTrustMode(args: ParsedArgs): ControlSshTrustMode {
+  const rawMode = normalizeControlSshTrustMode(requireFlagValue(args, "ssh-trust") || process.env.BRAINSTACK_TELEGRAM_SSH_TRUST?.trim());
+  return rawMode || "pinned";
+}
+
+function telegramSshTrustArgs(mode: ControlSshTrustMode, knownHostsPath: string): string[] {
+  if (mode === "default") {
+    return [];
+  }
+  if (mode === "pinned") {
+    return ["-o", "StrictHostKeyChecking=yes", "-o", `UserKnownHostsFile=${knownHostsPath}`];
+  }
+
+  return ["-o", "StrictHostKeyChecking=accept-new", "-o", `UserKnownHostsFile=${knownHostsPath}`];
+}
+
+function normalizeTelegramSendKind(args: ParsedArgs): string | null {
+  const kind = requireFlagValue(args, "kind");
+  if (kind === undefined) {
+    return null;
+  }
+  if (kind === "document" || kind === "photo") {
+    return kind;
+  }
+  throw new Error("--kind must be document or photo");
+}
+
+function telegramRemoteSendScript(options: {
+  remoteRepo: string;
+  displayName: string;
+  caption?: string;
+  context?: string;
+  chatId: number | null;
+  threadId: number | null;
+  kind: string | null;
+  maxBytes: number;
+  allowSensitive: boolean;
+}): string {
+  const sendArgs = [
+    "apps/telemux/src/send-file.ts",
+    "--file",
+    '"$tmp_file"',
+    "--display-name",
+    quoteForBash(options.displayName),
+    "--max-bytes",
+    quoteForBash(String(options.maxBytes)),
+    "--delete-after-send",
+    "--json"
+  ];
+  if (options.caption) sendArgs.push("--caption", quoteForBash(options.caption));
+  if (options.context) sendArgs.push("--context", quoteForBash(options.context));
+  if (options.chatId !== null) sendArgs.push("--chat-id", quoteForBash(String(options.chatId)));
+  if (options.threadId !== null) sendArgs.push("--thread-id", quoteForBash(String(options.threadId)));
+  if (options.kind) sendArgs.push("--kind", quoteForBash(options.kind));
+  if (options.allowSensitive) sendArgs.push("--allow-sensitive");
+
+  return `
+set -euo pipefail
+brainstack_expand_home() {
+  case "$1" in
+    "~") printf '%s\\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
+    *) printf '%s\\n' "$1" ;;
+  esac
+}
+
+runtime_env="$HOME/.config/brainstack/telemux.runtime.env"
+secrets_env="$HOME/.config/brainstack/telemux.secrets.env"
+set -a
+if [ -r "$runtime_env" ]; then . "$runtime_env"; fi
+if [ -r "$secrets_env" ]; then . "$secrets_env"; fi
+set +a
+
+state_root="\${BRAINSTACK_STATE_ROOT:-$HOME/.local/state/brainstack}"
+tmp_root="$state_root/telemux/incoming"
+mkdir -p "$tmp_root"
+chmod 700 "$tmp_root" 2>/dev/null || true
+tmp_file="$(mktemp "$tmp_root/brainctl-send.XXXXXX")"
+cleanup() { rm -f "$tmp_file"; }
+trap cleanup EXIT
+max_bytes=${quoteForBash(String(options.maxBytes))}
+head -c "$((max_bytes + 1))" > "$tmp_file"
+received_bytes="$(wc -c < "$tmp_file" | tr -d '[:space:]')"
+if [ "$received_bytes" -gt "$max_bytes" ]; then
+  echo "file too large while receiving: $received_bytes bytes > $max_bytes" >&2
+  exit 43
+fi
+
+repo="$(brainstack_expand_home ${quoteForBash(options.remoteRepo)})"
+cd "$repo"
+if [ -x "$HOME/.bun/bin/bun" ]; then
+  bun_bin="$HOME/.bun/bin/bun"
+else
+  bun_bin="$(command -v bun)"
+fi
+"$bun_bin" --no-env-file run ${sendArgs.join(" ")}
+`.trim();
+}
+
+function formatTelegramSendSummary(result: Record<string, unknown>): string {
+  const target = result.target && typeof result.target === "object" ? (result.target as Record<string, unknown>) : {};
+  const mode = typeof target.mode === "string" ? target.mode : "unknown";
+  const context = typeof target.contextSlug === "string" ? `:${target.contextSlug}` : "";
+  const thread = target.threadId === null || target.threadId === undefined ? "none" : String(target.threadId);
+  return `sent ${String(result.fileName || "file")} (${String(result.sizeBytes || "unknown")} bytes) to Telegram target=${mode}${context} thread=${thread}`;
+}
+
+async function commandTelegramSendFile(args: ParsedArgs): Promise<void> {
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile") || "client-macos", flag(args, "root"));
+  const filePath = requireFlagValue(args, "file");
+  if (!filePath) {
+    throw new Error("telegram send-file requires --file PATH");
+  }
+  const chatId = parseIntegerFlag(args, "chat-id");
+  const threadId = parseIntegerFlag(args, "thread-id");
+  const context = requireFlagValue(args, "context");
+  if (context && chatId !== null) {
+    throw new Error("telegram send-file accepts either --context or --chat-id, not both");
+  }
+  if (context && threadId !== null) {
+    throw new Error("telegram send-file uses the bound context thread; omit --thread-id with --context");
+  }
+  const maxBytes = parsePositiveIntegerFlag(args, "max-bytes", TELEGRAM_SEND_DEFAULT_MAX_BYTES);
+  const kind = normalizeTelegramSendKind(args);
+  const allowSensitive = hasFlag(args, "allow-sensitive");
+  const displayName = requireFlagValue(args, "display-name");
+  const localFile = await validateTelegramSendLocalFile(filePath, displayName, maxBytes, allowSensitive);
+  const via = telegramControlSshTarget(cfg, args);
+  const worker = telegramControlWorker(via);
+  const remoteRepo = requireFlagValue(args, "remote-repo") || process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() || "~/brainstack";
+  const remoteScript = telegramRemoteSendScript({
+    remoteRepo,
+    displayName: localFile.fileName,
+    caption: requireFlagValue(args, "caption"),
+    context,
+    chatId,
+    threadId,
+    kind,
+    maxBytes,
+    allowSensitive
+  });
+  const knownHostsPath = telegramKnownHostsPath(cfg, args);
+  const sshTrustMode = telegramSshTrustMode(args);
+  if (sshTrustMode === "accept-new") {
+    await ensureDir(dirname(knownHostsPath));
+  }
+  const sshArgs = [
+    "ssh",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=8",
+    ...telegramSshTrustArgs(sshTrustMode, knownHostsPath),
+    ...workerSshPortArgs(worker),
+    workerRemoteTarget(worker),
+    `bash -lc ${quoteForBash(remoteScript)}`
+  ];
+  const result = await runWithStdinFile(sshArgs, localFile.absolutePath, { maxBytes });
+  if (result.code !== 0) {
+    throw new Error(`telegram send-file failed over ssh with exit ${result.code}\n${result.stderr || result.stdout}`);
+  }
+  const output = result.stdout.trim();
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(output) as Record<string, unknown>;
+  } catch {
+    throw new Error(`telegram send-file returned non-JSON output\n${output}`);
+  }
+  if (hasFlag(args, "json")) {
+    console.log(JSON.stringify(parsed, null, 2));
+    return;
+  }
+  console.log(formatTelegramSendSummary(parsed));
+}
+
+async function commandTelegram(args: ParsedArgs): Promise<void> {
+  const subcommand = args.positional[0] || "help";
+  switch (subcommand) {
+    case "send-file":
+      return await commandTelegramSendFile(args);
+    case "help":
+    case "--help":
+    case "-h":
+      console.log("Usage: brainctl telegram send-file --file PATH [--config brainstack.yaml] [--via SSH_TARGET] [--remote-repo PATH] [--caption TEXT] [--context SLUG|--chat-id ID] [--thread-id ID] [--kind document|photo] [--max-bytes N] [--allow-sensitive] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default] [--json]");
+      return;
+    default:
+      throw new Error(`Unknown telegram command: ${subcommand}`);
+  }
+}
+
 async function commandImportText(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
   const title = flag(args, "title");
@@ -5947,6 +6308,8 @@ async function main(): Promise<void> {
       return await commandRepoLock(args);
     case "rotate-token":
       return await commandRotateToken(args);
+    case "telegram":
+      return await commandTelegram(args);
     case "migrate-current-install":
       return await commandMigrateCurrentInstall(args);
     case "smoke":

@@ -53,6 +53,23 @@ brainctl doctor --config ~/.config/brainstack/brainstack.yaml --write-smoke
 
 `--write-smoke` posts a small import artifact, so use it as an explicit setup verification rather than a routine health check.
 
+## Send A Mac File To Telegram
+
+When the control host runs telemux, a Mac client can ask BrainCTL to send a local file through the control host's Telegram bot without storing the bot token on the Mac:
+
+```bash
+brainctl telegram send-file \
+  --config ~/.config/brainstack/brainstack.yaml \
+  --via operator@brain-control \
+  --remote-repo ~/brainstack \
+  --file ~/Downloads/report.pdf \
+  --caption "Report from my Mac"
+```
+
+If `client.remoteSsh` is configured, `--via` can be omitted. The command streams the local file over SSH, invokes `apps/telemux/src/send-file.ts` on the control host, and lets telemux read its own `telemux.runtime.env` plus `telemux.secrets.env`. The default target is `FACTORY_TELEGRAM_CONTROL_CHAT_ID`; use `--context SLUG` to send into an existing bound telemux topic. Files are rejected locally and remotely if they are symlinks, directories, over 45 MiB by default, or look like secrets unless `--allow-sensitive` is explicitly supplied.
+
+SSH trust is pinned by default through `~/.config/brainstack/ssh_known_hosts` from the client config root. Run `brainctl trust-worker` or otherwise install the control host key first, or use `--known-hosts FILE` for a custom pin file. `--ssh-trust accept-new` is a bootstrap escape hatch only; it uses OpenSSH TOFU semantics and should be replaced with a pinned host key before routine use. Use `--display-name NAME` to change the Telegram filename and `--max-bytes N` for a smaller explicit cap.
+
 ## Harness Instructions
 
 The bootstrap installer installs real guidance, not prose pointers:

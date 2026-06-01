@@ -1,8 +1,44 @@
 import { expect, test } from "bun:test";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { FactoryConfig } from "../src/config";
+import type { ContextRecord } from "../src/db";
 import { TELEGRAM_BOT_COMMANDS, TelegramBot } from "../src/telegram";
+import { sendTelegramLocalFile } from "../src/telegram-file-send";
 
 const TEST_ALLOWED_TELEGRAM_USER_ID = 123456789;
+
+function testContext(slug: string, chatId: number | null, threadId: number | null): ContextRecord {
+  const now = new Date().toISOString();
+  return {
+    slug,
+    telegramChatId: chatId,
+    telegramThreadId: threadId,
+    machine: "control",
+    kind: "scratch",
+    state: "active",
+    transport: "local",
+    target: "scratch",
+    rootPath: "/tmp/scratch",
+    worktreePath: "/tmp/scratch",
+    branchName: null,
+    baseBranch: null,
+    latestRunLogPath: null,
+    lastSummary: null,
+    lastArtifacts: null,
+    codexSessionId: null,
+    lastRunAt: null,
+    usageAdapter: "manual",
+    harness: null,
+    harnessBin: null,
+    modelOverride: null,
+    reasoningEffortOverride: null,
+    lastError: null,
+    createdAt: now,
+    updatedAt: now
+  };
+}
 
 test("registered Telegram commands include implemented operator commands", () => {
   const commands = new Set(TELEGRAM_BOT_COMMANDS.map((command) => command.command));
@@ -182,6 +218,185 @@ test("sendAttachment uploads multipart documents into the correct Telegram threa
     expect(await (document as File).text()).toBe("hello world");
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("sendTelegramLocalFile sends a spooled file to control chat or bound context", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "telemux-send-file-"));
+  const filePath = join(dir, "report.md");
+  await writeFile(filePath, "# Report\n\nhello mobile\n");
+  const sent: Array<{
+    target: { chatId: number; threadId: number | null };
+    attachment: { kind: string; fileName: string; bytes: Uint8Array; mimeType?: string | null; caption?: string | null };
+  }> = [];
+  const telegram = {
+    async sendAttachment(
+      target: { chatId: number; threadId: number | null },
+      attachment: { kind: string; fileName: string; bytes: Uint8Array; mimeType?: string | null; caption?: string | null }
+    ) {
+      sent.push({ target, attachment });
+    }
+  };
+  const context = testContext("scratchpad", -100222, 77);
+  const db = {
+    getContextBySlug(slug: string) {
+      return slug === context.slug ? context : null;
+    }
+  };
+
+  try {
+    const controlResult = await sendTelegramLocalFile(
+      { telegramBotToken: "test-token", telegramControlChatId: -100111 },
+      db,
+      telegram,
+      {
+        filePath,
+        caption: "control report",
+        contextSlug: null,
+        chatId: null,
+        threadId: null,
+        kind: null,
+        displayName: null,
+        maxBytes: 1024 * 1024,
+        allowSensitive: false,
+        deleteAfterSend: false
+      }
+    );
+
+    expect(controlResult.target.mode).toBe("control");
+    expect(sent[0]?.target).toEqual({ chatId: -100111, threadId: null });
+    expect(sent[0]?.attachment.kind).toBe("document");
+    expect(sent[0]?.attachment.fileName).toBe("report.md");
+    expect(sent[0]?.attachment.mimeType).toBe("text/markdown");
+    expect(sent[0]?.attachment.caption).toBe("control report");
+    expect(new TextDecoder().decode(sent[0]?.attachment.bytes)).toBe("# Report\n\nhello mobile\n");
+
+    const contextResult = await sendTelegramLocalFile(
+      { telegramBotToken: "test-token", telegramControlChatId: -100111 },
+      db,
+      telegram,
+      {
+        filePath,
+        caption: null,
+        contextSlug: "scratchpad",
+        chatId: null,
+        threadId: null,
+        kind: "document",
+        displayName: "mobile-report.md",
+        maxBytes: 1024 * 1024,
+        allowSensitive: false,
+        deleteAfterSend: false
+      }
+    );
+
+    expect(contextResult.target).toEqual({
+      mode: "context",
+      contextSlug: "scratchpad",
+      chatId: -100222,
+      threadId: 77
+    });
+    expect(sent[1]?.target).toEqual({ chatId: -100222, threadId: 77 });
+    expect(sent[1]?.attachment.fileName).toBe("mobile-report.md");
+
+    const deletePath = join(dir, "delete-after-send.txt");
+    await writeFile(deletePath, "delete me after send");
+    const deleteResult = await sendTelegramLocalFile(
+      { telegramBotToken: "test-token", telegramControlChatId: -100111 },
+      db,
+      telegram,
+      {
+        filePath: deletePath,
+        caption: null,
+        contextSlug: null,
+        chatId: -100333,
+        threadId: 12,
+        kind: null,
+        displayName: null,
+        maxBytes: 1024 * 1024,
+        allowSensitive: false,
+        deleteAfterSend: true
+      }
+    );
+    expect(deleteResult.deleted).toBe(true);
+    expect(await Bun.file(deletePath).exists()).toBe(false);
+    expect(sent[2]?.target).toEqual({ chatId: -100333, threadId: 12 });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("sendTelegramLocalFile fails closed for missing token, unsafe files, and unresolved targets", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "telemux-send-file-security-"));
+  const safePath = join(dir, "safe.txt");
+  const tokenPath = join(dir, "secret-token.txt");
+  const symlinkPath = join(dir, "safe-link.txt");
+  await writeFile(safePath, "safe");
+  await writeFile(tokenPath, "token");
+  await symlink(safePath, symlinkPath);
+  const telegram = {
+    async sendAttachment() {
+      throw new Error("should not send");
+    }
+  };
+  const db = {
+    getContextBySlug() {
+      return null;
+    }
+  };
+  const baseOptions = {
+    filePath: safePath,
+    caption: null,
+    contextSlug: null,
+    chatId: null,
+    threadId: null,
+    kind: null,
+    displayName: null,
+    maxBytes: 1024,
+    allowSensitive: false,
+    deleteAfterSend: false
+  };
+
+  try {
+    await expect(sendTelegramLocalFile({ telegramBotToken: "", telegramControlChatId: -100111 }, db, telegram, baseOptions)).rejects.toThrow(
+      "FACTORY_TELEGRAM_BOT_TOKEN"
+    );
+    await expect(
+      sendTelegramLocalFile({ telegramBotToken: "test-token", telegramControlChatId: null }, db, telegram, baseOptions)
+    ).rejects.toThrow("FACTORY_TELEGRAM_CONTROL_CHAT_ID");
+    await expect(
+      sendTelegramLocalFile({ telegramBotToken: "test-token", telegramControlChatId: -100111 }, db, telegram, {
+        ...baseOptions,
+        filePath: symlinkPath
+      })
+    ).rejects.toThrow("symlink");
+    await expect(
+      sendTelegramLocalFile({ telegramBotToken: "test-token", telegramControlChatId: -100111 }, db, telegram, {
+        ...baseOptions,
+        filePath: tokenPath
+      })
+    ).rejects.toThrow("sensitive-looking");
+    await expect(
+      sendTelegramLocalFile({ telegramBotToken: "test-token", telegramControlChatId: -100111 }, db, telegram, {
+        ...baseOptions,
+        filePath: tokenPath,
+        displayName: "notes.txt"
+      })
+    ).rejects.toThrow("sensitive-looking");
+    await expect(
+      sendTelegramLocalFile({ telegramBotToken: "test-token", telegramControlChatId: -100111 }, db, telegram, {
+        ...baseOptions,
+        maxBytes: 1
+      })
+    ).rejects.toThrow("file too large");
+    await expect(
+      sendTelegramLocalFile({ telegramBotToken: "test-token", telegramControlChatId: -100111 }, db, telegram, {
+        ...baseOptions,
+        contextSlug: "scratchpad",
+        chatId: -100222
+      })
+    ).rejects.toThrow("either --context or --chat-id");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
