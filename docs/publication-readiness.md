@@ -9,7 +9,7 @@ Before sharing brainstack with another machine or person:
 - `brainctl smoke --profile single-node` passes.
 - `brainctl smoke --profile control` passes.
 - `brainctl init` has been tested only on fresh install roots; use `brainctl upgrade` or `brainctl apply-runtime` for existing installs.
-- `brainctl bootstrap-client` renders Codex, Claude, Cursor, SSH, env, and install artifacts.
+- `brainctl bootstrap-client` renders Codex, Claude, Cursor, SSH, env, and install artifacts from a source run and from the compiled binary.
 - Product examples do not contain real tokens, chat ids, private keys, or personal repo data.
 - Tailscale docs clearly separate Serve from Funnel.
 - Worker docs use OpenSSH over Tailscale by default.
@@ -32,7 +32,7 @@ scripts/release.sh
 
 The release script refuses dirty trees, runs `bun install --frozen-lockfile`, runs `bun test`, builds `dist/brainctl`, and emits a source archive from `git archive`.
 
-The `brainctl` binary is compiled with `--no-compile-autoload-dotenv` and `--no-compile-autoload-bunfig`. Those flags keep release artifacts from inheriting local release-machine `.env` or `bunfig.toml` behavior. `braind` and `telemux` are intentionally not compiled by default; they run from source under Bun so service behavior stays inspectable.
+The `brainctl` binary is compiled with `--no-compile-autoload-dotenv` and `--no-compile-autoload-bunfig`. Those flags keep release artifacts from inheriting local release-machine `.env` or `bunfig.toml` behavior. The binary embeds the client bootstrap templates so a Mac client can provision, doctor, init, and render `bootstrap-client` without a source checkout or Bun. `braind` and `telemux` are intentionally not compiled by default; they run from source under Bun so service behavior stays inspectable.
 
 Generated source-run services use `bun --no-env-file run ...` for the same reason: service env must come from explicit runtime/secrets env files, not ambient repo `.env` loading.
 

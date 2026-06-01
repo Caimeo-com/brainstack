@@ -154,7 +154,7 @@ async function startBraind(root: string, port: number, overrides: Record<string,
     env: braindTestEnv(root, port, overrides),
     stdout: "pipe",
     stderr: "pipe"
-  });
+  }, 15_000);
   await waitForBraind(port);
   return proc;
 }
@@ -455,6 +455,142 @@ describe("brainctl install safety", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  test("compiled client binary provisions, doctors, and bootstraps without Bun on PATH", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-compiled-client-"));
+    try {
+      const binary = join(dir, "brainctl");
+      expectSuccess(
+        runCommand([
+          "bun",
+          "build",
+          BRAINCTL,
+          "--compile",
+          "--no-compile-autoload-dotenv",
+          "--no-compile-autoload-bunfig",
+          "--outfile",
+          binary
+        ])
+      );
+
+      const binDir = join(dir, "bin");
+      await mkdir(binDir, { recursive: true });
+      await writeFile(
+        join(binDir, "codex"),
+        [
+          "#!/usr/bin/env sh",
+          "if [ \"${1:-}\" = \"--version\" ]; then echo 'codex fake'; exit 0; fi",
+          "if [ \"${1:-}\" = \"exec\" ] && [ \"${2:-}\" = \"--help\" ]; then",
+          "  echo '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --output-last-message'",
+          "  exit 0",
+          "fi",
+          "exit 0",
+          ""
+        ].join("\n")
+      );
+      await chmod(join(binDir, "codex"), 0o755);
+      const realGit = runCommand(["bash", "-lc", "command -v git"]).stdout.trim().split(/\r?\n/)[0] || "/usr/bin/git";
+      for (const name of ["git", "ssh", "tailscale"]) {
+        const fakeCommand = join(binDir, name);
+        if (name === "git") {
+          await writeFile(
+            fakeCommand,
+            [
+              "#!/usr/bin/env sh",
+              "if [ \"${1:-}\" = \"--version\" ]; then echo 'git fake'; exit 0; fi",
+              `exec ${realGit} "$@"`,
+              ""
+            ].join("\n")
+          );
+        } else {
+          await writeFile(
+            fakeCommand,
+            [
+              "#!/usr/bin/env sh",
+              "if [ \"${1:-}\" = \"-V\" ]; then echo '" + name + " fake'; exit 0; fi",
+              "if [ \"${1:-}\" = \"--version\" ]; then echo '" + name + " fake'; exit 0; fi",
+              "if [ \"${1:-}\" = \"status\" ] && [ \"${2:-}\" = \"--json\" ]; then echo '{}'; exit 0; fi",
+              "echo '" + name + " fake'",
+              ""
+            ].join("\n")
+          );
+        }
+        await chmod(fakeCommand, 0o755);
+      }
+
+      const noBunEnv = {
+        PATH: `${binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1",
+        BRAINSTACK_HARNESS_TEST_TIMEOUT_MS: "1000",
+        HOME: join(dir, "home"),
+        USER: "operator"
+      };
+      const bare = join(dir, "shared-brain.git");
+      const seed = join(dir, "seed");
+      git(["init", "--bare", "--initial-branch=main", bare], dir);
+      git(["clone", bare, seed], dir);
+      await writeFile(join(seed, "AGENTS.shared-client.md"), "# Shared Client\n");
+      git(["add", "AGENTS.shared-client.md"], seed);
+      git(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "seed"], seed);
+      git(["push", "-u", "origin", "main"], seed);
+
+      const tokenFile = join(dir, "brain-import-token.txt");
+      await writeFile(tokenFile, "compiled-client-token\n");
+      await chmod(tokenFile, 0o600);
+      const configPath = join(dir, "brainstack.yaml");
+      const provision = runCommand(
+        [
+          binary,
+          "provision",
+          "--profile",
+          "client-macos",
+          "--out",
+          configPath,
+          "--harness",
+          "codex",
+          "--brain-base-url",
+          "https://brain-control.example.ts.net",
+          "--brain-remote",
+          bare
+        ],
+        { env: noBunEnv }
+      );
+      expectSuccess(provision);
+      expect(provision.stdout).toContain("detected tools: git=present ssh=present tailscale=present");
+      expect(provision.stdout).not.toContain("bun=present");
+
+      const doctor = runCommand([binary, "doctor", "--config", configPath], { env: noBunEnv });
+      expectSuccess(doctor);
+      expect(doctor.stdout).toContain("WARN [versions] bun:");
+      expect(doctor.stdout).toContain("not required for client-macos standalone binary installs");
+      expect(doctor.stdout).not.toContain("FAIL [versions] bun:");
+
+      const init = runCommand([binary, "init", "--profile", "client-macos", "--config", configPath, "--import-token-file", tokenFile], {
+        env: noBunEnv
+      });
+      expectSuccess(init);
+      expect(await Bun.file(join(noBunEnv.HOME, "shared-brain", "AGENTS.shared-client.md")).exists()).toBe(true);
+      expect(await readFile(join(noBunEnv.HOME, ".config", "shared-brain.env"), "utf8")).toContain("BRAIN_IMPORT_TOKEN=compiled-client-token");
+
+      const missingTokenFileValue = runCommand([binary, "init", "--profile", "client-macos", "--config", configPath, "--import-token-file"], {
+        env: noBunEnv
+      });
+      expect(missingTokenFileValue.code).not.toBe(0);
+      expect(missingTokenFileValue.stderr).toContain("--import-token-file requires a value");
+
+      const out = join(dir, "bootstrap");
+      const bootstrap = runCommand([binary, "bootstrap-client", "--profile", "client-macos", "--config", configPath, "--out", out], {
+        cwd: dir,
+        env: noBunEnv
+      });
+      expectSuccess(bootstrap);
+      expect(await Bun.file(join(out, "install-client.sh")).exists()).toBe(true);
+      expect(await readFile(join(out, "client.env.example"), "utf8")).toContain("BRAIN_BASE_URL=https://brain-control.example.ts.net");
+      expect(await readFile(join(out, "install-client.sh"), "utf8")).toContain("git clone \"$REMOTE\" \"$TARGET_ABS\"");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test("worker provision makes privileged sudo proof explicit", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-provision-worker-sudo-"));
@@ -5064,7 +5200,7 @@ describe("public release hygiene", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  }, 15_000);
+  });
 
   test("doctor resolves remote worker harness through the worker user's shell PATH", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-remote-path-"));
@@ -5185,7 +5321,7 @@ describe("public release hygiene", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("worker doctor refuses accept-new SSH trust without explicit bootstrap override", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-worker-accept-new-refusal-"));

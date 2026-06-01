@@ -20,6 +20,14 @@ import {
   type OutboxEntry,
   type OutboxItem as SharedOutboxItem
 } from "../../outbox/src/outbox";
+import clientEnvExample from "../../client-bootstrap/client.env.example" with { type: "text" };
+import codexSharedBrainInclude from "../../client-bootstrap/codex-shared-brain.include.md" with { type: "text" };
+import codexGlobalAgents from "../../client-bootstrap/codex-global-AGENTS.md" with { type: "text" };
+import claudeUserClaude from "../../client-bootstrap/claude-user-CLAUDE.md" with { type: "text" };
+import claudeHooksExample from "../../client-bootstrap/claude-hooks-example.json" with { type: "text" };
+import cursorUserRule from "../../client-bootstrap/cursor-user-rule.md" with { type: "text" };
+import sshConfigFragmentExample from "../../client-bootstrap/ssh_config_fragment.example" with { type: "text" };
+import installClientScript from "../../client-bootstrap/install-client.sh" with { type: "text" };
 
 type Profile = "single-node" | "control" | "worker" | "client-macos" | "private-journal";
 const SUPPORTED_PROFILES: Profile[] = ["single-node", "control", "worker", "client-macos"];
@@ -157,6 +165,27 @@ interface BrainstackConfig {
 }
 
 const PRODUCT_ROOT = resolve(import.meta.dir, "..", "..", "..");
+const CLIENT_BOOTSTRAP_TEMPLATE_NAMES = [
+  "client.env.example",
+  "codex-shared-brain.include.md",
+  "codex-global-AGENTS.md",
+  "claude-user-CLAUDE.md",
+  "claude-hooks-example.json",
+  "cursor-user-rule.md",
+  "ssh_config_fragment.example",
+  "install-client.sh"
+] as const;
+type ClientBootstrapTemplateName = (typeof CLIENT_BOOTSTRAP_TEMPLATE_NAMES)[number];
+const CLIENT_BOOTSTRAP_TEMPLATES: Record<ClientBootstrapTemplateName, string> = {
+  "client.env.example": clientEnvExample,
+  "codex-shared-brain.include.md": codexSharedBrainInclude,
+  "codex-global-AGENTS.md": codexGlobalAgents,
+  "claude-user-CLAUDE.md": claudeUserClaude,
+  "claude-hooks-example.json": claudeHooksExample,
+  "cursor-user-rule.md": cursorUserRule,
+  "ssh_config_fragment.example": sshConfigFragmentExample,
+  "install-client.sh": installClientScript
+};
 const ALLOWED_TOP_LEVEL_CONFIG_KEYS = new Set([
   "schema_version",
   "config_version",
@@ -175,7 +204,7 @@ const ALLOWED_TOP_LEVEL_CONFIG_KEYS = new Set([
 
 function usage(): string {
   return `Usage:
-  brainctl init --profile single-node|control|worker|client-macos --config brainstack.yaml [--dry-run] [--root /tmp/install-root] [--seed-missing|--force-seed]
+  brainctl init --profile single-node|control|worker|client-macos --config brainstack.yaml [--dry-run] [--root /tmp/install-root] [--seed-missing|--force-seed] [--import-token-file FILE]
   brainctl provision --profile single-node|control|worker|client-macos [--out brainstack.yaml] [--harness codex|claude] [--harness-bin PATH_OR_NAME] [--enable-telemux] [--enroll-tailscale] [--tailscale-tag tag:brain] [--brain-base-url URL] [--brain-remote SSH_OR_PATH] [--require-harness-sudo] [--test-bot]
   brainctl upgrade --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
   brainctl apply-runtime --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
@@ -255,6 +284,13 @@ function boolFlag(args: ParsedArgs, key: string, fallback = false): boolean {
   return ["1", "true", "yes", "on"].includes(value.toLowerCase());
 }
 
+function requireFlagValue(args: ParsedArgs, key: string): string | undefined {
+  if (args.flags[key] === true) {
+    throw new Error(`--${key} requires a value`);
+  }
+  return flag(args, key);
+}
+
 function expandHome(input: string): string {
   if (input === "~") {
     return process.env.HOME || input;
@@ -298,7 +334,15 @@ function renderTemplate(text: string, replacements: Record<string, string>): str
 }
 
 function readClientBootstrapTemplate(path: string): string {
-  return readFileSync(join(PRODUCT_ROOT, "packages", "client-bootstrap", path), "utf8");
+  const template = CLIENT_BOOTSTRAP_TEMPLATES[path as ClientBootstrapTemplateName];
+  if (template === undefined) {
+    throw new Error(`Unknown client bootstrap template: ${path}`);
+  }
+  return template;
+}
+
+function profileRequiresBunRuntime(profile: Profile): boolean {
+  return profile !== "client-macos";
 }
 
 function normalizeHarness(value: string | undefined, fallback: HarnessName = "codex"): HarnessName {
@@ -662,11 +706,12 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
   const remoteSsh = `${machineUser}@${machineName}:${join(sharedBrainRoot, "bare", "shared-brain.git")}`;
   const harnessName = normalizeHarness(stringAt(harness, "name", stringAt(telemux, "harness", "codex")));
   const harnessBin = stringAt(harness, "bin", harnessName);
+  const configuredBunBin = stringAt(runtime, "bunBin", "");
 
   const cfg: BrainstackConfig = {
     schemaVersion,
     runtime: {
-      bunBin: stringAt(runtime, "bunBin", "") || resolveBunBin()
+      bunBin: configuredBunBin || (profileRequiresBunRuntime(profile) ? resolveBunBin() : "bun")
     },
     harness: {
       name: harnessName,
@@ -735,13 +780,22 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
 }
 
 function run(args: string[], options: { cwd?: string; env?: Record<string, string>; check?: boolean; timeoutMs?: number } = {}) {
-  const proc = Bun.spawnSync(args, {
-    cwd: options.cwd || process.cwd(),
-    env: { ...process.env, ...(options.env || {}) },
-    stdout: "pipe",
-    stderr: "pipe",
-    timeout: options.timeoutMs
-  });
+  let proc: ReturnType<typeof Bun.spawnSync>;
+  try {
+    proc = Bun.spawnSync(args, {
+      cwd: options.cwd || process.cwd(),
+      env: { ...process.env, ...(options.env || {}) },
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: options.timeoutMs
+    });
+  } catch (error) {
+    const stderr = error instanceof Error ? error.message : String(error);
+    if (options.check !== false) {
+      throw new Error(`${args.join(" ")} failed\n${stderr}`);
+    }
+    return { code: 127, stdout: "", stderr, timedOut: false };
+  }
   const stdout = proc.stdout.toString();
   const timedOut = proc.exitCode === null;
   const stderr = proc.stderr.toString() || (timedOut && options.timeoutMs ? `timed out after ${options.timeoutMs}ms` : "");
@@ -772,8 +826,8 @@ async function writeIfMissing(path: string, text: string, mode?: number): Promis
   return true;
 }
 
-async function readEnvSecretOrFile(envName: string, fileEnvName: string): Promise<string> {
-  const filePath = process.env[fileEnvName]?.trim();
+async function readEnvSecretOrFile(envName: string, fileEnvName: string, filePathOverride?: string): Promise<string> {
+  const filePath = filePathOverride?.trim() || process.env[fileEnvName]?.trim();
   if (filePath) {
     const absolute = abs(filePath);
     const info = await lstat(absolute);
@@ -841,6 +895,13 @@ function compareVersions(a: string, b: string): number {
 function installedBunVersion(): string | null {
   const proc = run(["bun", "--version"], { check: false });
   return proc.code === 0 ? proc.stdout.trim() : null;
+}
+
+function runtimeCommandAvailable(pathOrName: string): boolean {
+  if (!pathOrName.trim()) {
+    return false;
+  }
+  return pathOrName.includes("/") ? existsSync(pathOrName) : commandPath(pathOrName) !== null;
 }
 
 function refExists(repo: string, ref: string): boolean {
@@ -1370,18 +1431,8 @@ function clientBootstrapFiles(cfg: BrainstackConfig): Record<string, string> {
     MACHINE_USER: cfg.machine.user,
     SHARED_BRAIN_LOCAL_PATH: clientPath
   };
-  const templateNames = [
-    "client.env.example",
-    "codex-shared-brain.include.md",
-    "codex-global-AGENTS.md",
-    "claude-user-CLAUDE.md",
-    "claude-hooks-example.json",
-    "cursor-user-rule.md",
-    "ssh_config_fragment.example",
-    "install-client.sh"
-  ];
   return Object.fromEntries(
-    templateNames.map((name) => [name, renderTemplate(readClientBootstrapTemplate(name), replacements)])
+    CLIENT_BOOTSTRAP_TEMPLATE_NAMES.map((name) => [name, renderTemplate(readClientBootstrapTemplate(name), replacements)])
   );
 }
 
@@ -1569,7 +1620,7 @@ function canonicalJson(value: unknown): string {
     .join(",")}}`;
 }
 
-async function installLocalClientBootstrap(cfg: BrainstackConfig): Promise<string[]> {
+async function installLocalClientBootstrap(cfg: BrainstackConfig, options: { importTokenFile?: string } = {}): Promise<string[]> {
   const touched: string[] = [];
   const bootstrapRoot = join(cfg.paths.configRoot, "client-bootstrap");
   const bootstrapFiles = clientBootstrapFiles(cfg);
@@ -1598,7 +1649,7 @@ async function installLocalClientBootstrap(cfg: BrainstackConfig): Promise<strin
   if (await writeIfMissing(envPath, bootstrapFiles["client.env.example"], 0o600)) {
     touched.push(envPath);
   }
-  const importToken = await readEnvSecretOrFile("BRAIN_IMPORT_TOKEN", "BRAIN_IMPORT_TOKEN_FILE");
+  const importToken = await readEnvSecretOrFile("BRAIN_IMPORT_TOKEN", "BRAIN_IMPORT_TOKEN_FILE", options.importTokenFile);
   if (await setEnvIfBlank(envPath, "BRAIN_IMPORT_TOKEN", importToken)) {
     if (!touched.includes(envPath)) {
       touched.push(envPath);
@@ -1734,7 +1785,7 @@ function installHint(name: string): string {
 }
 
 function requiredProvisionCommands(profile: Profile): string[] {
-  const commands = ["bun", "git", "ssh", "tailscale"];
+  const commands = profileRequiresBunRuntime(profile) ? ["bun", "git", "ssh", "tailscale"] : ["git", "ssh", "tailscale"];
   if (profile === "single-node" || profile === "control" || profile === "worker") {
     commands.push("sshd");
   }
@@ -2169,7 +2220,7 @@ async function commandInit(args: ParsedArgs): Promise<void> {
     await writeText(join(cfg.paths.systemdUserRoot, "telemux.service"), telemuxService(cfg));
   }
   if (cfg.profile === "worker" || cfg.profile === "client-macos") {
-    const touched = await installLocalClientBootstrap(cfg);
+    const touched = await installLocalClientBootstrap(cfg, { importTokenFile: requireFlagValue(args, "import-token-file") });
     console.log(`client bootstrap touched: ${touched.length ? touched.join(", ") : "(none)"}`);
   }
   await writeFileMap(join(cfg.paths.stateRoot, "rendered"), renderFiles(cfg));
@@ -2438,13 +2489,29 @@ async function harnessGuidanceChecks(cfg: BrainstackConfig): Promise<DoctorCheck
 
 async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Promise<DoctorCheck[]> {
   const checks: DoctorCheck[] = [];
+  const bunRequired = profileRequiresBunRuntime(cfg.profile);
   const bunVersion = installedBunVersion();
+  if (bunRequired) {
+    checks.push(
+      bunVersion && compareVersions(bunVersion, MIN_BUN_VERSION) >= 0
+        ? check("PASS", "versions", "bun", `Bun ${bunVersion}; required >= ${MIN_BUN_VERSION}`)
+        : check("FAIL", "versions", "bun", bunVersion ? `Bun ${bunVersion}; required >= ${MIN_BUN_VERSION}` : "Bun runtime missing", installHint("bun"))
+    );
+  } else {
+    checks.push(
+      bunVersion && compareVersions(bunVersion, MIN_BUN_VERSION) >= 0
+        ? check("PASS", "versions", "bun", `Bun ${bunVersion}; optional for client-macos source workflows`)
+        : check("WARN", "versions", "bun", bunVersion ? `Bun ${bunVersion}; optional for client-macos source workflows` : "Bun runtime missing; not required for client-macos standalone binary installs")
+    );
+  }
+  const bunBinAvailable = runtimeCommandAvailable(cfg.runtime.bunBin);
   checks.push(
-    bunVersion && compareVersions(bunVersion, MIN_BUN_VERSION) >= 0
-      ? check("PASS", "versions", "bun", `Bun ${bunVersion}; required >= ${MIN_BUN_VERSION}`)
-      : check("FAIL", "versions", "bun", bunVersion ? `Bun ${bunVersion}; required >= ${MIN_BUN_VERSION}` : "Bun runtime missing", installHint("bun"))
+    bunBinAvailable
+      ? check("PASS", "versions", "bun-bin", cfg.runtime.bunBin)
+      : bunRequired
+        ? check("FAIL", "versions", "bun-bin", `${cfg.runtime.bunBin} does not exist`)
+        : check("WARN", "versions", "bun-bin", `${cfg.runtime.bunBin} unavailable; not used by client-macos binary installs`)
   );
-  checks.push(existsSync(cfg.runtime.bunBin) ? check("PASS", "versions", "bun-bin", cfg.runtime.bunBin) : check("FAIL", "versions", "bun-bin", `${cfg.runtime.bunBin} does not exist`));
   for (const name of ["git", "ssh", "tailscale"]) {
     checks.push(commandOk(name) ? check("PASS", "versions", name, commandVersion(name)) : check("FAIL", "versions", name, "missing", installHint(name)));
   }
@@ -4995,6 +5062,13 @@ function gitUpdateProbe(args: string[]): ReturnType<typeof run> {
   return run(["git", ...args], { cwd: PRODUCT_ROOT, check: false, timeoutMs: updateProbeTimeoutMs() });
 }
 
+function harnessVersionSummary(item: DoctorCheck): string {
+  if (item.detail.endsWith(" not found in PATH")) {
+    return "missing";
+  }
+  return item.detail.split(";")[0] || item.detail;
+}
+
 async function commandUpdates(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
   const branch = gitUpdateProbe(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.trim() || "unknown";
@@ -5006,12 +5080,12 @@ async function commandUpdates(args: ParsedArgs): Promise<void> {
   const aheadBehind = remoteRef
     ? gitUpdateProbe(["rev-list", "--left-right", "--count", `HEAD...${remoteRef}`]).stdout.trim()
     : "unknown";
-  const codex = commandOk("codex") ? commandVersion("codex") : "missing";
-  const claude = commandOk("claude") ? commandVersion("claude") : "missing";
   const compat = [
     harnessCompatibility("codex", "codex", { required: cfg.harness.name === "codex" }),
     harnessCompatibility("claude", "claude", { required: cfg.harness.name === "claude" })
   ];
+  const codex = harnessVersionSummary(compat[0]);
+  const claude = harnessVersionSummary(compat[1]);
   console.log(`brainstack_branch=${branch}`);
   console.log(`brainstack_head=${head}`);
   console.log(`origin_main=${origin || "unavailable"}`);

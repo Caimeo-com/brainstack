@@ -82,8 +82,11 @@ On a worker host, `brainctl init --profile worker` performs a real client bootst
 
 ```bash
 cd ~/brainstack
-BRAIN_IMPORT_TOKEN_FILE=~/brain-import-token.txt \
-  bun run packages/brainctl/src/main.ts init --profile worker --config ~/.config/brainstack/brainstack.yaml
+chmod 600 ~/brain-import-token.txt
+bun run packages/brainctl/src/main.ts init \
+  --profile worker \
+  --config ~/.config/brainstack/brainstack.yaml \
+  --import-token-file ~/brain-import-token.txt
 ```
 
 That clones the shared-brain repo to the configured client path, writes `~/.config/shared-brain.env` if missing, fills `BRAIN_IMPORT_TOKEN` only when provided and currently blank, and installs Codex/Claude/Cursor shared-brain guidance. It does not run local `braind`, does not run Telegram polling, and does not write an admin ingest token.

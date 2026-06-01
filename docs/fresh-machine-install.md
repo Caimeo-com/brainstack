@@ -20,6 +20,8 @@ export PATH="$HOME/.bun/bin:$PATH"
 
 Install and authenticate the selected harness, usually Codex or Claude, before running Brainstack provisioning. Brainstack only verifies the harness; it does not create harness accounts or permission-bypass settings.
 
+On a macOS client using a compiled `brainctl` binary, Bun and a Brainstack source checkout are not prerequisites. Install Git, SSH, Tailscale for the current tailnet workflow, and the selected harness, then use `docs/quickstart-client-macos.md`. Bun remains required for control, worker, and single-node machines because those profiles run Brainstack services from source.
+
 Do not reboot remote encrypted machines as part of setup. If a host uses disk encryption that needs a local unlock, keep all setup to service/package starts and user-level changes.
 
 ## Get Brainstack
@@ -30,7 +32,7 @@ cd ~/brainstack
 bun install --frozen-lockfile
 ```
 
-If using a compiled `brainctl` release later, this source checkout is still the clearest path for first installs because services and templates point at the product repo.
+For control, worker, and single-node installs this source checkout remains required because generated services point at the product repo. For macOS client-only installs, the compiled binary embeds the client bootstrap templates and can skip this section.
 
 ## Worker Install
 
@@ -51,8 +53,11 @@ Worker provisioning does not require passwordless sudo by default. Add `--requir
 Initialize the worker as a shared-brain client. If this machine should immediately push imports/proposals back to the brain, pass the import token without printing it:
 
 ```bash
-BRAIN_IMPORT_TOKEN_FILE=~/brain-import-token.txt \
-  bun run packages/brainctl/src/main.ts init --profile worker --config ~/.config/brainstack/brainstack.yaml
+chmod 600 ~/brain-import-token.txt
+bun run packages/brainctl/src/main.ts init \
+  --profile worker \
+  --config ~/.config/brainstack/brainstack.yaml \
+  --import-token-file ~/brain-import-token.txt
 ```
 
 Verify:

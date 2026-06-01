@@ -42,7 +42,7 @@ cd ~/brainstack
 bun build packages/brainctl/src/main.ts --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --outfile dist/brainctl
 ```
 
-The deterministic flags prevent the compiled binary from implicitly loading local `.env` or `bunfig.toml` files from the release machine.
+The deterministic flags prevent the compiled binary from implicitly loading local `.env` or `bunfig.toml` files from the release machine. The compiled CLI embeds the `packages/client-bootstrap` assets, so `client-macos` provisioning, doctor, init, and `bootstrap-client` can run from the binary without a Brainstack source checkout or Bun installed on that Mac. A binary client still needs Git, SSH, Tailscale for the current tailnet workflow, and the selected harness CLI. Control, worker, and single-node profiles still require Bun because generated services run the product source under Bun.
 
 Generated source-run services also invoke Bun with `--no-env-file` and load explicit `*.runtime.env` plus operator-owned `*.secrets.env` files. This keeps service behavior deterministic instead of depending on whichever `.env` happens to exist near the product repo.
 
