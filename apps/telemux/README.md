@@ -29,6 +29,8 @@ For a fresh-machine bootstrap, including passwordless sudo for the control user,
 - Context states: `active`, `pending`, `archived`, `error`.
 - `/newctx` is usually run once per reusable Telegram topic.
 - Plain text in a bound topic starts the configured harness if no session exists, otherwise resumes the stored topic session where supported.
+- Plain text is pre-dispatch routed first. Bare liveness/status/usage/latency questions are answered locally without starting the harness. Short informational questions can use a lightweight prompt wrapper. Attachments, scheduling, file/machine/code work, long messages, and ambiguous requests use the full durable-work wrapper.
+- `FACTORY_PRE_DISPATCH_CLASSIFIER=1` enables an optional cheap LLM classifier for ambiguous short plain-text messages. Keep `FACTORY_PRE_DISPATCH_CLASSIFIER_API_KEY` in a secrets env file. When enabled, ambiguous message text and minimal context metadata are sent to OpenAI's Responses API. The classifier is advisory; errors, low confidence, attachments, and risky work indicators fall back to the full work path. Use `/run` or `/resume` to force the full durable-work wrapper.
 - Resume dispatch acknowledgements are silent by default; the bot uses `typing` while work is active and posts the final result. Codex compaction events are reduced to a single `Compacting thread…` status line.
 - Telegram captions are treated as user text too, so captioned media messages can drive harness runs.
 - Inbound Telegram media is staged into `.factory/inbox/telegram/<message_id>/` inside the bound workspace before the run.

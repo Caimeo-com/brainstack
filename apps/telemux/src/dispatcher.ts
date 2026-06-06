@@ -25,6 +25,7 @@ import type { FactoryConfig } from "./config";
 import type { TelegramBot, TelegramTarget } from "./telegram";
 
 export type DispatchMode = "run" | "resume" | "loop";
+export type PromptProfile = "full" | "light";
 const MAX_QUEUED_CONTEXTS = 64;
 
 export interface DispatchResponse {
@@ -37,6 +38,7 @@ export interface DispatchOptions {
   notifyCompaction?: boolean;
   allowQueue?: boolean;
   rawPrompt?: boolean;
+  promptProfile?: PromptProfile;
   telegramInput?: TelegramInboundMessageInput | null;
   modelOverride?: string | null;
   reasoningEffortOverride?: ContextRecord["reasoningEffortOverride"];
@@ -143,7 +145,43 @@ function formatRunFailureForTelegram(errorText: string | null, logPath: string, 
   return message;
 }
 
-function buildPrompt(context: ContextRecord, mode: DispatchMode, instruction: string, telegramPromptSection: string | null = null): string {
+function buildLightPrompt(context: ContextRecord, mode: DispatchMode, instruction: string, telegramPromptSection: string | null = null): string {
+  const sections = [
+    `You are replying inside the Brainstack Telegram control plane for ${context.slug}.`,
+    `Machine: ${context.machine}.`,
+    `Kind: ${context.kind}.`,
+    `Transport: ${context.transport || "n/a"}.`,
+    `Target: ${context.target}.`,
+    `Root: ${context.rootPath}.`,
+    `Worktree: ${context.worktreePath}.`,
+    "Treat this as a lightweight informational turn.",
+    "You may perform read-only inspection when needed to answer, such as git status, git log, git diff --stat, and focused file reads.",
+    "Do not write files, install packages, run tests, make network calls, change system state, perform deployments, or update .factory files unless the user's message explicitly asks for work that requires those actions.",
+    "If the message actually needs edits, tests, scheduling, attachment delivery, deployment, or machine-operation work, say that it needs a full work turn instead of attempting a partial edit.",
+    `Do not create ${TELEGRAM_ATTACHMENTS_WORKSPACE_PATH} or ${CRON_REQUESTS_WORKSPACE_PATH} unless the user explicitly asked for a Telegram attachment or scheduled-job change.`,
+    `Control-plane mode: ${mode}.`,
+    "Instruction:",
+    instruction.trim()
+  ];
+
+  if (telegramPromptSection) {
+    sections.push(telegramPromptSection);
+  }
+
+  return sections.join("\n\n");
+}
+
+function buildPrompt(
+  context: ContextRecord,
+  mode: DispatchMode,
+  instruction: string,
+  telegramPromptSection: string | null = null,
+  profile: PromptProfile = "full"
+): string {
+  if (profile === "light") {
+    return buildLightPrompt(context, mode, instruction, telegramPromptSection);
+  }
+
   const autonomousNote =
     mode === "loop"
       ? "Keep working until you hit a genuine blocker or you reach a clean reviewable checkpoint."
@@ -527,7 +565,10 @@ export class Dispatcher {
         return "skipped";
       }
 
-      const prompt = options.rawPrompt ? instruction : buildPrompt(currentBeforeWorker, mode, instruction, preparedTelegramInput?.promptSection || null);
+      const promptProfile: PromptProfile = preparedTelegramInput ? "full" : options.promptProfile || "full";
+      const prompt = options.rawPrompt
+        ? instruction
+        : buildPrompt(currentBeforeWorker, mode, instruction, preparedTelegramInput?.promptSection || null, promptProfile);
       let compactionNotified = false;
       const rawModelOverride = options.modelOverride ?? currentBeforeWorker.modelOverride;
       const result = await this.workers.runCodex(currentBeforeWorker, prompt, mode, logPath, {

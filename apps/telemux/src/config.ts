@@ -5,6 +5,16 @@ export type WorkerTransport = "local" | "ssh" | "tailscale-ssh";
 export type HarnessName = "codex" | "claude";
 export type WorkerSshTrustMode = "pinned" | "accept-new";
 
+export interface PreDispatchClassifierConfig {
+  enabled: boolean;
+  apiKey: string;
+  model: string;
+  reasoningEffort: string | null;
+  timeoutMs: number;
+  maxChars: number;
+  confidenceThreshold: number;
+}
+
 export interface FactoryWorkerConfig {
   name: string;
   transport: WorkerTransport;
@@ -61,6 +71,7 @@ export interface FactoryConfig {
   allowAbsoluteArtifactPaths: boolean;
   textCoalesceMs: number;
   pendingTextRecoveryMaxAgeMs: number;
+  preDispatchClassifier: PreDispatchClassifierConfig;
 }
 
 export interface WorkerConfigInput {
@@ -99,6 +110,32 @@ function readOptionalNumber(env: NodeJS.ProcessEnv, name: string): number | null
 
   const value = Number(raw);
   return Number.isFinite(value) ? value : null;
+}
+
+function readBoolean(env: NodeJS.ProcessEnv, name: string, fallback = false): boolean {
+  const raw = env[name]?.trim().toLowerCase();
+  if (!raw) {
+    return fallback;
+  }
+
+  if (["1", "true", "yes", "on"].includes(raw)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(raw)) {
+    return false;
+  }
+
+  return fallback;
+}
+
+function readRatio(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name]?.trim();
+  if (!raw) {
+    return fallback;
+  }
+
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 && value <= 1 ? value : fallback;
 }
 
 function resolveMaybeRelative(projectRoot: string, value: string): string {
@@ -322,7 +359,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
     brainImportToken: env.BRAIN_IMPORT_TOKEN?.trim() || "",
     allowAbsoluteArtifactPaths: ["1", "true", "yes", "on"].includes((env.FACTORY_ALLOW_ABSOLUTE_ARTIFACT_PATHS || "").toLowerCase()),
     textCoalesceMs: readNumber(env, "FACTORY_TEXT_COALESCE_MS", 1500),
-    pendingTextRecoveryMaxAgeMs: readNumber(env, "FACTORY_TEXT_COALESCE_RECOVERY_MAX_AGE_MS", 5 * 60_000)
+    pendingTextRecoveryMaxAgeMs: readNumber(env, "FACTORY_TEXT_COALESCE_RECOVERY_MAX_AGE_MS", 5 * 60_000),
+    preDispatchClassifier: {
+      enabled: readBoolean(env, "FACTORY_PRE_DISPATCH_CLASSIFIER", false),
+      apiKey: env.FACTORY_PRE_DISPATCH_CLASSIFIER_API_KEY?.trim() || "",
+      model: env.FACTORY_PRE_DISPATCH_CLASSIFIER_MODEL?.trim() || "gpt-5.4-mini",
+      reasoningEffort: env.FACTORY_PRE_DISPATCH_CLASSIFIER_REASONING_EFFORT?.trim() || "minimal",
+      timeoutMs: readNumber(env, "FACTORY_PRE_DISPATCH_CLASSIFIER_TIMEOUT_MS", 800),
+      maxChars: readNumber(env, "FACTORY_PRE_DISPATCH_CLASSIFIER_MAX_CHARS", 600),
+      confidenceThreshold: readRatio(env, "FACTORY_PRE_DISPATCH_CLASSIFIER_CONFIDENCE", 0.75)
+    }
   };
 }
 

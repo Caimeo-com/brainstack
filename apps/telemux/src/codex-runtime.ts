@@ -62,3 +62,25 @@ export function formatCodexRuntimeOverrides(overrides: CodexRuntimeOverrides): s
     `effort=${overrides.reasoningEffortOverride || "default"}`
   ].join(" ");
 }
+
+export function codexModeName(overrides: CodexRuntimeOverrides): string {
+  const preset = Object.values(CODEX_MODE_PRESETS).find(
+    (candidate) =>
+      candidate.modelOverride === overrides.modelOverride &&
+      candidate.reasoningEffortOverride === overrides.reasoningEffortOverride
+  );
+
+  if (preset) {
+    return preset.name;
+  }
+
+  if (!overrides.modelOverride && !overrides.reasoningEffortOverride) {
+    return "default";
+  }
+
+  return "custom";
+}
+
+export function formatCodexModeSummary(overrides: CodexRuntimeOverrides): string {
+  return `${codexModeName(overrides)} (${formatCodexRuntimeOverrides(overrides)})`;
+}

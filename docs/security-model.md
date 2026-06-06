@@ -87,6 +87,8 @@ Telemux passes authorized Telegram-topic prompts and staged files to the configu
 
 Worker harness resolution is intentionally per-worker: context override, worker default, then global default. Remote workers resolve their harness binary through the worker's own `PATH` by default. This avoids accidentally executing a path discovered on the control host.
 
+Pre-dispatch routing reduces accidental harness execution for plain-text meta messages, but it is not a security boundary. Deterministic guards route attachments, file/code/machine work, scheduling, long messages, and ambiguous input to the full harness path. The optional LLM classifier is advisory and fail-open: low confidence, errors, timeouts, missing dedicated API key, or risky work indicators use the full work path. When enabled, it sends up to `FACTORY_PRE_DISPATCH_CLASSIFIER_MAX_CHARS` characters of the ambiguous message plus the context slug, kind, state, and machine name to OpenAI's Responses API; keep it disabled where those contents must not leave the host.
+
 Before enabling telemux on a control host, read [`operator-preflight.md`](./operator-preflight.md).
 
 ## Token Compromise Impact

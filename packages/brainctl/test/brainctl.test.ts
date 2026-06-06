@@ -2349,6 +2349,7 @@ describe("public release hygiene", () => {
       expect(scriptText).toContain("openssl dgst -sha256");
       expect(scriptText).toContain("BRAINSTACK_HANDOFF_LIVE_HOSTS");
       expect(scriptText).toContain("BRAINSTACK_HANDOFF_INCLUDE_SHARED_BRAIN");
+      expect(scriptText).toContain("--allow-dirty");
       expect(scriptText).toContain("find \"$bundle_dir\" -type l");
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -2357,6 +2358,145 @@ describe("public release hygiene", () => {
       }
     }
   });
+
+  test("handoff script times out stuck proof commands with visible progress", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainstack-handoff-timeout-"));
+    try {
+      const binDir = join(dir, "bin");
+      await mkdir(join(dir, "scripts"), { recursive: true });
+      await mkdir(binDir, { recursive: true });
+      await writeFile(join(dir, "scripts", "handoff.sh"), await readFile(join(PRODUCT_ROOT, "scripts", "handoff.sh"), "utf8"));
+      await chmod(join(dir, "scripts", "handoff.sh"), 0o755);
+      await writeFile(
+        join(binDir, "bun"),
+        [
+          "#!/usr/bin/env bash",
+          "set -eu",
+          "if [ \"${1:-}\" = run ]; then exec sleep 5; fi",
+          "if [ \"${1:-}\" = test ]; then exec sleep 5; fi",
+          "echo 'unexpected fake bun invocation' >&2",
+          "exit 1",
+          ""
+        ].join("\n")
+      );
+      await chmod(join(binDir, "bun"), 0o755);
+      expectSuccess(runCommand(["git", "init"], { cwd: dir }));
+      expectSuccess(runCommand(["git", "config", "user.email", "test@example.invalid"], { cwd: dir }));
+      expectSuccess(runCommand(["git", "config", "user.name", "Test"], { cwd: dir }));
+      expectSuccess(runCommand(["git", "add", "."], { cwd: dir }));
+      expectSuccess(runCommand(["git", "commit", "-m", "fixture"], { cwd: dir }));
+
+      const out = join(dir, "out");
+      await mkdir(out, { recursive: true });
+      const result = runCommand(["bash", "scripts/handoff.sh", "--out", out], {
+        cwd: dir,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`,
+          BRAINSTACK_HANDOFF_UTC: "20260525T000100Z",
+          BRAINSTACK_HANDOFF_STEP_TIMEOUT_SECONDS: "1",
+          BRAINSTACK_HANDOFF_PROGRESS_INTERVAL_SECONDS: "1"
+        }
+      });
+      expect(result.code).toBe(124);
+      expect(result.stderr).toContain("timeout after 1s: brainctl bootstrap-client custom path");
+      const proofOutput = await readFile(join(out, "handoff-20260525T000100Z", "command-outputs", "bootstrap-client-custom-path.txt"), "utf8");
+      expect(proofOutput).toContain("handoff command timed out after 1s");
+      expect(proofOutput).toContain("bootstrap-client");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("handoff script allow-dirty snapshots tracked and untracked worktree files", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainstack-handoff-dirty-fixture-"));
+    try {
+      const binDir = join(dir, "bin");
+      await mkdir(join(dir, "scripts"), { recursive: true });
+      await mkdir(join(dir, "docs"), { recursive: true });
+      await mkdir(join(dir, "packages", "client-bootstrap"), { recursive: true });
+      await mkdir(binDir, { recursive: true });
+      await writeFile(join(dir, "scripts", "handoff.sh"), await readFile(join(PRODUCT_ROOT, "scripts", "handoff.sh"), "utf8"));
+      await chmod(join(dir, "scripts", "handoff.sh"), 0o755);
+      await writeFile(
+        join(binDir, "bun"),
+        [
+          "#!/usr/bin/env bash",
+          "set -eu",
+          "if [ \"${1:-}\" = test ]; then echo '1 pass'; exit 0; fi",
+          "if [ \"${1:-}\" = --version ]; then echo 'Bun fake'; exit 0; fi",
+          "case \" $* \" in *brainctl*'handoff cross-brain blocked example'*) echo 'without --confirm-cross-brain' >&2; exit 1 ;; esac",
+          "if [ \"${1:-}\" = run ]; then",
+          "  shift",
+          "  case \"${1:-}\" in",
+          "    build:brainctl) echo 'build ok'; exit 0 ;;",
+          "    *.ts) echo 'server fake'; sleep 0.05; exit 0 ;;",
+          "    *brainctl*) echo \"brainctl fake $*\"; exit 0 ;;",
+          "  esac",
+          "fi",
+          "echo \"bun fake $*\"",
+          ""
+        ].join("\n")
+      );
+      await chmod(join(binDir, "bun"), 0o755);
+      await writeFile(join(binDir, "curl"), "#!/usr/bin/env bash\ncase \" $* \" in *127.0.0.1:*'/health'*) exit 0 ;; *) exit 22 ;; esac\n");
+      await chmod(join(binDir, "curl"), 0o755);
+      await writeFile(join(dir, "package.json"), "{\"scripts\":{\"build:brainctl\":\"echo build\"}}\n");
+      await writeFile(join(dir, "README.md"), "Clean README\n");
+      await writeFile(join(dir, "docs", "security-postures.md"), "It defaults to a trusted private mesh, does not require read tokens, and says: Do not expose trusted-tailnet mode to the public internet.\n");
+      await writeFile(join(dir, "docs", "tailscale-exposure.md"), "Use brainctl expose tailscale with tailscale serve.\n");
+      await writeFile(join(dir, "docs", "multi-brain.md"), "project config uses .brainstack.yaml and profiles.yaml. Repo-local URLs, remotes, token environment names, and local clone paths require user trust and may be pending-trust. Sections are not hard security boundaries; they are retrieval boundaries.\n");
+      await writeFile(join(dir, "docs", "outbox-security.md"), "Outbox payloads are sensitive plaintext by default. No queued payload is silently truncated. Future server-sealed mode is documented.\n");
+      await writeFile(join(dir, "docs", "diagrams.md"), "```mermaid\ngraph TD\nA-->B\n```\n");
+      await writeFile(join(dir, "packages", "client-bootstrap", "claude-user-CLAUDE.md"), "Use brainctl search --repo . and brainctl remember --repo .\n");
+      expectSuccess(runCommand(["git", "init"], { cwd: dir }));
+      expectSuccess(runCommand(["git", "config", "user.email", "test@example.invalid"], { cwd: dir }));
+      expectSuccess(runCommand(["git", "config", "user.name", "Test"], { cwd: dir }));
+      expectSuccess(runCommand(["git", "add", "."], { cwd: dir }));
+      expectSuccess(runCommand(["git", "commit", "-m", "fixture"], { cwd: dir }));
+
+      await writeFile(join(dir, "README.md"), "Dirty README\nBrainstack runs on trusted private networks.\n");
+      await writeFile(join(dir, "docs", "extra-proof.md"), "Untracked proof file\n");
+
+      const refused = runCommand(["bash", "scripts/handoff.sh", "--out", join(dir, "refused-out")], {
+        cwd: dir,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`,
+          BRAINSTACK_HANDOFF_UTC: "20260525T000200Z"
+        }
+      });
+      expect(refused.code).not.toBe(0);
+      expect(refused.stderr).toContain("git tree is dirty");
+      expect(refused.stderr).toContain("--allow-dirty");
+
+      const out = join(dir, "out");
+      await mkdir(out, { recursive: true });
+      const allowed = runCommand(["bash", "scripts/handoff.sh", "--allow-dirty", "--out", out], {
+        cwd: dir,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`,
+          BRAINSTACK_HANDOFF_UTC: "20260525T000201Z"
+        }
+      });
+      expectSuccess(allowed);
+      const zipPath = join(out, "handoff-20260525T000201Z.zip");
+      const readme = runCommand(["unzip", "-p", zipPath, "handoff-20260525T000201Z/source/README.md"]);
+      expectSuccess(readme);
+      expect(readme.stdout).toContain("Dirty README");
+      const untracked = runCommand(["unzip", "-p", zipPath, "handoff-20260525T000201Z/source/docs/extra-proof.md"]);
+      expectSuccess(untracked);
+      expect(untracked.stdout).toBe("Untracked proof file\n");
+      const manifest = runCommand(["unzip", "-p", zipPath, "handoff-20260525T000201Z/MANIFEST.txt"]);
+      expectSuccess(manifest);
+      expect(manifest.stdout).toContain("Allow dirty tree: yes");
+      expect(manifest.stdout).toContain("Dirty tree included: yes");
+      expect(manifest.stdout).toContain("working-tree snapshot");
+      const changes = runCommand(["unzip", "-p", zipPath, "handoff-20260525T000201Z/CHANGES.txt"]);
+      expectSuccess(changes);
+      expect(changes.stdout).toContain("Dirty Working Tree");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test("handoff script scans tracked hidden files for token-shaped secrets before zipping", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainstack-handoff-secret-fixture-"));
@@ -2403,6 +2543,19 @@ describe("public release hygiene", () => {
         ].join("\n")
       );
       await chmod(join(binDir, "bun"), 0o755);
+      await writeFile(
+        join(binDir, "curl"),
+        [
+          "#!/usr/bin/env bash",
+          "set -eu",
+          "case \" $* \" in",
+          "  *127.0.0.1:*'/health'*) exit 0 ;;",
+          "  *) exit 22 ;;",
+          "esac",
+          ""
+        ].join("\n")
+      );
+      await chmod(join(binDir, "curl"), 0o755);
       await writeFile(join(dir, "package.json"), "{\"scripts\":{\"build:brainctl\":\"echo build\"}}\n");
       await writeFile(join(dir, "README.md"), "Brainstack runs on trusted private networks.\n");
       await writeFile(join(dir, "docs", "security-postures.md"), "It defaults to a trusted private mesh, does not require read tokens, and says: Do not expose trusted-tailnet mode to the public internet.\n");
@@ -2933,6 +3086,12 @@ describe("public release hygiene", () => {
       expect(runtimeEnv).toContain("PATH=/home/operator/.local/bin:");
       expect(runtimeEnv).toContain("BRAINSTACK_WORKER_PATH=/home/operator/.local/bin:");
       expect(runtimeEnv).toContain("/home/operator/.bun/bin");
+      expect(runtimeEnv).toContain("FACTORY_TEXT_COALESCE_RECOVERY_MAX_AGE_MS=300000");
+      expect(runtimeEnv).toContain("FACTORY_PRE_DISPATCH_CLASSIFIER=0");
+      expect(runtimeEnv).toContain("FACTORY_PRE_DISPATCH_CLASSIFIER_REASONING_EFFORT=minimal");
+      expect(runtimeEnv).toContain("FACTORY_PRE_DISPATCH_CLASSIFIER_TIMEOUT_MS=800");
+      const secretsEnv = await readFile(join(out, "env", "telemux.secrets.env.example"), "utf8");
+      expect(secretsEnv).toContain("FACTORY_PRE_DISPATCH_CLASSIFIER_API_KEY=");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -5086,8 +5245,10 @@ describe("public release hygiene", () => {
       expect(harnessTimeout.stdout).toContain("codex=timed out after 100ms");
       expect(harnessTimeout.stdout).toContain("FAIL codex-harness: timed out after 100ms; CLI compatibility probe timed out");
 
+      const partialBinDir = join(dir, "partial-bin");
+      await mkdir(partialBinDir, { recursive: true });
       await writeFile(
-        join(binDir, "codex"),
+        join(partialBinDir, "codex"),
         [
           "#!/usr/bin/env sh",
           "if [ \"${1:-}\" = \"--version\" ]; then printf 'codex-cli partial\\n'; exit 0; fi",
@@ -5096,9 +5257,9 @@ describe("public release hygiene", () => {
           ""
         ].join("\n")
       );
-      await chmod(join(binDir, "codex"), 0o755);
+      await chmod(join(partialBinDir, "codex"), 0o755);
       const partialHelpTimeout = runBrainctl(["updates", "--config", configPath], {
-        PATH: `${binDir}:${process.env.PATH || ""}`,
+        PATH: `${partialBinDir}:${binDir}:${process.env.PATH || ""}`,
         BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1",
         BRAINSTACK_UPDATE_PROBE_COMMANDS: "none",
         BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS: "1000"

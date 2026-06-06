@@ -2,24 +2,33 @@ import { deliverAttachmentRequests, formatAttachmentDeliveryIssues } from "./att
 import { randomUUID } from "node:crypto";
 import {
   CODEX_MODE_PRESETS,
+  formatCodexModeSummary,
   formatCodexRuntimeOverrides,
   normalizeCodexModelOverride,
   parseCodexModePreset,
   parseCodexReasoningEffort
 } from "./codex-runtime";
+import { formatControlMetaResponse, resolveControlMetaKind } from "./control-meta";
 import { CronManager } from "./cron-manager";
 import { ContextRecord, FactoryDb, type PendingTextRecord } from "./db";
 import { ContextService, nextRecommendedAction, normalizeSlug } from "./contexts";
 import { Dispatcher } from "./dispatcher";
 import { CronJobDraft, CronJobRecord, CronSchedule, normalizeCronSchedule, scheduleSummary } from "./cron-jobs";
 import { CronScheduler } from "./cron-scheduler";
+import { classifyPreDispatch } from "./pre-dispatch-router";
 import {
   parseArtifactEntries,
   removeArtifactEntriesFromMarkdown,
   selectArtifactEntries,
   type ArtifactEntry
 } from "./telegram-attachments";
-import { extractTelegramInput, filterPhaseOneTelegramInput, isAudioOnlyTelegramInput, telegramMessageText } from "./telegram-inputs";
+import {
+  extractTelegramInput,
+  filterPhaseOneTelegramInput,
+  isAudioOnlyTelegramInput,
+  telegramMessageText,
+  type TelegramInboundMessageInput
+} from "./telegram-inputs";
 import {
   builtinRoutineCommandToken,
   builtinRoutineDraft,
@@ -191,6 +200,10 @@ interface ArtifactShortcutSnapshot {
   createdAt: number;
 }
 
+interface PlainTextHandlingResult {
+  accepted: boolean;
+}
+
 const CRON_SHORTCUT_TTL_MS = 15 * 60 * 1000;
 const CRON_SHORTCUT_MAX_SNAPSHOTS = 50;
 const ARTIFACT_SHORTCUT_TTL_MS = 15 * 60 * 1000;
@@ -203,29 +216,8 @@ function audioNotSupportedText(): string {
   return "Audio and voice Telegram messages are not forwarded to Codex yet. Phase 2 will transcribe them first.";
 }
 
-function codexModeName(context: ContextRecord): string {
-  const preset = Object.values(CODEX_MODE_PRESETS).find(
-    (candidate) =>
-      candidate.modelOverride === context.modelOverride &&
-      candidate.reasoningEffortOverride === context.reasoningEffortOverride
-  );
-
-  if (preset) {
-    return preset.name;
-  }
-
-  if (!context.modelOverride && !context.reasoningEffortOverride) {
-    return "default";
-  }
-
-  return "custom";
-}
-
 function codexModeSummary(context: ContextRecord): string {
-  return `${codexModeName(context)} (${formatCodexRuntimeOverrides({
-    modelOverride: context.modelOverride,
-    reasoningEffortOverride: context.reasoningEffortOverride
-  })})`;
+  return formatCodexModeSummary(context);
 }
 
 interface ParsedScheduleArgs {
@@ -461,17 +453,7 @@ export class CommandHandler {
           return;
         }
 
-        if (!hasAttachments && (await this.maybeSendArtifactsFromPlainText(boundContext, text, target))) {
-          return;
-        }
-
-        const response = await this.dispatcher.dispatch("resume", boundContext, text, target, {
-          telegramInput,
-          userId: message.from?.id ?? null
-        });
-        if (response.message) {
-          await this.telegram.sendText(target, response.message);
-        }
+        await this.handleBoundPlainText(boundContext, text, target, telegramInput, message.from?.id ?? null);
         return;
       }
 
@@ -1513,16 +1495,9 @@ export class CommandHandler {
     if (pending.parts.length > 1) {
       console.log(`coalesced ${pending.parts.length} Telegram text messages for ${context.slug}`);
     }
-    if (await this.maybeSendArtifactsFromPlainText(context, prompt, pending.target)) {
-      this.db.deletePendingTextIfGenerationMatch(key, flushedGenerationId);
-      return;
-    }
     try {
-      const response = await this.dispatcher.dispatch("resume", context, prompt, pending.target, {
-        telegramInput: null,
-        userId: pending.userId
-      });
-      if (response.accepted) {
+      const result = await this.handleBoundPlainText(context, prompt, pending.target, null, pending.userId);
+      if (result.accepted) {
         this.db.deletePendingTextIfGenerationMatch(key, flushedGenerationId);
       } else {
         const restoreStatus = this.restorePendingTextForRetry(pending, flushedPartsJson);
@@ -1533,13 +1508,76 @@ export class CommandHandler {
           );
         }
       }
-      if (response.message) {
-        await this.telegram.sendText(pending.target, response.message);
-      }
     } catch (error) {
       const restoreStatus = this.restorePendingTextForRetry(pending, flushedPartsJson);
       await this.reportPendingTextFlushError(pending.target, error, restoreStatus === "restored");
     }
+  }
+
+  private async handleBoundPlainText(
+    context: ContextRecord,
+    text: string,
+    target: TelegramTarget,
+    telegramInput: TelegramInboundMessageInput | null,
+    userId: number | null
+  ): Promise<PlainTextHandlingResult> {
+    const hasAttachments = Boolean(telegramInput?.attachments.length);
+
+    if (!hasAttachments && (await this.maybeSendArtifactsFromPlainText(context, text, target))) {
+      return { accepted: true };
+    }
+
+    const freshContext = this.db.getContextBySlug(context.slug) || context;
+    const preDispatch = await classifyPreDispatch({
+      text,
+      context: freshContext,
+      hasAttachments,
+      classifier: this.config.preDispatchClassifier
+    });
+    this.logPreDispatchRoute(freshContext, preDispatch);
+
+    if (preDispatch.route === "control_meta") {
+      const controlKind = resolveControlMetaKind(preDispatch);
+      await this.telegram.sendText(
+        target,
+        await formatControlMetaResponse({
+          context: freshContext,
+          classification: preDispatch,
+          busy: this.dispatcher.isActive(freshContext.slug),
+          runtime: controlKind === "liveness" ? this.workers.describeWorkerRuntime(freshContext.machine, freshContext) : null,
+          contextStatus: controlKind === "status" ? this.formatContextStatus(freshContext) : ""
+        })
+      );
+      return { accepted: true };
+    }
+
+    const promptProfile = preDispatch.route === "light_harness" ? "light" : "full";
+    const response = await this.dispatcher.dispatch("resume", freshContext, text, target, {
+      telegramInput,
+      userId,
+      promptProfile,
+      sourceLabel: promptProfile === "light" ? "pre-dispatch light" : null
+    });
+    if (response.message) {
+      await this.telegram.sendText(target, response.message);
+    }
+
+    return { accepted: response.accepted };
+  }
+
+  private logPreDispatchRoute(context: ContextRecord, classification: Awaited<ReturnType<typeof classifyPreDispatch>>): void {
+    const safeReason = classification.source === "llm" ? "llm-classifier" : classification.reason;
+    console.log(
+      [
+        "pre-dispatch route",
+        `context=${context.slug}`,
+        `route=${classification.route}`,
+        `kind=${classification.controlKind || "n/a"}`,
+        `source=${classification.source}`,
+        `confidence=${classification.confidence.toFixed(2)}`,
+        `reason=${safeReason.replace(/\s+/g, "-")}`
+      ].join(" ")
+    );
   }
 
   private async reportPendingTextFlushError(target: TelegramTarget, error: unknown, restored = true): Promise<void> {

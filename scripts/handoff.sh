@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/handoff.sh [--mode review|forensic] [--out DIR] [--base COMMIT] [--notes FILE]
+  scripts/handoff.sh [--mode review|forensic] [--out DIR] [--base COMMIT] [--notes FILE] [--allow-dirty] [--full-test|--no-full-test]
 
 Defaults:
   --mode review
@@ -15,15 +15,270 @@ Environment:
   BRAINSTACK_HANDOFF_UTC=YYYYMMDDTHHMMSSZ  Override bundle timestamp.
   BRAINSTACK_HANDOFF_LIVE_HOSTS="host1 host2"  In forensic mode only, collect opt-in live SSH/Tailscale checks.
   BRAINSTACK_HANDOFF_PRIVATE_SUBSTITUTIONS_FILE=PATH  Optional gitignored literal substitutions file with "private=replacement" lines.
+  BRAINSTACK_HANDOFF_STEP_TIMEOUT_SECONDS=300  Per-command timeout for normal proof steps.
+  BRAINSTACK_HANDOFF_TEST_TIMEOUT_SECONDS=1200  Timeout for the full test suite step.
+  BRAINSTACK_HANDOFF_FOCUSED_TEST_TIMEOUT_SECONDS=240  Timeout for focused proof tests.
+  BRAINSTACK_HANDOFF_PROGRESS_INTERVAL_SECONDS=30  How often to print still-running status.
+  BRAINSTACK_HANDOFF_FULL_TEST=0|1  Override full-suite execution. Defaults to review=0, forensic=1.
 
 The bundle is for review/audit handoff only. It is not a release artifact.
 USAGE
+}
+
+log() {
+  printf '[handoff] %s\n' "$*" >&2
+}
+
+die() {
+  echo "handoff refused: $*" >&2
+  exit 1
+}
+
+cleanup_paths=()
+cleanup_pids=()
+
+register_cleanup_path() {
+  cleanup_paths+=("$1")
+}
+
+register_cleanup_pid() {
+  cleanup_pids+=("$1")
+}
+
+remove_cleanup_pid() {
+  local target="$1"
+  local pid
+  local next_pids=()
+  for pid in "${cleanup_pids[@]:-}"; do
+    if [ "$pid" != "$target" ]; then
+      next_pids+=("$pid")
+    fi
+  done
+  if [ "${#next_pids[@]}" -eq 0 ]; then
+    cleanup_pids=()
+  else
+    cleanup_pids=("${next_pids[@]}")
+  fi
+}
+
+cleanup() {
+  local status=$?
+  local pid
+  local path_to_clean
+  trap - EXIT INT TERM
+  for pid in "${cleanup_pids[@]:-}"; do
+    if [ -n "$pid" ]; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+  for path_to_clean in "${cleanup_paths[@]:-}"; do
+    if [ -n "$path_to_clean" ]; then
+      rm -rf "$path_to_clean"
+    fi
+  done
+  exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+require_uint() {
+  local name="$1"
+  local value="$2"
+  case "$value" in
+    ""|*[!0-9]*)
+      echo "handoff refused: $name must be a non-negative integer" >&2
+      exit 2
+      ;;
+  esac
+}
+
+HANDOFF_STEP_TIMEOUT_SECONDS="${BRAINSTACK_HANDOFF_STEP_TIMEOUT_SECONDS:-300}"
+HANDOFF_TEST_TIMEOUT_SECONDS="${BRAINSTACK_HANDOFF_TEST_TIMEOUT_SECONDS:-1200}"
+HANDOFF_FOCUSED_TEST_TIMEOUT_SECONDS="${BRAINSTACK_HANDOFF_FOCUSED_TEST_TIMEOUT_SECONDS:-240}"
+HANDOFF_PROGRESS_INTERVAL_SECONDS="${BRAINSTACK_HANDOFF_PROGRESS_INTERVAL_SECONDS:-30}"
+require_uint BRAINSTACK_HANDOFF_STEP_TIMEOUT_SECONDS "$HANDOFF_STEP_TIMEOUT_SECONDS"
+require_uint BRAINSTACK_HANDOFF_TEST_TIMEOUT_SECONDS "$HANDOFF_TEST_TIMEOUT_SECONDS"
+require_uint BRAINSTACK_HANDOFF_FOCUSED_TEST_TIMEOUT_SECONDS "$HANDOFF_FOCUSED_TEST_TIMEOUT_SECONDS"
+require_uint BRAINSTACK_HANDOFF_PROGRESS_INTERVAL_SECONDS "$HANDOFF_PROGRESS_INTERVAL_SECONDS"
+
+quote_command() {
+  printf '%q' "$1"
+  shift
+  while [ "$#" -gt 0 ]; do
+    printf ' %q' "$1"
+    shift
+  done
+}
+
+run_capture() {
+  local label="$1"
+  local output_file="$2"
+  local timeout_seconds="$3"
+  shift 3
+  local output_dir
+  local start_seconds
+  local next_notice
+  local pid
+  local status
+  local elapsed
+  local had_errexit=0
+
+  case "$-" in
+    *e*) had_errexit=1 ;;
+  esac
+
+  output_dir="$(dirname "$output_file")"
+  mkdir -p "$output_dir"
+  : > "$output_file"
+  log "start: $label"
+  start_seconds=$SECONDS
+  next_notice=$((start_seconds + HANDOFF_PROGRESS_INTERVAL_SECONDS))
+
+  "$@" > "$output_file" 2>&1 &
+  pid=$!
+  register_cleanup_pid "$pid"
+
+  while kill -0 "$pid" 2>/dev/null; do
+    elapsed=$((SECONDS - start_seconds))
+    if [ "$timeout_seconds" -gt 0 ] && [ "$elapsed" -ge "$timeout_seconds" ]; then
+      {
+        echo
+        echo "handoff command timed out after ${timeout_seconds}s: $label"
+        printf 'command: '
+        quote_command "$@"
+        echo
+      } >> "$output_file"
+      log "timeout after ${timeout_seconds}s: $label"
+      kill "$pid" 2>/dev/null || true
+      sleep 2
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+      set +e
+      wait "$pid" 2>/dev/null
+      if [ "$had_errexit" -eq 1 ]; then
+        set -e
+      else
+        set +e
+      fi
+      remove_cleanup_pid "$pid"
+      return 124
+    fi
+    if [ "$HANDOFF_PROGRESS_INTERVAL_SECONDS" -gt 0 ] && [ "$SECONDS" -ge "$next_notice" ]; then
+      log "still running (${elapsed}s): $label"
+      next_notice=$((SECONDS + HANDOFF_PROGRESS_INTERVAL_SECONDS))
+    fi
+    sleep 0.05
+  done
+
+  set +e
+  wait "$pid"
+  status=$?
+  if [ "$had_errexit" -eq 1 ]; then
+    set -e
+  else
+    set +e
+  fi
+  remove_cleanup_pid "$pid"
+  elapsed=$((SECONDS - start_seconds))
+  if [ "$status" -ne 0 ]; then
+    if [ "${HANDOFF_RUN_CAPTURE_ALLOW_FAILURE:-0}" = "1" ]; then
+      log "done after ${elapsed}s with expected non-zero exit $status: $label"
+      return "$status"
+    fi
+    log "failed after ${elapsed}s: $label (exit $status)"
+    tail -40 "$output_file" >&2 || true
+    return "$status"
+  fi
+  log "done after ${elapsed}s: $label"
+}
+
+run_optional_capture() {
+  local label="$1"
+  local output_file="$2"
+  local timeout_seconds="$3"
+  local status
+  shift 3
+  set +e
+  HANDOFF_RUN_CAPTURE_ALLOW_FAILURE=1 run_capture "$label" "$output_file" "$timeout_seconds" "$@"
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    printf '\noptional command exited %s; retained for evidence only.\n' "$status" >> "$output_file"
+  fi
+  return 0
+}
+
+run_focused_test() {
+  local label="$1"
+  local output_name="$2"
+  local test_file="$3"
+  local test_name="$4"
+  run_capture "$label" "$bundle_dir/command-outputs/$output_name" "$HANDOFF_FOCUSED_TEST_TIMEOUT_SECONDS" \
+    bun test "$test_file" -t "$test_name"
+}
+
+validate_repo_relative_path() {
+  local rel="$1"
+  case "$rel" in
+    ""|/*|../*|*/../*|*/..|.|./*)
+      echo "handoff refused: unsafe repo-relative path in dirty snapshot: $rel" >&2
+      exit 1
+      ;;
+  esac
+}
+
+remove_source_path() {
+  local rel="$1"
+  validate_repo_relative_path "$rel"
+  rm -rf "$bundle_dir/source/$rel"
+}
+
+overlay_source_path() {
+  local rel="$1"
+  local target
+  validate_repo_relative_path "$rel"
+  target="$bundle_dir/source/$rel"
+  if [ -L "$rel" ]; then
+    echo "handoff refused: dirty snapshot path is a symlink: $rel" >&2
+    exit 1
+  fi
+  if [ ! -e "$rel" ]; then
+    rm -rf "$target"
+    return 0
+  fi
+  if [ ! -f "$rel" ]; then
+    echo "handoff refused: dirty snapshot path is not a regular file: $rel" >&2
+    exit 1
+  fi
+  rm -rf "$target"
+  mkdir -p "$(dirname "$target")"
+  cp -p "$rel" "$target"
+}
+
+collect_dirty_overlay_paths() {
+  local output_file="$1"
+  : > "$output_file"
+  git diff --name-only -z --diff-filter=ACMRT HEAD -- >> "$output_file"
+  git ls-files -z --others --exclude-standard >> "$output_file"
+}
+
+apply_dirty_worktree_snapshot() {
+  local overlay_paths_file="$1"
+  local rel
+  while IFS= read -r -d '' rel; do
+    remove_source_path "$rel"
+  done < <(git diff --name-only -z --diff-filter=D HEAD --)
+  while IFS= read -r -d '' rel; do
+    overlay_source_path "$rel"
+  done < "$overlay_paths_file"
 }
 
 mode="review"
 out_dir="${TMPDIR:-/tmp}"
 base_ref=""
 notes_file=""
+full_test="${BRAINSTACK_HANDOFF_FULL_TEST:-}"
+allow_dirty="0"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -43,6 +298,18 @@ while [ "$#" -gt 0 ]; do
       notes_file="${2:-}"
       shift 2
       ;;
+    --allow-dirty)
+      allow_dirty="1"
+      shift
+      ;;
+    --full-test)
+      full_test="1"
+      shift
+      ;;
+    --no-full-test)
+      full_test="0"
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -59,6 +326,17 @@ if [ "$mode" != "review" ] && [ "$mode" != "forensic" ]; then
   echo "invalid mode: $mode" >&2
   exit 2
 fi
+if [ -z "$full_test" ]; then
+  if [ "$mode" = "forensic" ]; then
+    full_test="1"
+  else
+    full_test="0"
+  fi
+fi
+if [ "$full_test" != "0" ] && [ "$full_test" != "1" ]; then
+  echo "invalid BRAINSTACK_HANDOFF_FULL_TEST value: $full_test" >&2
+  exit 2
+fi
 
 if [ -n "$notes_file" ] && [ ! -f "$notes_file" ]; then
   echo "handoff refused: notes file not found: $notes_file" >&2
@@ -68,10 +346,15 @@ fi
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-if [ -n "$(git status --porcelain)" ]; then
+dirty_status="$(git status --porcelain)"
+if [ -n "$dirty_status" ] && [ "$allow_dirty" != "1" ]; then
   echo "handoff refused: git tree is dirty" >&2
   git status --short >&2
+  echo "Use --allow-dirty to include tracked working-tree changes and untracked non-ignored files in source/." >&2
   exit 1
+fi
+if [ -n "$dirty_status" ]; then
+  log "dirty tree accepted by --allow-dirty; source/ will be a working-tree snapshot"
 fi
 
 if ! command -v bun >/dev/null 2>&1; then
@@ -84,6 +367,10 @@ if ! command -v rg >/dev/null 2>&1; then
 fi
 if ! command -v zip >/dev/null 2>&1; then
   echo "handoff refused: zip is required" >&2
+  exit 1
+fi
+if ! command -v curl >/dev/null 2>&1; then
+  echo "handoff refused: curl is required for local HTTP smoke checks" >&2
   exit 1
 fi
 
@@ -106,8 +393,16 @@ case "$zip_path" in
   *) echo "handoff refused: zip path escaped output directory" >&2; exit 1 ;;
 esac
 
+dirty_overlay_paths_file=""
+if [ "$allow_dirty" = "1" ] && [ -n "$dirty_status" ]; then
+  dirty_overlay_paths_file="$(mktemp "${TMPDIR:-/tmp}/brainstack-handoff-dirty-paths.XXXXXX")"
+  register_cleanup_path "$dirty_overlay_paths_file"
+  collect_dirty_overlay_paths "$dirty_overlay_paths_file"
+fi
+
 rm -rf "$bundle_dir" "$zip_path" "${zip_path}.sha256"
 mkdir -p "$bundle_dir"/{source,generated,command-outputs,service-state,shared-brain}
+log "writing bundle workspace: $bundle_dir"
 
 product_head="$(git rev-parse HEAD)"
 if [ -n "$base_ref" ]; then
@@ -133,8 +428,13 @@ if [ "$mode" = "forensic" ] && [ -n "$handoff_factory_root" ] && [ -d "$handoff_
   factory_head="$(git -C "$handoff_factory_root" rev-parse HEAD)"
 fi
 
-# Exactly one source representation: source/ as a git archive at HEAD.
+# Exactly one source representation: source/.
 git archive --format=tar HEAD | tar -C "$bundle_dir/source" -xf -
+source_tree_note="source/ contains tracked HEAD after handoff path/private-literal sanitization; Product HEAD is the canonical source identity."
+if [ "$allow_dirty" = "1" ] && [ -n "$dirty_status" ]; then
+  apply_dirty_worktree_snapshot "$dirty_overlay_paths_file"
+  source_tree_note="source/ contains a working-tree snapshot: tracked HEAD overlaid with tracked local changes and untracked non-ignored files, after handoff path/private-literal sanitization. Product HEAD is only the base commit identity."
+fi
 
 {
   echo "# brainstack handoff changes"
@@ -150,6 +450,21 @@ git archive --format=tar HEAD | tar -C "$bundle_dir/source" -xf -
     git diff --stat "${base_commit}..${product_head}"
   else
     echo "No base commit is available. This appears to be an initial commit handoff."
+  fi
+  if [ -n "$dirty_status" ]; then
+    echo
+    echo "## Dirty Working Tree"
+    if [ "$allow_dirty" = "1" ]; then
+      echo "--allow-dirty was set. The source/ tree includes tracked local changes and untracked non-ignored files."
+    else
+      echo "Dirty tree was detected but not included."
+    fi
+    echo
+    echo "## Dirty Status"
+    printf '%s\n' "$dirty_status"
+    echo
+    echo "## Dirty Diff Stat"
+    git diff --stat HEAD -- || true
   fi
 } > "$bundle_dir/CHANGES.txt"
 
@@ -169,11 +484,11 @@ brain:
   publicBaseUrl: https://brain-control.example.ts.net
 YAML
 
-bun run packages/brainctl/src/main.ts bootstrap-client \
+run_capture "brainctl bootstrap-client custom path" "$bundle_dir/command-outputs/bootstrap-client-custom-path.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" \
+  bun run packages/brainctl/src/main.ts bootstrap-client \
   --profile client-macos \
   --config "$custom_config" \
-  --out "$bundle_dir/generated/client-bootstrap-custom-path" \
-  > "$bundle_dir/command-outputs/bootstrap-client-custom-path.txt" 2>&1
+  --out "$bundle_dir/generated/client-bootstrap-custom-path"
 
 state_config="$bundle_dir/generated/custom-state-control.yaml"
 cat > "$state_config" <<'YAML'
@@ -195,13 +510,14 @@ telemux:
   enabled: false
 YAML
 
-bun run packages/brainctl/src/main.ts join-worker \
+run_capture "brainctl join-worker custom state root" "$bundle_dir/generated/join-worker-custom-state.md" "$HANDOFF_STEP_TIMEOUT_SECONDS" \
+  bun run packages/brainctl/src/main.ts join-worker \
   --config "$state_config" \
-  --worker brain-worker \
-  > "$bundle_dir/generated/join-worker-custom-state.md" 2>&1
+  --worker brain-worker
 
 provision_config="$bundle_dir/generated/provision-client-macos.yaml"
-env USER=operator HOME=/home/operator bun run packages/brainctl/src/main.ts provision \
+run_capture "brainctl provision client-macos" "$bundle_dir/command-outputs/provision-client-macos.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" \
+  env USER=operator HOME=/home/operator bun run packages/brainctl/src/main.ts provision \
   --profile client-macos \
   --out "$provision_config" \
   --root "$bundle_dir/generated/provision-root" \
@@ -210,92 +526,69 @@ env USER=operator HOME=/home/operator bun run packages/brainctl/src/main.ts prov
   --hostname client-laptop \
   --brain-base-url https://brain-control.example.ts.net \
   --brain-remote operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git \
-  --skip-harness-sudo-test \
-  > "$bundle_dir/command-outputs/provision-client-macos.txt" 2>&1
+  --skip-harness-sudo-test
 
-bun run packages/brainctl/src/main.ts destroy \
+run_capture "brainctl destroy dry-run client-macos" "$bundle_dir/command-outputs/destroy-client-macos-dry-run.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" \
+  bun run packages/brainctl/src/main.ts destroy \
   --config "$provision_config" \
   --profile client-macos \
-  --dry-run \
-  > "$bundle_dir/command-outputs/destroy-client-macos-dry-run.txt" 2>&1
+  --dry-run
 
-bun run packages/brainctl/src/main.ts expose tailscale \
+run_capture "brainctl expose tailscale dry-run" "$bundle_dir/command-outputs/expose-tailscale-dry-run.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" \
+  bun run packages/brainctl/src/main.ts expose tailscale \
   --config "$state_config" \
-  --dry-run \
-  > "$bundle_dir/command-outputs/expose-tailscale-dry-run.txt" 2>&1
+  --dry-run
 
 {
   echo "product_head=$product_head"
   echo "base_commit=${base_commit:-none}"
   echo "mode=$mode"
+  echo "allow_dirty=$allow_dirty"
+  echo "dirty_tree=$([ -n "$dirty_status" ] && echo yes || echo no)"
   git status --short
 } > "$bundle_dir/command-outputs/git-status.txt"
 
-bun test > "$bundle_dir/command-outputs/bun-test.txt" 2>&1
+if [ "$full_test" = "1" ]; then
+  run_capture "bun test full suite" "$bundle_dir/command-outputs/bun-test.txt" "$HANDOFF_TEST_TIMEOUT_SECONDS" bun test
+else
+  log "skip: bun test full suite (review mode; use --full-test or --mode forensic to include it)"
+  {
+    echo "Full bun test was not run for this review handoff."
+    echo "Use scripts/handoff.sh --full-test or scripts/handoff.sh --mode forensic when the bundle must include a full-suite gate."
+    echo "Focused proof tests are still collected in separate command-output artifacts."
+  } > "$bundle_dir/command-outputs/bun-test.txt"
+fi
 
-bun run build:brainctl > "$bundle_dir/command-outputs/build-brainctl.txt" 2>&1
+run_capture "bun run build:brainctl" "$bundle_dir/command-outputs/build-brainctl.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" bun run build:brainctl
 
-bun run packages/brainctl/src/main.ts doctor \
+run_capture "brainctl doctor --workers" "$bundle_dir/command-outputs/brainctl-doctor-workers.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" \
+  bun run packages/brainctl/src/main.ts doctor \
   --config examples/control.yaml \
   --root "$bundle_dir/generated/example-root" \
-  --workers \
-  > "$bundle_dir/command-outputs/brainctl-doctor-workers.txt" 2>&1
+  --workers
 
-bun run packages/brainctl/src/main.ts updates \
+run_capture "brainctl updates" "$bundle_dir/command-outputs/brainctl-updates.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" \
+  bun run packages/brainctl/src/main.ts updates \
   --config examples/control.yaml \
-  --root "$bundle_dir/generated/example-root" \
-  > "$bundle_dir/command-outputs/brainctl-updates.txt" 2>&1
+  --root "$bundle_dir/generated/example-root"
 
-bun test apps/telemux/test/phase1.test.ts -t "Telegram text coalescing" \
-  > "$bundle_dir/command-outputs/telemux-coalescing-test.txt" 2>&1
-
-bun test apps/telemux/test/phase1.test.ts -t "worker harness" \
-  > "$bundle_dir/command-outputs/worker-harness-path-neutral-test.txt" 2>&1
-
-bun test packages/brainctl/test/brainctl.test.ts -t "braind converts expired running" \
-  > "$bundle_dir/command-outputs/idempotency-recovery-test.txt" 2>&1
-
-bun test packages/brainctl/test/brainctl.test.ts -t "pre-mutation idempotent import failures" \
-  > "$bundle_dir/command-outputs/idempotency-preflight-retry.txt" 2>&1
-
-bun test packages/brainctl/test/brainctl.test.ts -t "braind escapes search snippets" \
-  > "$bundle_dir/command-outputs/healthz-and-search-safety-test.txt" 2>&1
-
-bun test packages/brainctl/test/brainctl.test.ts -t "worker SSH trust" \
-  > "$bundle_dir/command-outputs/ssh-trust-lock-recovery-test.txt" 2>&1
-
-bun test apps/telemux/test/phase1.test.ts -t "SSH accept-new trust mode" \
-  > "$bundle_dir/command-outputs/ssh-accept-new-dispatch-refusal-test.txt" 2>&1
-
-bun test packages/brainctl/test/brainctl.test.ts -t "outbox moves repeated HTTP 425" \
-  > "$bundle_dir/command-outputs/outbox-425-terminal-test.txt" 2>&1
-
-bun test packages/brainctl/test/brainctl.test.ts -t "doctor explains trusted-tailnet" \
-  > "$bundle_dir/command-outputs/security-posture-doctor-test.txt" 2>&1
-
-bun test packages/brainctl/test/brainctl.test.ts -t "project context uses profiles" \
-  > "$bundle_dir/command-outputs/multi-brain-profiles-test.txt" 2>&1
-
-bun test packages/brainctl/test/brainctl.test.ts -t "project context blocks personal" \
-  > "$bundle_dir/command-outputs/multi-brain-repo-local-safety-test.txt" 2>&1
-
-bun test packages/brainctl/test/brainctl.test.ts -t "worker init prints exact manual merge" \
-  > "$bundle_dir/command-outputs/harness-guidance-existing-file.txt" 2>&1
-
-bun test packages/brainctl/test/brainctl.test.ts -t "slow URL import preparation" \
-  > "$bundle_dir/command-outputs/write-gate-narrowing-test.txt" 2>&1
-
-bun test packages/brainctl/test/brainctl.test.ts -t "outbox surfaces corrupt" \
-  > "$bundle_dir/command-outputs/outbox-hardening-test.txt" 2>&1
-
-bun test packages/brainctl/test/brainctl.test.ts -t "outbox warns on large" \
-  > "$bundle_dir/command-outputs/outbox-large-payload-test.txt" 2>&1
-
-bun test apps/telemux/test/phase1.test.ts -t "telemux state database" \
-  > "$bundle_dir/command-outputs/telemux-private-state-test.txt" 2>&1
-
-bun test apps/telemux/test/phase1.test.ts -t "dispatcher reports running queued turns abandoned" \
-  > "$bundle_dir/command-outputs/telegram-durable-queue-test.txt" 2>&1
+run_focused_test "test: Telegram text coalescing" "telemux-coalescing-test.txt" apps/telemux/test/phase1.test.ts "Telegram text coalescing"
+run_focused_test "test: worker harness" "worker-harness-path-neutral-test.txt" apps/telemux/test/phase1.test.ts "worker harness"
+run_focused_test "test: idempotency recovery" "idempotency-recovery-test.txt" packages/brainctl/test/brainctl.test.ts "braind converts expired running"
+run_focused_test "test: idempotency preflight retry" "idempotency-preflight-retry.txt" packages/brainctl/test/brainctl.test.ts "pre-mutation idempotent import failures"
+run_focused_test "test: healthz and search safety" "healthz-and-search-safety-test.txt" packages/brainctl/test/brainctl.test.ts "braind escapes search snippets"
+run_focused_test "test: worker SSH trust" "ssh-trust-lock-recovery-test.txt" packages/brainctl/test/brainctl.test.ts "worker SSH trust"
+run_focused_test "test: SSH accept-new dispatch refusal" "ssh-accept-new-dispatch-refusal-test.txt" apps/telemux/test/phase1.test.ts "SSH accept-new trust mode"
+run_focused_test "test: outbox 425 terminal" "outbox-425-terminal-test.txt" packages/brainctl/test/brainctl.test.ts "outbox moves repeated HTTP 425"
+run_focused_test "test: security posture doctor" "security-posture-doctor-test.txt" packages/brainctl/test/brainctl.test.ts "doctor explains trusted-tailnet"
+run_focused_test "test: multi-brain profiles" "multi-brain-profiles-test.txt" packages/brainctl/test/brainctl.test.ts "project context uses profiles"
+run_focused_test "test: multi-brain repo-local safety" "multi-brain-repo-local-safety-test.txt" packages/brainctl/test/brainctl.test.ts "project context blocks personal"
+run_focused_test "test: harness guidance existing file" "harness-guidance-existing-file.txt" packages/brainctl/test/brainctl.test.ts "worker init prints exact manual merge"
+run_focused_test "test: write gate narrowing" "write-gate-narrowing-test.txt" packages/brainctl/test/brainctl.test.ts "slow URL import preparation"
+run_focused_test "test: outbox hardening" "outbox-hardening-test.txt" packages/brainctl/test/brainctl.test.ts "outbox surfaces corrupt"
+run_focused_test "test: outbox large payload" "outbox-large-payload-test.txt" packages/brainctl/test/brainctl.test.ts "outbox warns on large"
+run_focused_test "test: telemux private state" "telemux-private-state-test.txt" apps/telemux/test/phase1.test.ts "telemux state database"
+run_focused_test "test: Telegram durable queue" "telegram-durable-queue-test.txt" apps/telemux/test/phase1.test.ts "dispatcher reports running queued turns abandoned"
 
 cp "$bundle_dir/command-outputs/security-posture-doctor-test.txt" "$bundle_dir/command-outputs/doctor-security-posture-default.txt"
 cp "$bundle_dir/command-outputs/security-posture-doctor-test.txt" "$bundle_dir/command-outputs/doctor-security-posture-public-bind.txt"
@@ -323,7 +616,7 @@ cp "$bundle_dir/command-outputs/healthz-and-search-safety-test.txt" "$bundle_dir
 cp "$bundle_dir/command-outputs/write-gate-narrowing-test.txt" "$bundle_dir/command-outputs/write-gate-slow-url-proof.txt"
 cp "$bundle_dir/command-outputs/worker-harness-path-neutral-test.txt" "$bundle_dir/command-outputs/worker-path-cache.txt"
 
-{
+collect_docs_presence() {
   assert_doc_contains() {
     local file="$1"
     local pattern="$2"
@@ -355,9 +648,11 @@ cp "$bundle_dir/command-outputs/worker-harness-path-neutral-test.txt" "$bundle_d
   assert_doc_contains docs/outbox-security.md "server-sealed" "future server-sealed encryption explanation"
   assert_doc_contains packages/client-bootstrap/claude-user-CLAUDE.md "brainctl search --repo \\." "Claude bootstrap uses repo-scoped search"
   assert_doc_contains packages/client-bootstrap/claude-user-CLAUDE.md "brainctl remember --repo \\." "Claude bootstrap uses repo-scoped remember"
-} > "$bundle_dir/command-outputs/docs-presence.txt" 2>&1
+}
+run_capture "documentation presence assertions" "$bundle_dir/command-outputs/docs-presence.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" collect_docs_presence
 
 multi_brain_smoke_root="$(mktemp -d "${out_dir}/brainstack-handoff-multibrain.XXXXXX")"
+register_cleanup_path "$multi_brain_smoke_root"
 multi_brain_config="$multi_brain_smoke_root/config.yaml"
 multi_brain_repo="$multi_brain_smoke_root/repo"
 multi_brain_work="$multi_brain_smoke_root/brains/lindy"
@@ -401,12 +696,12 @@ crossBrainWrites:
   personalToLindy: ask
 YAML
 
-bun run packages/brainctl/src/main.ts context \
+run_capture "multi-brain context pending trust" "$bundle_dir/command-outputs/context-pending-trust-cli.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" \
+  bun run packages/brainctl/src/main.ts context \
   --repo "$multi_brain_repo" \
   --config "$multi_brain_config" \
   --root "$multi_brain_smoke_root" \
-  --no-sync \
-  > "$bundle_dir/command-outputs/context-pending-trust-cli.txt" 2>&1
+  --no-sync
 
 mkdir -p "$multi_brain_smoke_root/config"
 cat > "$multi_brain_smoke_root/config/profiles.yaml" <<YAML
@@ -422,38 +717,38 @@ brains:
     classification: personal
 YAML
 
-bun run packages/brainctl/src/main.ts allow repo \
+run_capture "multi-brain allow personal wiki" "$bundle_dir/command-outputs/context-personal-allow-cli.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" \
+  bun run packages/brainctl/src/main.ts allow repo \
   --repo "$multi_brain_repo" \
   --brain personal \
   --sections wiki \
   --always \
   --config "$multi_brain_config" \
-  --root "$multi_brain_smoke_root" \
-  > "$bundle_dir/command-outputs/context-personal-allow-cli.txt" 2>&1
+  --root "$multi_brain_smoke_root"
 
-bun run packages/brainctl/src/main.ts context \
+run_capture "multi-brain context after trust" "$bundle_dir/command-outputs/context-after-trust-cli.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" \
+  bun run packages/brainctl/src/main.ts context \
+  --repo "$multi_brain_repo" \
+  --config "$multi_brain_config" \
+  --root "$multi_brain_smoke_root" \
+  --no-sync
+
+run_capture "multi-brain source-labelled search" "$bundle_dir/command-outputs/search-source-labelled-cli.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" \
+  bun run packages/brainctl/src/main.ts search \
   --repo "$multi_brain_repo" \
   --config "$multi_brain_config" \
   --root "$multi_brain_smoke_root" \
   --no-sync \
-  > "$bundle_dir/command-outputs/context-after-trust-cli.txt" 2>&1
-
-bun run packages/brainctl/src/main.ts search \
-  --repo "$multi_brain_repo" \
-  --config "$multi_brain_config" \
-  --root "$multi_brain_smoke_root" \
-  --no-sync \
-  --query handoff \
-  > "$bundle_dir/command-outputs/search-source-labelled-cli.txt" 2>&1
+  --query handoff
 
 set +e
-bun run packages/brainctl/src/main.ts remember \
+HANDOFF_RUN_CAPTURE_ALLOW_FAILURE=1 run_capture "multi-brain cross-brain remember blocked" "$bundle_dir/command-outputs/remember-cross-brain-blocked-cli.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" \
+  bun run packages/brainctl/src/main.ts remember \
   --repo "$multi_brain_repo" \
   --target lindy \
   --summary "handoff cross-brain blocked example" \
   --config "$multi_brain_config" \
-  --root "$multi_brain_smoke_root" \
-  > "$bundle_dir/command-outputs/remember-cross-brain-blocked-cli.txt" 2>&1
+  --root "$multi_brain_smoke_root"
 remember_blocked_code=$?
 set -e
 printf 'exit=%s\n' "$remember_blocked_code" >> "$bundle_dir/command-outputs/remember-cross-brain-blocked-cli.txt"
@@ -462,19 +757,19 @@ if [ "$remember_blocked_code" -eq 0 ]; then
   exit 1
 fi
 
-bun run packages/brainctl/src/main.ts remember \
+run_capture "multi-brain cross-brain remember confirmed" "$bundle_dir/command-outputs/remember-cross-brain-confirmed-cli.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" \
+  bun run packages/brainctl/src/main.ts remember \
   --repo "$multi_brain_repo" \
   --target lindy \
   --summary "handoff cross-brain confirmed example" \
   --confirm-cross-brain \
   --config "$multi_brain_config" \
-  --root "$multi_brain_smoke_root" \
-  > "$bundle_dir/command-outputs/remember-cross-brain-confirmed-cli.txt" 2>&1
+  --root "$multi_brain_smoke_root"
 
-bun run packages/brainctl/src/main.ts outbox list \
+run_capture "multi-brain outbox list" "$bundle_dir/command-outputs/outbox-list-cli.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" \
+  bun run packages/brainctl/src/main.ts outbox list \
   --config "$multi_brain_config" \
-  --root "$multi_brain_smoke_root" \
-  > "$bundle_dir/command-outputs/outbox-list-cli.txt" 2>&1
+  --root "$multi_brain_smoke_root"
 
 rm -rf "$multi_brain_smoke_root"
 
@@ -521,26 +816,41 @@ Bun.serve({
 });
 await new Promise(() => {});
 EOF
-{
+
+run_outbox_smoke() {
   export BRAIN_BASE_URL="http://127.0.0.1:$outbox_port"
   export BRAIN_IMPORT_TOKEN="handoff-token"
   export BRAINSTACK_BRAIN_WRITE_TIMEOUT_MS=300
+  local server_pid
+  local ready
+  local attempt
+
   bun run packages/brainctl/src/main.ts import-text --config "$outbox_config" --title "handoff offline note" --text "offline queue smoke" --source-harness codex --source-machine client
   bun run packages/brainctl/src/main.ts outbox status --config "$outbox_config"
   bun run "$outbox_server" >"$bundle_dir/command-outputs/outbox-smoke-server.log" 2>&1 &
   server_pid=$!
   trap 'kill "$server_pid" 2>/dev/null || true' EXIT
-  for _ in $(seq 1 40); do
-    curl -fsS "http://127.0.0.1:$outbox_port/health" >/dev/null 2>&1 && break
+  ready=0
+  for attempt in $(seq 1 40); do
+    if curl -fsS "http://127.0.0.1:$outbox_port/health" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
     sleep 0.05
   done
+  if [ "$ready" -ne 1 ]; then
+    echo "outbox smoke server did not become ready on port $outbox_port" >&2
+    tail -40 "$bundle_dir/command-outputs/outbox-smoke-server.log" >&2 || true
+    return 1
+  fi
   bun run packages/brainctl/src/main.ts outbox flush --config "$outbox_config"
   bun run packages/brainctl/src/main.ts outbox status --config "$outbox_config"
   kill "$server_pid" 2>/dev/null || true
   wait "$server_pid" 2>/dev/null || true
   trap - EXIT
   echo "received_lines=$(test -f "$outbox_received" && wc -l < "$outbox_received" || echo 0)"
-} > "$bundle_dir/command-outputs/outbox-queue-flush-smoke.txt" 2>&1
+}
+run_capture "outbox queue/flush smoke" "$bundle_dir/command-outputs/outbox-queue-flush-smoke.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" run_outbox_smoke
 
 tailscale_ip_for_name() {
   local target="$1"
@@ -563,60 +873,80 @@ if (node?.TailscaleIPs?.length) {
 
 live_hosts="${BRAINSTACK_HANDOFF_LIVE_HOSTS:-}"
 if [ "$mode" = "forensic" ] && [ -n "$live_hosts" ] && command -v tailscale >/dev/null 2>&1; then
-  {
-    tailscale status 2>&1 || true
-  } > "$bundle_dir/command-outputs/tailscale-summary.txt"
+  run_optional_capture "tailscale status" "$bundle_dir/command-outputs/tailscale-summary.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" tailscale status
 
   for host in $live_hosts; do
     safe_host="$(printf '%s' "$host" | sed 's/[^A-Za-z0-9_.-]/_/g')"
     output="$bundle_dir/command-outputs/tailscale-whois-${safe_host}.txt"
-    {
-      ip="$(tailscale_ip_for_name "$host" 2>/dev/null || true)"
+    collect_tailscale_whois() {
+      local checked_host="$1"
+      ip="$(tailscale_ip_for_name "$checked_host" 2>/dev/null || true)"
       if [ -n "$ip" ]; then
         echo "$ tailscale whois $ip"
         tailscale whois "$ip" 2>&1 || true
       else
-        echo "No Tailscale IP found for $host in tailscale status --json."
+        echo "No Tailscale IP found for $checked_host in tailscale status --json."
       fi
-    } > "$output"
+    }
+    run_optional_capture "tailscale whois $host" "$output" "$HANDOFF_STEP_TIMEOUT_SECONDS" collect_tailscale_whois "$host"
   done
 fi
 
 if [ "$mode" = "forensic" ] && [ -n "$live_hosts" ] && command -v ssh >/dev/null 2>&1; then
   for host in $live_hosts; do
     safe_host="$(printf '%s' "$host" | sed 's/[^A-Za-z0-9_.-]/_/g')"
-    {
-      echo "$ ssh -o BatchMode=yes -o ConnectTimeout=5 ${safe_host} true"
-      if ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" true 2>&1; then
+    collect_ssh_true() {
+      local checked_host="$1"
+      local safe_checked_host="$2"
+      echo "$ ssh -o BatchMode=yes -o ConnectTimeout=5 ${safe_checked_host} true"
+      if ssh -o BatchMode=yes -o ConnectTimeout=5 "$checked_host" true 2>&1; then
         echo "exit=0"
       else
         status=$?
         echo "exit=$status"
       fi
-    } > "$bundle_dir/command-outputs/ssh-${safe_host}-true.txt"
+      echo "safe_host=$safe_checked_host"
+    }
+    run_optional_capture "ssh smoke $host" "$bundle_dir/command-outputs/ssh-${safe_host}-true.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" collect_ssh_true "$host" "$safe_host"
   done
 fi
 
-if [ "$mode" = "forensic" ] && curl -fsS --max-time 2 http://127.0.0.1:8080/healthz > "$bundle_dir/service-state/braind-health.json" 2>/dev/null; then
-  :
+if [ "$mode" = "forensic" ]; then
+  set +e
+  HANDOFF_RUN_CAPTURE_ALLOW_FAILURE=1 run_capture "braind local healthz" "$bundle_dir/service-state/braind-health.json" 5 curl -fsS --max-time 2 http://127.0.0.1:8080/healthz
+  braind_health_status=$?
+  set -e
+  if [ "$braind_health_status" -ne 0 ]; then
+    echo "braind health unavailable on http://127.0.0.1:8080/healthz" > "$bundle_dir/service-state/braind-health.txt"
+    rm -f "$bundle_dir/service-state/braind-health.json"
+  fi
 else
   if [ "$mode" = "forensic" ]; then
     echo "braind health unavailable on http://127.0.0.1:8080/healthz" > "$bundle_dir/service-state/braind-health.txt"
   else
     echo "braind live health is not collected in review mode because it can include local absolute paths. Use --mode forensic only when live host evidence is intended." > "$bundle_dir/service-state/braind-health.txt"
   fi
-  rm -f "$bundle_dir/service-state/braind-health.json"
 fi
 
-systemctl is-active shared-brain.service > "$bundle_dir/service-state/shared-brain-system-is-active.txt" 2>&1 || true
-systemctl --user is-active telemux.service > "$bundle_dir/service-state/telemux-user-is-active.txt" 2>&1 || true
+if command -v systemctl >/dev/null 2>&1; then
+  run_optional_capture "systemctl shared-brain is-active" "$bundle_dir/service-state/shared-brain-system-is-active.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" systemctl is-active shared-brain.service
+  run_optional_capture "systemctl --user telemux is-active" "$bundle_dir/service-state/telemux-user-is-active.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" systemctl --user is-active telemux.service
+else
+  echo "systemctl is not available on this host." > "$bundle_dir/service-state/shared-brain-system-is-active.txt"
+  echo "systemctl is not available on this host." > "$bundle_dir/service-state/telemux-user-is-active.txt"
+fi
 
 if [ "$mode" = "forensic" ]; then
-  git log --oneline -20 > "$bundle_dir/command-outputs/git-log.txt"
-  systemctl status shared-brain.service --no-pager > "$bundle_dir/service-state/shared-brain-system-status.txt" 2>&1 || true
-  systemctl --user status telemux.service --no-pager > "$bundle_dir/service-state/telemux-user-status.txt" 2>&1 || true
+  run_capture "git log" "$bundle_dir/command-outputs/git-log.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" git log --oneline -20
+  if command -v systemctl >/dev/null 2>&1; then
+    run_optional_capture "systemctl shared-brain status" "$bundle_dir/service-state/shared-brain-system-status.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" systemctl status shared-brain.service --no-pager
+    run_optional_capture "systemctl --user telemux status" "$bundle_dir/service-state/telemux-user-status.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" systemctl --user status telemux.service --no-pager
+  else
+    echo "systemctl is not available on this host." > "$bundle_dir/service-state/shared-brain-system-status.txt"
+    echo "systemctl is not available on this host." > "$bundle_dir/service-state/telemux-user-status.txt"
+  fi
   if command -v tailscale >/dev/null 2>&1; then
-    tailscale debug prefs > "$bundle_dir/service-state/tailscale-prefs.txt" 2>&1 || true
+    run_optional_capture "tailscale debug prefs" "$bundle_dir/service-state/tailscale-prefs.txt" "$HANDOFF_STEP_TIMEOUT_SECONDS" tailscale debug prefs
   fi
 fi
 
@@ -670,7 +1000,7 @@ cat > "$bundle_dir/CLAIMS_AND_PROOF.md" <<'EOF'
 | Docs and packaged guidance contain the trusted-tailnet, multi-brain, context, and outbox-security terms expected by the audit. | `command-outputs/docs-presence.txt` |
 | `brainctl` compiled successfully without dotenv/bunfig autoloading. | `command-outputs/build-brainctl.txt` |
 | Mermaid diagrams are checked in and included for reviewer context. | `generated/diagrams.md` |
-| Bun tests passed for the product tree at HEAD. | `command-outputs/bun-test.txt` |
+| Full-suite test status is explicit; review bundles may skip the heavy full-suite gate while retaining focused proof artifacts. | `command-outputs/bun-test.txt` |
 | Local braind health is skipped in review mode and collected only in forensic mode. | `service-state/braind-health.json` or `service-state/braind-health.txt` |
 | Optional live host evidence is forensic-only and opt-in. | `BRAINSTACK_HANDOFF_LIVE_HOSTS` |
 | Secret-looking tokens and private keys were scanned before zipping. | `command-outputs/secret-scan.txt` |
@@ -703,7 +1033,7 @@ cat <<EOF
 
 See \`CHANGES.txt\` for the base commit, head commit, changed files, and diff stat.
 
-The \`source/\` tree is the tracked HEAD archive after handoff path/private-literal sanitization. Use the Product HEAD commit in \`MANIFEST.txt\` as the canonical exact source identity.
+The \`source/\` tree is described in \`MANIFEST.txt\`. Clean handoffs use tracked HEAD; \`--allow-dirty\` handoffs use a working-tree snapshot overlaid on tracked HEAD.
 
 ## Claims And Proof
 
@@ -716,7 +1046,13 @@ See \`CLAIMS_AND_PROOF.md\` for the claim-to-evidence map.
 
 ## Exact Validations Run
 
-- \`bun test\`
+EOF
+if [ "$full_test" = "1" ]; then
+  echo "- \`bun test\`"
+else
+  echo "- Full \`bun test\` was skipped for this review bundle; use \`--full-test\` or \`--mode forensic\` to include it."
+fi
+cat <<EOF
 - \`bun run build:brainctl\`
 - \`brainctl bootstrap-client\` with a custom \`client.localPath\`
 - \`brainctl join-worker\` with a custom \`paths.stateRoot\`
@@ -750,9 +1086,12 @@ Base commit: ${base_commit:-none}
 Product HEAD: $product_head
 Shared brain HEAD: $shared_head
 Factory workspace HEAD: $factory_head
+Full Bun test run: $([ "$full_test" = "1" ] && echo yes || echo no)
+Allow dirty tree: $([ "$allow_dirty" = "1" ] && echo yes || echo no)
+Dirty tree included: $([ "$allow_dirty" = "1" ] && [ -n "$dirty_status" ] && echo yes || echo no)
 Pass notes included: $([ -n "$notes_file" ] && echo yes || echo no)
 Source representation: source/
-Source tree note: source/ contains tracked HEAD after handoff path/private-literal sanitization; Product HEAD is the canonical source identity.
+Source tree note: $source_tree_note
 Secrets included: no
 Binaries included: no
 EOF

@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { ContextKind, ContextRecord, ContextState, FactoryDb } from "./db";
+import type { CodexReasoningEffort } from "./codex-runtime";
 
 export interface NewContextArgs {
   slug: string;
@@ -21,6 +22,10 @@ export interface NewContextArgs {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function defaultReasoningEffortOverride(kind: ContextKind): CodexReasoningEffort | null {
+  return kind === "scratch" ? "low" : null;
 }
 
 function targetChanged(existing: ContextRecord | null, next: NewContextArgs): boolean {
@@ -109,7 +114,7 @@ export class ContextService {
       harness: existing?.harness || null,
       harnessBin: existing?.harnessBin || null,
       modelOverride: existing?.modelOverride || null,
-      reasoningEffortOverride: existing?.reasoningEffortOverride || null,
+      reasoningEffortOverride: existing?.reasoningEffortOverride || defaultReasoningEffortOverride(args.kind),
       lastError: args.lastError ?? (resetSession ? null : (existing?.lastError || null)),
       createdAt: existing?.createdAt || timestamp,
       updatedAt: timestamp

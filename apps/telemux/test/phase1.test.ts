@@ -9,6 +9,7 @@ import { CronScheduler } from "../src/cron-scheduler";
 import { ContextService } from "../src/contexts";
 import { FactoryDb } from "../src/db";
 import { Dispatcher } from "../src/dispatcher";
+import { classifyPreDispatch } from "../src/pre-dispatch-router";
 import { ensureBasicLoops } from "../src/basic-loops";
 import { flushBrainOutbox, postBrainImportOrQueue } from "../src/brain-outbox";
 import { canonicalJson, sha256Hex } from "../../../packages/outbox/src/outbox";
@@ -697,6 +698,8 @@ test("phase 1 workflow covers local host/scratch and pending remote behavior", a
     const scratchpad = fixture.db.getContextBySlug("scratchpad");
     expect(scratchpad?.kind).toBe("scratch");
     expect(scratchpad?.state).toBe("active");
+    expect(scratchpad?.reasoningEffortOverride).toBe("low");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Codex mode: custom (model=default effort=low)");
     expect(await Bun.file(join(fixture.factoryRoot, "scratch", "scratchpad", ".git", "HEAD")).exists()).toBe(true);
     expect(gitHasCommit(join(fixture.factoryRoot, "scratch", "scratchpad"))).toBe(true);
 
@@ -2123,7 +2126,7 @@ test("context usage and manual compaction stay concise and harness-aware", async
     expect(contextText).toContain("Context: compact-lab");
     expect(contextText).toContain("Harness: codex");
     expect(contextText).toContain("Model: default");
-    expect(contextText).toContain("Thinking effort: default");
+    expect(contextText).toContain("Thinking effort: low");
 
     await fixture.commands.handleMessage(telegramMessage("/usage", 90));
     const usageText = fixture.telegram.sent.at(-1)?.text || "";
@@ -2155,6 +2158,278 @@ test("context usage and manual compaction stay concise and harness-aware", async
   }
 }, 30_000);
 
+test("plain-text pre-dispatch answers liveness and usage locally without starting the harness", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "20"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx meta-local control scratch", 94));
+    const worktree = join(fixture.factoryRoot, "scratch", "meta-local");
+    const turnFile = join(worktree, ".factory", "fake-turn-count");
+    const promptFile = join(worktree, ".factory", "control-plane.prompt.md");
+
+    const beforeLiveness = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage("You up?", 94));
+    await waitFor(() =>
+      fixture.telegram.sent.slice(beforeLiveness).some((entry) => entry.text.includes("Handled locally by telemux"))
+    );
+    const livenessText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(livenessText).toContain("Up.");
+    expect(livenessText).toContain("Context: meta-local");
+    expect(livenessText).toContain("no harness run was started");
+    expect(await Bun.file(turnFile).exists()).toBe(false);
+    expect(await Bun.file(promptFile).exists()).toBe(false);
+
+    const beforeUsage = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage("How many tokens does this query spend?", 94));
+    await waitFor(() => fixture.telegram.sent.slice(beforeUsage).some((entry) => entry.text.includes("Usage check.")));
+    const usageText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(usageText).toContain("Handled locally by telemux");
+    expect(usageText).toContain("Latest completed harness run");
+    expect(usageText).toContain("No local run log recorded yet.");
+    expect(await Bun.file(turnFile).exists()).toBe(false);
+    expect(await Bun.file(promptFile).exists()).toBe(false);
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("plain-text pre-dispatch uses a light prompt for informational questions and full prompts for work", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "20"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx light-route control scratch", 95));
+    await fixture.commands.handleMessage(telegramMessage("What were we doing?", 95));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for light-route.")));
+    const lightPrompt = await readFile(join(fixture.factoryRoot, "scratch", "light-route", ".factory", "control-plane.prompt.md"), "utf8");
+    expect(lightPrompt).toContain("Treat this as a lightweight informational turn.");
+    expect(lightPrompt).toContain("You may perform read-only inspection when needed to answer");
+    expect(lightPrompt).toContain("What were we doing?");
+    expect(lightPrompt).not.toContain("Start by reading those files and the current git status.");
+    expect(lightPrompt).not.toContain("Before finishing, update all relevant .factory files");
+
+    await fixture.commands.handleMessage(telegramMessage("/newctx full-route control scratch", 96));
+    await fixture.commands.handleMessage(telegramMessage("Fix tests.", 96));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for full-route.")));
+    const fullPrompt = await readFile(join(fixture.factoryRoot, "scratch", "full-route", ".factory", "control-plane.prompt.md"), "utf8");
+    expect(fullPrompt).toContain("Start by reading those files and the current git status.");
+    expect(fullPrompt).toContain("Before finishing, update all relevant .factory files");
+    expect(fullPrompt).toContain("Fix tests.");
+
+    await fixture.commands.handleMessage(telegramMessage("/newctx token-work-route control scratch", 99));
+    const beforeTokenWork = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage("Can you update the token budget?", 99));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for token-work-route.")));
+    expect(fixture.telegram.sent.slice(beforeTokenWork).some((entry) => entry.text.includes("Usage check."))).toBe(false);
+    const tokenWorkPrompt = await readFile(
+      join(fixture.factoryRoot, "scratch", "token-work-route", ".factory", "control-plane.prompt.md"),
+      "utf8"
+    );
+    expect(tokenWorkPrompt).toContain("Start by reading those files and the current git status.");
+
+    await fixture.commands.handleMessage(telegramMessage("/newctx latency-work-route control scratch", 100));
+    const beforeLatencyWork = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage("What would it take to add dark mode?", 100));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for latency-work-route.")));
+    expect(fixture.telegram.sent.slice(beforeLatencyWork).some((entry) => entry.text.includes("Latest run diagnostics."))).toBe(false);
+    const latencyWorkPrompt = await readFile(
+      join(fixture.factoryRoot, "scratch", "latency-work-route", ".factory", "control-plane.prompt.md"),
+      "utf8"
+    );
+    expect(latencyWorkPrompt).toContain("Start by reading those files and the current git status.");
+
+    await fixture.commands.handleMessage(telegramMessage("/newctx read-usage-route control scratch", 101));
+    const beforeReadUsage = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage("Tail the log, how many tokens did that take?", 101));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for read-usage-route.")));
+    expect(fixture.telegram.sent.slice(beforeReadUsage).some((entry) => entry.text.includes("Usage check."))).toBe(false);
+    const readUsagePrompt = await readFile(
+      join(fixture.factoryRoot, "scratch", "read-usage-route", ".factory", "control-plane.prompt.md"),
+      "utf8"
+    );
+    expect(readUsagePrompt).toContain("Start by reading those files and the current git status.");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("coalesced mixed meta and work text fails open to the full work prompt", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "80"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx mixed-route control scratch", 97));
+    await fixture.commands.handleMessage(telegramMessage("You up?", 97));
+    await fixture.commands.handleMessage(telegramMessage("Fix tests.", 97));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for mixed-route.")));
+    const prompt = await readFile(join(fixture.factoryRoot, "scratch", "mixed-route", ".factory", "control-plane.prompt.md"), "utf8");
+    expect(prompt).toContain("You up?\n\nFix tests.");
+    expect(prompt).toContain("Start by reading those files and the current git status.");
+    expect(prompt).not.toContain("Treat this as a lightweight informational turn.");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("optional LLM pre-dispatch classifier is advisory and fails open", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx classifier-policy control scratch", 98));
+    const context = fixture.db.getContextBySlug("classifier-policy");
+    expect(context).toBeTruthy();
+
+    const classifier = {
+      ...fixture.config.preDispatchClassifier,
+      enabled: true,
+      apiKey: "test-key",
+      model: "cheap-test-model",
+      timeoutMs: 50,
+      maxChars: 600,
+      confidenceThreshold: 0.75
+    };
+    const bodies = [
+      { output_text: '{"route":"light_harness","confidence":0.91,"reason":"short informational question"}' },
+      { output_text: '{"route":"control_meta","controlKind":"usage","confidence":"0.93","reason":"usage question"}' },
+      {
+        output: [
+          {
+            content: [
+              {
+                text: {
+                  value: '{"route":"light_harness","confidence":0.88,"reason":"nested response text"}'
+                }
+              }
+            ]
+          }
+        ]
+      },
+      { output_text: '{"route":"light_harness","confidence":0.2,"reason":"weak guess"}' },
+      { output_text: "not json" },
+      { status: "incomplete", output: [] }
+    ];
+    let calls = 0;
+    const fetcher: typeof fetch = async () => {
+      const body = bodies[calls] || bodies.at(-1)!;
+      calls += 1;
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    };
+
+    const llmLight = await classifyPreDispatch({
+      text: "Any concerns?",
+      context: context!,
+      hasAttachments: false,
+      classifier,
+      fetcher
+    });
+    expect(llmLight.route).toBe("light_harness");
+    expect(llmLight.source).toBe("llm");
+    expect(calls).toBe(1);
+
+    const llmUsage = await classifyPreDispatch({
+      text: "Costs ran hot earlier",
+      context: context!,
+      hasAttachments: false,
+      classifier,
+      fetcher
+    });
+    expect(llmUsage.route).toBe("control_meta");
+    expect(llmUsage.source).toBe("llm");
+    expect(llmUsage.controlKind).toBe("usage");
+    expect(calls).toBe(2);
+
+    const nestedText = await classifyPreDispatch({
+      text: "Talk through alternatives",
+      context: context!,
+      hasAttachments: false,
+      classifier,
+      fetcher
+    });
+    expect(nestedText.route).toBe("light_harness");
+    expect(nestedText.source).toBe("llm");
+    expect(calls).toBe(3);
+
+    const deterministicFull = await classifyPreDispatch({
+      text: "Fix the bug in src/main.ts",
+      context: context!,
+      hasAttachments: false,
+      classifier,
+      fetcher
+    });
+    expect(deterministicFull.route).toBe("full_harness");
+    expect(deterministicFull.source).toBe("deterministic");
+    expect(calls).toBe(3);
+
+    const lowConfidence = await classifyPreDispatch({
+      text: "Maybe talk through options",
+      context: context!,
+      hasAttachments: false,
+      classifier,
+      fetcher
+    });
+    expect(lowConfidence.route).toBe("full_harness");
+    expect(lowConfidence.source).toBe("fallback");
+    expect(calls).toBe(4);
+
+    const invalidOutput = await classifyPreDispatch({
+      text: "A vague note",
+      context: context!,
+      hasAttachments: false,
+      classifier,
+      fetcher
+    });
+    expect(invalidOutput.route).toBe("full_harness");
+    expect(invalidOutput.source).toBe("fallback");
+    expect(calls).toBe(5);
+
+    const incompleteOutput = await classifyPreDispatch({
+      text: "A second vague note",
+      context: context!,
+      hasAttachments: false,
+      classifier,
+      fetcher
+    });
+    expect(incompleteOutput.route).toBe("full_harness");
+    expect(incompleteOutput.source).toBe("fallback");
+    expect(calls).toBe(6);
+
+    const attachmentFull = await classifyPreDispatch({
+      text: "Any concerns?",
+      context: context!,
+      hasAttachments: true,
+      classifier,
+      fetcher
+    });
+    expect(attachmentFull.route).toBe("full_harness");
+    expect(attachmentFull.source).toBe("deterministic");
+    expect(calls).toBe(6);
+
+    const configWithoutDedicatedKey = loadConfig({
+      ...process.env,
+      FACTORY_CONTROL_ROOT: fixture.controlRoot,
+      FACTORY_FACTORY_ROOT: fixture.factoryRoot,
+      FACTORY_WORKERS_FILE: fixture.workersFile,
+      FACTORY_PRE_DISPATCH_CLASSIFIER: "1",
+      FACTORY_PRE_DISPATCH_CLASSIFIER_API_KEY: "",
+      OPENAI_API_KEY: "ambient-key-must-not-be-used"
+    });
+    expect(configWithoutDedicatedKey.preDispatchClassifier.apiKey).toBe("");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
 test("manual compaction failures are classified without false positives from normal compact text", async () => {
   const fixture = await createFixture();
 
@@ -2174,15 +2449,17 @@ exit 31
 
     const beforeNormalFailureCount = fixture.telegram.sent.length;
     await fixture.commands.handleMessage(telegramMessage("ordinary compact word failure", 93));
-    await waitFor(() =>
-      fixture.telegram.sent.slice(beforeNormalFailureCount).some((entry) => entry.text.includes("ordinary run mentioned compact and failed"))
+    await waitFor(
+      () => fixture.telegram.sent.slice(beforeNormalFailureCount).some((entry) => entry.text.includes("ordinary run mentioned compact and failed")),
+      10_000
     );
     expect(fixture.telegram.sent.slice(beforeNormalFailureCount).some((entry) => entry.text.includes("Codex compaction failed."))).toBe(false);
 
     const beforeManualFailureCount = fixture.telegram.sent.length;
     await fixture.commands.handleMessage(telegramMessage("/compact", 93));
-    await waitFor(() =>
-      fixture.telegram.sent.slice(beforeManualFailureCount).some((entry) => entry.text.includes("Codex compaction failed."))
+    await waitFor(
+      () => fixture.telegram.sent.slice(beforeManualFailureCount).some((entry) => entry.text.includes("Codex compaction failed.")),
+      10_000
     );
     const manualFailureText = fixture.telegram.sent.slice(beforeManualFailureCount).map((entry) => entry.text).join("\n\n");
     expect(manualFailureText).toContain("Compacting thread…");
@@ -3419,7 +3696,9 @@ test("phase 1 inbound Telegram media stages files and only forwards images to Co
     const photoMetadataPath = join(mediaRoot, ".factory", "inbox", "telegram", String(photoMessage.message_id), "message.json");
     expect(await readFile(stagedPhotoPath, "utf8")).toBe("fake image bytes");
     expect(await readFile(photoMetadataPath, "utf8")).toContain("\"attachedAsImage\": true");
-    expect(await readFile(join(mediaRoot, ".factory", "control-plane.prompt.md"), "utf8")).toContain("Telegram inbound message:");
+    const mediaPrompt = await readFile(join(mediaRoot, ".factory", "control-plane.prompt.md"), "utf8");
+    expect(mediaPrompt).toContain("Telegram inbound message:");
+    expect(mediaPrompt).toContain("Start by reading those files and the current git status.");
     expect(await readFile(join(mediaRoot, ".factory", "fake-images.txt"), "utf8")).toContain(
       `.factory/inbox/telegram/${photoMessage.message_id}/photo-1.jpg`
     );

@@ -133,7 +133,8 @@ The required grant shape is directional: operator to control/worker, control to 
 ## Handoff Bundles
 
 - Use `scripts/handoff.sh --mode review` for reviewer-minimal bundles and `--mode forensic` only when a larger audit trail is requested.
-- Prefer a clean tree. If intentional untracked source files must be reviewed, add explicit notes and verify the archive includes them.
+- Review mode records a focused proof set; use `--full-test` or forensic mode when the bundle itself must include the full `bun test` gate.
+- Prefer a clean tree. If intentional untracked source files must be reviewed, use `--allow-dirty`, add explicit notes, and verify the archive includes them.
 - Include a pass-specific notes file with the purpose, evidence, blocked items, and residual risk.
 - Verify archive contents, not just the output path. Check that `.git`, env files, dependency trees, caches, private keys, tokens, and local scratch artifacts are absent.
 
