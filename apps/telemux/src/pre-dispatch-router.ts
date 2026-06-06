@@ -3,7 +3,7 @@ import type { ContextRecord } from "./db";
 
 export type PreDispatchRoute = "control_meta" | "light_harness" | "full_harness";
 export type PreDispatchSource = "deterministic" | "llm" | "fallback";
-export type ControlMetaKind = "liveness" | "usage" | "latency" | "status";
+export type ControlMetaKind = "ack" | "liveness" | "usage" | "latency" | "status";
 
 export interface PreDispatchClassification {
   route: PreDispatchRoute;
@@ -24,14 +24,14 @@ export interface PreDispatchInput {
 type DeterministicRoute = PreDispatchClassification | null;
 
 const ROUTES = new Set<PreDispatchRoute>(["control_meta", "light_harness", "full_harness"]);
-const CONTROL_META_KINDS = new Set<ControlMetaKind>(["liveness", "usage", "latency", "status"]);
+const CONTROL_META_KINDS = new Set<ControlMetaKind>(["ack", "liveness", "usage", "latency", "status"]);
 const CLASSIFIER_ENDPOINT = "https://api.openai.com/v1/responses";
 const HARD_FULL_MAX_CHARS = 1200;
 
 const CLASSIFIER_PROMPT = [
   "Classify one Telegram message for a developer control plane.",
-  "Return only compact JSON: {\"route\":\"control_meta|light_harness|full_harness\",\"controlKind\":\"liveness|usage|latency|status|null\",\"confidence\":0.0,\"reason\":\"short reason\"}.",
-  "control_meta is only for liveness, status, latency, token/cost/usage questions about the control plane or latest run.",
+  "Return only compact JSON: {\"route\":\"control_meta|light_harness|full_harness\",\"controlKind\":\"ack|liveness|usage|latency|status|null\",\"confidence\":0.0,\"reason\":\"short reason\"}.",
+  "control_meta is only for bare acknowledgements/no-ops, liveness, status, latency, token/cost/usage questions about the control plane or latest run.",
   "light_harness is only for short informational, recap, explanation, or planning questions that can use existing conversation context without reading or changing files.",
   "full_harness is for code, filesystem, shell, repo, machine, SSH, scheduling, attachment, deployment, audit, debugging, testing, installation, long, or ambiguous requests.",
   "When uncertain, choose full_harness."
@@ -130,6 +130,11 @@ function isBareStatus(text: string): boolean {
   return /^(?:status|context|topic status|what context is this|where are we)$/.test(normalized);
 }
 
+function isBareAcknowledgement(text: string): boolean {
+  const normalized = normalizeUtterance(text).replace(/[👍✅🙏]+/g, "").trim();
+  return /^(?:thanks|thank you|thx|ty|ok|okay|k|cool|nice|great|got it|understood|sounds good|perfect|lol|haha|ha)$/.test(normalized);
+}
+
 function isLatencyQuestion(text: string): boolean {
   const normalized = normalizeUtterance(text);
   return (
@@ -188,10 +193,14 @@ function deterministicClassification(input: PreDispatchInput): DeterministicRout
     return classification("control_meta", "deterministic", "bare liveness probe", 1, "liveness");
   }
 
+  if (isBareAcknowledgement(text)) {
+    return classification("control_meta", "deterministic", "bare acknowledgement", 1, "ack");
+  }
+
   const pathLike = hasPathLikeReference(text);
   const schedulingIntent = hasSchedulingIntent(text);
   const attachmentIntent = hasAttachmentIntent(text);
-  const workIntent = hasMutatingIntent(text) || hasExecutionIntent(text) || hasReadInspectionIntent(text);
+  const workIntent = hasWorkIntent(text) || hasMachineOpsIntent(text) || hasMutatingIntent(text) || hasExecutionIntent(text) || hasReadInspectionIntent(text);
 
   if (isLatencyQuestion(text) && !pathLike && !schedulingIntent && !attachmentIntent && !workIntent) {
     return classification("control_meta", "deterministic", "run latency question", 0.95, "latency");

@@ -573,6 +573,21 @@ function errorResponse(status: number, message: string): Response {
   return layout(`Error ${status}`, `<div class="masthead"><h1>Error ${status}</h1><p>${htmlEscape(message)}</p></div>`, status);
 }
 
+function unexpectedErrorResponse(request: Request, url: URL, error: unknown): Response {
+  const requestId = randomUUID();
+  const detail = error instanceof Error ? { message: error.message, stack: error.stack } : { message: String(error) };
+  console.error("braind unexpected request error", {
+    request_id: requestId,
+    method: request.method,
+    path: url.pathname,
+    ...detail
+  });
+  const message = `Internal server error. Reference: ${requestId}`;
+  return wantsJson(request, url)
+    ? json({ error: "Internal server error", request_id: requestId }, 500)
+    : errorResponse(500, message);
+}
+
 function wantsJson(request: Request, url: URL): boolean {
   return url.pathname.startsWith("/api/") || url.searchParams.get("format") === "json" || request.headers.get("accept")?.includes("application/json") === true;
 }
@@ -1166,11 +1181,41 @@ async function readJsonBody(request: Request): Promise<Record<string, unknown>> 
   if (!bytes.byteLength) {
     return {};
   }
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+    parsed = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
   } catch {
     reject(400, "Request body must be valid JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    reject(400, "Request body must be a JSON object");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function normalizeMultipartContentType(value: string): string {
+  const [mediaType, ...parameters] = value.split(";");
+  return [mediaType.trim().toLowerCase(), ...parameters].join(";");
+}
+
+async function readMultipartFormData(request: Request, contentType: string): Promise<FormData> {
+  const normalizedContentType = normalizeMultipartContentType(contentType);
+  const formRequest =
+    normalizedContentType === contentType
+      ? request
+      : (() => {
+          const headers = new Headers(request.headers);
+          headers.set("content-type", normalizedContentType);
+          return new Request(request.url, {
+            method: request.method,
+            headers,
+            body: request.body
+          });
+        })();
+  try {
+    return await formRequest.formData();
+  } catch (error) {
+    reject(400, `Multipart request body could not be parsed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -1767,12 +1812,12 @@ async function writeImport(
 
 async function importFromRequest(request: Request, authScope: AuthScope): Promise<Record<string, unknown>> {
   const contentType = request.headers.get("content-type") || "";
-  if (contentType.includes("multipart/form-data")) {
+  if (contentType.toLowerCase().includes("multipart/form-data")) {
     requireContentLength(request, maxImportBytes + 256 * 1024, "Multipart request body");
-    const form = await request.formData();
+    const form = await readMultipartFormData(request, contentType);
     const file = form.get("file");
     if (!(file instanceof File)) {
-      throw new Error("multipart request requires a file field");
+      reject(400, "multipart request requires a file field");
     }
     assertImportSize(file.size, "Uploaded file");
     const input = {
@@ -1881,7 +1926,7 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
     });
   }
 
-  throw new Error("Import request must include text, url, or multipart file");
+  reject(400, "Import request must include text, url, or multipart file");
 }
 
 async function proposeFromRequest(request: Request, authScope: AuthScope): Promise<Record<string, unknown>> {
@@ -2254,7 +2299,9 @@ const server = Bun.serve({
           })
         );
       }
-      return errorResponse(404, `Unknown route: ${url.pathname}`);
+      return wantsJson(request, url)
+        ? json({ error: `Unknown route: ${url.pathname}` }, 404)
+        : errorResponse(404, `Unknown route: ${url.pathname}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (error instanceof HttpError) {
@@ -2266,7 +2313,7 @@ const server = Bun.serve({
       if (message.startsWith("Forbidden")) {
         return json({ error: message }, 403);
       }
-      return wantsJson(request, url) ? json({ error: message }, 500) : errorResponse(500, message);
+      return unexpectedErrorResponse(request, url, error);
     }
   }
 });

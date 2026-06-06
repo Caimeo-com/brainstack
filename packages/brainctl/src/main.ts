@@ -892,6 +892,26 @@ function run(args: string[], options: { cwd?: string; env?: Record<string, strin
   return { code, stdout, stderr, timedOut };
 }
 
+function isLocalGitRemote(remote: string): boolean {
+  const value = remote.trim();
+  return value.startsWith("/") || value.startsWith("~/") || value.startsWith("file://");
+}
+
+function safeGitProtocolArgs(remote: string): string[] {
+  return [
+    "-c",
+    "protocol.ext.allow=never",
+    "-c",
+    `protocol.file.allow=${isLocalGitRemote(remote) ? "user" : "never"}`
+  ];
+}
+
+function safeGitProtocolEnv(remote: string): Record<string, string> {
+  return {
+    GIT_ALLOW_PROTOCOL: isLocalGitRemote(remote) ? "ssh:https:http:git:file" : "ssh:https:http:git"
+  };
+}
+
 async function runWithStdinFile(args: string[], filePath: string, options: { cwd?: string; env?: Record<string, string>; maxBytes?: number } = {}) {
   const proc = Bun.spawn(args, {
     cwd: options.cwd || process.cwd(),
@@ -1118,6 +1138,80 @@ function validateInviteSshTarget(input: string, label: string): string {
   return value;
 }
 
+function validateInviteGitRemote(input: string, label: string): string {
+  const value = input.trim();
+  if (!value) {
+    throw new Error(`${label} must not be empty`);
+  }
+  if (value.startsWith("-") || /[\s\u0000-\u001f\u007f]/.test(value) || /^[A-Za-z][A-Za-z0-9+.-]*::/.test(value)) {
+    throw new Error(`${label} must be a safe SSH git remote`);
+  }
+  if (value.startsWith("ssh://")) {
+    let parsed: URL;
+    try {
+      parsed = new URL(value);
+    } catch {
+      throw new Error(`${label} must be a valid ssh:// git remote`);
+    }
+    const pathSegments = parsed.pathname.split("/").filter(Boolean);
+    if (
+      parsed.username.startsWith("-") ||
+      parsed.hostname.startsWith("-") ||
+      parsed.password ||
+      !parsed.hostname ||
+      !parsed.pathname ||
+      parsed.pathname === "/" ||
+      pathSegments.some((segment) => segment === ".." || segment.startsWith("-"))
+    ) {
+      throw new Error(`${label} must be a safe ssh:// git remote`);
+    }
+    return value;
+  }
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value) || /^(?:file|ext|fd):/i.test(value)) {
+    throw new Error(`${label} must be a safe SSH git remote`);
+  }
+  const match = value.match(/^(?:(?<user>[A-Za-z0-9._~-]+)@)?(?<host>\[[^\]\s/]+\]|[A-Za-z0-9._~-]+):(?<path>[^\s\u0000-\u001f\u007f]+)$/);
+  const pathSegments = match?.groups?.path.split("/").filter(Boolean) || [];
+  if (
+    !match?.groups?.host ||
+    !match.groups.path ||
+    match.groups.user?.startsWith("-") ||
+    match.groups.host.startsWith("-") ||
+    pathSegments.some((segment) => segment === ".." || segment.startsWith("-"))
+  ) {
+    throw new Error(`${label} must be a safe SSH git remote`);
+  }
+  return value;
+}
+
+function validateInviteRemoteRepoPath(input: string, label: string): string {
+  const value = input.trim();
+  if (!value) {
+    throw new Error(`${label} must not be empty`);
+  }
+  if (value.startsWith("-") || /[\u0000-\u001f\u007f]/.test(value) || value.split("/").includes("..")) {
+    throw new Error(`${label} must be a safe absolute or home-relative remote path`);
+  }
+  if (!value.startsWith("/") && !value.startsWith("~/")) {
+    throw new Error(`${label} must be an absolute or home-relative remote path`);
+  }
+  return value;
+}
+
+function validateInviteClientPath(input: string, label: string): string {
+  const value = input.trim();
+  if (!value) {
+    throw new Error(`${label} must not be empty`);
+  }
+  if (value.startsWith("-") || /[\u0000-\u001f\u007f]/.test(value) || value.split("/").includes("..")) {
+    throw new Error(`${label} must be a safe absolute or home-relative local path`);
+  }
+  if (!value.startsWith("/") && !value.startsWith("~/")) {
+    throw new Error(`${label} must be an absolute or home-relative local path`);
+  }
+  return value;
+}
+
 function inviteBareHost(input: string, label: string): string {
   const value = input.trim();
   if (!value) {
@@ -1246,7 +1340,11 @@ function decodeClientInvite(input: string): BrainstackClientInvite {
   }
   const publicBaseUrl = String(invite.brain.publicBaseUrl);
   httpUrlHostname(publicBaseUrl, "invite brain.publicBaseUrl");
+  const brainRemoteSsh = validateInviteGitRemote(String(invite.brain.remoteSsh), "invite brain.remoteSsh");
   const controlSshTarget = validateInviteSshTarget(String(invite.control.sshTarget), "invite control.sshTarget");
+  const controlRemoteRepo = validateInviteRemoteRepoPath(String(invite.control.remoteRepo), "invite control.remoteRepo");
+  const clientLocalPath = validateInviteClientPath(String(invite.client.localPath || "~/shared-brain"), "invite client.localPath");
+  const clientEnvPath = validateInviteClientPath(String(invite.client.envPath || "~/.config/shared-brain.env"), "invite client.envPath");
   const expiresAt = Date.parse(String(invite.expires_at || ""));
   if (!Number.isFinite(expiresAt)) {
     throw new Error("invite has an invalid expires_at value");
@@ -1263,18 +1361,18 @@ function decodeClientInvite(input: string): BrainstackClientInvite {
     profile: "client-macos",
     brain: {
       publicBaseUrl,
-      remoteSsh: String(invite.brain.remoteSsh)
+      remoteSsh: brainRemoteSsh
     },
     control: {
       sshTarget: controlSshTarget,
-      remoteRepo: String(invite.control.remoteRepo),
+      remoteRepo: controlRemoteRepo,
       sshKnownHosts: Array.isArray(invite.control.sshKnownHosts)
         ? sanitizeInviteKnownHosts(invite.control.sshKnownHosts, "invite control.sshKnownHosts")
         : []
     },
     client: {
-      localPath: String(invite.client.localPath || "~/shared-brain"),
-      envPath: String(invite.client.envPath || "~/.config/shared-brain.env")
+      localPath: clientLocalPath,
+      envPath: clientEnvPath
     },
     harness: {
       name: harnessName,
@@ -2053,10 +2151,14 @@ async function installLocalClientBootstrap(cfg: BrainstackConfig, options: { imp
 
   const target = clientLocalPathAbs(cfg);
   if (gitExists(target)) {
-    run(["git", "-C", target, "pull", "--ff-only"]);
+    run(["git", "-C", target, ...safeGitProtocolArgs(cfg.client.remoteSsh), "pull", "--ff-only"], {
+      env: safeGitProtocolEnv(cfg.client.remoteSsh)
+    });
   } else {
     await ensureDir(dirname(target));
-    run(["git", "clone", cfg.client.remoteSsh, target]);
+    run(["git", ...safeGitProtocolArgs(cfg.client.remoteSsh), "clone", "--", cfg.client.remoteSsh, target], {
+      env: safeGitProtocolEnv(cfg.client.remoteSsh)
+    });
   }
   touched.push(target);
 

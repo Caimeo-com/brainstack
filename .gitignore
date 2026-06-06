@@ -22,6 +22,7 @@ brainstack-control-host-mobile.png
 *.sqlite-shm
 *.sqlite-wal
 *.tgz
+*.hidden.md
 handoff-*.zip
 handoff-*.zip.sha256
 handoff-*/

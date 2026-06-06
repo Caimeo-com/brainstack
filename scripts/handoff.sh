@@ -215,6 +215,10 @@ run_focused_test() {
   local test_name="$4"
   run_capture "$label" "$bundle_dir/command-outputs/$output_name" "$HANDOFF_FOCUSED_TEST_TIMEOUT_SECONDS" \
     bun test "$test_file" -t "$test_name"
+  if grep -Eq 'matched 0 tests|Ran 0 tests| 0 pass' "$bundle_dir/command-outputs/$output_name"; then
+    echo "handoff refused: focused proof matched zero tests: $test_file -t $test_name" >&2
+    exit 1
+  fi
 }
 
 validate_repo_relative_path() {

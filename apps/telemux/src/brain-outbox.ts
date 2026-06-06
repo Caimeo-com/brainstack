@@ -45,6 +45,27 @@ function outboxRoot(config: FactoryConfig): string {
   return resolve(config.stateRoot, "outbox", brainId);
 }
 
+function queuedDestinationViolation(item: QueuedBrainWrite, config: FactoryConfig): string | null {
+  if (!item.url) {
+    return null;
+  }
+  let queuedUrl: URL;
+  let configuredUrl: URL;
+  try {
+    queuedUrl = new URL(item.url);
+    configuredUrl = new URL(config.brainBaseUrl);
+  } catch (error) {
+    return `queued outbox destination is invalid: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  if (queuedUrl.username || queuedUrl.password) {
+    return "queued outbox destination must not contain URL credentials";
+  }
+  if (queuedUrl.protocol !== configuredUrl.protocol || queuedUrl.host !== configuredUrl.host) {
+    return `queued outbox destination origin ${queuedUrl.origin} does not match configured brain origin ${configuredUrl.origin}`;
+  }
+  return null;
+}
+
 async function findMatchingQueuedWrite(root: string, endpoint: BrainEndpoint, idempotencyKey: string): Promise<{ path: string; item: QueuedBrainWrite } | null> {
   const scan = await scanOutbox(root);
   if (scan.corrupt.length) {
@@ -180,8 +201,16 @@ export async function flushBrainOutbox(config: FactoryConfig): Promise<{ flushed
       kept += 1;
       continue;
     }
+    const destinationViolation = queuedDestinationViolation(normalized, config);
+    if (destinationViolation) {
+      normalized.last_error = destinationViolation;
+      normalized.terminal_error = destinationViolation;
+      await writeOutboxItem(path, normalized);
+      kept += 1;
+      continue;
+    }
     try {
-      const response = await fetch(new URL(`/api/${normalized.endpoint}`, normalized.url || config.brainBaseUrl).toString(), {
+      const response = await fetch(new URL(`/api/${normalized.endpoint}`, config.brainBaseUrl).toString(), {
         method: "POST",
         headers: {
           Authorization: `Bearer ${config.brainImportToken}`,

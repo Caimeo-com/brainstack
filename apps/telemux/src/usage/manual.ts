@@ -1,4 +1,23 @@
+import { open } from "node:fs/promises";
 import type { ContextRecord } from "../db";
+
+const MANUAL_USAGE_LOG_TAIL_BYTES = 2 * 1024 * 1024;
+
+async function readLogTail(path: string, maxBytes = MANUAL_USAGE_LOG_TAIL_BYTES): Promise<{ text: string; truncated: boolean }> {
+  const handle = await open(path, "r");
+  try {
+    const info = await handle.stat();
+    const start = Math.max(0, info.size - maxBytes);
+    const length = info.size - start;
+    const buffer = Buffer.alloc(length);
+    if (length > 0) {
+      await handle.read(buffer, 0, length, start);
+    }
+    return { text: buffer.toString("utf8"), truncated: start > 0 };
+  } finally {
+    await handle.close();
+  }
+}
 
 export async function summarizeManualUsage(context: ContextRecord): Promise<string> {
   if (!context.latestRunLogPath) {
@@ -10,7 +29,7 @@ export async function summarizeManualUsage(context: ContextRecord): Promise<stri
     return `Latest log path is recorded but missing: ${context.latestRunLogPath}`;
   }
 
-  const text = await file.text();
+  const { text, truncated } = await readLogTail(context.latestRunLogPath);
   let inputTokens = 0;
   let cachedInputTokens = 0;
   let outputTokens = 0;
@@ -49,10 +68,11 @@ export async function summarizeManualUsage(context: ContextRecord): Promise<stri
 
   return [
     `Adapter: manual`,
+    truncated ? `Scope: last ${MANUAL_USAGE_LOG_TAIL_BYTES} bytes of log` : null,
     `Turns counted: ${turns}`,
     `Input tokens: ${inputTokens}`,
     `Cached input tokens: ${cachedInputTokens}`,
     `Output tokens: ${outputTokens}`,
     `Log: ${context.latestRunLogPath}`
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }

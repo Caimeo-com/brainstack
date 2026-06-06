@@ -1220,6 +1220,81 @@ describe("braind write safety", () => {
     }
   });
 
+  test("import returns client errors for malformed payloads and normalizes multipart media type", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-import-client-errors-"));
+    const port = 37_000 + Math.floor(Math.random() * 2_000);
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const root = await createSingleNodeInstall(dir);
+      proc = await startBraind(root, port);
+      const endpoint = `http://127.0.0.1:${port}/api/import`;
+      const headers = {
+        Authorization: "Bearer import-test-token",
+        "Content-Type": "application/json"
+      };
+
+      const arrayBody = await fetch(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(["not", "an", "object"])
+      });
+      expect(arrayBody.status).toBe(400);
+      expect(await arrayBody.text()).toContain("Request body must be a JSON object");
+
+      const missingPayload = await fetch(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          source_harness: "test-harness",
+          source_machine: "test-machine",
+          source_type: "note"
+        })
+      });
+      expect(missingPayload.status).toBe(400);
+      expect(await missingPayload.text()).toContain("Import request must include text, url, or multipart file");
+
+      const boundary = "----BrainstackCaseInsensitive";
+      const multipartBody = [
+        `--${boundary}`,
+        'Content-Disposition: form-data; name="title"',
+        "",
+        "Multipart import",
+        `--${boundary}`,
+        'Content-Disposition: form-data; name="source_harness"',
+        "",
+        "test-harness",
+        `--${boundary}`,
+        'Content-Disposition: form-data; name="source_machine"',
+        "",
+        "test-machine",
+        `--${boundary}`,
+        'Content-Disposition: form-data; name="source_type"',
+        "",
+        "multipart",
+        `--${boundary}`,
+        'Content-Disposition: form-data; name="file"; filename="note.txt"',
+        "Content-Type: text/plain",
+        "",
+        "hello from multipart",
+        `--${boundary}--`,
+        ""
+      ].join("\r\n");
+      const multipart = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer import-test-token",
+          "Content-Type": `Multipart/Form-Data; boundary=${boundary}`
+        },
+        body: multipartBody
+      });
+      expect(multipart.status).toBe(200);
+      expect(await multipart.text()).toContain("artifact_id");
+    } finally {
+      await stopBraind(proc);
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   test("fresh install homepage does not render dead default page links", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-home-links-"));
     const port = 39_000 + Math.floor(Math.random() * 5_000);
@@ -1373,6 +1448,10 @@ describe("braind write safety", () => {
         body: JSON.stringify(payload)
       });
       expect(first.status).toBe(500);
+      const firstBody = (await first.json()) as Record<string, unknown>;
+      expect(firstBody.error).toBe("Internal server error");
+      expect(typeof firstBody.request_id).toBe("string");
+      expect(JSON.stringify(firstBody)).not.toContain(staging);
       await writeFile(dirtyPath, cleanHome);
       const second = await fetch(`http://127.0.0.1:${port}/api/import`, {
         method: "POST",
@@ -1516,7 +1595,7 @@ describe("braind write safety", () => {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 12_000);
 
   test("braind queues concurrent mutations instead of rejecting ready writes", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-mutation-queue-"));
@@ -1562,7 +1641,7 @@ describe("braind write safety", () => {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 12_000);
 
   test("slow URL import preparation does not hold the mutation gate for ready text imports", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-url-prep-gate-"));
@@ -1646,7 +1725,7 @@ describe("braind write safety", () => {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 12_000);
 
   test("write-rate source cache is bounded while preserving per-source quotas", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-rate-cache-"));
@@ -1684,7 +1763,7 @@ describe("braind write safety", () => {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 12_000);
 
   test("write-rate limiting has a token-level quota across rotated sources", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-rate-token-"));
@@ -5158,6 +5237,10 @@ describe("public release hygiene", () => {
       await chmod(join(binDir, "pacman"), 0o755);
       await chmod(join(binDir, "sleepy-shell"), 0o755);
       await writeFixtureConfig(configPath);
+      await writeFile(
+        configPath,
+        `${await readFile(configPath, "utf8")}harness:\n  name: codex\n  bin: ${join(binDir, "codex")}\n`
+      );
       const result = runBrainctl(["updates", "--config", configPath], {
         PATH: `${binDir}:${process.env.PATH || ""}`,
         BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1",
@@ -5945,13 +6028,19 @@ describe("public release hygiene", () => {
 
       await writeFile(
         join(binDir, "git"),
-        [
-          "#!/usr/bin/env bash",
-          "set -euo pipefail",
-          "if [ \"${1:-}\" = clone ]; then mkdir -p \"$3/.git\"; exit 0; fi",
-          "if [ \"${1:-}\" = --version ]; then echo 'git fake'; exit 0; fi",
-          "exit 0",
-          ""
+          [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "for arg in \"$@\"; do",
+            "  if [ \"$arg\" = clone ]; then",
+            "    target=\"${@: -1}\"",
+            "    mkdir -p \"$target/.git\"",
+            "    exit 0",
+            "  fi",
+            "done",
+            "if [ \"${1:-}\" = --version ]; then echo 'git fake'; exit 0; fi",
+            "exit 0",
+            ""
         ].join("\n")
       );
       for (const name of ["ssh", "tailscale", "codex"]) {
@@ -6252,6 +6341,144 @@ describe("public release hygiene", () => {
       });
       expect(result.code).not.toBe(0);
       expect(`${result.stdout}\n${result.stderr}`).toContain("safe bare SSH host");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("enroll rejects unsafe invite git remotes and local paths", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-invite-unsafe-remote-"));
+    try {
+      const baseInvitePayload = {
+        schema_version: 1,
+        type: "brainstack-client-invite",
+        created_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        profile: "client-macos",
+        brain: {
+          publicBaseUrl: "https://control.example.ts.net",
+          remoteSsh: "operator@control.example:/home/operator/shared-brain/bare/shared-brain.git"
+        },
+        control: {
+          sshTarget: "operator@control.example",
+          remoteRepo: "/home/operator/brainstack",
+          sshKnownHosts: []
+        },
+        client: {
+          localPath: "~/shared-brain",
+          envPath: "~/.config/shared-brain.env"
+        },
+        harness: {
+          name: "codex",
+          bin: "codex"
+        }
+      };
+      const encodeInvite = (payload: unknown) => `bs1_${Buffer.from(JSON.stringify(payload)).toString("base64url")}`;
+
+      const unsafeRemote = runBrainctl(
+        [
+          "enroll",
+          "--invite",
+          encodeInvite({
+            ...baseInvitePayload,
+            brain: {
+              ...baseInvitePayload.brain,
+              remoteSsh: "ext::sh -c 'touch /tmp/brainstack-poc'"
+            }
+          }),
+          "--config",
+          join(dir, "client-unsafe-remote.yaml"),
+          "--skip-init",
+          "--skip-doctor"
+        ],
+        { HOME: dir, USER: "operator" }
+      );
+      expect(unsafeRemote.code).not.toBe(0);
+      expect(`${unsafeRemote.stdout}\n${unsafeRemote.stderr}`).toContain("invite brain.remoteSsh");
+
+      const fileRemote = runBrainctl(
+        [
+          "enroll",
+          "--invite",
+          encodeInvite({
+            ...baseInvitePayload,
+            brain: {
+              ...baseInvitePayload.brain,
+              remoteSsh: `file://${join(dir, "attacker.git")}`
+            }
+          }),
+          "--config",
+          join(dir, "client-file-remote.yaml"),
+          "--skip-init",
+          "--skip-doctor"
+        ],
+        { HOME: dir, USER: "operator" }
+      );
+      expect(fileRemote.code).not.toBe(0);
+      expect(`${fileRemote.stdout}\n${fileRemote.stderr}`).toContain("invite brain.remoteSsh");
+
+      const optionPathRemote = runBrainctl(
+        [
+          "enroll",
+          "--invite",
+          encodeInvite({
+            ...baseInvitePayload,
+            brain: {
+              ...baseInvitePayload.brain,
+              remoteSsh: "operator@control.example:-upload-pack=sh"
+            }
+          }),
+          "--config",
+          join(dir, "client-option-path-remote.yaml"),
+          "--skip-init",
+          "--skip-doctor"
+        ],
+        { HOME: dir, USER: "operator" }
+      );
+      expect(optionPathRemote.code).not.toBe(0);
+      expect(`${optionPathRemote.stdout}\n${optionPathRemote.stderr}`).toContain("invite brain.remoteSsh");
+
+      const traversalRemote = runBrainctl(
+        [
+          "enroll",
+          "--invite",
+          encodeInvite({
+            ...baseInvitePayload,
+            brain: {
+              ...baseInvitePayload.brain,
+              remoteSsh: "operator@control.example:../shared-brain.git"
+            }
+          }),
+          "--config",
+          join(dir, "client-traversal-remote.yaml"),
+          "--skip-init",
+          "--skip-doctor"
+        ],
+        { HOME: dir, USER: "operator" }
+      );
+      expect(traversalRemote.code).not.toBe(0);
+      expect(`${traversalRemote.stdout}\n${traversalRemote.stderr}`).toContain("invite brain.remoteSsh");
+
+      const unsafePath = runBrainctl(
+        [
+          "enroll",
+          "--invite",
+          encodeInvite({
+            ...baseInvitePayload,
+            client: {
+              ...baseInvitePayload.client,
+              localPath: "../shared-brain"
+            }
+          }),
+          "--config",
+          join(dir, "client-unsafe-path.yaml"),
+          "--skip-init",
+          "--skip-doctor"
+        ],
+        { HOME: dir, USER: "operator" }
+      );
+      expect(unsafePath.code).not.toBe(0);
+      expect(`${unsafePath.stdout}\n${unsafePath.stderr}`).toContain("invite client.localPath");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

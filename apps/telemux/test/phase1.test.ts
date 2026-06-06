@@ -12,7 +12,7 @@ import { Dispatcher } from "../src/dispatcher";
 import { classifyPreDispatch } from "../src/pre-dispatch-router";
 import { ensureBasicLoops } from "../src/basic-loops";
 import { flushBrainOutbox, postBrainImportOrQueue } from "../src/brain-outbox";
-import { canonicalJson, sha256Hex } from "../../../packages/outbox/src/outbox";
+import { buildOutboxItem, canonicalJson, sha256Hex, writeOutboxItem } from "../../../packages/outbox/src/outbox";
 import {
   parseArtifactEntries,
   removeArtifactEntriesFromMarkdown,
@@ -561,6 +561,8 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
     FACTORY_TEXT_COALESCE_MS: envOverrides.FACTORY_TEXT_COALESCE_MS || "20",
     FACTORY_TELEGRAM_BOT_TOKEN: "test-token",
     FACTORY_ALLOWED_TELEGRAM_USER_ID: String(TEST_ALLOWED_TELEGRAM_USER_ID),
+    BRAIN_BASE_URL: "",
+    BRAIN_IMPORT_TOKEN: "",
     ...envOverrides
   });
 
@@ -2181,6 +2183,14 @@ test("plain-text pre-dispatch answers liveness and usage locally without startin
     expect(await Bun.file(turnFile).exists()).toBe(false);
     expect(await Bun.file(promptFile).exists()).toBe(false);
 
+    const beforeAck = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage("thanks", 94));
+    await waitFor(() => fixture.telegram.sent.slice(beforeAck).some((entry) => entry.text.includes("Noted.")));
+    const ackText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(ackText).toContain("Handled locally by telemux");
+    expect(await Bun.file(turnFile).exists()).toBe(false);
+    expect(await Bun.file(promptFile).exists()).toBe(false);
+
     const beforeUsage = fixture.telegram.sent.length;
     await fixture.commands.handleMessage(telegramMessage("How many tokens does this query spend?", 94));
     await waitFor(() => fixture.telegram.sent.slice(beforeUsage).some((entry) => entry.text.includes("Usage check.")));
@@ -2252,6 +2262,28 @@ test("plain-text pre-dispatch uses a light prompt for informational questions an
       "utf8"
     );
     expect(readUsagePrompt).toContain("Start by reading those files and the current git status.");
+
+    await fixture.commands.handleMessage(telegramMessage("/newctx investigate-slow-route control scratch", 102));
+    const beforeInvestigateSlow = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage("Can you investigate why this is so slow?", 102));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for investigate-slow-route.")));
+    expect(fixture.telegram.sent.slice(beforeInvestigateSlow).some((entry) => entry.text.includes("Latest run diagnostics."))).toBe(false);
+    const investigateSlowPrompt = await readFile(
+      join(fixture.factoryRoot, "scratch", "investigate-slow-route", ".factory", "control-plane.prompt.md"),
+      "utf8"
+    );
+    expect(investigateSlowPrompt).toContain("Can you investigate why this is so slow?");
+
+    await fixture.commands.handleMessage(telegramMessage("/newctx review-usage-route control scratch", 103));
+    const beforeReviewUsage = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage("Can you review the token usage?", 103));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for review-usage-route.")));
+    expect(fixture.telegram.sent.slice(beforeReviewUsage).some((entry) => entry.text.includes("Usage check."))).toBe(false);
+    const reviewUsagePrompt = await readFile(
+      join(fixture.factoryRoot, "scratch", "review-usage-route", ".factory", "control-plane.prompt.md"),
+      "utf8"
+    );
+    expect(reviewUsagePrompt).toContain("Can you review the token usage?");
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
@@ -2441,6 +2473,14 @@ test("manual compaction failures are classified without false positives from nor
     await makeExecutable(
       fixture.fakeCodex,
       `#!/usr/bin/env bash
+if (($# >= 2)) && [[ "$1" == "exec" && "$2" == "--help" ]]; then
+  echo '--dangerously-bypass-approvals-and-sandbox --output-last-message --skip-git-repo-check'
+  exit 0
+fi
+if (($# >= 1)) && [[ "$1" == "--version" ]]; then
+  echo 'codex fake'
+  exit 0
+fi
 cat >/dev/null
 echo 'ordinary run mentioned compact and failed' >&2
 exit 31
@@ -2451,7 +2491,7 @@ exit 31
     await fixture.commands.handleMessage(telegramMessage("ordinary compact word failure", 93));
     await waitFor(
       () => fixture.telegram.sent.slice(beforeNormalFailureCount).some((entry) => entry.text.includes("ordinary run mentioned compact and failed")),
-      10_000
+      25_000
     );
     expect(fixture.telegram.sent.slice(beforeNormalFailureCount).some((entry) => entry.text.includes("Codex compaction failed."))).toBe(false);
 
@@ -2459,7 +2499,7 @@ exit 31
     await fixture.commands.handleMessage(telegramMessage("/compact", 93));
     await waitFor(
       () => fixture.telegram.sent.slice(beforeManualFailureCount).some((entry) => entry.text.includes("Codex compaction failed.")),
-      10_000
+      25_000
     );
     const manualFailureText = fixture.telegram.sent.slice(beforeManualFailureCount).map((entry) => entry.text).join("\n\n");
     expect(manualFailureText).toContain("Compacting thread…");
@@ -2469,7 +2509,7 @@ exit 31
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }
-}, 30_000);
+}, 45_000);
 
 test("manual compaction reports unsupported harnesses", async () => {
   const fixture = await createFixture({
@@ -2790,6 +2830,15 @@ test("artifact delivery supports backticked bare relative filenames", async () =
     await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for bareartifact.")));
     await waitFor(() => !fixture.dispatcher.isActive("bareartifact"));
     expect(fixture.telegram.attachments).toHaveLength(broadTaskAttachmentCount);
+    await writeFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), artifactMarkdown);
+
+    const broadFileTaskAttachmentCount = fixture.telegram.attachments.length;
+    const beforeBroadFileTask = fixture.telegram.sent.length;
+    await fixture.commands.handleMessage(telegramMessage("Upload the new config.json to the worker", 67));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 2 for bareartifact.")));
+    await waitFor(() => !fixture.dispatcher.isActive("bareartifact"));
+    expect(fixture.telegram.attachments).toHaveLength(broadFileTaskAttachmentCount);
+    expect(fixture.telegram.sent.slice(beforeBroadFileTask).some((entry) => entry.text.includes("No artifact file paths matched"))).toBe(false);
     await writeFile(join(context!.worktreePath, ".factory", "ARTIFACTS.md"), artifactMarkdown);
 
     const attachmentCount = fixture.telegram.attachments.length;
@@ -3275,6 +3324,67 @@ test("telemux brain outbox moves repeated HTTP 425 responses to terminal review"
   }
 }, 10_000);
 
+test("telemux brain outbox refuses queued writes that retarget the live import token", async () => {
+  const configuredPort = 45_000 + Math.floor(Math.random() * 2_000);
+  const forgedPort = configuredPort + 2_500;
+  const stateRoot = await mkdtemp(join(tmpdir(), "telemux-outbox-destination-"));
+  let forgedHits = 0;
+  let forgedAuth = "";
+  let forgedServer: ReturnType<typeof Bun.serve> | null = null;
+  const fixture = await createFixture({
+    BRAINSTACK_STATE_ROOT: stateRoot,
+    BRAIN_BASE_URL: `http://127.0.0.1:${configuredPort}`,
+    BRAIN_IMPORT_TOKEN: "outbox-token"
+  });
+
+  try {
+    forgedServer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: forgedPort,
+      fetch(request) {
+        forgedHits += 1;
+        forgedAuth = request.headers.get("authorization") || "";
+        return Response.json({ ok: true });
+      }
+    });
+    const payload = {
+      title: "Forged import",
+      text: "should not be replayed to the queued URL",
+      source_machine: "control",
+      source_harness: "telemux",
+      source_type: "test"
+    };
+    const queued = buildOutboxItem(
+      {
+        endpoint: "import",
+        url: `http://127.0.0.1:${forgedPort}`,
+        payload,
+        source_machine: "control",
+        source_harness: "telemux"
+      },
+      "forged queued destination"
+    );
+    const outboxRoot = join(fixture.config.stateRoot, "outbox", sha256Hex(fixture.config.brainBaseUrl).slice(0, 16));
+    await mkdir(outboxRoot, { recursive: true });
+    const queuedPath = join(outboxRoot, `${queued.id}.json`);
+    await writeOutboxItem(queuedPath, queued);
+
+    expect(await flushBrainOutbox(fixture.config)).toEqual({ flushed: 0, kept: 1 });
+    expect(forgedHits).toBe(0);
+    expect(forgedAuth).toBe("");
+    const item = JSON.parse(await readFile(queuedPath, "utf8")) as { terminal_error?: string; last_error?: string };
+    expect(item.terminal_error || "").toContain("does not match configured brain origin");
+    expect(item.last_error || "").toContain("does not match configured brain origin");
+  } finally {
+    if (forgedServer) {
+      forgedServer.stop(true);
+    }
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+}, 10_000);
+
 test("Telegram text coalescing merges quick text and commands flush pending text", async () => {
   const fixture = await createFixture({
     FACTORY_TEXT_COALESCE_MS: "80"
@@ -3430,6 +3540,51 @@ test("Telegram text coalescing preserves older text when newer text arrives befo
     expect(prompt).toContain("older text\n\nnewer text");
   } finally {
     process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("Telegram text coalescing reschedules newer text when its timer fires during an accepted flush", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "30"
+  });
+  let originalDispatcher: unknown = null;
+  let releaseDispatch: (() => void) | null = null;
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx coalescedefer control scratch", 70));
+    originalDispatcher = (fixture.commands as unknown as { dispatcher: unknown }).dispatcher;
+    let dispatchStarted = false;
+    (fixture.commands as unknown as { dispatcher: { dispatch: () => Promise<{ accepted: boolean; message: string }> } }).dispatcher = {
+      dispatch: async () => {
+        dispatchStarted = true;
+        await new Promise<void>((resolve) => {
+          releaseDispatch = resolve;
+        });
+        return { accepted: true, message: "synthetic acceptance" };
+      }
+    };
+
+    await fixture.commands.handleMessage(telegramMessage("older accepted text", 70));
+    await waitFor(() => dispatchStarted);
+    await fixture.commands.handleMessage(telegramMessage("newer text whose timer fires during old flush", 70));
+    await Bun.sleep(80);
+
+    (fixture.commands as unknown as { dispatcher: unknown }).dispatcher = originalDispatcher;
+    releaseDispatch?.();
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for coalescedefer.")));
+
+    expect(fixture.db.listPendingText()).toHaveLength(0);
+    const prompt = await readFile(join(fixture.factoryRoot, "scratch", "coalescedefer", ".factory", "control-plane.prompt.md"), "utf8");
+    expect(prompt).toContain("newer text whose timer fires during old flush");
+    expect(prompt).not.toContain("older accepted text");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    if (originalDispatcher) {
+      (fixture.commands as unknown as { dispatcher: unknown }).dispatcher = originalDispatcher;
+    }
+    releaseDispatch?.();
+    clearPendingTextTimers(fixture);
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 10_000);

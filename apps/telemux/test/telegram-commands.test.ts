@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FactoryConfig } from "../src/config";
@@ -395,6 +395,46 @@ test("sendTelegramLocalFile fails closed for missing token, unsafe files, and un
         chatId: -100222
       })
     ).rejects.toThrow("either --context or --chat-id");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("sendTelegramLocalFile refuses delete-after-send when the path changes before cleanup", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "telemux-send-file-delete-race-"));
+  const sendPath = join(dir, "report.txt");
+  const replacementTarget = join(dir, "replacement.txt");
+  await writeFile(sendPath, "report");
+  await writeFile(replacementTarget, "replacement");
+  const telegram = {
+    async sendAttachment() {
+      await rm(sendPath, { force: true });
+      await symlink(replacementTarget, sendPath);
+    }
+  };
+  const db = {
+    getContextBySlug() {
+      return null;
+    }
+  };
+
+  try {
+    await expect(
+      sendTelegramLocalFile({ telegramBotToken: "test-token", telegramControlChatId: -100111 }, db, telegram, {
+        filePath: sendPath,
+        caption: null,
+        contextSlug: null,
+        chatId: null,
+        threadId: null,
+        kind: null,
+        displayName: null,
+        maxBytes: 1024,
+        allowSensitive: false,
+        deleteAfterSend: true
+      })
+    ).rejects.toThrow("changed after send");
+    expect((await lstat(sendPath)).isSymbolicLink()).toBe(true);
+    expect(await Bun.file(replacementTarget).exists()).toBe(true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -1,5 +1,6 @@
 import { deliverAttachmentRequests, formatAttachmentDeliveryIssues } from "./attachment-delivery";
 import { randomUUID } from "node:crypto";
+import { open } from "node:fs/promises";
 import {
   CODEX_MODE_PRESETS,
   formatCodexModeSummary,
@@ -95,18 +96,23 @@ function artifactSendIntentFromText(text: string): ArtifactSendIntent | null {
     return null;
   }
 
-  const quotedPath = normalized.match(/`([^`\s]+\.[^`\s]+)`/);
-  if (quotedPath?.[1]) {
-    return { filterText: quotedPath[1], latestOnly: false };
-  }
-
-  const pathLike = normalized.match(/(?:^|\s)((?:\.{0,2}\/|~\/)?[\w.-]+(?:\/[\w.-]+)*\.[A-Za-z0-9]{1,12})(?=$|[\s),.;:!?])/);
-  if (pathLike?.[1]) {
-    return { filterText: pathLike[1], latestOnly: false };
-  }
-
   const object = "(?:artifact|artifacts|attachment|attachments|file|files|document|documents|report|reports|it|this|that)";
   const qualifier = "(?:(?:the\\s+)?(?:latest|last|current)|the|this|that)";
+  const pathToken = "`([^`\\s]+\\.[^`\\s]+)`|((?:\\.{0,2}/|~/)?[\\w.-]+(?:/[\\w.-]+)*\\.[A-Za-z0-9]{1,12})";
+  const directPathRequest = new RegExp(
+    `^(?:please\\s+)?(?:send|attach|upload)(?:\\s+me)?(?:\\s+${qualifier})?(?:\\s+(?:artifact|attachment|file|document|report))?\\s+(?:${pathToken})(?:\\s+please)?[.!?]*$`,
+    "i"
+  );
+  const politePathRequest = new RegExp(
+    `^(?:can|could|would)\\s+you\\s+(?:please\\s+)?(?:send|attach|upload)(?:\\s+me)?(?:\\s+${qualifier})?(?:\\s+(?:artifact|attachment|file|document|report))?\\s+(?:${pathToken})(?:\\s+please)?[.!?]*$`,
+    "i"
+  );
+  const pathRequest = normalized.match(directPathRequest) || normalized.match(politePathRequest);
+  const requestedPath = pathRequest?.[1] || pathRequest?.[2] || pathRequest?.[3] || pathRequest?.[4];
+  if (requestedPath) {
+    return { filterText: requestedPath, latestOnly: false };
+  }
+
   const directRequest = new RegExp(
     `^(?:please\\s+)?(?:send|attach|upload)(?:\\s+me)?(?:\\s+${qualifier})?\\s+${object}(?:\\s+please)?[.!?]*$`,
     "i"
@@ -122,13 +128,28 @@ function artifactSendIntentFromText(text: string): ArtifactSendIntent | null {
   return null;
 }
 
+const LOG_TAIL_READ_BYTES = 2 * 1024 * 1024;
+
 async function readTail(path: string, lines = 40): Promise<string> {
   const file = Bun.file(path);
   if (!(await file.exists())) {
     return `Missing log file: ${path}`;
   }
 
-  const text = await file.text();
+  const handle = await open(path, "r");
+  let text = "";
+  try {
+    const info = await handle.stat();
+    const start = Math.max(0, info.size - LOG_TAIL_READ_BYTES);
+    const length = info.size - start;
+    const buffer = Buffer.alloc(length);
+    if (length > 0) {
+      await handle.read(buffer, 0, length, start);
+    }
+    text = buffer.toString("utf8");
+  } finally {
+    await handle.close();
+  }
   const tail = text.split("\n").slice(-lines).join("\n").trim();
   return tail || "(log is empty)";
 }
@@ -375,6 +396,7 @@ function formatUpdateCheckCommandResult(result: {
 
 export class CommandHandler {
   private readonly pendingText = new Map<string, PendingTextPrompt>();
+  private readonly flushingPendingTextKeys = new Set<string>();
   private readonly cronShortcutSnapshots = new Map<string, CronShortcutSnapshot>();
   private readonly artifactShortcutSnapshots = new Map<string, ArtifactShortcutSnapshot>();
 
@@ -1455,62 +1477,79 @@ export class CommandHandler {
 
   private async flushPendingText(target: TelegramTarget, userId: number | null): Promise<void> {
     const key = this.pendingKey(target, userId);
-    let pending = this.pendingText.get(key);
-    if (!pending) {
-      const stored = this.db.getPendingText(key);
-      if (stored) {
-        const generationId = this.pendingTextGenerationFor(stored);
-        let parts: string[] = [];
-        try {
-          const parsed = JSON.parse(stored.partsJson) as unknown;
-          parts = Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
-        } catch {
-          parts = [];
-        }
-        pending = {
-          key,
-          target: { chatId: stored.chatId, threadId: stored.threadId },
-          userId: stored.userId,
-          contextSlug: stored.contextSlug,
-          parts,
-          generationId,
-          createdAt: Date.parse(stored.createdAt) || Date.now(),
-          timer: setTimeout(() => undefined, 0)
-        };
-      }
-    }
-    if (!pending) {
+    if (this.flushingPendingTextKeys.has(key)) {
       return;
     }
-    clearTimeout(pending.timer);
-    this.pendingText.delete(key);
-    const flushedPartsJson = JSON.stringify(pending.parts);
-    const flushedGenerationId = pending.generationId;
-    const context = this.contexts.getContextBySlug(pending.contextSlug);
-    if (!context || context.state === "archived") {
-      this.db.deletePendingTextIfGenerationMatch(key, flushedGenerationId);
-      return;
-    }
-    const prompt = pending.parts.join("\n\n");
-    if (pending.parts.length > 1) {
-      console.log(`coalesced ${pending.parts.length} Telegram text messages for ${context.slug}`);
-    }
+    this.flushingPendingTextKeys.add(key);
     try {
-      const result = await this.handleBoundPlainText(context, prompt, pending.target, null, pending.userId);
-      if (result.accepted) {
-        this.db.deletePendingTextIfGenerationMatch(key, flushedGenerationId);
-      } else {
-        const restoreStatus = this.restorePendingTextForRetry(pending, flushedPartsJson);
-        if (restoreStatus === "preserved-newer") {
-          await this.telegram.sendText(
-            pending.target,
-            "Pending Telegram text was not dispatched; newer text for another context remains queued, so please resend the older text."
-          );
+      let pending = this.pendingText.get(key);
+      if (!pending) {
+        const stored = this.db.getPendingText(key);
+        if (stored) {
+          const generationId = this.pendingTextGenerationFor(stored);
+          let parts: string[] = [];
+          try {
+            const parsed = JSON.parse(stored.partsJson) as unknown;
+            parts = Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+          } catch {
+            parts = [];
+          }
+          pending = {
+            key,
+            target: { chatId: stored.chatId, threadId: stored.threadId },
+            userId: stored.userId,
+            contextSlug: stored.contextSlug,
+            parts,
+            generationId,
+            createdAt: Date.parse(stored.createdAt) || Date.now(),
+            timer: setTimeout(() => undefined, 0)
+          };
         }
       }
-    } catch (error) {
-      const restoreStatus = this.restorePendingTextForRetry(pending, flushedPartsJson);
-      await this.reportPendingTextFlushError(pending.target, error, restoreStatus === "restored");
+      if (!pending) {
+        return;
+      }
+      clearTimeout(pending.timer);
+      this.pendingText.delete(key);
+      const flushedPartsJson = JSON.stringify(pending.parts);
+      const flushedGenerationId = pending.generationId;
+      const context = this.contexts.getContextBySlug(pending.contextSlug);
+      if (!context || context.state === "archived") {
+        this.db.deletePendingTextIfGenerationMatch(key, flushedGenerationId);
+        await this.telegram.sendText(
+          pending.target,
+          `${pending.contextSlug} is archived or unavailable; your pending message was not dispatched. Rebind or create a new context, then resend it.`
+        );
+        return;
+      }
+      const prompt = pending.parts.join("\n\n");
+      if (pending.parts.length > 1) {
+        console.log(`coalesced ${pending.parts.length} Telegram text messages for ${context.slug}`);
+      }
+      try {
+        const result = await this.handleBoundPlainText(context, prompt, pending.target, null, pending.userId);
+        if (result.accepted) {
+          this.db.deletePendingTextIfGenerationMatch(key, flushedGenerationId);
+        } else {
+          const restoreStatus = this.restorePendingTextForRetry(pending, flushedPartsJson);
+          if (restoreStatus === "preserved-newer") {
+            await this.telegram.sendText(
+              pending.target,
+              "Pending Telegram text was not dispatched; newer text for another context remains queued, so please resend the older text."
+            );
+          }
+        }
+      } catch (error) {
+        const restoreStatus = this.restorePendingTextForRetry(pending, flushedPartsJson);
+        await this.reportPendingTextFlushError(pending.target, error, restoreStatus === "restored");
+      }
+    } finally {
+      this.flushingPendingTextKeys.delete(key);
+      const deferred = this.pendingText.get(key);
+      if (deferred) {
+        clearTimeout(deferred.timer);
+        deferred.timer = this.pendingTextTimer(deferred.target, deferred.userId);
+      }
     }
   }
 

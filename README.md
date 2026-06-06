@@ -106,3 +106,7 @@ Brainstack is designed for trusted private networks. In `trusted-tailnet` mode, 
 Client/worker bootstrap accepts `BRAIN_IMPORT_TOKEN` or `BRAIN_IMPORT_TOKEN_FILE` and writes it into `~/.config/shared-brain.env` only when the token slot is blank. `brainctl doctor --write-smoke` performs an explicit mutating import smoke test when you want to prove pushback is ready.
 
 Read [`docs/operator-preflight.md`](./docs/operator-preflight.md) before enabling `telemux`. The control-plane profile assumes a trusted private machine; telemux passes authorized Telegram work into the configured harness process and is not a sandbox.
+
+## License
+
+Brainstack is released under the [MIT License](./LICENSE).

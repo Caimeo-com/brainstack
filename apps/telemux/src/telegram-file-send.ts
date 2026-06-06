@@ -1,4 +1,5 @@
-import { lstat, readFile, rm } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { lstat, open, rm } from "node:fs/promises";
 import { basename, extname } from "node:path";
 import type { FactoryConfig } from "./config";
 import type { ContextRecord, FactoryDb } from "./db";
@@ -183,6 +184,14 @@ function preferredKind(path: string, requested: TelegramAttachmentKind | null): 
   return PHOTO_EXTENSIONS.has(extname(path).toLowerCase()) ? "photo" : "document";
 }
 
+function sameFileIdentity(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function noFollowOpenFlag(): number {
+  return typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+}
+
 function contextTarget(db: Pick<FactoryDb, "getContextBySlug">, slug: string): Pick<ContextRecord, "slug" | "telegramChatId" | "telegramThreadId"> {
   const context = db.getContextBySlug(slug);
   if (!context) {
@@ -247,15 +256,12 @@ export async function sendTelegramLocalFile(
     throw new Error("FACTORY_TELEGRAM_BOT_TOKEN is required to send Telegram files");
   }
 
-  const info = await lstat(options.filePath);
-  if (info.isSymbolicLink()) {
+  const pathInfo = await lstat(options.filePath);
+  if (pathInfo.isSymbolicLink()) {
     throw new Error(`refusing to send symlink: ${options.filePath}`);
   }
-  if (!info.isFile()) {
+  if (!pathInfo.isFile()) {
     throw new Error(`not a regular file: ${options.filePath}`);
-  }
-  if (info.size > options.maxBytes) {
-    throw new Error(`file too large: ${info.size} bytes > ${options.maxBytes}`);
   }
 
   const sourceFileName = sanitizeFileName(basename(options.filePath));
@@ -265,7 +271,32 @@ export async function sendTelegramLocalFile(
   }
 
   const target = resolveTarget(config, db, options);
-  const bytes = await readFile(options.filePath);
+  const handle = await open(options.filePath, constants.O_RDONLY | noFollowOpenFlag()).catch((error) => {
+    if (error && typeof error === "object" && "code" in error && error.code === "ELOOP") {
+      throw new Error(`refusing to send symlink: ${options.filePath}`);
+    }
+    throw error;
+  });
+  let fileInfo: Stats;
+  let bytes: Buffer;
+  try {
+    fileInfo = await handle.stat();
+    if (!sameFileIdentity(pathInfo, fileInfo)) {
+      throw new Error(`refusing to send file because it changed during validation: ${options.filePath}`);
+    }
+    if (!fileInfo.isFile()) {
+      throw new Error(`not a regular file: ${options.filePath}`);
+    }
+    if (fileInfo.size > options.maxBytes) {
+      throw new Error(`file too large: ${fileInfo.size} bytes > ${options.maxBytes}`);
+    }
+    bytes = await handle.readFile();
+    if (bytes.byteLength > options.maxBytes) {
+      throw new Error(`file too large: ${bytes.byteLength} bytes > ${options.maxBytes}`);
+    }
+  } finally {
+    await handle.close();
+  }
   const kind = preferredKind(fileName, options.kind);
   const mimeType = mimeTypeForPath(fileName);
 
@@ -282,13 +313,17 @@ export async function sendTelegramLocalFile(
 
   let deleted = false;
   if (options.deleteAfterSend) {
+    const deleteInfo = await lstat(options.filePath);
+    if (deleteInfo.isSymbolicLink() || !sameFileIdentity(fileInfo, deleteInfo)) {
+      throw new Error(`refusing to delete file because it changed after send: ${options.filePath}`);
+    }
     await rm(options.filePath, { force: true });
     deleted = true;
   }
 
   return {
     fileName,
-    sizeBytes: info.size,
+    sizeBytes: fileInfo.size,
     mimeType,
     kind,
     target,

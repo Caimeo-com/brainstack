@@ -28,6 +28,10 @@ export async function formatControlMetaResponse(input: ControlMetaResponseInput)
   const busy = input.busy ? "yes" : "no";
   const kind = resolveControlMetaKind(input.classification);
 
+  if (kind === "ack") {
+    return ["Noted.", LOCAL_HANDLING_NOTE].join("\n");
+  }
+
   if (kind === "usage") {
     const usage = await summarizeUsage(context);
     return ["Usage check.", `Context: ${context.slug}`, LOCAL_HANDLING_NOTE, "", "Latest completed harness run:", usage.text].join(
