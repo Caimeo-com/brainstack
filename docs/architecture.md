@@ -10,6 +10,8 @@
 - `packages/client-bootstrap`: harness client bootstrap artifacts.
 - `packages/skills`: portable skills, outside brain content.
 
+`brainstackd` is `brainctl daemon run`, not a separate binary. On client and worker machines it keeps the local shared-brain clone fresh, flushes the outbox, refreshes shared skills from the local clone, and writes local status for doctor/menubar-style consumers. It is convenience automation only: canonical writes still flow through `braind`, and hooks must fail open.
+
 ## Shared Brain Data
 
 The canonical shared brain is a git repo of markdown, manifests, raw artifacts, proposals, and logs.

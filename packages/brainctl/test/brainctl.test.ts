@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:net";
 import { hostname, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { gzipSync } from "node:zlib";
+import { gzipSync, gunzipSync } from "node:zlib";
 import { syncWritableRepo, syncWritableRepoAsync, withRepoLock } from "../../../apps/braind/src/brain-lib";
 import { loadConfig, parseSimpleYaml } from "../src/main";
 
@@ -81,6 +81,33 @@ function runBrainctl(args: string[], env?: Record<string, string>) {
   return runCommand(["bun", "run", BRAINCTL, ...args], { env });
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+async function readQueuedPayloadFromOutput(output: string): Promise<Record<string, unknown>> {
+  const queuedPath = output
+    .split(/\r?\n/)
+    .find((line) => line.includes("shared-brain write queued:"))
+    ?.replace(/^.*shared-brain write queued:\s*/, "")
+    .trim();
+  if (!queuedPath) {
+    throw new Error(`queued path not found in output:\n${output}`);
+  }
+  const item = JSON.parse(await readFile(queuedPath, "utf8")) as Record<string, unknown>;
+  if (item.payload && typeof item.payload === "object") {
+    return item.payload as Record<string, unknown>;
+  }
+  const storage = item.payload_storage as Record<string, unknown> | undefined;
+  if (storage?.encoding === "json" && storage.data && typeof storage.data === "object" && !Array.isArray(storage.data)) {
+    return storage.data as Record<string, unknown>;
+  }
+  if (storage?.encoding === "json-gzip-base64" && typeof storage.data === "string") {
+    return JSON.parse(gunzipSync(Buffer.from(storage.data, "base64")).toString("utf8")) as Record<string, unknown>;
+  }
+  throw new Error(`queued payload not readable: ${queuedPath}`);
+}
+
 function git(args: string[], cwd: string): string {
   const result = runCommand(["git", ...args], { cwd });
   if (result.code !== 0) {
@@ -104,6 +131,26 @@ async function writeFixtureConfig(path: string): Promise<void> {
       "  publicBaseUrl: https://brain-control.example.ts.net",
       "telemux:",
       "  enabled: false",
+      ""
+    ].join("\n")
+  );
+}
+
+async function writeFixtureClientConfig(path: string, options: { home: string; stateRoot: string; localPath?: string }): Promise<void> {
+  await writeFile(
+    path,
+    [
+      "schema_version: 1",
+      "profile: client-macos",
+      "machine:",
+      "  name: client",
+      "  user: operator",
+      "paths:",
+      `  home: ${options.home}`,
+      `  stateRoot: ${options.stateRoot}`,
+      "client:",
+      `  localPath: ${options.localPath || join(options.home, "shared-brain")}`,
+      "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
       ""
     ].join("\n")
   );
@@ -630,6 +677,523 @@ describe("brainctl install safety", () => {
       await rm(dir, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("import skill packages local files, folders, and URLs through the outbox", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-skill-import-"));
+    const port = 47_000 + Math.floor(Math.random() * 1_000);
+    const urlSkill = [
+      "---",
+      "name: url-skill",
+      "description: URL installed skill",
+      "---",
+      "",
+      "Use this URL skill."
+    ].join("\n");
+    let sourceServer: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const configPath = join(dir, "client.yaml");
+      const serverScript = join(dir, "source-server.ts");
+      await writeFile(
+        serverScript,
+        [
+          `const port = ${port};`,
+          `const body = ${JSON.stringify(urlSkill)};`,
+          "Bun.serve({",
+          "  hostname: '127.0.0.1',",
+          "  port,",
+          "  fetch(req) {",
+          "    if (new URL(req.url).pathname === '/health') return Response.json({ ok: true });",
+          "    return new Response(body, { headers: { 'content-type': 'text/markdown' } });",
+          "  }",
+          "});",
+          "await new Promise(() => {});",
+          ""
+        ].join("\n")
+      );
+      sourceServer = Bun.spawn(["bun", "run", serverScript], { stdout: "pipe", stderr: "pipe" });
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        try {
+          const health = await fetch(`http://127.0.0.1:${port}/health`);
+          if (health.ok) {
+            break;
+          }
+        } catch {
+          await Bun.sleep(25);
+        }
+      }
+      await writeFixtureClientConfig(configPath, { home, stateRoot });
+      const skillDir = join(dir, "brainstack-local");
+      await mkdir(join(skillDir, "references"), { recursive: true });
+      await writeFile(
+        join(skillDir, "SKILL.md"),
+        [
+          "---",
+          "name: local-skill",
+          "description: Local folder skill",
+          "---",
+          "",
+          "Use this local skill."
+        ].join("\n")
+      );
+      await writeFile(join(skillDir, "references", "guide.md"), "reference body\n");
+
+      const localImport = runBrainctl(["import", "skill", join(skillDir, "SKILL.md"), "--config", configPath], { HOME: home });
+      expectSuccess(localImport);
+      const localPayload = await readQueuedPayloadFromOutput(`${localImport.stdout}\n${localImport.stderr}`);
+      expect(localPayload.source_type).toBe("skill");
+      const localPackage = JSON.parse(String(localPayload.text)) as Record<string, unknown>;
+      expect(localPackage.kind).toBe("brainstack.skill_package");
+      expect(localPackage.name).toBe("local-skill");
+      expect((localPackage.files as Array<Record<string, unknown>>).map((file) => file.path)).toEqual(["SKILL.md", "references/guide.md"]);
+      expect((localPackage.source as Record<string, unknown>).kind).toBe("local");
+
+      const privateUrlBlocked = runBrainctl(["import", "skill", `http://127.0.0.1:${port}/SKILL.md`, "--config", configPath], { HOME: home });
+      expect(privateUrlBlocked.code).not.toBe(0);
+      expect(privateUrlBlocked.stderr).toContain("blocked private address");
+
+      const urlImport = runBrainctl(["import", "skill", `http://127.0.0.1:${port}/SKILL.md`, "--config", configPath, "--allow-private-url"], { HOME: home });
+      expectSuccess(urlImport);
+      const urlPayload = await readQueuedPayloadFromOutput(`${urlImport.stdout}\n${urlImport.stderr}`);
+      const urlPackage = JSON.parse(String(urlPayload.text)) as Record<string, unknown>;
+      expect(urlPackage.name).toBe("url-skill");
+      expect((urlPackage.files as Array<Record<string, unknown>>).map((file) => file.path)).toEqual(["SKILL.md"]);
+      expect((urlPackage.source as Record<string, unknown>).kind).toBe("url");
+    } finally {
+      sourceServer?.kill();
+      await sourceServer?.exited;
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("import skills deterministically plans and applies shared skill imports", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-import-skills-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const repo = join(dir, "shared-brain");
+      const configPath = join(dir, "client.yaml");
+      const cwd = join(dir, "workspace");
+      await writeFixtureClientConfig(configPath, { home, stateRoot, localPath: repo });
+
+      async function writeSkill(root: string, name: string, description: string, body = "Use this skill.\n"): Promise<string> {
+        await mkdir(root, { recursive: true });
+        const text = ["---", `name: ${name}`, `description: ${description}`, "---", "", body].join("\n");
+        await writeFile(join(root, "SKILL.md"), text);
+        return text;
+      }
+
+      const cwdSkill = await writeSkill(join(cwd, "packages", "skills", "shared-skill"), "shared-skill", "Workspace copy");
+      await writeFile(join(cwd, "packages", "skills", "shared-skill", "guide.md"), "workspace reference\n");
+      await writeSkill(join(home, ".codex", "skills", "shared-skill"), "shared-skill", "Lower-priority duplicate");
+      await writeSkill(join(home, ".codex", "skills", "codex-only"), "codex-only", "Codex skill");
+      await writeSkill(join(home, ".claude", "skills", "claude-only"), "claude-only", "Claude skill");
+      await writeSkill(join(home, ".cursor", "skills", "cursor-only"), "cursor-only", "Cursor skill");
+      const alreadySkill = await writeSkill(join(home, ".codex", "skills", "already-skill"), "already-skill", "Already imported");
+
+      await mkdir(join(repo, "manifests", "sources"), { recursive: true });
+      await mkdir(join(repo, "raw", "imported"), { recursive: true });
+      const alreadyPackage = {
+        schema_version: 1,
+        kind: "brainstack.skill_package",
+        name: "already-skill",
+        description: "Already imported",
+        imported_at: "2026-06-10T12:00:00.000Z",
+        source: { kind: "test" },
+        files: [
+          {
+            path: "SKILL.md",
+            encoding: "utf8",
+            content: alreadySkill,
+            size_bytes: new TextEncoder().encode(alreadySkill).byteLength,
+            sha256: sha256Text(alreadySkill)
+          }
+        ]
+      };
+      await writeFile(join(repo, "raw", "imported", "already-skill.json"), `${JSON.stringify(alreadyPackage, null, 2)}\n`);
+      await writeFile(
+        join(repo, "manifests", "sources", "already-skill.json"),
+        `${JSON.stringify(
+          {
+            id: "already-skill",
+            title: "Skill import: already-skill",
+            created_at: "2026-06-10T12:00:00.000Z",
+            source_type: "skill",
+            raw_path: "raw/imported/already-skill.json",
+            tags: ["brainstack-skill"]
+          },
+          null,
+          2
+        )}\n`
+      );
+
+      const env = { HOME: home, CODEX_HOME: join(home, ".codex") };
+      const plan = runCommand(["bun", "run", BRAINCTL, "import", "skills", "--config", configPath, "--json"], { cwd, env });
+      expectSuccess(plan);
+      expect(plan.stderr).not.toContain("shared-brain write queued");
+      const planBody = JSON.parse(plan.stdout) as Record<string, unknown>;
+      expect(planBody.note).toContain("global shared-brain imports");
+      const proposedNames = (planBody.proposed as Array<Record<string, unknown>>).map((item) => item.name);
+      expect(proposedNames).toEqual(["claude-only", "codex-only", "cursor-only", "shared-skill"]);
+      const sharedProposal = (planBody.proposed as Array<Record<string, unknown>>).find((item) => item.name === "shared-skill") as Record<string, unknown>;
+      expect(sharedProposal.root).toBe(await realpath(resolve(cwd, "packages", "skills", "shared-skill")));
+      expect(sharedProposal.action).toBe("install");
+      const skipped = planBody.skipped as Array<Record<string, unknown>>;
+      expect(skipped.some((item) => item.name === "already-skill" && String(item.reason).includes("already in shared brain"))).toBe(true);
+      expect(skipped.some((item) => item.name === "shared-skill" && String(item.reason).includes("duplicate skill name"))).toBe(true);
+
+      const apply = runCommand(["bun", "run", BRAINCTL, "import", "skills", "--config", configPath, "--skill", "shared-skill", "--apply", "--json"], { cwd, env });
+      expectSuccess(apply);
+      const applyBody = JSON.parse(apply.stdout) as Record<string, unknown>;
+      expect(applyBody.applied).toEqual(["shared-skill"]);
+      const payload = await readQueuedPayloadFromOutput(`${apply.stdout}\n${apply.stderr}`);
+      expect(payload.source_type).toBe("skill");
+      const importedPackage = JSON.parse(String(payload.text)) as Record<string, unknown>;
+      expect(importedPackage.name).toBe("shared-skill");
+      expect((importedPackage.files as Array<Record<string, unknown>>).map((file) => file.path)).toEqual(["SKILL.md", "guide.md"]);
+      expect(String((importedPackage.files as Array<Record<string, unknown>>)[0].content)).toBe(cwdSkill);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("skills refresh installs verified shared-brain skill packages without clobbering local skills", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-skills-refresh-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const repo = join(dir, "shared-brain");
+      const installRoot = join(dir, "codex-skills");
+      const configPath = join(dir, "client.yaml");
+      await writeFixtureClientConfig(configPath, { home, stateRoot, localPath: repo });
+      await mkdir(join(repo, "manifests", "sources"), { recursive: true });
+      await mkdir(join(repo, "raw", "imported"), { recursive: true });
+      const skillText = [
+        "---",
+        "name: imported-skill",
+        "description: Imported shared skill",
+        "---",
+        "",
+        "Use this imported skill."
+      ].join("\n");
+      const referenceText = "shared reference\n";
+      const packageBody = {
+        schema_version: 1,
+        kind: "brainstack.skill_package",
+        name: "imported-skill",
+        description: "Imported shared skill",
+        imported_at: "2026-06-10T12:00:00.000Z",
+        source: { kind: "test" },
+        files: [
+          {
+            path: "SKILL.md",
+            encoding: "utf8",
+            content: skillText,
+            size_bytes: new TextEncoder().encode(skillText).byteLength,
+            sha256: sha256Text(skillText)
+          },
+          {
+            path: "references/note.md",
+            encoding: "utf8",
+            content: referenceText,
+            size_bytes: new TextEncoder().encode(referenceText).byteLength,
+            sha256: sha256Text(referenceText)
+          }
+        ]
+      };
+      await writeFile(join(repo, "raw", "imported", "skill.md"), `${JSON.stringify(packageBody, null, 2)}\n`);
+      await writeFile(
+        join(repo, "manifests", "sources", "skill.json"),
+        `${JSON.stringify(
+          {
+            id: "skill",
+            title: "Skill import",
+            created_at: "2026-06-10T12:00:00.000Z",
+            source_type: "skill",
+            raw_path: "raw/imported/skill.md",
+            tags: ["brainstack-skill"]
+          },
+          null,
+          2
+        )}\n`
+      );
+
+      await mkdir(join(installRoot, "imported-skill"), { recursive: true });
+      await writeFile(join(installRoot, "imported-skill", "SKILL.md"), "local edits stay put\n");
+      const skipped = runBrainctl(["skills", "refresh", "--config", configPath, "--repo", repo, "--dir", installRoot, "--no-sync"], { HOME: home });
+      expectSuccess(skipped);
+      expect(skipped.stdout).toContain("skipped=1 imported-skill");
+      expect(await readFile(join(installRoot, "imported-skill", "SKILL.md"), "utf8")).toBe("local edits stay put\n");
+
+      const forced = runBrainctl(["skills", "refresh", "--config", configPath, "--repo", repo, "--dir", installRoot, "--no-sync", "--force"], { HOME: home });
+      expectSuccess(forced);
+      expect(forced.stdout).toContain("installed=1 imported-skill");
+      expect(await readFile(join(installRoot, "imported-skill", "SKILL.md"), "utf8")).toContain("Imported shared skill");
+      expect(await readFile(join(installRoot, "imported-skill", "references", "note.md"), "utf8")).toBe(referenceText);
+      expect(await Bun.file(join(installRoot, "imported-skill", ".brainstack-skill-package.json")).exists()).toBe(true);
+
+      const doctor = runBrainctl(["skills", "doctor", "--dir", installRoot, "--json"], { HOME: home });
+      expectSuccess(doctor);
+      const doctorBody = JSON.parse(doctor.stdout) as Record<string, unknown>;
+      expect(doctorBody.ok).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("hooks install status remove preserve unrelated hooks and hook run fails open", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-hooks-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const configPath = join(dir, "client.yaml");
+      await writeFixtureClientConfig(configPath, { home, stateRoot, localPath: join(dir, "shared-brain") });
+      await mkdir(join(home, ".codex"), { recursive: true });
+      await writeFile(
+        join(home, ".codex", "hooks.json"),
+        `${JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "echo keep" }] }] } }, null, 2)}\n`
+      );
+
+      const install = runBrainctl(["hooks", "install", "--target", "all", "--config", configPath, "--brainctl", "brainctl"], { HOME: home });
+      expectSuccess(install);
+      const status = runBrainctl(["hooks", "status", "--target", "all"], { HOME: home });
+      expectSuccess(status);
+      expect(status.stdout).toContain("codex: installed");
+      expect(status.stdout).toContain("claude: installed");
+      expect(status.stdout).toContain("cursor: installed");
+
+      const codexHooks = JSON.parse(await readFile(join(home, ".codex", "hooks.json"), "utf8")) as Record<string, unknown>;
+      expect(JSON.stringify(codexHooks)).toContain("echo keep");
+      expect(JSON.stringify(codexHooks)).toContain("hook run --harness codex");
+      const claudeHooks = JSON.parse(await readFile(join(home, ".claude", "settings.json"), "utf8")) as Record<string, unknown>;
+      expect(JSON.stringify(claudeHooks)).toContain("hook run --harness claude");
+      const cursorHooks = JSON.parse(await readFile(join(home, ".cursor", "hooks.json"), "utf8")) as Record<string, unknown>;
+      expect(JSON.stringify(cursorHooks)).toContain("beforeSubmitPrompt");
+      expect(JSON.stringify(cursorHooks)).toContain("hook run --harness cursor");
+
+      const hookCommand = [
+        "printf",
+        "%s",
+        shellQuote(JSON.stringify({ prompt: "hello" })),
+        "|",
+        "bun",
+        "--no-env-file",
+        "run",
+        shellQuote(BRAINCTL),
+        "hook",
+        "run",
+        "--harness",
+        "codex",
+        "--event",
+        "UserPromptSubmit",
+        "--config",
+        shellQuote(configPath)
+      ].join(" ");
+      const hookRun = runCommand(["sh", "-c", hookCommand], { env: { HOME: home } });
+      expectSuccess(hookRun);
+      expect(hookRun.stdout.trim()).toBe("{}");
+      const eventFiles = await readdir(join(stateRoot, "harness-events"));
+      expect(eventFiles.length).toBeGreaterThan(0);
+      const eventLog = await readFile(join(stateRoot, "harness-events", eventFiles[0]), "utf8");
+      expect(eventLog).toContain("UserPromptSubmit");
+      expect(eventLog).toContain("refresh-skipped");
+      expect(eventLog).toContain(sha256Text("hello"));
+      expect(eventLog).not.toContain('"prompt":"hello"');
+
+      const remove = runBrainctl(["hooks", "remove", "--target", "all"], { HOME: home });
+      expectSuccess(remove);
+      const removedCodexHooks = JSON.parse(await readFile(join(home, ".codex", "hooks.json"), "utf8")) as Record<string, unknown>;
+      expect(JSON.stringify(removedCodexHooks)).toContain("echo keep");
+      expect(JSON.stringify(removedCodexHooks)).not.toContain("hook run --harness codex");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("daemon once keeps the local shared-brain clone fresh and records status", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-daemon-once-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const configPath = join(dir, "client.yaml");
+      const bare = join(dir, "shared-brain.git");
+      const seed = join(dir, "seed");
+      const clone = join(home, "shared-brain");
+      git(["init", "--bare", "--initial-branch=main", bare], dir);
+      git(["clone", bare, seed], dir);
+      await writeFile(join(seed, "README.md"), "v1\n");
+      git(["add", "README.md"], seed);
+      git(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "seed"], seed);
+      git(["push", "-u", "origin", "main"], seed);
+      git(["clone", bare, clone], dir);
+      await writeFile(join(seed, "README.md"), "v2\n");
+      git(["add", "README.md"], seed);
+      git(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "update"], seed);
+      git(["push"], seed);
+      await writeFixtureClientConfig(configPath, { home, stateRoot, localPath: clone });
+
+      const result = runBrainctl(["daemon", "once", "--config", configPath, "--target", "codex"], { HOME: home });
+      expectSuccess(result);
+      expect(await readFile(join(clone, "README.md"), "utf8")).toBe("v2\n");
+      const status = JSON.parse(await readFile(join(stateRoot, "daemon", "status.json"), "utf8")) as Record<string, unknown>;
+      expect(status.ok).toBe(true);
+      expect(status.iteration).toBe(1);
+      expect((status.repo as Record<string, unknown>).exists).toBe(true);
+      expect((status.repo as Record<string, unknown>).clean).toBe(true);
+      expect((status.repo as Record<string, unknown>).head).toBe(git(["rev-parse", "HEAD"], clone));
+      expect((status.outbox as Record<string, unknown>).detail).toContain("flushed=");
+      expect((status.skills as Record<string, unknown>).detail).toContain("refreshed");
+      expect(await Bun.file(join(stateRoot, "daemon", "brainstackd.lock")).exists()).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("daemon once refuses to refresh skills from a dirty shared-brain clone", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-daemon-dirty-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const configPath = join(dir, "client.yaml");
+      const bare = join(dir, "shared-brain.git");
+      const seed = join(dir, "seed");
+      const clone = join(home, "shared-brain");
+      git(["init", "--bare", "--initial-branch=main", bare], dir);
+      git(["clone", bare, seed], dir);
+      await writeFile(join(seed, "README.md"), "v1\n");
+      git(["add", "README.md"], seed);
+      git(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "seed"], seed);
+      git(["push", "-u", "origin", "main"], seed);
+      git(["clone", bare, clone], dir);
+      await writeFile(join(clone, "local-edit.md"), "not canonical yet\n");
+      await writeFixtureClientConfig(configPath, { home, stateRoot, localPath: clone });
+
+      const result = runBrainctl(["daemon", "once", "--config", configPath, "--target", "codex"], { HOME: home });
+      expectSuccess(result);
+      const status = JSON.parse(await readFile(join(stateRoot, "daemon", "status.json"), "utf8")) as Record<string, unknown>;
+      expect(status.ok).toBe(false);
+      expect((status.repo as Record<string, unknown>).clean).toBe(false);
+      expect((status.skills as Record<string, unknown>).ok).toBe(false);
+      expect((status.skills as Record<string, unknown>).detail).toContain("unsafe for skill refresh");
+      expect(await Bun.file(join(home, ".codex", "skills")).exists()).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("daemon once refuses to start when another daemon lock is live", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-daemon-lock-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const configPath = join(dir, "client.yaml");
+      await writeFixtureClientConfig(configPath, { home, stateRoot, localPath: join(home, "shared-brain") });
+      await mkdir(join(stateRoot, "daemon"), { recursive: true });
+      await writeFile(join(stateRoot, "daemon", "brainstackd.lock"), `${JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() })}\n`);
+
+      const result = runBrainctl(["daemon", "once", "--config", configPath], { HOME: home });
+      expect(result.code).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("brainstack daemon already running");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("daemon install status and uninstall manage a user service without a second binary", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-daemon-install-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const systemdRoot = join(dir, "systemd-user");
+      const configPath = join(dir, "client.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: client",
+          "  user: operator",
+          "paths:",
+          `  home: ${home}`,
+          `  stateRoot: ${stateRoot}`,
+          `  systemdUserRoot: ${systemdRoot}`,
+          "client:",
+          `  localPath: ${join(home, "shared-brain")}`,
+          `  remoteSsh: ${join(dir, "shared-brain.git")}`,
+          ""
+        ].join("\n")
+      );
+
+      const dryRun = runBrainctl(["daemon", "install", "--config", configPath, "--platform", "systemd", "--dry-run", "--brainctl", "brainctl"], { HOME: home });
+      expectSuccess(dryRun);
+      expect(dryRun.stdout).toContain("daemon run");
+      expect(dryRun.stdout).toContain("brainstackd.service");
+      const install = runBrainctl(["daemon", "install", "--config", configPath, "--platform", "systemd", "--brainctl", "brainctl"], { HOME: home });
+      expectSuccess(install);
+      const servicePath = join(systemdRoot, "brainstackd.service");
+      const service = await readFile(servicePath, "utf8");
+      expect(service).toContain("daemon run");
+      expect(service).toContain(configPath);
+      const manifest = JSON.parse(await readFile(join(home, ".config", "brainstack", "managed-artifacts.json"), "utf8")) as Record<string, unknown>;
+      const artifactPaths = (manifest.artifacts as Array<Record<string, unknown>>).map((artifact) => artifact.path);
+      expect(artifactPaths).toContain(servicePath);
+
+      const status = runBrainctl(["daemon", "status", "--config", configPath, "--platform", "systemd", "--json"], { HOME: home });
+      expectSuccess(status);
+      const body = JSON.parse(status.stdout) as Record<string, unknown>;
+      expect((body.service as Record<string, unknown>).installed).toBe(true);
+      expect((body.service as Record<string, unknown>).path).toBe(servicePath);
+
+      const uninstall = runBrainctl(["daemon", "uninstall", "--config", configPath, "--platform", "systemd"], { HOME: home });
+      expectSuccess(uninstall);
+      expect(await Bun.file(servicePath).exists()).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("remember uses the enrolled default config when --config is omitted", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-default-config-"));
+    try {
+      const home = join(dir, "home");
+      const configRoot = join(home, ".config", "brainstack");
+      const stateRoot = join(dir, "state");
+      const configPath = join(configRoot, "brainstack.yaml");
+      await mkdir(configRoot, { recursive: true });
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: client",
+          "  user: operator",
+          "paths:",
+          `  home: ${home}`,
+          `  stateRoot: ${stateRoot}`,
+          `  configRoot: ${configRoot}`,
+          "brain:",
+          "  publicBaseUrl: http://127.0.0.1:9",
+          "client:",
+          `  localPath: ${join(home, "shared-brain")}`,
+          `  envPath: ${join(home, ".config", "shared-brain.env")}`,
+          "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+      await mkdir(join(home, ".config"), { recursive: true });
+      await writeFile(join(home, ".config", "shared-brain.env"), "BRAIN_IMPORT_TOKEN=test-token\n");
+
+      const result = runBrainctl(["remember", "--repo", dir, "--summary", "default config smoke"], { HOME: home, BRAINSTACK_CONFIG: "" });
+      expectSuccess(result);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("shared-brain write queued:");
+      expect(`${result.stdout}\n${result.stderr}`).not.toContain("writable but missing explicit baseUrl/importTokenEnv");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 
   test("worker provision makes privileged sudo proof explicit", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-provision-worker-sudo-"));

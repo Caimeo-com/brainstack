@@ -28,6 +28,11 @@ bun run packages/brainctl/src/main.ts context --repo .
 bun run packages/brainctl/src/main.ts search --repo . "runbook"
 bun run packages/brainctl/src/main.ts outbox status --config examples/client-macos.yaml
 bun run packages/brainctl/src/main.ts skills install --target codex --profile client --dry-run
+bun run packages/brainctl/src/main.ts skills doctor --dir ~/.codex/skills
+bun run packages/brainctl/src/main.ts import skills --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts import skill ~/.codex/skills/brainstack/SKILL.md --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts daemon status --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts hooks status --target all
 bun run packages/brainctl/src/main.ts upgrade --profile control --config examples/control.yaml
 bun run packages/brainctl/src/main.ts destroy --config ~/.config/brainstack/brainstack.yaml --dry-run
 ```
@@ -79,7 +84,7 @@ Private journaling should use an explicit separate repo/service/token boundary. 
 
 Start with the quickstart docs in `docs/`.
 See [`docs/fresh-machine-install.md`](./docs/fresh-machine-install.md) for bootstrapping a new control, worker, or client machine from prerequisites through `doctor`.
-See [`docs/portable-skills.md`](./docs/portable-skills.md) for installing Brainstack's public Codex skill/runbook bundle.
+See [`docs/portable-skills.md`](./docs/portable-skills.md) for installing Brainstack's public Codex skill/runbook bundle, importing local or URL skills into the shared brain, refreshing shared skills, and installing fail-open harness hooks. See [`docs/daemon.md`](./docs/daemon.md) for the local `brainctl daemon` mode that keeps client/worker clones, outbox, and shared skills fresh in the background.
 See [`docs/diagrams.md`](./docs/diagrams.md) for the read/write/outbox, Telegram coalescing, and control/client/worker topology diagrams.
 See [`docs/routines.md`](./docs/routines.md) for scheduled routines, built-in update checks, brain-curator setup, and daily check-ins.
 See [`docs/security-postures.md`](./docs/security-postures.md), [`docs/tailscale-exposure.md`](./docs/tailscale-exposure.md), [`docs/multi-brain.md`](./docs/multi-brain.md), and [`docs/outbox-security.md`](./docs/outbox-security.md) for the current posture, exposure, project-context, and outbox boundaries.

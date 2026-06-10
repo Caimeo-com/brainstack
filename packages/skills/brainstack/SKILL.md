@@ -41,6 +41,50 @@ brainctl skills install --target codex --profile operator
 
 Use `client` for ordinary enrolled machines and `operator` for admins who operate control hosts, workers, curation, and recovery. `control` is the control-host subset, `worker` is the worker/client subset, and invite enrollment can use `none` or installer `--skip-skills` when no Codex skills should be written. Create operator-machine invites with `brainctl invite create --skills-profile operator` when the installer should lay down the operator bundle during enrollment. Use `--skill NAME` for explicit installs, `--all` for every public skill, `--dir DIR` for a custom Codex skills root, and `--dry-run` before writing.
 
+Shared skills are imported separately from the embedded public bundle:
+
+```bash
+brainctl import skill ~/.codex/skills/brainstack/SKILL.md --config ~/.config/brainstack/brainstack.yaml
+brainctl import skill ~/.codex/skills/private-overlay --config ~/.config/brainstack/brainstack.yaml
+brainctl import skill https://github.com/example/skill-repo --config ~/.config/brainstack/brainstack.yaml
+brainctl import skills --config ~/.config/brainstack/brainstack.yaml
+brainctl import skills --config ~/.config/brainstack/brainstack.yaml --apply
+```
+
+Local `SKILL.md` inputs package the whole parent skill folder. Directory inputs must contain `SKILL.md`. URL inputs fetch a raw `SKILL.md` or clone a repository/tree URL. Raw-file URL imports block localhost/private network targets by default; pass `--allow-private-url` only for trusted private skill sources. The package is written through the normal import/outbox path with provenance and file hashes; if the brain is offline, flush later with `brainctl outbox flush`.
+
+Use `brainctl import skills` before a broad migration. It scans the current directory plus default Codex, Claude, and Cursor skill roots, prints a deterministic no-side-effect plan, notes duplicate/already-current skills, and only enqueues global shared-brain imports with `--apply`.
+
+Connected machines install shared skill packages from their local clone:
+
+```bash
+brainctl skills refresh --config ~/.config/brainstack/brainstack.yaml --target codex
+brainctl skills doctor --dir ~/.codex/skills --check-remote
+```
+
+`skills refresh` refuses to clobber an existing unmarked local skill unless `--force` is passed. `skills doctor --check-remote` may use the network and should be run intentionally, not as a routine hook.
+
+Harness hooks can run the refresh/checkpoint-metadata path in the background:
+
+```bash
+brainctl hooks install --target all --config ~/.config/brainstack/brainstack.yaml
+brainctl hooks status --target all
+brainctl hooks remove --target all
+```
+
+Hooks are fail-open convenience integration. If Brainstack, Git, or the local clone is unavailable, the harness should continue without blocking the user's prompt.
+
+For client and worker machines that should keep the local clone fresh without per-prompt Git work, use the local daemon mode:
+
+```bash
+brainctl daemon install --config ~/.config/brainstack/brainstack.yaml
+brainctl daemon install --config ~/.config/brainstack/brainstack.yaml --start
+brainctl daemon status --config ~/.config/brainstack/brainstack.yaml
+brainctl daemon once --config ~/.config/brainstack/brainstack.yaml
+```
+
+`brainstackd` is not a second binary; it is `brainctl daemon run`. It pulls the local clone with `git pull --ff-only`, flushes outbox, refreshes shared skills from the local clone, and writes local status. It must not edit canonical wiki pages, run LLMs, silently repair dirty clones, or become required for correctness.
+
 Keep public skills generic. Private topology, exact hostnames, operator usernames, service paths, Telegram chat ids, and local runbook exceptions belong in a private overlay skill outside `packages/skills`.
 
 ## Install And Enrollment Flow

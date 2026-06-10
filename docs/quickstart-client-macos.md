@@ -1,6 +1,6 @@
 # Quickstart: macOS Client
 
-The macOS client profile installs no services. It clones the shared-brain repo, writes a local env file if missing, and installs Codex/Claude/Cursor instruction snippets without silently overwriting existing files. The installer normalizes `~/shared-brain` to an absolute path before clone/pull operations, so the default path works on macOS and Linux.
+The macOS client profile clones the shared-brain repo, writes a local env file if missing, installs Codex/Claude/Cursor instruction snippets without silently overwriting existing files, and can install an optional LaunchAgent for `brainctl daemon run`. The installer normalizes `~/shared-brain` to an absolute path before clone/pull operations, so the default path works on macOS and Linux.
 
 The smooth client path is a current-platform compiled `brainctl` binary. It does not need Bun or a Brainstack source checkout on the Mac because the client bootstrap assets and public Codex skills are embedded in the binary. It still checks Git, SSH, Tailscale for the current tailnet workflow, and the selected harness, but it does not require passwordless sudo because ordinary clients do not run Brainstack machine-administration services.
 
@@ -139,6 +139,36 @@ The bootstrap installer installs real guidance, not prose pointers:
 - Claude: writes real `@~/.config/brainstack/client-bootstrap/claude-user-CLAUDE.md` import syntax.
 - Cursor: writes the actual shared-brain rule content if no rule exists. If it exists, the installer prints the exact merge command.
 - The generated files come from checked-in templates under `packages/client-bootstrap/`; compiled `brainctl` embeds those templates and only renders config placeholders at install time.
+
+For background refresh/checkpoint integration, install fail-open hooks after enrollment:
+
+```bash
+brainctl hooks install --target all --config ~/.config/brainstack/brainstack.yaml
+brainctl hooks status --target all
+```
+
+`--target codex` writes `~/.codex/hooks.json`, `--target claude` writes `~/.claude/settings.json`, and `--target cursor` writes `~/.cursor/hooks.json`. `--target all` applies all three. The installer preserves unrelated hook entries and `brainctl hooks remove --target all` removes only Brainstack-managed entries. Hooks refresh shared skill packages on session or prompt start and write local checkpoint metadata; if Brainstack is offline, they return success without blocking the harness.
+
+To globalize existing local skills, start with the no-side-effect planner:
+
+```bash
+brainctl import skills --config ~/.config/brainstack/brainstack.yaml
+brainctl import skills --config ~/.config/brainstack/brainstack.yaml --apply
+```
+
+The planner scans the current directory plus default Codex, Claude, and Cursor skill roots. `--apply` enqueues the proposed skills as global shared-brain imports so connected harnesses can refresh them on the next prompt or manual `brainctl skills refresh`.
+
+## Local Daemon
+
+Install the local daemon when this Mac should keep `~/shared-brain`, outbox, and shared skills fresh without every harness hook doing Git work:
+
+```bash
+brainctl daemon install --config ~/.config/brainstack/brainstack.yaml
+brainctl daemon install --config ~/.config/brainstack/brainstack.yaml --start
+brainctl daemon status --config ~/.config/brainstack/brainstack.yaml
+```
+
+On macOS this writes `~/Library/LaunchAgents/com.brainstack.daemon.plist`. It runs the same `brainctl` binary in daemon mode; there is no second binary to install. See [`daemon.md`](./daemon.md).
 
 ## Read/Write Model
 
