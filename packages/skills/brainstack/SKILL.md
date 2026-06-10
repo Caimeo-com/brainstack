@@ -32,21 +32,21 @@ If a required value is missing and cannot be discovered from config, ask the use
 
 ## Installing This Skill Bundle
 
-Public Brainstack skills are versioned product artifacts under `packages/skills`; they are not shared-brain content. Install them into Codex with:
+Public Brainstack skills are versioned product artifacts under `packages/skills`; they are not shared-brain content. Codex invite enrollment installs the client skill profile automatically. Use these commands to repair, refresh, or deliberately switch bundles:
 
 ```bash
 brainctl skills install --target codex --profile client
 brainctl skills install --target codex --profile operator
 ```
 
-Use `client` for ordinary enrolled machines and `operator` for admins who operate control hosts, workers, curation, and recovery. Use `--skill NAME` for explicit installs, `--all` for every public skill, `--dir DIR` for a custom Codex skills root, and `--dry-run` before writing.
+Use `client` for ordinary enrolled machines and `operator` for admins who operate control hosts, workers, curation, and recovery. `control` is the control-host subset, `worker` is the worker/client subset, and invite enrollment can use `none` or installer `--skip-skills` when no Codex skills should be written. Create operator-machine invites with `brainctl invite create --skills-profile operator` when the installer should lay down the operator bundle during enrollment. Use `--skill NAME` for explicit installs, `--all` for every public skill, `--dir DIR` for a custom Codex skills root, and `--dry-run` before writing.
 
 Keep public skills generic. Private topology, exact hostnames, operator usernames, service paths, Telegram chat ids, and local runbook exceptions belong in a private overlay skill outside `packages/skills`.
 
 ## Install And Enrollment Flow
 
 - Control hosts are source-run today: clone Brainstack, install Bun deps, run `brainctl provision`, inspect config, run `brainctl init`, enable user services, and verify with `brainctl doctor`.
-- Client machines should use invites when available: the control host runs `brainctl invite create`, the client runs the release installer, pastes the private invite, and `brainctl enroll` writes config, bootstrap guidance, optional tokens, SSH pins, and doctor output.
+- Client machines should use invites when available: the control host runs `brainctl invite create`, the client runs the release installer, pastes the private invite, and `brainctl enroll` writes config, bootstrap guidance, optional tokens, SSH pins, Codex skills for Codex invites, and doctor output.
 - Token-bearing invites are bearer secrets. Prefer private files or prompts over putting `bs1_...` values in shell history, chat logs, process argv, or issue trackers.
 - The public installer is only a downloader/checksum shim. Setup policy stays in `brainctl enroll` so retries and audits use versioned product code.
 - Standalone client binaries must embed client bootstrap templates and portable skills. Do not add source-tree-relative reads for assets required by released binaries.

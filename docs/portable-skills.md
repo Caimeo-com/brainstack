@@ -21,6 +21,8 @@ Profiles:
 - `control`: control-host operations, curation, and remote-machine operations.
 - `worker`: worker/client discipline and remote-machine operations.
 
+Invite enrollment also accepts `--skills-profile none` and installer `--skip-skills` when no Codex skills should be installed. `none` is an enrollment opt-out, not a `brainctl skills install --profile` bundle.
+
 Options:
 
 - `--skill NAME` installs one or more explicit skills.

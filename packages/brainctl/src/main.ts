@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { chmod, cp, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { isIP } from "node:net";
@@ -194,6 +194,9 @@ interface BrainstackClientInvite {
     name: HarnessName;
     bin: string;
   };
+  skills?: {
+    profile: PortableSkillProfile;
+  };
   importToken?: string;
 }
 
@@ -272,8 +275,8 @@ function usage(): string {
   brainctl bootstrap-client --profile client-macos --config brainstack.yaml --out DIR
   brainctl skills install [--target codex] [--profile client|operator|control|worker] [--skill NAME|--all] [--dir DIR] [--dry-run]
   brainctl skills list
-  brainctl invite create --config brainstack.yaml [--import-token-file FILE|--import-token-env ENV] [--ssh-known-hosts-file FILE] [--control-ssh SSH_TARGET] [--control-repo PATH] [--expires-hours N] [--install-url URL] [--json]
-  brainctl enroll --invite bs1_...|--invite-file FILE|- [--config brainstack.yaml] [--skip-init] [--skip-doctor] [--force]
+  brainctl invite create --config brainstack.yaml [--import-token-file FILE|--import-token-env ENV] [--ssh-known-hosts-file FILE] [--control-ssh SSH_TARGET] [--control-repo PATH] [--skills-profile client|operator|control|worker|none] [--expires-hours N] [--install-url URL] [--json]
+  brainctl enroll --invite bs1_...|--invite-file FILE|- [--config brainstack.yaml] [--skills-profile client|operator|control|worker|none] [--skip-skills] [--skip-init] [--skip-doctor] [--force]
   brainctl join-worker --config brainstack.yaml --worker WORKER_HOST [--ssh-user USER] [--out DIR]
   brainctl trust-worker --config brainstack.yaml --worker WORKER_NAME [--host HOST] [--dry-run]
   brainctl worker-cache status|clear --config brainstack.yaml [worker|--all]
@@ -610,13 +613,13 @@ function stringifySimpleYaml(value: Record<string, unknown>, indent = 0): string
   return `${lines.join("\n")}\n`;
 }
 
-async function loadRawConfig(path?: string): Promise<Record<string, unknown>> {
+async function loadRawConfig(path?: string, profileHint?: string): Promise<Record<string, unknown>> {
   if (!path) {
     return {};
   }
   const configPath = abs(path);
   if (!existsSync(configPath)) {
-    throw new Error(await missingConfigMessage(configPath));
+    throw new Error(await missingConfigMessage(configPath, profileHint));
   }
   const text = await readFile(configPath, "utf8");
   if (configPath.endsWith(".json")) {
@@ -645,13 +648,23 @@ async function discoverConfigCandidates(configDir: string): Promise<string[]> {
     });
 }
 
-async function missingConfigMessage(configPath: string): Promise<string> {
+async function missingConfigMessage(configPath: string, profileHint?: string): Promise<string> {
   const candidates = await discoverConfigCandidates(dirname(configPath));
+  const profile = SUPPORTED_PROFILES.includes(profileHint as Profile) ? (profileHint as Profile) : "control";
+  const createLines =
+    profile === "client-macos"
+      ? [
+          "Create one by enrolling with a private invite:",
+          `  brainctl enroll --invite-file /path/to/invite.txt --config ${configPath}`,
+          "",
+          "Or manually provision a client config:",
+          `  brainctl provision --profile client-macos --out ${configPath} --harness codex --brain-base-url URL --brain-remote SSH_OR_PATH`
+        ]
+      : ["Create one with:", `  brainctl provision --profile ${profile} --out ${configPath} --harness codex`];
   return [
     `Brainstack config not found: ${configPath}`,
     "",
-    "Create one with:",
-    `  brainctl provision --profile control --out ${configPath} --harness codex`,
+    ...createLines,
     "",
     "Or pass an existing config explicitly:",
     ...candidates.map((candidate) => `  brainctl doctor --config ${candidate}`),
@@ -740,7 +753,7 @@ function resolveBunBin(): string {
 }
 
 export async function loadConfig(configPath?: string, profileOverride?: string, rootOverride?: string): Promise<BrainstackConfig> {
-  const raw = await loadRawConfig(configPath);
+  const raw = await loadRawConfig(configPath, profileOverride);
   validateRawConfig(raw);
   const schemaVersion = numberAt(raw, "schema_version", numberAt(raw, "config_version", CONFIG_SCHEMA_VERSION));
   const profile = (profileOverride || stringAt(raw, "profile", "single-node")) as Profile;
@@ -1353,6 +1366,16 @@ function decodeClientInvite(input: string): BrainstackClientInvite {
     throw new Error(`invite expired at ${invite.expires_at}`);
   }
   const harnessName = normalizeHarness(invite.harness.name);
+  let skillsProfile: PortableSkillProfile | undefined;
+  if (invite.skills !== undefined) {
+    if (!invite.skills || typeof invite.skills !== "object" || Array.isArray(invite.skills)) {
+      throw new Error("invite skills section must be an object");
+    }
+    const rawSkillsProfile = (invite.skills as { profile?: unknown }).profile;
+    if (rawSkillsProfile !== undefined) {
+      skillsProfile = normalizePortableSkillProfile(String(rawSkillsProfile));
+    }
+  }
   return {
     schema_version: 1,
     type: CLIENT_INVITE_TYPE,
@@ -1378,6 +1401,7 @@ function decodeClientInvite(input: string): BrainstackClientInvite {
       name: harnessName,
       bin: String(invite.harness.bin || harnessName)
     },
+    skills: skillsProfile ? { profile: skillsProfile } : undefined,
     importToken: typeof invite.importToken === "string" && invite.importToken.trim() ? invite.importToken.trim() : undefined
   };
 }
@@ -2214,6 +2238,47 @@ async function installLocalClientBootstrap(cfg: BrainstackConfig, options: { imp
 function commandPath(name: string): string | null {
   const proc = run(["bash", "-c", `command -v ${shellSingleQuote(name)}`], { check: false, env: userShellPathEnv() });
   return proc.code === 0 && proc.stdout.trim() ? proc.stdout.trim().split(/\r?\n/)[0] : null;
+}
+
+function executableFile(path: string): boolean {
+  try {
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function commonCodexAppCliPath(): string | null {
+  const candidates = [
+    "/Applications/Codex.app/Contents/Resources/codex",
+    process.env.HOME ? join(process.env.HOME, "Applications", "Codex.app", "Contents", "Resources", "codex") : ""
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (executableFile(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function resolveEnrollHarnessBin(invite: BrainstackClientInvite): { configBin: string; executable: string } | null {
+  const invitedBin = invite.harness.bin || invite.harness.name;
+  if (invitedBin.includes("/") && executableFile(absWithHome(invitedBin, process.env.HOME || "."))) {
+    const absoluteBin = absWithHome(invitedBin, process.env.HOME || ".");
+    return { configBin: absoluteBin, executable: absoluteBin };
+  }
+  const resolved = commandPath(invitedBin) || commandPath(invite.harness.name);
+  if (resolved) {
+    return { configBin: invitedBin, executable: resolved };
+  }
+  if (invite.harness.name === "codex") {
+    const codexAppCli = commonCodexAppCliPath();
+    if (codexAppCli) {
+      return { configBin: codexAppCli, executable: codexAppCli };
+    }
+  }
+  return null;
 }
 
 let cachedUserShellPath: string | null | undefined;
@@ -3203,9 +3268,9 @@ async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Pro
 
   const tailscaleBin = commandPath("tailscale");
   if (tailscaleBin) {
-    const status = run([tailscaleBin, "status", "--json"], { check: false });
+    const status = run([tailscaleBin, "status", "--json"], { check: false, timeoutMs: updateProbeTimeoutMs() });
     checks.push(status.code === 0 ? check("PASS", "tailscale", "status", "tailscale status --json succeeded") : check("WARN", "tailscale", "status", (status.stderr || status.stdout).trim()));
-    const serve = run([tailscaleBin, "serve", "status"], { check: false });
+    const serve = run([tailscaleBin, "serve", "status"], { check: false, timeoutMs: updateProbeTimeoutMs() });
     checks.push(serve.code === 0 ? check("PASS", "tailscale", "serve", "serve status available") : check("WARN", "tailscale", "serve", (serve.stderr || serve.stdout).trim()));
   }
 
@@ -5461,12 +5526,27 @@ function inviteInstallCommand(installUrl: string): string {
   return `curl -fsSL ${shellSingleQuote(installUrl)} | sh`;
 }
 
+type EnrollSkillsProfile = PortableSkillProfile | "none";
+
+function normalizeEnrollSkillsProfile(value: string | undefined, fallback: EnrollSkillsProfile): EnrollSkillsProfile {
+  const normalized = (value || fallback).trim().toLowerCase();
+  if (normalized === "none" || normalized === "off" || normalized === "skip") {
+    return "none";
+  }
+  return normalizePortableSkillProfile(normalized);
+}
+
+function defaultInviteSkillsProfile(harnessName: HarnessName): EnrollSkillsProfile {
+  return harnessName === "codex" ? "client" : "none";
+}
+
 async function commandInviteCreate(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile") || "control", flag(args, "root"));
   const expiresHours = parsePositiveIntegerFlag(args, "expires-hours", 24);
   const createdAt = new Date();
   const expiresAt = new Date(createdAt.getTime() + expiresHours * 60 * 60 * 1000);
   const harnessName = normalizeHarness(requireFlagValue(args, "harness") || cfg.harness.name);
+  const skillsProfile = normalizeEnrollSkillsProfile(requireFlagValue(args, "skills-profile"), defaultInviteSkillsProfile(harnessName));
   const controlSshTarget = inviteControlSshTarget(cfg, args);
   const invitePayload: BrainstackClientInvite = {
     schema_version: 1,
@@ -5490,7 +5570,8 @@ async function commandInviteCreate(args: ParsedArgs): Promise<void> {
     harness: {
       name: harnessName,
       bin: requireFlagValue(args, "harness-bin") || harnessName
-    }
+    },
+    skills: skillsProfile === "none" ? undefined : { profile: skillsProfile }
   };
   const importToken = await inviteImportToken(args);
   if (importToken) {
@@ -5513,7 +5594,8 @@ async function commandInviteCreate(args: ParsedArgs): Promise<void> {
           installCommand,
           expiresAt: invitePayload.expires_at,
           includesImportToken: Boolean(importToken),
-          includesSshKnownHosts: invitePayload.control.sshKnownHosts.length > 0
+          includesSshKnownHosts: invitePayload.control.sshKnownHosts.length > 0,
+          skillsProfile
         },
         null,
         2
@@ -5529,6 +5611,7 @@ async function commandInviteCreate(args: ParsedArgs): Promise<void> {
   console.log(`expires: ${invitePayload.expires_at}`);
   console.log(`import token embedded: ${importToken ? "yes" : "no"}`);
   console.log(`ssh host pin embedded: ${invitePayload.control.sshKnownHosts.length ? "yes" : "no"}`);
+  console.log(`codex skills profile: ${skillsProfile}`);
   if (importToken) {
     console.log("treat the invite as a bearer secret; avoid putting it in shell history or shared logs.");
   }
@@ -5542,14 +5625,14 @@ async function commandInvite(args: ParsedArgs): Promise<void> {
     case "help":
     case "--help":
     case "-h":
-      console.log("Usage: brainctl invite create --config brainstack.yaml [--import-token-file FILE|--import-token-env ENV] [--ssh-known-hosts-file FILE] [--control-ssh SSH_TARGET] [--control-repo PATH] [--expires-hours N] [--install-url URL] [--json]");
+      console.log("Usage: brainctl invite create --config brainstack.yaml [--import-token-file FILE|--import-token-env ENV] [--ssh-known-hosts-file FILE] [--control-ssh SSH_TARGET] [--control-repo PATH] [--skills-profile client|operator|control|worker|none] [--expires-hours N] [--install-url URL] [--json]");
       return;
     default:
       throw new Error(`Unknown invite command: ${subcommand}`);
   }
 }
 
-function buildEnrollConfig(invite: BrainstackClientInvite, args: ParsedArgs): Record<string, unknown> {
+function buildEnrollConfig(invite: BrainstackClientInvite, args: ParsedArgs, harnessBin: string): Record<string, unknown> {
   const user = process.env.USER || "operator";
   const home = abs(requireFlagValue(args, "home") || process.env.HOME || ".");
   const machineName = requireFlagValue(args, "machine") || discoveredMachineName();
@@ -5561,7 +5644,7 @@ function buildEnrollConfig(invite: BrainstackClientInvite, args: ParsedArgs): Re
     },
     harness: {
       name: invite.harness.name,
-      bin: invite.harness.bin
+      bin: harnessBin
     },
     machine: {
       name: machineName,
@@ -5696,7 +5779,7 @@ async function readInviteFile(path: string): Promise<string> {
 
 async function commandEnroll(args: ParsedArgs): Promise<void> {
   if (hasFlag(args, "help") || args.positional[0] === "help" || args.positional[0] === "-h" || args.positional[0] === "--help") {
-    console.log("Usage: brainctl enroll --invite bs1_...|--invite-file FILE|- [--config brainstack.yaml] [--skip-init] [--skip-doctor] [--force]");
+    console.log("Usage: brainctl enroll --invite bs1_...|--invite-file FILE|- [--config brainstack.yaml] [--skills-profile client|operator|control|worker|none] [--skip-skills] [--skip-init] [--skip-doctor] [--force]");
     return;
   }
   const inviteInput = requireFlagValue(args, "invite");
@@ -5713,13 +5796,13 @@ async function commandEnroll(args: ParsedArgs): Promise<void> {
     "";
   const invite = decodeClientInvite(rawInvite);
   ensureProvisionPrereqs("client-macos");
-  const harnessPath = commandPath(invite.harness.bin) || commandPath(invite.harness.name);
-  if (!harnessPath) {
+  const harness = resolveEnrollHarnessBin(invite);
+  if (!harness) {
     throw new Error(`enroll blocked: invited harness ${invite.harness.bin} is missing.\n${installHint(invite.harness.name)}`);
   }
 
   const configPath = abs(requireFlagValue(args, "config") || "~/.config/brainstack/brainstack.yaml");
-  const rendered = stringifySimpleYaml(buildEnrollConfig(invite, args));
+  const rendered = stringifySimpleYaml(buildEnrollConfig(invite, args, harness.configBin));
   await writeEnrollConfig(configPath, rendered, hasFlag(args, "force"));
   const cfg = await loadConfig(configPath, "client-macos", flag(args, "root"));
   const installedKnownHosts = await installInviteKnownHosts(cfg, invite.control.sshKnownHosts);
@@ -5738,6 +5821,12 @@ async function commandEnroll(args: ParsedArgs): Promise<void> {
       initFlags["import-token-file"] = overrideTokenFile;
     }
     await commandInit({ command: "init", positional: [], flags: initFlags }, { importToken: overrideTokenFile ? undefined : invite.importToken });
+  }
+
+  const defaultSkillsProfile = invite.skills?.profile || defaultInviteSkillsProfile(invite.harness.name);
+  const skillsProfile = normalizeEnrollSkillsProfile(requireFlagValue(args, "skills-profile"), defaultSkillsProfile);
+  if (!hasFlag(args, "skip-skills") && skillsProfile !== "none") {
+    await commandSkills({ command: "skills", positional: ["install"], flags: { target: "codex", profile: skillsProfile } });
   }
 
   if (!hasFlag(args, "skip-doctor")) {

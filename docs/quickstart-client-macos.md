@@ -2,7 +2,9 @@
 
 The macOS client profile installs no services. It clones the shared-brain repo, writes a local env file if missing, and installs Codex/Claude/Cursor instruction snippets without silently overwriting existing files. The installer normalizes `~/shared-brain` to an absolute path before clone/pull operations, so the default path works on macOS and Linux.
 
-The smooth client path is a current-platform compiled `brainctl` binary. It does not need Bun or a Brainstack source checkout on the Mac because the client bootstrap assets are embedded in the binary. It still checks Git, SSH, Tailscale for the current tailnet workflow, and the selected harness, but it does not require passwordless sudo because ordinary clients do not run Brainstack machine-administration services.
+The smooth client path is a current-platform compiled `brainctl` binary. It does not need Bun or a Brainstack source checkout on the Mac because the client bootstrap assets and public Codex skills are embedded in the binary. It still checks Git, SSH, Tailscale for the current tailnet workflow, and the selected harness, but it does not require passwordless sudo because ordinary clients do not run Brainstack machine-administration services.
+
+Use this path even on a Mac that also has a Brainstack development checkout. The checkout is for product work; the installed client lives under normal user locations such as `~/.local/bin/brainctl`, `~/.config/brainstack/brainstack.yaml`, `~/.config/shared-brain.env`, `~/.codex/skills`, and `~/shared-brain`.
 
 ## Binary-First Install
 
@@ -16,11 +18,32 @@ brainctl invite create \
   --ssh-known-hosts-file ~/.config/brainstack/control_ssh_known_hosts
 ```
 
-Run the printed command on the Mac after the selected release exists, then paste the printed invite at the prompt. The installer keeps the invite out of `brainctl` argv by writing it to a private temporary file and calling `brainctl enroll --invite-file ...`; enrollment writes `~/.config/brainstack/brainstack.yaml`, installs pinned SSH host keys when embedded, clones the shared brain, installs harness guidance, and runs doctor unless `--skip-doctor` is passed to the installer.
+Run the printed command on the Mac after the selected release exists, then paste the printed invite at the prompt. The installer keeps the invite out of `brainctl` argv by writing it to a private temporary file and calling `brainctl enroll --invite-file ...`; enrollment writes `~/.config/brainstack/brainstack.yaml`, installs pinned SSH host keys when embedded, clones the shared brain, installs harness guidance, installs the default Codex client skill bundle when the invite uses Codex, and runs doctor unless `--skip-doctor` is passed to the installer.
+
+If this Mac is the operator's daily-driver machine, create the invite with the operator skill bundle:
+
+```bash
+brainctl invite create \
+  --config ~/.config/brainstack/brainstack.yaml \
+  --import-token-file ~/brain-import-token.txt \
+  --control-ssh operator@brain-control \
+  --ssh-known-hosts-file ~/.config/brainstack/control_ssh_known_hosts \
+  --skills-profile operator
+```
 
 `--ssh-known-hosts-file` should contain the control SSH host pin for the `--control-ssh` target. Extra entries are ignored; a file with no matching control-host pin is rejected.
 
 For scripted setup, save the invite to a `chmod 600` file and pass `--invite-file /path/to/invite.txt`. Avoid `--invite bs1_...` on shared machines because token-bearing invites can otherwise land in shell history or process listings.
+
+Skill profile values:
+
+- `client`: ordinary enrolled Mac or Linux client. Installs shared-brain client usage plus the generic Brainstack runbook.
+- `operator`: admin or daily-driver machine that should operate control hosts, workers, curation, recovery, and client workflows. Installs every public Brainstack skill.
+- `control`: control-host operations, curation, and remote-machine operations.
+- `worker`: worker/client discipline plus remote-machine operations.
+- `none`: no Codex skills. Use only when the harness is not Codex or skills are managed separately.
+
+Installer flags override the invite profile. Use `--skip-skills` to suppress skill installation without changing the invite, `--skip-doctor` when diagnostics will run separately, `--skip-init` to write config and host pins only, and `--skip-enroll` to install only the `brainctl` binary.
 
 Manual binary-first install remains useful for custom configs:
 
@@ -53,7 +76,7 @@ BRAIN_IMPORT_TOKEN_FILE=~/brain-import-token.txt \
 
 Brainstack also ships public Codex skills with the CLI. They are generic product runbooks for shared-brain usage, client discipline, file relay, and operator workflows; they do not contain private machine topology.
 
-On an enrolled client:
+Invite enrollment installs the Codex client skill profile automatically for Codex clients. On an enrolled client, rerun this only to repair or intentionally switch profiles:
 
 ```bash
 brainctl skills install --target codex --profile client
@@ -66,6 +89,8 @@ brainctl skills install --target codex --profile operator
 ```
 
 Use `--dry-run` to inspect the files first. Keep exact hostnames, local service paths, and Telegram routing details in a private local overlay skill, not in the public Brainstack package.
+
+Codex App users can satisfy the enrollment harness check with `/Applications/Codex.app/Contents/Resources/codex`; `codex` does not have to be on `PATH`. If the app-bundled CLI is the only Codex binary found, enrollment writes that absolute path into the Brainstack client config.
 
 ## Client Env
 

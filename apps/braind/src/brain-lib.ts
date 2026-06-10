@@ -535,6 +535,17 @@ async function runCommandAsync(args: string[], cwd: string, check = true): Promi
   return normalizedStdout;
 }
 
+function cleanWritableRepoStatus(status: string): string {
+  return status
+    .split(/\r?\n/)
+    .filter((line) => {
+      const path = line.slice(3).trim();
+      return path !== ".shared-brain.lock" && !path.startsWith(".shared-brain.lock/");
+    })
+    .join("\n")
+    .trim();
+}
+
 export function syncWritableRepo(repoRoot: string): void {
   if (!existsSync(join(repoRoot, ".git"))) {
     throw new Error(`Writable repo is not a git checkout: ${repoRoot}`);
@@ -543,8 +554,8 @@ export function syncWritableRepo(repoRoot: string): void {
   if (branch !== "main") {
     throw new Error(`Writable repo must be on main before writes; found ${branch} in ${repoRoot}`);
   }
-  const dirty = runCommand(["git", "status", "--porcelain"], repoRoot);
-  if (dirty.trim()) {
+  const dirty = cleanWritableRepoStatus(runCommand(["git", "status", "--porcelain"], repoRoot));
+  if (dirty) {
     throw new Error(`Writable repo is dirty; refusing API write until cleaned: ${repoRoot}`);
   }
   runCommand(["git", "fetch", "origin", "main"], repoRoot);
@@ -572,8 +583,8 @@ export async function syncWritableRepoAsync(repoRoot: string): Promise<void> {
   if (branch !== "main") {
     throw new Error(`Writable repo must be on main before writes; found ${branch} in ${repoRoot}`);
   }
-  const dirty = await runCommandAsync(["git", "status", "--porcelain"], repoRoot);
-  if (dirty.trim()) {
+  const dirty = cleanWritableRepoStatus(await runCommandAsync(["git", "status", "--porcelain"], repoRoot));
+  if (dirty) {
     throw new Error(`Writable repo is dirty; refusing API write until cleaned: ${repoRoot}`);
   }
   await runCommandAsync(["git", "fetch", "origin", "main"], repoRoot);

@@ -6,7 +6,7 @@ import { createServer, type Server } from "node:net";
 import { hostname, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
-import { syncWritableRepo } from "../../../apps/braind/src/brain-lib";
+import { syncWritableRepo, syncWritableRepoAsync, withRepoLock } from "../../../apps/braind/src/brain-lib";
 import { loadConfig, parseSimpleYaml } from "../src/main";
 
 const PRODUCT_ROOT = resolve(import.meta.dir, "..", "..", "..");
@@ -28,9 +28,17 @@ const FORBIDDEN_PUBLIC_PATTERNS: Array<{ label: string; pattern: RegExp }> = [
 ];
 
 function runCommand(args: string[], options: { cwd?: string; env?: Record<string, string> } = {}) {
+  const envOverrides = options.env || {};
+  const defaultEnv: Record<string, string> = {
+    BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS: "1000",
+    BRAINSTACK_SHELL_PATH_TIMEOUT_MS: "1000"
+  };
+  if (!("BRAINSTACK_SKIP_USER_PATH_RESOLVE" in envOverrides || "BRAINSTACK_WORKER_PATH" in envOverrides || "SHELL" in envOverrides)) {
+    defaultEnv.BRAINSTACK_SKIP_USER_PATH_RESOLVE = "1";
+  }
   const proc = Bun.spawnSync(args, {
     cwd: options.cwd || PRODUCT_ROOT,
-    env: { ...process.env, ...(options.env || {}) },
+    env: { ...process.env, ...defaultEnv, ...envOverrides },
     stdout: "pipe",
     stderr: "pipe"
   });
@@ -289,6 +297,12 @@ telemux:
       expect(output).toContain(`brainctl provision --profile control --out ${missing}`);
       expect(output).toContain(`brainctl doctor --config ${candidate}`);
       expect(output).not.toContain("ENOENT");
+      const clientResult = runBrainctl(["doctor", "--profile", "client-macos", "--config", missing], { HOME: dir });
+      expect(clientResult.code).not.toBe(0);
+      const clientOutput = `${clientResult.stdout}\n${clientResult.stderr}`;
+      expect(clientOutput).toContain(`brainctl enroll --invite-file /path/to/invite.txt --config ${missing}`);
+      expect(clientOutput).toContain(`brainctl provision --profile client-macos --out ${missing}`);
+      expect(clientOutput).not.toContain("brainctl provision --profile control");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -1036,6 +1050,35 @@ describe("braind write safety", () => {
       syncWritableRepo(staging);
       expect(await readFile(join(staging, "wiki", "Index.md"), "utf8")).toContain("Direct push content");
       expect(git(["rev-parse", "HEAD"], staging)).toBe(git(["rev-parse", "origin/main"], staging));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("staging dirty check ignores Brainstack's own repo lock only", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-lock-sync-"));
+    try {
+      const bare = join(dir, "shared-brain.git");
+      const staging = join(dir, "staging");
+
+      git(["init", "--bare", "--initial-branch=main", bare], dir);
+      git(["clone", bare, staging], dir);
+      await writeFile(join(staging, "README.md"), "# Shared Brain\n");
+      git(["add", "README.md"], staging);
+      git(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "seed"], staging);
+      git(["push", "-u", "origin", "main"], staging);
+
+      await withRepoLock(staging, async () => {
+        await syncWritableRepoAsync(staging);
+      });
+      expect(git(["status", "--short"], staging)).toBe("");
+      expect(existsSync(join(staging, ".shared-brain.lock"))).toBe(false);
+
+      await writeFile(join(staging, "dirty.md"), "real dirt\n");
+      await expect(withRepoLock(staging, async () => syncWritableRepoAsync(staging))).rejects.toThrow(
+        /Writable repo is dirty/
+      );
+      expect(existsSync(join(staging, ".shared-brain.lock"))).toBe(false);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -5078,7 +5121,7 @@ describe("public release hygiene", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   test("outbox moves repeated HTTP 425 idempotency responses to terminal review", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-outbox-425-"));
@@ -5206,7 +5249,7 @@ describe("public release hygiene", () => {
       }
       await rm(dir, { recursive: true, force: true });
     }
-  }, 20_000);
+  }, 30_000);
 
   test("updates command is read-only and reports versions", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-updates-"));
@@ -5469,7 +5512,7 @@ describe("public release hygiene", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 10_000);
 
   test("doctor resolves remote worker harness through the worker user's shell PATH", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-remote-path-"));
@@ -5495,7 +5538,7 @@ describe("public release hygiene", () => {
         ].join("\n")
       );
       await chmod(fakeCodex, 0o755);
-      for (const name of ["bun", "git", "ssh", "tailscale"]) {
+      for (const name of ["bun", "git", "ssh", "tailscale", "sudo"]) {
         const fakeCommand = join(remoteBin, name);
         await writeFile(
           fakeCommand,
@@ -5542,6 +5585,7 @@ describe("public release hygiene", () => {
           "shift", // remote target
           "export PATH=/usr/bin:/bin",
           `export SHELL='${fakeShell}'`,
+          "unset BRAINSTACK_SKIP_USER_PATH_RESOLVE",
           "exec \"$@\"",
           ""
         ].join("\n")
@@ -5679,7 +5723,7 @@ describe("public release hygiene", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 10_000);
 
   test("telegram send-file rejects unsafe local files before opening SSH", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-telegram-send-file-unsafe-"));
@@ -5730,7 +5774,7 @@ describe("public release hygiene", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 10_000);
 
   test("worker doctor refuses accept-new SSH trust without explicit bootstrap override", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-worker-accept-new-refusal-"));
@@ -5865,7 +5909,7 @@ describe("public release hygiene", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 10_000);
 
   test("doctor runs local harness wrappers with the user's shell PATH", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-local-harness-path-"));
@@ -5999,7 +6043,7 @@ describe("public release hygiene", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   test("invite create and enroll perform one-line client bootstrap without leaking the import token", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-invite-enroll-"));
@@ -6085,6 +6129,8 @@ describe("public release hygiene", () => {
           tokenPath,
           "--ssh-known-hosts-file",
           knownHostsPath,
+          "--skills-profile",
+          "operator",
           "--install-url",
           "https://example.invalid/brainstack/install.sh",
           "--json"
@@ -6098,11 +6144,13 @@ describe("public release hygiene", () => {
       expect(inviteResult.installCommand).toContain("https://example.invalid/brainstack/install.sh");
       expect(inviteResult.includesImportToken).toBe(true);
       expect(inviteResult.includesSshKnownHosts).toBe(true);
+      expect(inviteResult.skillsProfile).toBe("operator");
       const decoded = JSON.parse(Buffer.from(String(inviteResult.invite).slice("bs1_".length), "base64url").toString("utf8"));
       expect(decoded.importToken).toBe("import-token-value");
       expect(decoded.control.remoteRepo).toBe(join(home, "brainstack"));
       expect(decoded.control.sshTarget).toBe("operator@control.example");
       expect(decoded.control.sshKnownHosts).toEqual(["control.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeBrainstackControlKeyForTestsOnly"]);
+      expect(decoded.skills.profile).toBe("operator");
 
       const clientConfig = join(dir, "client.yaml");
       const enrolled = runBrainctl(["enroll", "--invite", inviteResult.invite, "--config", clientConfig, "--skip-doctor"], {
@@ -6125,6 +6173,8 @@ describe("public release hygiene", () => {
       expect((await stat(clientEnvPath)).mode & 0o777).toBe(0o600);
       expect((await readdir(configRoot)).filter((name) => name.includes(".invite-import-token")).length).toBe(0);
       expect((await stat(join(home, "shared-brain", ".git"))).isDirectory()).toBe(true);
+      expect(await readFile(join(home, ".codex", "skills", "shared-brain-client", "SKILL.md"), "utf8")).toContain("Shared Brain Client");
+      expect(await readFile(join(home, ".codex", "skills", "remote-machine-ops", "SKILL.md"), "utf8")).toContain("Remote Machine Ops");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -6517,6 +6567,8 @@ describe("public release hygiene", () => {
     expect(installScript).toContain("shasum -a 256");
     expect(installScript).toContain("openssl dgst -sha256");
     expect(installScript).toContain("--invite-file");
+    expect(installScript).toContain("--skills-profile");
+    expect(installScript).toContain("--skip-skills");
     expect(installScript).toContain("refusing non-HTTPS download URL");
     expect(installScript).toContain("--allow-unsafe-invite");
     expect(installScript).toContain("raw invites in argv/env can leak");

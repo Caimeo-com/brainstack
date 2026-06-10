@@ -64,6 +64,8 @@ curl -fsSL "https://github.com/Caimeo-com/brainstack/releases/download/$RELEASE_
 
 Paste the printed invite when prompted. The installer only downloads and verifies `brainctl`; enrollment, config rendering, token installation, client bootstrap, and post-install doctor checks live in the versioned CLI. See [`docs/install-one-line.md`](./docs/install-one-line.md).
 
+Use `brainctl invite create --skills-profile operator` for an admin or daily-driver machine that should receive every public Brainstack skill during enrollment. The default `client` profile is for ordinary enrolled machines. Installer flags can override the invite: `--skills-profile client|operator|control|worker|none`, `--skip-skills`, `--skip-doctor`, `--skip-init`, and `--skip-enroll` are documented in [`docs/install-one-line.md`](./docs/install-one-line.md#flag-reference).
+
 Generated source-run services also invoke Bun with `--no-env-file` and load explicit `*.runtime.env` plus operator-owned `*.secrets.env` files. This keeps service behavior deterministic instead of depending on whichever `.env` happens to exist near the product repo.
 
 ## Profiles

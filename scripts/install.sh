@@ -3,7 +3,7 @@ set -eu
 
 usage() {
   cat <<'USAGE'
-Usage: install.sh [--invite-file FILE|-] [--version vX.Y.Z|latest] [--base-url URL] [--bin-dir DIR] [--config FILE] [--skip-enroll] [--skip-init] [--skip-doctor] [--force]
+Usage: install.sh [--invite-file FILE|-] [--version vX.Y.Z|latest] [--base-url URL] [--bin-dir DIR] [--config FILE] [--skills-profile client|operator|control|worker|none] [--skip-enroll] [--skip-init] [--skip-skills] [--skip-doctor] [--force]
 
 Downloads the platform-specific brainctl binary, verifies its SHA256 sidecar,
 installs it to the target bin directory, and optionally runs brainctl enroll.
@@ -13,6 +13,23 @@ the trust anchor.
 If no invite file is provided and a terminal is attached, the installer prompts
 for one after brainctl is installed. That keeps token-bearing invites out of
 shell history, environment snapshots, and brainctl argv.
+
+Flags:
+  --invite-file FILE|-    Read a private invite from FILE or stdin.
+  --version TAG|latest    Download a GitHub release tag or latest release.
+  --base-url URL          Download assets from URL instead of GitHub releases.
+  --bin-dir DIR           Install brainctl into DIR. Default: $HOME/.local/bin.
+  --config FILE           Write enrollment config to FILE.
+  --skills-profile VALUE  Install Codex skills for client, operator, control,
+                          worker, or none. Installer value overrides invite.
+  --skip-enroll           Install brainctl only; do not run enrollment.
+  --skip-init             Enroll config and host pins only; skip local clone,
+                          env, harness guidance, skills, and doctor.
+  --skip-skills           Do not install Codex skills during enrollment.
+  --skip-doctor           Do not run post-enrollment doctor.
+  --force                 Allow replacing an existing Brainstack config.
+  --allow-unsafe-invite   Permit raw --invite/BRAINSTACK_INVITE only for local
+                          throwaway tests. Prefer --invite-file.
 USAGE
 }
 
@@ -24,10 +41,12 @@ invite_file="${BRAINSTACK_INVITE_FILE:-}"
 config_file="${BRAINSTACK_CONFIG:-}"
 skip_enroll=0
 skip_init=0
+skip_skills=0
 skip_doctor=0
 force=0
 prompt_unavailable=0
 allow_unsafe_invite=0
+skills_profile="${BRAINSTACK_SKILLS_PROFILE:-}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -91,6 +110,19 @@ while [ "$#" -gt 0 ]; do
       ;;
     --skip-init)
       skip_init=1
+      shift
+      ;;
+    --skip-skills)
+      skip_skills=1
+      shift
+      ;;
+    --skills-profile)
+      [ "$#" -ge 2 ] || { echo "install.sh: --skills-profile requires a value" >&2; exit 2; }
+      skills_profile="$2"
+      shift 2
+      ;;
+    --skills-profile=*)
+      skills_profile="${1#*=}"
       shift
       ;;
     --skip-doctor)
@@ -300,6 +332,12 @@ if [ "$skip_enroll" -eq 0 ] && { [ -n "$invite" ] || [ -n "$invite_file" ]; }; t
   fi
   if [ "$skip_init" -eq 1 ]; then
     set -- "$@" --skip-init
+  fi
+  if [ "$skip_skills" -eq 1 ]; then
+    set -- "$@" --skip-skills
+  fi
+  if [ -n "$skills_profile" ]; then
+    set -- "$@" --skills-profile "$skills_profile"
   fi
   if [ "$skip_doctor" -eq 1 ]; then
     set -- "$@" --skip-doctor

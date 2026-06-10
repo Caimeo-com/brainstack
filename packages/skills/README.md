@@ -25,6 +25,8 @@ Profiles are convenience bundles:
 - `control`: `brainstack`, `brain-curator`, `remote-machine-ops`.
 - `worker`: `shared-brain-client`, `remote-machine-ops`.
 
+Invite enrollment also accepts `--skills-profile none` and installer `--skip-skills` when no Codex skills should be written. `none` is an enrollment opt-out, not a `brainctl skills install --profile` bundle.
+
 Use `--skill NAME` for a smaller explicit install, `--all` for every public skill, `--dir DIR` for a non-default Codex skills root, and `--dry-run` to inspect the write plan.
 
 Keep this package generic. Do not add private hostnames, personal paths, live tokens, Telegram chat ids, tailnet names, or customer-specific topology. Operators who need exact machine names or service paths should maintain a private local overlay skill outside this package.
