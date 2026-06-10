@@ -139,6 +139,29 @@ YAML
   echo "Brainstack client config installed at $config_file."
 }
 
+validate_remote() {
+  # A leading hyphen would be parsed as a git option even when quoted, and unexpected
+  # protocols can invoke arbitrary transports.
+  case "$REMOTE" in
+    -*)
+      echo "BRAIN_GIT_REMOTE must not start with '-': $REMOTE" >&2
+      exit 2
+      ;;
+    *[$'\n\r\t']*)
+      echo "BRAIN_GIT_REMOTE must not contain control characters" >&2
+      exit 2
+      ;;
+    ssh://*|https://*|git@*:*|/*|~/*|file:///*)
+      ;;
+    *)
+      echo "BRAIN_GIT_REMOTE must be an ssh://, https://, git@host:path, or absolute local path remote: $REMOTE" >&2
+      exit 2
+      ;;
+  esac
+}
+
+validate_remote
+
 TARGET_ABS="$(expand_path "$TARGET")"
 BOOTSTRAP_ABS="$(expand_path "$BOOTSTRAP_DIR")"
 
@@ -152,7 +175,7 @@ render_template "$(dirname "$0")/claude-user-CLAUDE.md" "$BOOTSTRAP_DIR/claude-u
 if [ -d "$TARGET_ABS/.git" ]; then
   git -C "$TARGET_ABS" pull --ff-only
 else
-  git clone "$REMOTE" "$TARGET_ABS"
+  git clone -- "$REMOTE" "$TARGET_ABS"
 fi
 
 if [ ! -f "$ENV_FILE" ]; then

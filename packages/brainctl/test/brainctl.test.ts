@@ -647,7 +647,7 @@ describe("brainctl install safety", () => {
       expectSuccess(bootstrap);
       expect(await Bun.file(join(out, "install-client.sh")).exists()).toBe(true);
       expect(await readFile(join(out, "client.env.example"), "utf8")).toContain("BRAIN_BASE_URL=https://brain-control.example.ts.net");
-      expect(await readFile(join(out, "install-client.sh"), "utf8")).toContain("git clone \"$REMOTE\" \"$TARGET_ABS\"");
+      expect(await readFile(join(out, "install-client.sh"), "utf8")).toContain("git clone -- \"$REMOTE\" \"$TARGET_ABS\"");
 
       const skillRoot = join(dir, "codex-skills");
       const skillInstall = runCommand([binary, "skills", "install", "--profile", "client", "--dir", skillRoot], {
@@ -3310,7 +3310,8 @@ describe("public release hygiene", () => {
       expect(installScript).toContain("TARGET_ABS=\"$(expand_path \"$TARGET\")\"");
       expect(installScript).toContain("TARGET=\"${SHARED_BRAIN_LOCAL_PATH:-~/shared-brain}\"");
       expect(installScript).toContain("git -C \"$TARGET_ABS\" pull --ff-only");
-      expect(installScript).toContain("git clone \"$REMOTE\" \"$TARGET_ABS\"");
+      expect(installScript).toContain("git clone -- \"$REMOTE\" \"$TARGET_ABS\"");
+      expect(installScript).toContain("validate_remote");
       expect(installScript).toContain("ln -s \"$BOOTSTRAP_DIR/codex-shared-brain.include.md\" \"$CODEX_HOME/AGENTS.md\"");
       expect(installScript).not.toContain("Read the product-owned shared-brain snippet");
       expect(installScript).toContain("@$BOOTSTRAP_ABS/claude-user-CLAUDE.md");
@@ -6704,12 +6705,20 @@ describe("public release hygiene", () => {
       expectSuccess(created);
       expect(created.stdout).not.toContain("import-token-value");
       const inviteResult = JSON.parse(created.stdout);
-      expect(String(inviteResult.invite).startsWith("bs1_")).toBe(true);
+      // Token-bearing invites must not be printed to stdout by default; they land in
+      // a 0600 file referenced by invitePath.
+      expect(inviteResult.invite).toBeUndefined();
+      expect(typeof inviteResult.invitePath).toBe("string");
+      expect(created.stdout).not.toContain("bs1_");
+      const invitePath = String(inviteResult.invitePath);
+      expect(((await stat(invitePath)).mode & 0o777)).toBe(0o600);
+      const inviteValue = (await readFile(invitePath, "utf8")).trim();
+      expect(inviteValue.startsWith("bs1_")).toBe(true);
       expect(inviteResult.installCommand).toContain("https://example.invalid/brainstack/install.sh");
       expect(inviteResult.includesImportToken).toBe(true);
       expect(inviteResult.includesSshKnownHosts).toBe(true);
       expect(inviteResult.skillsProfile).toBe("operator");
-      const decoded = JSON.parse(Buffer.from(String(inviteResult.invite).slice("bs1_".length), "base64url").toString("utf8"));
+      const decoded = JSON.parse(Buffer.from(inviteValue.slice("bs1_".length), "base64url").toString("utf8"));
       expect(decoded.importToken).toBe("import-token-value");
       expect(decoded.control.remoteRepo).toBe(join(home, "brainstack"));
       expect(decoded.control.sshTarget).toBe("operator@control.example");
@@ -6717,7 +6726,16 @@ describe("public release hygiene", () => {
       expect(decoded.skills.profile).toBe("operator");
 
       const clientConfig = join(dir, "client.yaml");
-      const enrolled = runBrainctl(["enroll", "--invite", inviteResult.invite, "--config", clientConfig, "--skip-doctor"], {
+      const rawInviteRefused = runBrainctl(["enroll", "--invite", inviteValue, "--config", clientConfig, "--skip-doctor"], {
+        HOME: home,
+        USER: "operator",
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1"
+      });
+      expect(rawInviteRefused.code).not.toBe(0);
+      expect(`${rawInviteRefused.stdout}\n${rawInviteRefused.stderr}`).toContain("shell history");
+
+      const enrolled = runBrainctl(["enroll", "--invite-file", invitePath, "--config", clientConfig, "--skip-doctor"], {
         HOME: home,
         USER: "operator",
         PATH: `${binDir}:${process.env.PATH || ""}`,
@@ -6908,7 +6926,7 @@ describe("public release hygiene", () => {
         }
       };
       const invite = `bs1_${Buffer.from(JSON.stringify(invitePayload)).toString("base64url")}`;
-      const result = runBrainctl(["enroll", "--invite", invite, "--config", join(dir, "client.yaml"), "--skip-init", "--skip-doctor"], {
+      const result = runBrainctl(["enroll", "--invite", invite, "--allow-unsafe-invite", "--config", join(dir, "client.yaml"), "--skip-init", "--skip-doctor"], {
         HOME: home,
         USER: "operator",
         PATH: `${binDir}:${process.env.PATH || ""}`,
@@ -6949,7 +6967,7 @@ describe("public release hygiene", () => {
         }
       };
       const invite = `bs1_${Buffer.from(JSON.stringify(invitePayload)).toString("base64url")}`;
-      const result = runBrainctl(["enroll", "--invite", invite, "--config", join(dir, "client.yaml"), "--skip-init", "--skip-doctor"], {
+      const result = runBrainctl(["enroll", "--invite", invite, "--allow-unsafe-invite", "--config", join(dir, "client.yaml"), "--skip-init", "--skip-doctor"], {
         HOME: dir,
         USER: "operator"
       });
@@ -7000,6 +7018,7 @@ describe("public release hygiene", () => {
               remoteSsh: "ext::sh -c 'touch /tmp/brainstack-poc'"
             }
           }),
+          "--allow-unsafe-invite",
           "--config",
           join(dir, "client-unsafe-remote.yaml"),
           "--skip-init",
@@ -7021,6 +7040,7 @@ describe("public release hygiene", () => {
               remoteSsh: `file://${join(dir, "attacker.git")}`
             }
           }),
+          "--allow-unsafe-invite",
           "--config",
           join(dir, "client-file-remote.yaml"),
           "--skip-init",
@@ -7042,6 +7062,7 @@ describe("public release hygiene", () => {
               remoteSsh: "operator@control.example:-upload-pack=sh"
             }
           }),
+          "--allow-unsafe-invite",
           "--config",
           join(dir, "client-option-path-remote.yaml"),
           "--skip-init",
@@ -7063,6 +7084,7 @@ describe("public release hygiene", () => {
               remoteSsh: "operator@control.example:../shared-brain.git"
             }
           }),
+          "--allow-unsafe-invite",
           "--config",
           join(dir, "client-traversal-remote.yaml"),
           "--skip-init",
@@ -7084,6 +7106,7 @@ describe("public release hygiene", () => {
               localPath: "../shared-brain"
             }
           }),
+          "--allow-unsafe-invite",
           "--config",
           join(dir, "client-unsafe-path.yaml"),
           "--skip-init",

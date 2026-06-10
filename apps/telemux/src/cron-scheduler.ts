@@ -146,7 +146,10 @@ export class CronScheduler {
         continue;
       }
 
-      const message = `Recovered unfinished claimed run ${run.scheduledFor}; job paused for operator review`;
+      // A claimed-but-unfinished run is ambiguous: the side effect (reminder send,
+      // dispatch) may or may not have happened before the crash. Say so explicitly
+      // so the operator verifies before re-running instead of assuming "not sent".
+      const message = `Recovered unfinished claimed run ${run.scheduledFor}; the action may have POSSIBLY COMPLETED before restart (e.g. reminder possibly sent). Job paused for operator review; verify delivery before re-running.`;
       await this.manager.saveJob({
         ...job,
         enabled: false,
@@ -170,38 +173,45 @@ export class CronScheduler {
         lastError: null,
         updatedAt: nowIso()
       });
+      let sentConfirmed = false;
       try {
-      await this.telegram.sendText(
-        {
-          chatId: claimed.targetChatId,
-          threadId: claimed.targetThreadId
-        },
-        claimed.reminderText || `Scheduled reminder: ${claimed.label}`
-      );
-        const saved = await this.saveClaimedOutcome(claimed, {
+        await this.telegram.sendText(
+          {
+            chatId: claimed.targetChatId,
+            threadId: claimed.targetThreadId
+          },
+          claimed.reminderText || `Scheduled reminder: ${claimed.label}`
+        );
+        sentConfirmed = true;
+        // Durably record the confirmed send before bookkeeping that could throw.
+        this.db.saveCronRun(this.manager.createRunRecord(job.id, manual.scheduledFor, "sent", `Manual reminder sent: ${job.label}`));
+        await this.saveClaimedOutcome(claimed, {
           lastRunAt: referenceIso,
           lastScheduledFor: manual.scheduledFor,
           lastResult: `Manual reminder sent for ${referenceIso}`,
           lastError: null
         });
-        this.db.saveCronRun(
-          this.manager.createRunRecord(
-            job.id,
-            manual.scheduledFor,
-            saved ? "sent" : "skipped",
-            saved ? `Manual reminder sent: ${job.label}` : `Cron ${job.id} changed during manual reminder delivery; result was not written`
-          )
-        );
         return `Cron run sent: ${job.id} (${job.label})`;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        if (sentConfirmed) {
+          // Never downgrade a provider-confirmed send because bookkeeping failed.
+          console.error(`manual reminder post-send bookkeeping failed for ${job.id}`, error);
+          await this.saveClaimedOutcome(claimed, {
+            lastRunAt: referenceIso,
+            lastScheduledFor: manual.scheduledFor,
+            lastResult: `Manual reminder sent for ${referenceIso}`,
+            lastError: `Post-send bookkeeping failed: ${message}`
+          }).catch(() => undefined);
+          return `Cron run sent: ${job.id} (${job.label})`;
+        }
         const saved = await this.saveClaimedOutcome(claimed, {
           lastRunAt: referenceIso,
           lastScheduledFor: manual.scheduledFor,
           lastResult: null,
           lastError: message
         });
-        this.db.saveCronRun(this.manager.createRunRecord(job.id, referenceIso, saved ? "failed" : "skipped", message));
+        this.db.saveCronRun(this.manager.createRunRecord(job.id, manual.scheduledFor, saved ? "failed" : "skipped", message));
         throw error;
       }
     }
@@ -260,7 +270,7 @@ export class CronScheduler {
         lastError: accepted.message
       });
       if (saved || this.db.getCronJob(job.id)) {
-        this.db.saveCronRun(this.manager.createRunRecord(job.id, referenceIso, saved ? "failed" : "skipped", accepted.message));
+        this.db.saveCronRun(this.manager.createRunRecord(job.id, manual.scheduledFor, saved ? "failed" : "skipped", accepted.message));
       }
       return accepted.message || `Cron run failed: ${job.id} (${job.label})`;
     }
@@ -339,7 +349,11 @@ export class CronScheduler {
 
     let result;
     try {
-      result = await this.dispatcher.withContextLock(runnableContext, () => this.workers.runUpdateCheck(runnableContext, logPath));
+      result = await this.dispatcher.withContextLock(runnableContext, () => this.workers.runUpdateCheck(runnableContext, logPath), {
+        mode: "update-check",
+        logPath,
+        target: { chatId: job.targetChatId, threadId: job.targetThreadId }
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (isContextBusyMessage(message)) {
@@ -372,16 +386,33 @@ export class CronScheduler {
       }
       throw new Error(message);
     }
-    this.db.saveCronRun(
-      this.manager.createRunRecord(job.id, manual.scheduledFor, "sent", `Deterministic update check ${result.reportPath || ""}`.trim())
-    );
-    await this.telegram.sendText(
-      {
-        chatId: job.targetChatId,
-        threadId: job.targetThreadId
-      },
-      this.formatUpdateCheckResult(result)
-    );
+    // Only mark the run "sent" after the Telegram summary is actually delivered.
+    try {
+      await this.telegram.sendText(
+        {
+          chatId: job.targetChatId,
+          threadId: job.targetThreadId
+        },
+        this.formatUpdateCheckResult(result)
+      );
+      this.db.saveCronRun(
+        this.manager.createRunRecord(job.id, manual.scheduledFor, "sent", `Deterministic update check ${result.reportPath || ""}`.trim())
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.db.saveCronRun(
+        this.manager.createRunRecord(
+          job.id,
+          manual.scheduledFor,
+          "completed_notification_failed",
+          `Update check completed but Telegram notification failed: ${message}. Artifact: ${result.reportPath || "n/a"}`
+        )
+      );
+      await this.saveClaimedOutcome(saved, {
+        lastResult: saved.lastResult,
+        lastError: `Telegram notification failed: ${message}`
+      }).catch(() => undefined);
+    }
     return `Cron run completed: ${job.id} (${job.label})${result.reportPath ? ` artifact=${result.reportPath}` : ""}`;
   }
 
@@ -424,6 +455,7 @@ export class CronScheduler {
 
   private async runReminderJob(job: CronJobRecord, scheduledFor: string, alreadyAdvanced: boolean): Promise<void> {
     const claimed = await this.claimJobSlot(job, scheduledFor, alreadyAdvanced);
+    let sentConfirmed = false;
 
     try {
       await this.telegram.sendText(
@@ -433,20 +465,29 @@ export class CronScheduler {
         },
         claimed.reminderText || `Scheduled reminder: ${claimed.label}`
       );
+      sentConfirmed = true;
 
-      const saved = await this.saveClaimedOutcome(claimed, {
+      // Telegram confirmed the send: durably mark the run "sent" before any further
+      // bookkeeping that could fail, so a crash here cannot make recovery treat this
+      // run as "not sent" and let the operator replay a duplicate reminder.
+      this.finishClaimRun(job.id, scheduledFor, "sent", `Reminder sent: ${claimed.label}`);
+
+      await this.saveClaimedOutcome(claimed, {
         lastResult: `Reminder sent for ${scheduledFor}`,
         lastError: null
       });
-      if (!saved) {
-        if (this.db.getCronJob(job.id)) {
-          this.finishClaimRun(job.id, scheduledFor, "skipped", `Cron ${job.id} changed during reminder delivery; result was not written`);
-        }
-        return;
-      }
-      this.finishClaimRun(job.id, scheduledFor, "sent", `Reminder sent: ${claimed.label}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (sentConfirmed) {
+        // The provider confirmed delivery; never downgrade the durable "sent" status
+        // because post-send bookkeeping failed. Record the bookkeeping failure only.
+        console.error(`reminder post-send bookkeeping failed for ${job.id}`, error);
+        await this.saveClaimedOutcome(claimed, {
+          lastResult: `Reminder sent for ${scheduledFor}`,
+          lastError: `Post-send bookkeeping failed: ${message}`
+        }).catch(() => undefined);
+        return;
+      }
       const saved = await this.saveClaimedOutcome(claimed, {
         lastResult: null,
         lastError: message
@@ -563,7 +604,11 @@ export class CronScheduler {
         throw new Error(`Cron ${job.id} context ${context.slug} is no longer active`);
       }
 
-      const result = await this.dispatcher.withContextLock(runnableContext, () => this.workers.runUpdateCheck(runnableContext, logPath));
+      const result = await this.dispatcher.withContextLock(runnableContext, () => this.workers.runUpdateCheck(runnableContext, logPath), {
+        mode: "update-check",
+        logPath,
+        target: { chatId: job.targetChatId, threadId: job.targetThreadId }
+      });
       if (!result.ok) {
         const message = result.stderr || result.stdout || `update-check exited ${result.exitCode}`;
         if (result.exitCode === 89 && message.includes("context archived before update-check launch")) {
@@ -584,7 +629,8 @@ export class CronScheduler {
         return;
       }
 
-      this.finishClaimRun(job.id, scheduledFor, "sent", `Deterministic update check ${result.reportPath || ""}`.trim());
+      // Only mark the run "sent" after the Telegram summary is actually delivered;
+      // artifact completion and notification delivery are separate outcomes.
       try {
         await this.telegram.sendText(
           {
@@ -593,8 +639,15 @@ export class CronScheduler {
           },
           this.formatUpdateCheckResult(result)
         );
+        this.finishClaimRun(job.id, scheduledFor, "sent", `Deterministic update check ${result.reportPath || ""}`.trim());
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        this.finishClaimRun(
+          job.id,
+          scheduledFor,
+          "completed_notification_failed",
+          `Update check completed but Telegram notification failed: ${message}. Artifact: ${result.reportPath || "n/a"}`
+        );
         await this.saveClaimedOutcome(saved, {
           lastResult: saved.lastResult,
           lastError: `Telegram notification failed: ${message}`

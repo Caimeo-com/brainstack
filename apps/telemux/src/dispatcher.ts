@@ -320,6 +320,29 @@ export class Dispatcher {
   }
 
   recoverQueuedTurns(): void {
+    // Reconcile durable active-run records before accepting new work: a restart can
+    // leave a setsid-detached harness still mutating the workspace, so the operator
+    // must hear about it instead of telemux silently accepting another run.
+    for (const run of this.db.takeStaleActiveRuns()) {
+      console.warn(`active run interrupted by restart: ${run.contextSlug} (${run.mode}, started ${run.startedAt})`);
+      const context = this.db.getContextBySlug(run.contextSlug);
+      if (context && context.state !== "archived") {
+        this.contexts.saveContext({
+          ...context,
+          lastError: `telemux restarted during an active ${run.mode} run started at ${run.startedAt}; the harness process may still be running. Log: ${run.logPath || "n/a"}`
+        });
+      }
+      if (run.chatId !== null) {
+        void this.telegram.sendText(
+          { chatId: run.chatId, threadId: run.threadId },
+          [
+            `${run.contextSlug} had an active ${run.mode} run interrupted by a telemux restart.`,
+            `The harness process may still be running detached. Check the log before dispatching new work: ${run.logPath || "n/a"}`
+          ].join("\n")
+        );
+      }
+    }
+
     const abandoned = this.db.markRunningQueuedTurnsAbandoned();
     if (abandoned.length > 0) {
       console.warn(`queued turns abandoned after restart: ${abandoned.length}`);
@@ -337,7 +360,11 @@ export class Dispatcher {
     }
   }
 
-  async withContextLock<T>(context: ContextRecord, run: () => Promise<T>): Promise<T> {
+  async withContextLock<T>(
+    context: ContextRecord,
+    run: () => Promise<T>,
+    meta?: { mode: string; logPath: string | null; target?: TelegramTarget | null }
+  ): Promise<T> {
     if (this.activeJobs.has(context.slug)) {
       throw new Error(`${context.slug} already has an active job. Use /topicinfo or /tail.`);
     }
@@ -347,10 +374,24 @@ export class Dispatcher {
       releaseLock = resolve;
     });
     this.activeJobs.set(context.slug, lock);
+    if (meta) {
+      // Locked runs that mutate workspaces deserve the same durable restart
+      // reconciliation as dispatched harness jobs.
+      this.db.recordActiveRun({
+        contextSlug: context.slug,
+        mode: meta.mode,
+        logPath: meta.logPath,
+        chatId: meta.target?.chatId ?? null,
+        threadId: meta.target?.threadId ?? null
+      });
+    }
 
     try {
       return await run();
     } finally {
+      if (meta) {
+        this.db.clearActiveRun(context.slug);
+      }
       if (this.activeJobs.get(context.slug) === lock) {
         this.activeJobs.delete(context.slug);
       }
@@ -433,7 +474,15 @@ export class Dispatcher {
         lastRunAt: new Date().toISOString(),
         lastError: null
       });
+      this.db.recordActiveRun({
+        contextSlug: savedContext.slug,
+        mode,
+        logPath,
+        chatId: replyTarget.chatId,
+        threadId: replyTarget.threadId
+      });
     } catch (error) {
+      this.db.clearActiveRun(context.slug);
       if (this.activeJobs.get(context.slug) === lock) {
         this.activeJobs.delete(context.slug);
       }
@@ -452,6 +501,7 @@ export class Dispatcher {
         });
     }
     void job.finally(() => {
+      this.db.clearActiveRun(savedContext.slug);
       if (this.activeJobs.get(savedContext.slug) === lock) {
         this.activeJobs.delete(savedContext.slug);
       }

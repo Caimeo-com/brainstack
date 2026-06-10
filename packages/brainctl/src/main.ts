@@ -11,9 +11,12 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { hostname, tmpdir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import {
+  assertOutboxCapacity,
   buildOutboxItem,
   decodeOutboxPayload,
   ensurePrivateOutboxDir,
+  outboxDestinationForKey,
+  outboxItemFileBytes,
   outboxLimitsFromEnv,
   normalizeOutboxItem as normalizeSharedOutboxItem,
   outboxItemKey as sharedOutboxItemKey,
@@ -209,7 +212,8 @@ interface BrainstackClientInvite {
 
 const PRODUCT_ROOT = resolve(import.meta.dir, "..", "..", "..");
 const TELEGRAM_SEND_DEFAULT_MAX_BYTES = 45 * 1024 * 1024;
-const TELEGRAM_SEND_SENSITIVE_FILE_PATTERN = /(?:^|[./_-])(?:id_rsa|id_ed25519|authorized_keys|known_hosts|token|secret|passwd|shadow|keyring)(?:$|[./_-])/i;
+const TELEGRAM_SEND_SENSITIVE_FILE_PATTERN =
+  /(?:^|[./_-])(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|token|tokens|secret|secrets|passwd|password|passwords|shadow|keyring|credential|credentials|apikey|api[_-]?keys?|private|cert|certs|certificate|kubeconfig|htpasswd|netrc|npmrc|pgpass|wallet|keystore|otp|totp|2fa)(?:$|[./_-])/i;
 const CLIENT_INVITE_PREFIX = "bs1_";
 const CLIENT_INVITE_TYPE = "brainstack-client-invite";
 const CLIENT_INVITE_MAX_CHARS = 128 * 1024;
@@ -285,7 +289,7 @@ function usage(): string {
   brainctl skills refresh [--target codex|claude|cursor] [--config brainstack.yaml] [--repo PATH] [--skill NAME] [--dir DIR] [--no-sync] [--force] [--quiet]
   brainctl skills doctor [--target codex|claude|cursor] [--dir DIR] [--check-remote] [--json]
   brainctl skills list
-  brainctl import skill <SKILL.md|DIR|URL> --config brainstack.yaml [--title TITLE] [--source-harness HARNESS] [--source-machine MACHINE] [--max-bytes N] [--max-files N] [--allow-private-url]
+  brainctl import skill <SKILL.md|DIR|URL> --config brainstack.yaml [--title TITLE] [--source-harness HARNESS] [--source-machine MACHINE] [--max-bytes N] [--max-files N] [--allow-private-url] [--allow-ssh-git]
   brainctl import skills [--config brainstack.yaml] [--target codex|claude|cursor|all] [--scan-dir DIR] [--skill NAME] [--apply] [--json]
   brainctl hooks install|status|remove [--target codex|claude|cursor|all] [--config brainstack.yaml] [--brainctl PATH_OR_COMMAND] [--dry-run]
   brainctl hook run --harness codex|claude|cursor --event EVENT [--config brainstack.yaml]
@@ -955,20 +959,35 @@ async function runWithStdinFile(args: string[], filePath: string, options: { cwd
   let inputError: unknown = null;
 
   try {
-    const reader = Bun.file(filePath).stream().getReader();
-    let totalBytes = 0;
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) {
-        break;
+    // Open once with O_NOFOLLOW and validate the same descriptor we stream from, so
+    // the path cannot be swapped for a symlink or different file between the earlier
+    // lstat-based validation and the actual read (TOCTOU).
+    const handle = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const info = await handle.stat();
+      if (!info.isFile()) {
+        throw new Error(`not a regular file: ${filePath}`);
       }
-      totalBytes += chunk.value.byteLength;
-      if (options.maxBytes !== undefined && totalBytes > options.maxBytes) {
-        throw new Error(`file grew beyond max bytes while streaming: ${totalBytes} bytes > ${options.maxBytes}`);
+      if (options.maxBytes !== undefined && info.size > options.maxBytes) {
+        throw new Error(`file too large: ${info.size} bytes > ${options.maxBytes}`);
       }
-      proc.stdin.write(chunk.value);
+      const buffer = Buffer.alloc(64 * 1024);
+      let totalBytes = 0;
+      while (true) {
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, -1);
+        if (!bytesRead) {
+          break;
+        }
+        totalBytes += bytesRead;
+        if (options.maxBytes !== undefined && totalBytes > options.maxBytes) {
+          throw new Error(`file grew beyond max bytes while streaming: ${totalBytes} bytes > ${options.maxBytes}`);
+        }
+        proc.stdin.write(Buffer.from(buffer.subarray(0, bytesRead)));
+      }
+      await proc.stdin.flush();
+    } finally {
+      await handle.close().catch(() => undefined);
     }
-    await proc.stdin.flush();
   } catch (error) {
     inputError = error;
     proc.kill();
@@ -2224,7 +2243,33 @@ async function writeManagedManifest(cfg: BrainstackConfig, daemonPlatformOverrid
 async function loadManagedManifest(cfg: BrainstackConfig): Promise<ManagedArtifactsManifest> {
   const path = managedManifestPath(cfg);
   if (existsSync(path)) {
-    return JSON.parse(await readFile(path, "utf8")) as ManagedArtifactsManifest;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(path, "utf8"));
+    } catch (error) {
+      throw new Error(`ownership manifest is corrupt: ${path}; inspect or remove it before destructive operations (${error instanceof Error ? error.message : String(error)})`);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Array.isArray((parsed as ManagedArtifactsManifest).artifacts)) {
+      throw new Error(`ownership manifest has an unexpected shape: ${path}; inspect or remove it before destructive operations`);
+    }
+    const manifest = parsed as ManagedArtifactsManifest;
+    const validKinds = new Set(["file", "dir", "symlink", "service", "repo", "tailscale-serve"]);
+    const validScopes = new Set(["control", "worker", "client", "all"]);
+    for (const artifact of manifest.artifacts) {
+      if (
+        !artifact ||
+        typeof artifact !== "object" ||
+        Array.isArray(artifact) ||
+        typeof artifact.path !== "string" ||
+        !artifact.path.trim() ||
+        !validKinds.has(String(artifact.kind)) ||
+        !validScopes.has(String(artifact.scope))
+      ) {
+        // Fail before any service-stop or deletion side effect, not midway through.
+        throw new Error(`ownership manifest contains a malformed artifact entry: ${path}; inspect or remove it before destructive operations`);
+      }
+    }
+    return manifest;
   }
   return {
     schema_version: 1,
@@ -2774,7 +2819,8 @@ async function commandProvision(args: ParsedArgs): Promise<void> {
   }
   const config = buildProvisionConfig(profile, { name: selectedHarness.name, bin: selectedHarness.bin }, args);
   const out = abs(flag(args, "out") || "~/.config/brainstack/brainstack.yaml");
-  await writeText(out, stringifySimpleYaml(config));
+  // Config exposes hostnames, SSH remotes, and topology; never leave it umask-default readable.
+  await writeText(out, stringifySimpleYaml(config), 0o600);
   const cfg = await loadConfig(out, profile);
   await ensureDir(cfg.paths.configRoot);
   await writeManagedManifest(cfg);
@@ -5231,12 +5277,9 @@ async function findMatchingOutboxItem(root: string, endpoint: "import" | "propos
 
 async function queueOutboxItem(cfg: BrainstackConfig, item: Omit<OutboxItem, "id" | "created_at" | "retry_count" | "idempotency_key" | "last_error">, error: string): Promise<string> {
   const payload = item.payload ? item.payload : decodeOutboxPayload(item as OutboxItem);
-  const destination = {
-    brain_id: item.brain_id || null,
-    url: item.url || null,
-    import_token_env: item.import_token_env || null
-  };
-  const idempotencyKey = outboxItemKey(item.endpoint, payload, destination);
+  // Use the shared destination shape so direct sends, queued entries, and flush
+  // replays all present the same idempotency key to the brain.
+  const idempotencyKey = outboxItemKey(item.endpoint, payload, outboxDestinationForKey(item));
   const id = `${item.endpoint}-${idempotencyKey.slice(0, 32)}`;
   const root = outboxRootForDestination(cfg, { brainId: item.brain_id, baseUrl: item.url });
   await ensurePrivateOutboxDir(root);
@@ -5253,6 +5296,7 @@ async function queueOutboxItem(cfg: BrainstackConfig, item: Omit<OutboxItem, "id
     error,
     existing
   );
+  await assertOutboxCapacity(root, existing ? path : null, outboxItemFileBytes(queuedItem));
   await writeOutboxItem(path, queuedItem);
   const storage = queuedItem.payload_storage;
   const limits = outboxLimitsFromEnv();
@@ -5266,9 +5310,15 @@ async function queueOutboxItem(cfg: BrainstackConfig, item: Omit<OutboxItem, "id
 function brainWriteIdempotencyKey(
   endpoint: "import" | "propose",
   payload: Record<string, unknown>,
-  destination: { brain_id?: string | null; url?: string | null; import_token_env?: string | null } = {}
+  destination: { brain_id?: string | null; url?: string | null } = {}
 ): string {
-  return outboxItemKey(endpoint, payload, destination);
+  // Must match the key shape queued/flushed items use (normalizeOutboxItem), so the
+  // brain can recognize an outbox replay of a request that already arrived once.
+  return outboxItemKey(
+    endpoint,
+    payload,
+    outboxDestinationForKey({ brain_id: destination.brain_id || undefined, url: destination.url || undefined })
+  );
 }
 
 function normalizeOutboxItem(item: OutboxItem): OutboxItem {
@@ -5330,8 +5380,7 @@ async function postBrainWriteOrQueue(
         "Content-Type": "application/json",
         "Idempotency-Key": brainWriteIdempotencyKey(endpoint, payload, {
           brain_id: overrides.targetBrainId || null,
-          url: baseUrl || null,
-          import_token_env: overrides.importTokenEnv || null
+          url: baseUrl || null
         })
       },
       body: JSON.stringify(payload),
@@ -5718,11 +5767,25 @@ async function commandInviteCreate(args: ParsedArgs): Promise<void> {
   const invite = encodeClientInvite(invitePayload);
   const installUrl = requireFlagValue(args, "install-url") || DEFAULT_INSTALL_URL;
   const installCommand = inviteInstallCommand(installUrl);
+
+  // Token-bearing invites are bearer secrets: never print them to stdout by default,
+  // where they land in scrollback, CI logs, and shell transcripts. Write them to a
+  // 0600 file instead, unless the operator explicitly opts into printing.
+  const outFlag = requireFlagValue(args, "out");
+  const printSecret = hasFlag(args, "print-secret");
+  let invitePath: string | null = null;
+  if (outFlag || (importToken && !printSecret)) {
+    const defaultOut = join(cfg.paths.configRoot, "invites", `client-invite-${createdAt.toISOString().replace(/[:.]/g, "-")}.txt`);
+    invitePath = absWithHome(outFlag || defaultOut, cfg.paths.home);
+    await writeText(invitePath, `${invite}\n`, 0o600);
+  }
+  const printInvite = invitePath === null;
+
   if (hasFlag(args, "json")) {
     console.log(
       JSON.stringify(
         {
-          invite,
+          ...(printInvite ? { invite } : { invitePath }),
           installCommand,
           expiresAt: invitePayload.expires_at,
           includesImportToken: Boolean(importToken),
@@ -5737,8 +5800,14 @@ async function commandInviteCreate(args: ParsedArgs): Promise<void> {
   }
   console.log(installCommand);
   console.log("");
-  console.log("Paste this invite when the installer prompts for it:");
-  console.log(invite);
+  if (printInvite) {
+    console.log("Paste this invite when the installer prompts for it:");
+    console.log(invite);
+  } else {
+    console.log(`Invite written to: ${invitePath}`);
+    console.log("Transfer it over a private channel and pass it to the installer with --invite-file, or pipe it on stdin.");
+    console.log("Use --print-secret to print the invite to stdout instead (it will land in terminal scrollback).");
+  }
   console.log("");
   console.log(`expires: ${invitePayload.expires_at}`);
   console.log(`import token embedded: ${importToken ? "yes" : "no"}`);
@@ -5746,6 +5815,9 @@ async function commandInviteCreate(args: ParsedArgs): Promise<void> {
   console.log(`codex skills profile: ${skillsProfile}`);
   if (importToken) {
     console.log("treat the invite as a bearer secret; avoid putting it in shell history or shared logs.");
+    if (/\/releases\/latest\//.test(installUrl)) {
+      console.log("WARN install URL uses the moving 'latest' release; pass --install-url with a pinned release tag so enrollment installs a known binary.");
+    }
   }
 }
 
@@ -5757,7 +5829,7 @@ async function commandInvite(args: ParsedArgs): Promise<void> {
     case "help":
     case "--help":
     case "-h":
-      console.log("Usage: brainctl invite create --config brainstack.yaml [--import-token-file FILE|--import-token-env ENV] [--ssh-known-hosts-file FILE] [--control-ssh SSH_TARGET] [--control-repo PATH] [--skills-profile client|operator|control|worker|none] [--expires-hours N] [--install-url URL] [--json]");
+      console.log("Usage: brainctl invite create --config brainstack.yaml [--import-token-file FILE|--import-token-env ENV] [--ssh-known-hosts-file FILE] [--control-ssh SSH_TARGET] [--control-repo PATH] [--skills-profile client|operator|control|worker|none] [--expires-hours N] [--install-url URL] [--out FILE] [--print-secret] [--json]");
       return;
     default:
       throw new Error(`Unknown invite command: ${subcommand}`);
@@ -5921,6 +5993,13 @@ async function commandEnroll(args: ParsedArgs): Promise<void> {
   if (inviteSources.length > 1) {
     throw new Error("enroll accepts only one invite source: --invite, --invite-file, or BRAINSTACK_INVITE");
   }
+  // Raw invites in argv or env leak through shell history, process listings, and
+  // environment snapshots. Match install.sh: file/stdin is the default-safe path.
+  if ((inviteInput || inviteEnv) && !hasFlag(args, "allow-unsafe-invite")) {
+    throw new Error(
+      "raw invites in --invite/BRAINSTACK_INVITE can leak through shell history or process listings; use --invite-file FILE (or --invite-file - for stdin). Pass --allow-unsafe-invite only for local throwaway smoke tests."
+    );
+  }
   const rawInvite =
     inviteInput ||
     (inviteFile ? await readInviteFile(inviteFile) : "") ||
@@ -5977,15 +6056,29 @@ function sanitizeTelegramSendFileName(value: string): string {
   return cleaned || "brainstack-file";
 }
 
+function hasMixedScriptConfusables(value: string): boolean {
+  // Names mixing Latin with Cyrillic/Greek letters are a classic trick to dodge
+  // keyword-based sensitive-name checks (e.g. "secrеt.txt" with a Cyrillic е).
+  const hasLatin = /[a-z]/i.test(value);
+  const hasConfusableScript = /[\u0370-\u03ff\u0400-\u04ff]/.test(value);
+  return hasLatin && hasConfusableScript;
+}
+
 function isSensitiveTelegramFileName(value: string): boolean {
-  const normalized = sanitizeTelegramSendFileName(value).toLowerCase();
+  // NFKC-normalize before matching so unicode presentation tricks cannot dodge the
+  // keyword checks.
+  const normalized = sanitizeTelegramSendFileName(value).normalize("NFKC").toLowerCase();
   return (
     normalized.startsWith(".") ||
     normalized === ".env" ||
     normalized.endsWith(".env") ||
     normalized.endsWith(".pem") ||
     normalized.endsWith(".key") ||
-    TELEGRAM_SEND_SENSITIVE_FILE_PATTERN.test(normalized)
+    normalized.endsWith(".p12") ||
+    normalized.endsWith(".pfx") ||
+    normalized.endsWith(".jks") ||
+    TELEGRAM_SEND_SENSITIVE_FILE_PATTERN.test(normalized) ||
+    hasMixedScriptConfusables(normalized)
   );
 }
 
@@ -7137,7 +7230,62 @@ async function buildSingleFileSkillPackageFromUrl(input: string, url: string, op
   return { ...base, package_sha256: skillPackageHash(base) };
 }
 
-async function buildUrlSkillPackage(input: string, options: { maxBytes: number; maxFiles: number; maxFileBytes: number; allowPrivateUrl: boolean }): Promise<SkillPackage> {
+/**
+ * Git skill remotes must pass the same private-network guard as raw HTTP imports, and
+ * SSH/git-protocol remotes can invoke local SSH credentials, so they need an explicit
+ * opt-in even for public hosts.
+ */
+async function assertSafeGitSkillRemote(remote: string, options: { allowPrivateUrl: boolean; allowSshGit: boolean }): Promise<void> {
+  const trimmed = remote.trim();
+  if (!trimmed || trimmed.startsWith("-")) {
+    throw new Error(`skill git import remote is not a valid remote: ${trimmed.slice(0, 120)}`);
+  }
+  if (/[\u0000-\u001f]/.test(trimmed)) {
+    throw new Error("skill git import remote contains control characters");
+  }
+  let protocol: string;
+  let host: string;
+  const scpLike = trimmed.match(/^git@([^:/]+):/);
+  if (scpLike) {
+    protocol = "ssh";
+    host = scpLike[1];
+  } else {
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      throw new Error(`skill git import remote is not a valid URL: ${trimmed.slice(0, 120)}`);
+    }
+    protocol = parsed.protocol.replace(/:$/, "").toLowerCase();
+    host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  }
+  if (protocol === "file") {
+    // Local repositories are operator-owned input; the private-network guard does not apply.
+    return;
+  }
+  if (!["https", "http", "ssh", "git"].includes(protocol)) {
+    throw new Error(`skill git import does not allow ${protocol}:// remotes`);
+  }
+  if ((protocol === "ssh" || protocol === "git") && !options.allowSshGit) {
+    throw new Error("skill git import over ssh/git protocols can use local SSH credentials; rerun with --allow-ssh-git only for trusted remotes, or use an https remote");
+  }
+  if (!options.allowPrivateUrl) {
+    if (!host || host === "localhost" || host.endsWith(".localhost")) {
+      throw new Error("skill git import blocked localhost remote; rerun with --allow-private-url only for trusted private fetches");
+    }
+    const directIpVersion = isIP(host);
+    const addresses = directIpVersion ? [{ address: host, family: directIpVersion }] : await lookup(host, { all: true, verbatim: true });
+    if (!addresses.length) {
+      throw new Error("skill git import DNS lookup returned no addresses");
+    }
+    const blocked = addresses.find((entry) => isBlockedSkillUrlIp(entry.address));
+    if (blocked) {
+      throw new Error(`skill git import blocked private address ${blocked.address}; rerun with --allow-private-url only for trusted private fetches`);
+    }
+  }
+}
+
+async function buildUrlSkillPackage(input: string, options: { maxBytes: number; maxFiles: number; maxFileBytes: number; allowPrivateUrl: boolean; allowSshGit: boolean }): Promise<SkillPackage> {
   const github = githubSkillUrl(input);
   if (github?.kind === "raw") {
     return await buildSingleFileSkillPackageFromUrl(input, github.url, { maxBytes: Math.min(options.maxBytes, options.maxFileBytes), allowPrivateUrl: options.allowPrivateUrl });
@@ -7146,14 +7294,23 @@ async function buildUrlSkillPackage(input: string, options: { maxBytes: number; 
   if (!gitSource) {
     return await buildSingleFileSkillPackageFromUrl(input, input, { maxBytes: Math.min(options.maxBytes, options.maxFileBytes), allowPrivateUrl: options.allowPrivateUrl });
   }
+  await assertSafeGitSkillRemote(gitSource.remote, { allowPrivateUrl: options.allowPrivateUrl, allowSshGit: options.allowSshGit });
   const tempRoot = await mkdtemp(join(tmpdir(), "brainstack-skill-url-"));
   try {
     const checkout = join(tempRoot, "checkout");
     const cloneArgs = ["git", ...safeGitProtocolArgs(gitSource.remote), "clone", "--depth", "1"];
+    if (!options.allowPrivateUrl) {
+      // The pre-clone DNS guard checks only the original host; refuse HTTP redirects
+      // so the clone cannot be bounced to a private target after the check.
+      cloneArgs.splice(1, 0, "-c", "http.followRedirects=false");
+    }
     if (gitSource.ref) {
+      if (gitSource.ref.startsWith("-")) {
+        throw new Error(`skill git import ref is not a valid ref: ${gitSource.ref.slice(0, 120)}`);
+      }
       cloneArgs.push("--branch", gitSource.ref);
     }
-    cloneArgs.push(gitSource.remote, checkout);
+    cloneArgs.push("--", gitSource.remote, checkout);
     run(cloneArgs, { check: true, timeoutMs: 60_000, env: safeGitProtocolEnv(gitSource.remote) });
     const root = gitSource.subdir ? join(checkout, gitSource.subdir) : checkout;
     const packageRoot = (await resolveLocalSkillRoot(root)).root;
@@ -7224,7 +7381,7 @@ async function commandImport(args: ParsedArgs): Promise<void> {
   }
   if (subcommand !== "skill") {
     if (subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
-      console.log("Usage: brainctl import skill <SKILL.md|DIR|URL> --config brainstack.yaml [--title TITLE] [--source-harness HARNESS] [--source-machine MACHINE] [--max-bytes N] [--max-files N] [--allow-private-url]\n       brainctl import skills [--config brainstack.yaml] [--target codex|claude|cursor|all] [--scan-dir DIR] [--skill NAME] [--apply] [--json]");
+      console.log("Usage: brainctl import skill <SKILL.md|DIR|URL> --config brainstack.yaml [--title TITLE] [--source-harness HARNESS] [--source-machine MACHINE] [--max-bytes N] [--max-files N] [--allow-private-url] [--allow-ssh-git]\n       brainctl import skills [--config brainstack.yaml] [--target codex|claude|cursor|all] [--scan-dir DIR] [--skill NAME] [--apply] [--json]");
       return;
     }
     throw new Error(`Unknown import subcommand: ${subcommand}`);
@@ -7238,8 +7395,9 @@ async function commandImport(args: ParsedArgs): Promise<void> {
   const maxFiles = parsePositiveIntegerFlag(args, "max-files", SKILL_IMPORT_DEFAULT_MAX_FILES);
   const maxFileBytes = parsePositiveIntegerFlag(args, "max-file-bytes", Math.min(SKILL_IMPORT_DEFAULT_MAX_FILE_BYTES, maxBytes));
   const allowPrivateUrl = hasFlag(args, "allow-private-url");
+  const allowSshGit = hasFlag(args, "allow-ssh-git");
   const pkg = isUrlLikeSkillSource(source)
-    ? await buildUrlSkillPackage(source, { maxBytes, maxFiles, maxFileBytes, allowPrivateUrl })
+    ? await buildUrlSkillPackage(source, { maxBytes, maxFiles, maxFileBytes, allowPrivateUrl, allowSshGit })
     : await buildLocalSkillPackage(source, { maxBytes, maxFiles, maxFileBytes });
   validateSkillPackage(pkg, source);
   const title = requireFlagValue(args, "title") || `Skill import: ${pkg.name}`;
@@ -7925,20 +8083,8 @@ async function acquireDaemonLock(cfg: BrainstackConfig): Promise<() => Promise<v
   await chmod(daemonStateDir(cfg), 0o700).catch(() => undefined);
   const path = daemonLockPath(cfg);
   let acquired = false;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const existing = await readFile(path, "utf8").catch(() => "");
-    if (existing) {
-      let prior: { pid?: number; created_at?: string };
-      try {
-        prior = JSON.parse(existing) as { pid?: number; created_at?: string };
-      } catch {
-        throw new Error(`brainstack daemon lock is unreadable: ${path}`);
-      }
-      if (typeof prior.pid === "number" && processAlive(prior.pid)) {
-        throw new Error(`brainstack daemon already running with pid ${prior.pid}`);
-      }
-      await rm(path, { force: true });
-    }
+  for (let attempt = 0; attempt < 5 && !acquired; attempt += 1) {
+    // Atomic create first: O_EXCL means exactly one contender can win a fresh lock.
     try {
       const handle = await open(path, "wx", 0o600);
       try {
@@ -7949,10 +8095,52 @@ async function acquireDaemonLock(cfg: BrainstackConfig): Promise<() => Promise<v
       acquired = true;
       break;
     } catch (error) {
-      if ((error as { code?: string }).code === "EEXIST") {
-        continue;
+      if ((error as { code?: string }).code !== "EEXIST") {
+        throw error;
       }
-      throw error;
+    }
+
+    const existing = await readFile(path, "utf8").catch(() => null);
+    if (existing === null) {
+      // Lock disappeared between create and read; retry the atomic create.
+      continue;
+    }
+    let prior: { pid?: number; created_at?: string };
+    try {
+      prior = JSON.parse(existing) as { pid?: number; created_at?: string };
+    } catch {
+      // A malformed lock is treated as held: removing it blindly could break a live
+      // daemon whose lock was corrupted, so require explicit operator recovery.
+      throw new Error(`brainstack daemon lock is unreadable: ${path}; inspect and remove it manually if no daemon is running`);
+    }
+    if (typeof prior.pid === "number" && processAlive(prior.pid)) {
+      throw new Error(`brainstack daemon already running with pid ${prior.pid}`);
+    }
+    // Stale lock: removal happens under a short-lived takeover mutex (atomic mkdir)
+    // with a content re-check, so two contenders can never remove each other's
+    // freshly created locks.
+    const takeoverDir = `${path}.takeover`;
+    try {
+      await mkdir(takeoverDir);
+    } catch (error) {
+      if ((error as { code?: string }).code !== "EEXIST") {
+        throw error;
+      }
+      // Another process is recovering; clear an abandoned mutex, then retry.
+      const mutexInfo = await lstat(takeoverDir).catch(() => null);
+      if (mutexInfo && Date.now() - mutexInfo.mtimeMs > 60_000) {
+        await rmdir(takeoverDir).catch(() => undefined);
+      }
+      await Bun.sleep(50);
+      continue;
+    }
+    try {
+      const recheck = await readFile(path, "utf8").catch(() => null);
+      if (recheck === existing) {
+        await rm(path, { force: true });
+      }
+    } finally {
+      await rmdir(takeoverDir).catch(() => undefined);
     }
   }
   if (!acquired) {
@@ -8751,6 +8939,27 @@ async function commandBackup(args: ParsedArgs): Promise<void> {
   }
 }
 
+function normalizedTarEntry(entry: string): string {
+  return entry.replace(/^\.\//, "");
+}
+
+async function assertRestoreSourceTreeSafe(root: string): Promise<void> {
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    const info = await lstat(path);
+    if (info.isSymbolicLink()) {
+      throw new Error(`backup contains a symlink; refusing to restore: ${path}`);
+    }
+    if (info.isDirectory()) {
+      await assertRestoreSourceTreeSafe(path);
+      continue;
+    }
+    if (!info.isFile()) {
+      throw new Error(`backup contains a non-regular file; refusing to restore: ${path}`);
+    }
+  }
+}
+
 async function commandRestore(args: ParsedArgs): Promise<void> {
   const backup = flag(args, "backup");
   const target = flag(args, "target");
@@ -8759,18 +8968,93 @@ async function commandRestore(args: ParsedArgs): Promise<void> {
   }
   const source = abs(backup);
   const dest = abs(target);
+  const force = hasFlag(args, "force");
+  const isDirectorySource = statSync(source).isDirectory();
+
+  // Validate the backup before touching the target: require the Brainstack backup
+  // manifest, and for archives reject absolute or traversal member paths.
+  if (isDirectorySource) {
+    if (!existsSync(join(source, "MANIFEST.txt"))) {
+      throw new Error(`backup directory is missing MANIFEST.txt; refusing to restore unverified content: ${source}`);
+    }
+    // Symlinks or special files in a backup tree could be followed by later
+    // Brainstack reads/writes inside the restored target.
+    await assertRestoreSourceTreeSafe(source);
+  } else {
+    const listing = run(["tar", "-tzf", source], { check: true, timeoutMs: 300_000 })
+      .stdout.split("\n")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    if (!listing.length) {
+      throw new Error(`backup archive is empty: ${source}`);
+    }
+    for (const entry of listing) {
+      const normalizedEntry = normalizedTarEntry(entry);
+      if (normalizedEntry.startsWith("/") || normalizedEntry.split("/").includes("..")) {
+        throw new Error(`backup archive contains unsafe member path: ${entry}`);
+      }
+    }
+    if (!listing.some((entry) => normalizedTarEntry(entry) === "MANIFEST.txt" || normalizedTarEntry(entry).endsWith("/MANIFEST.txt"))) {
+      throw new Error(`backup archive is missing MANIFEST.txt; refusing to restore unverified content: ${source}`);
+    }
+    // Reject symlink, hardlink, and device/FIFO members before extraction; only
+    // regular files and directories are restorable.
+    const verbose = run(["tar", "-tvzf", source], { check: true, timeoutMs: 300_000 })
+      .stdout.split("\n")
+      .map((entry) => entry.trimEnd())
+      .filter(Boolean);
+    for (const line of verbose) {
+      const typeChar = line[0];
+      if (typeChar !== "-" && typeChar !== "d") {
+        throw new Error(`backup archive contains a non-regular member (type '${typeChar}'); refusing to restore: ${line.slice(0, 200)}`);
+      }
+    }
+  }
+
+  const destEntries = existsSync(dest) ? await readdir(dest).catch(() => null) : [];
+  if (destEntries === null) {
+    throw new Error(`restore target exists and is not a directory: ${dest}`);
+  }
+  if (destEntries.length && !force) {
+    throw new Error(`restore target is not empty: ${dest}; rerun with --force to swap it aside and restore`);
+  }
+
   if (!hasFlag(args, "apply")) {
-    console.log(`dry-run restore: would copy ${source} to ${dest}`);
+    console.log(`dry-run restore: would restore ${source} into ${dest}${destEntries.length ? " (existing content moved aside)" : ""}`);
     console.log("rerun with --apply to perform the restore");
     return;
   }
-  await ensureDir(dest);
-  if (statSync(source).isDirectory()) {
-    await cp(source, dest, { recursive: true, force: true, errorOnExist: false });
-  } else {
-    run(["tar", "-xzf", source, "-C", dest]);
+
+  // Restore into a fresh temp directory first, then swap into place, so a partial
+  // extraction failure never leaves the target with mixed old/new state.
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+  const tempDest = `${dest}.restore-tmp-${process.pid}-${stamp}`;
+  await ensureDir(tempDest);
+  await chmod(tempDest, 0o700).catch(() => undefined);
+  try {
+    if (isDirectorySource) {
+      await cp(source, tempDest, { recursive: true, force: true, errorOnExist: false });
+    } else {
+      run(["tar", "-xzf", source, "-C", tempDest]);
+    }
+  } catch (error) {
+    await rm(tempDest, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
   }
-  console.log(`restore copied into ${dest}`);
+
+  if (existsSync(dest)) {
+    if (destEntries.length) {
+      const preservePath = `${dest}.pre-restore-${stamp}`;
+      await rename(dest, preservePath);
+      console.log(`existing target moved aside: ${preservePath}`);
+    } else {
+      await rmdir(dest);
+    }
+  } else {
+    await ensureDir(dirname(dest));
+  }
+  await rename(tempDest, dest);
+  console.log(`restore completed into ${dest}`);
 }
 
 async function removePath(path: string, dryRun: boolean, removed: string[]): Promise<void> {
@@ -8888,6 +9172,17 @@ async function commandDestroy(args: ParsedArgs): Promise<void> {
     join(cfg.paths.home, ".cursor", "rules", "shared-brain.md"),
     clientEnvPathAbs(cfg)
   ]);
+
+  // The on-disk manifest is mutable state. Never trust its paths directly: validate
+  // every entry against a freshly computed allowlist from the live config so a
+  // corrupt or tampered manifest cannot direct destroy at arbitrary user paths.
+  const allowedArtifactPaths = new Set<string>();
+  for (const platform of ["launchd", "systemd"] as const) {
+    for (const expected of expectedManagedArtifacts(cfg, platform)) {
+      allowedArtifactPaths.add(absWithHome(expected.path, cfg.paths.home));
+    }
+  }
+
   const artifacts = manifest.artifacts
     .filter((artifact) => artifactInScope(artifact, scope))
     .filter((artifact) => !exactHandled.has(artifact.path))
@@ -8901,7 +9196,16 @@ async function commandDestroy(args: ParsedArgs): Promise<void> {
       skipped.push(`${artifact.path} (ownership manifest missing; inferred artifact not removed)`);
       continue;
     }
-    await removePath(artifact.path, dryRun, removed);
+    if (typeof artifact.path !== "string" || !artifact.path.trim()) {
+      skipped.push(`(manifest entry with empty path ignored)`);
+      continue;
+    }
+    const resolvedArtifactPath = absWithHome(artifact.path, cfg.paths.home);
+    if (!allowedArtifactPaths.has(resolvedArtifactPath)) {
+      skipped.push(`${artifact.path} (not a brainstack-owned artifact for this config; manifest entry ignored)`);
+      continue;
+    }
+    await removePath(resolvedArtifactPath, dryRun, removed);
   }
 
   if (hasFlag(args, "remove-shared-brain")) {
@@ -9174,14 +9478,23 @@ async function commandTrustWorker(args: ParsedArgs): Promise<void> {
     throw new Error(`ssh-keyscan returned no host keys for ${host}; stderr=${scan.stderr.trim() || "(empty)"}`);
   }
   await ensureDir(dirname(knownHostsPath));
+  if (existsSync(knownHostsPath)) {
+    const info = await lstat(knownHostsPath);
+    if (info.isSymbolicLink() || !info.isFile()) {
+      throw new Error(`refusing to update non-regular known-hosts file: ${knownHostsPath}`);
+    }
+  }
   const existing = existsSync(knownHostsPath) ? await readFile(knownHostsPath, "utf8") : "";
   const additions = scannedLines.filter((line) => !existing.split(/\r?\n/).includes(line));
   if (!additions.length) {
+    // Pinned host topology should not be group/world readable even when no new
+    // entries are added; tighten legacy 0644 files in passing.
+    await chmod(knownHostsPath, 0o600).catch(() => undefined);
     console.log(`pinned host key lines already present for ${host} in ${knownHostsPath}`);
     return;
   }
   const prefix = existing && !existing.endsWith("\n") ? "\n" : "";
-  await writeText(knownHostsPath, `${existing}${prefix}${additions.join("\n")}\n`, 0o644);
+  await writeText(knownHostsPath, `${existing}${prefix}${additions.join("\n")}\n`, 0o600);
   console.log(`pinned ${additions.length} host key line(s) for ${host} in ${knownHostsPath}`);
   console.log(`worker ${worker.name} should use sshTrustMode: pinned`);
 }
@@ -9521,7 +9834,7 @@ async function commandMigrateCurrentInstall(args: ParsedArgs): Promise<void> {
       enableSsh: false
     }
   };
-  await writeText(out, stringifySimpleYaml(current));
+  await writeText(out, stringifySimpleYaml(current), 0o600);
   console.log(`wrote current-install compatibility config: ${out}`);
   console.log(`existing live clone remains untouched: ${cfg.paths.sharedBrainRoot}/live/shared-brain`);
 }

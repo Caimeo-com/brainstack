@@ -343,15 +343,27 @@ export class CronManager {
   }
 
   async fastForwardMissedRuns(referenceIso: string): Promise<void> {
+    const maxRecordedMissesPerJob = 50;
     for (const job of this.db.listCronJobs()) {
       if (!job.enabled || job.pendingRunAt || !job.nextRunAt || job.nextRunAt >= referenceIso) {
         continue;
       }
 
+      // Enumerate every missed logical occurrence (bounded) so downtime spanning
+      // multiple windows does not collapse into a single ambiguous skip record.
+      const missedRuns: string[] = [];
+      let cursor: string | null = job.nextRunAt;
+      while (cursor && cursor < referenceIso && missedRuns.length < maxRecordedMissesPerJob) {
+        missedRuns.push(cursor);
+        cursor = nextCronRunAt(job.schedule, cursor);
+      }
+      const missedCount = missedRuns.length + (cursor && cursor < referenceIso ? 1 : 0);
+      const missedSuffix = missedCount > 1 ? ` (${missedCount}${cursor && cursor < referenceIso ? "+" : ""} missed window(s))` : "";
+
       const updated = {
         ...job,
         nextRunAt: nextCronRunAt(job.schedule, referenceIso),
-        lastResult: `Skipped missed run before scheduler start at ${referenceIso}`,
+        lastResult: `Skipped missed run before scheduler start at ${referenceIso}${missedSuffix}`,
         lastError: null,
         updatedAt: nowIso()
       };
@@ -361,15 +373,17 @@ export class CronManager {
       }
 
       await this.saveJob(updated);
-      this.db.saveCronRun({
-        id: `cron-run-skip-${job.id}-${referenceIso.replace(/[^0-9]/g, "")}`,
-        jobId: job.id,
-        scheduledFor: job.nextRunAt,
-        startedAt: referenceIso,
-        finishedAt: referenceIso,
-        status: "skipped",
-        note: `Skipped missed run before scheduler start`
-      });
+      for (const missedAt of missedRuns) {
+        this.db.saveCronRun({
+          id: `cron-run-skip-${job.id}-${missedAt.replace(/[^0-9]/g, "")}`,
+          jobId: job.id,
+          scheduledFor: missedAt,
+          startedAt: referenceIso,
+          finishedAt: referenceIso,
+          status: "skipped",
+          note: `Skipped missed run before scheduler start`
+        });
+      }
     }
   }
 

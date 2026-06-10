@@ -4,7 +4,7 @@ import { lookup } from "node:dns/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { hostname } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import {
@@ -19,6 +19,7 @@ import {
   getRepoPaths,
   gitCommitAndPush,
   ingestArtifacts,
+  isSafeManifestId,
   isoNow,
   lintWiki,
   parseFrontmatter,
@@ -859,15 +860,16 @@ async function withIdempotency(
   run: (markSideEffectStarted: () => Promise<void>) => Promise<Record<string, unknown>>
 ): Promise<Record<string, unknown>> {
   const rawKey = request.headers.get("idempotency-key")?.trim();
-  if (!rawKey) {
-    return await run(async () => undefined);
-  }
-  if (rawKey.length > 200) {
+  if (rawKey && rawKey.length > 200) {
     reject(400, "Idempotency-Key is too long");
   }
+  // Idempotency must not depend on the caller remembering to send a key: without one,
+  // derive a semantic key from the canonical request hash so retries of the same
+  // logical payload share one record instead of creating duplicate commits.
+  const effectiveKey = rawKey || `semantic-${requestHash}`;
 
   const paths = getRepoPaths(writeRepoRoot);
-  const keyHash = sha256Text(rawKey);
+  const keyHash = sha256Text(effectiveKey);
   const recordPath = join(paths.idempotencyDir, endpoint, `${keyHash}.json`);
   const relativeRecordPath = `derived/idempotency/${endpoint}/${keyHash}.json`;
   const lockDir = `${recordPath}.lock`;
@@ -1078,14 +1080,12 @@ async function completedIdempotencyReplay(
   requestHash: string
 ): Promise<Record<string, unknown> | null> {
   const rawKey = request.headers.get("idempotency-key")?.trim();
-  if (!rawKey) {
-    return null;
-  }
-  if (rawKey.length > 200) {
+  if (rawKey && rawKey.length > 200) {
     reject(400, "Idempotency-Key is too long");
   }
+  const effectiveKey = rawKey || `semantic-${requestHash}`;
   const paths = getRepoPaths(writeRepoRoot);
-  const recordPath = join(paths.idempotencyDir, endpoint, `${sha256Text(rawKey)}.json`);
+  const recordPath = join(paths.idempotencyDir, endpoint, `${sha256Text(effectiveKey)}.json`);
   const existing = await readJsonFile<IdempotencyRecord>(recordPath);
   if (!existing) {
     return null;
@@ -1445,12 +1445,19 @@ async function readResponseBytesCapped(response: Response, label: string): Promi
 
 type AuthScope = "import" | "admin";
 
+// Compare fixed-length digests so token checks do not leak prefix-match timing.
+function tokenEquals(presented: string, expected: string): boolean {
+  const presentedHash = createHash("sha256").update(presented).digest();
+  const expectedHash = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(presentedHash, expectedHash);
+}
+
 function requestAuthScope(request: Request): AuthScope | null {
   const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
-  if (adminToken && token === adminToken) {
+  if (adminToken && tokenEquals(token, adminToken)) {
     return "admin";
   }
-  if (importToken && token === importToken) {
+  if (importToken && tokenEquals(token, importToken)) {
     return "import";
   }
   return null;
@@ -2254,6 +2261,11 @@ const server = Bun.serve({
             : [];
         if (!artifactIds.length) {
           reject(400, "artifact_id or artifact_ids is required");
+        }
+        for (const artifactId of artifactIds) {
+          if (!isSafeManifestId(artifactId)) {
+            reject(400, `artifact id is not a valid identifier: ${artifactId.slice(0, 128)}`);
+          }
         }
         return json(
           await withMutationGate(async () => {

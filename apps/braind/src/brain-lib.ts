@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { existsSync, realpathSync } from "node:fs";
-import { mkdir, readFile, readdir, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
@@ -100,6 +100,7 @@ export interface HealthStatus {
   indexed_docs: number;
   last_reindex_at: string | null;
   indexed_commit: string | null;
+  index_partial: string | null;
   repo_root: string;
 }
 
@@ -243,16 +244,33 @@ async function readJson<T>(path: string): Promise<T> {
 }
 
 async function listFiles(root: string): Promise<string[]> {
-  if (!existsSync(root)) {
+  return await listFilesBounded(root, { remaining: Number.POSITIVE_INFINITY });
+}
+
+/**
+ * Bounded traversal so pathological or hostile trees cannot make discovery itself
+ * consume unbounded time/memory before any indexing budget applies. The budget is
+ * shared across calls via the mutable state object.
+ */
+async function listFilesBounded(root: string, state: { remaining: number; truncated?: boolean }, maxDepth = 64): Promise<string[]> {
+  if (!existsSync(root) || state.remaining <= 0 || maxDepth <= 0) {
+    if (state.remaining <= 0 || maxDepth <= 0) {
+      state.truncated = true;
+    }
     return [];
   }
   const entries = await readdir(root, { withFileTypes: true });
   const files: string[] = [];
   for (const entry of entries) {
+    if (state.remaining <= 0) {
+      state.truncated = true;
+      break;
+    }
     const fullPath = join(root, entry.name);
     if (entry.isDirectory()) {
-      files.push(...(await listFiles(fullPath)));
+      files.push(...(await listFilesBounded(fullPath, state, maxDepth - 1)));
     } else if (entry.isFile()) {
+      state.remaining -= 1;
       files.push(fullPath);
     }
   }
@@ -520,19 +538,123 @@ function runCommand(args: string[], cwd: string, check = true): string {
   return stdout;
 }
 
-async function runCommandAsync(args: string[], cwd: string, check = true): Promise<string> {
-  const proc = Bun.spawn(args, { cwd, stdout: "pipe", stderr: "pipe" });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited
-  ]);
-  const normalizedStdout = stdout.trim();
-  const normalizedStderr = stderr.trim();
-  if (check && exitCode !== 0) {
-    throw new Error(`${args.join(" ")} failed: ${normalizedStderr || normalizedStdout}`);
+interface RunCommandOptions {
+  timeoutMs?: number;
+  maxOutputBytes?: number;
+  /** Out-param: set to true when stdout/stderr hit the output cap (check=false callers). */
+  outputState?: { truncated?: boolean };
+}
+
+const DEFAULT_SUBPROCESS_TIMEOUT_MS = 120_000;
+const DEFAULT_SUBPROCESS_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+
+function envBudget(key: string, fallback: number): number {
+  const parsed = Number(process.env[key] || "");
+  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : fallback;
+}
+
+// Reindex budgets keep search rebuilds bounded under growth or deliberately large
+// imports; a partial index with diagnostics beats a permanently stale one.
+function reindexBudgets(): { maxFiles: number; maxTotalBytes: number; maxDocBytes: number } {
+  return {
+    maxFiles: envBudget("BRAIN_REINDEX_MAX_FILES", 50_000),
+    maxTotalBytes: envBudget("BRAIN_REINDEX_MAX_TOTAL_BYTES", 512 * 1024 * 1024),
+    maxDocBytes: envBudget("BRAIN_REINDEX_MAX_DOC_BYTES", 4 * 1024 * 1024)
+  };
+}
+
+async function readTextCapped(path: string, maxBytes: number): Promise<{ text: string; truncated: boolean; bytes: number }> {
+  const info = await stat(path);
+  if (info.size <= maxBytes) {
+    return { text: await readText(path), truncated: false, bytes: info.size };
   }
-  return normalizedStdout;
+  const handle = await open(path, "r");
+  try {
+    const buffer = Buffer.alloc(maxBytes);
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+    return { text: buffer.subarray(0, bytesRead).toString("utf8"), truncated: true, bytes: bytesRead };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readCappedStream(stream: ReadableStream<Uint8Array> | null, maxBytes: number, onOverflow: () => void): Promise<string> {
+  if (!stream) {
+    return "";
+  }
+  const reader = stream.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let overflowed = false;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    if (overflowed) {
+      continue;
+    }
+    total += value.byteLength;
+    if (total > maxBytes) {
+      overflowed = true;
+      onOverflow();
+      continue;
+    }
+    chunks.push(Buffer.from(value));
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  return overflowed ? `${text}\n[output truncated at ${maxBytes} bytes]` : text;
+}
+
+/**
+ * Subprocesses run while the mutation gate/repo lock is held, so a hung git push or
+ * hostile document normalization must not block all writes forever or buffer
+ * unbounded output in memory.
+ */
+async function runCommandAsync(args: string[], cwd: string, check = true, options: RunCommandOptions = {}): Promise<string> {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_SUBPROCESS_TIMEOUT_MS;
+  const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_SUBPROCESS_MAX_OUTPUT_BYTES;
+  const proc = Bun.spawn(args, { cwd, stdout: "pipe", stderr: "pipe" });
+  let timedOut = false;
+  let outputOverflow = false;
+  const killForOverflow = () => {
+    outputOverflow = true;
+    proc.kill();
+  };
+  const termTimer = setTimeout(() => {
+    timedOut = true;
+    proc.kill();
+  }, timeoutMs);
+  const killTimer = setTimeout(() => {
+    proc.kill(9);
+  }, timeoutMs + 5_000);
+  try {
+    const [stdout, stderr, exitCode] = await Promise.all([
+      readCappedStream(proc.stdout as ReadableStream<Uint8Array> | null, maxOutputBytes, killForOverflow),
+      readCappedStream(proc.stderr as ReadableStream<Uint8Array> | null, maxOutputBytes, killForOverflow),
+      proc.exited
+    ]);
+    if (timedOut) {
+      throw new Error(`${args[0]} ${args[1] || ""} timed out after ${timeoutMs}ms`.trim());
+    }
+    if (outputOverflow) {
+      if (options.outputState) {
+        options.outputState.truncated = true;
+      }
+      if (check) {
+        throw new Error(`${args[0]} ${args[1] || ""} exceeded the ${maxOutputBytes} byte output cap`.trim());
+      }
+    }
+    const normalizedStdout = stdout.trim();
+    const normalizedStderr = stderr.trim();
+    if (check && exitCode !== 0) {
+      throw new Error(`${args.join(" ")} failed: ${(normalizedStderr || normalizedStdout).slice(0, 4_000)}`);
+    }
+    return normalizedStdout;
+  } finally {
+    clearTimeout(termTimer);
+    clearTimeout(killTimer);
+  }
 }
 
 function cleanWritableRepoStatus(status: string): string {
@@ -750,8 +872,21 @@ async function normalizeArtifactFile(
     }
   } else if (extension === ".docx") {
     if (await commandExists("pandoc")) {
-      body = await runCommandAsync(["pandoc", rawAbsolutePath, "-t", "gfm"], paths.repoRoot, false) || "";
-      if (!body.trim()) {
+      // Import-token callers can trigger normalization, so cap it harder than trusted git plumbing.
+      const pandocState: { truncated?: boolean } = {};
+      body = await runCommandAsync(["pandoc", rawAbsolutePath, "-t", "gfm"], paths.repoRoot, false, { timeoutMs: 60_000, maxOutputBytes: 8 * 1024 * 1024, outputState: pandocState }) || "";
+      if (pandocState.truncated) {
+        // Capped output is not a complete normalization; do not record it as one.
+        status = "deferred";
+        body = [
+          `# ${title}`,
+          "",
+          "Normalization deferred. `pandoc` output exceeded the normalization size cap.",
+          "",
+          `- Raw artifact: [[${rawRepoPath}]]`,
+          ""
+        ].join("\n");
+      } else if (!body.trim()) {
         status = "deferred";
         body = [
           `# ${title}`,
@@ -777,8 +912,19 @@ async function normalizeArtifactFile(
     }
   } else if (extension === ".pdf" || manifest.mime_type === "application/pdf") {
     if (await commandExists("pdftotext")) {
-      body = await runCommandAsync(["pdftotext", rawAbsolutePath, "-"], paths.repoRoot, false);
-      if (!body.trim()) {
+      const pdfState: { truncated?: boolean } = {};
+      body = await runCommandAsync(["pdftotext", rawAbsolutePath, "-"], paths.repoRoot, false, { timeoutMs: 60_000, maxOutputBytes: 8 * 1024 * 1024, outputState: pdfState });
+      if (pdfState.truncated) {
+        status = "deferred";
+        body = [
+          `# ${title}`,
+          "",
+          "Normalization deferred. `pdftotext` output exceeded the normalization size cap.",
+          "",
+          `- Raw artifact: [[${rawRepoPath}]]`,
+          ""
+        ].join("\n");
+      } else if (!body.trim()) {
         status = "deferred";
         body = [
           `# ${title}`,
@@ -823,7 +969,18 @@ async function findSourceManifestFiles(paths: RepoPaths): Promise<string[]> {
   return (await listFiles(paths.sourceManifestDir)).filter((file) => file.endsWith(".json")).sort();
 }
 
+// Manifest ids come from request bodies and imported manifest metadata; they must be
+// canonical identifiers, never path fragments that could escape the manifest roots.
+const MANIFEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+export function isSafeManifestId(id: string): boolean {
+  return MANIFEST_ID_PATTERN.test(id) && !id.includes("..");
+}
+
 export async function findSourceManifestById(repoRoot: string, artifactId: string): Promise<SourceManifest | null> {
+  if (!isSafeManifestId(artifactId)) {
+    return null;
+  }
   const paths = getRepoPaths(repoRoot);
   const filePath = join(paths.sourceManifestDir, `${artifactId}.json`);
   if (!existsSync(filePath)) {
@@ -843,6 +1000,9 @@ async function findSourceManifestBySha(paths: RepoPaths, sha256: string): Promis
 }
 
 async function findManifestById(directory: string, id: string): Promise<Record<string, unknown> | null> {
+  if (!isSafeManifestId(id)) {
+    return null;
+  }
   const filePath = join(directory, `${id}.json`);
   if (!existsSync(filePath)) {
     return null;
@@ -1259,10 +1419,28 @@ export async function rebuildIndex(repoRoot: string): Promise<{ indexedDocs: num
     const insertLink = db.prepare(`INSERT INTO links (from_path, to_path) VALUES (?, ?)`);
 
     let indexedDocs = 0;
-    const wikiFiles = (await listFiles(paths.wikiDir)).filter((file) => file.endsWith(".md")).sort();
+    const budgets = reindexBudgets();
+    let totalIndexedBytes = 0;
+    let skippedForBudget = 0;
+    let truncatedDocs = 0;
+    const budgetExceeded = (): boolean => indexedDocs >= budgets.maxFiles || totalIndexedBytes >= budgets.maxTotalBytes;
+    // Bound discovery itself, not just indexing: allow some slack over maxFiles for
+    // non-indexable files that the filters drop.
+    const scanState = { remaining: budgets.maxFiles * 2, truncated: false };
+
+    const wikiFiles = (await listFilesBounded(paths.wikiDir, scanState)).filter((file) => file.endsWith(".md")).sort();
     for (const absolutePath of wikiFiles) {
+      if (budgetExceeded()) {
+        skippedForBudget += 1;
+        continue;
+      }
       const repoPath = toRepoRelative(repoRoot, absolutePath);
-      const raw = await readText(absolutePath);
+      const capped = await readTextCapped(absolutePath, budgets.maxDocBytes);
+      const raw = capped.text;
+      totalIndexedBytes += capped.bytes;
+      if (capped.truncated) {
+        truncatedDocs += 1;
+      }
       const { data, body } = parseFrontmatter(raw);
       const title =
         typeof data.title === "string" ? data.title : findFirstHeading(raw) || inferTitleFromPath(repoPath);
@@ -1289,19 +1467,28 @@ export async function rebuildIndex(repoRoot: string): Promise<{ indexedDocs: num
     }
 
     const rawFiles = [
-      ...(await listFiles(paths.normalizedDir)),
-      ...(await listFiles(paths.importedDir)),
-      ...(await listFiles(paths.conversationsDir)),
-      ...(await listFiles(paths.proposalsPendingDir)),
-      ...(await listFiles(paths.proposalsAppliedDir))
+      ...(await listFilesBounded(paths.normalizedDir, scanState)),
+      ...(await listFilesBounded(paths.importedDir, scanState)),
+      ...(await listFilesBounded(paths.conversationsDir, scanState)),
+      ...(await listFilesBounded(paths.proposalsPendingDir, scanState)),
+      ...(await listFilesBounded(paths.proposalsAppliedDir, scanState))
     ]
       .filter((file, index, all) => all.indexOf(file) === index)
       .filter((file) => existsSync(file) && isTextLike(file, guessMimeFromPath(file)))
       .sort();
 
     for (const absolutePath of rawFiles) {
+      if (budgetExceeded()) {
+        skippedForBudget += 1;
+        continue;
+      }
       const repoPath = toRepoRelative(repoRoot, absolutePath);
-      const text = await readText(absolutePath);
+      const capped = await readTextCapped(absolutePath, budgets.maxDocBytes);
+      const text = capped.text;
+      totalIndexedBytes += capped.bytes;
+      if (capped.truncated) {
+        truncatedDocs += 1;
+      }
       const title = findFirstHeading(text) || inferTitleFromPath(repoPath);
       const headings = extractHeadings(text).join("\n");
       const type = repoPath.startsWith("raw/normalized/")
@@ -1317,9 +1504,17 @@ export async function rebuildIndex(repoRoot: string): Promise<{ indexedDocs: num
 
     const lastReindexAt = isoNow();
     const indexedCommit = await runCommandAsync(["git", "rev-parse", "HEAD"], repoRoot, false) || "";
+    const indexPartial =
+      skippedForBudget > 0 || truncatedDocs > 0 || scanState.truncated
+        ? `partial: ${skippedForBudget} file(s) skipped and ${truncatedDocs} document(s) truncated by reindex budgets${scanState.truncated ? "; file discovery was truncated by the scan cap" : ""} (files=${budgets.maxFiles}, total_bytes=${budgets.maxTotalBytes}, doc_bytes=${budgets.maxDocBytes})`
+        : "";
+    if (indexPartial) {
+      console.warn(`search reindex ${indexPartial}`);
+    }
     db.prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`).run("last_reindex_at", lastReindexAt);
     db.prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`).run("indexed_docs", String(indexedDocs));
     db.prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`).run("indexed_commit", indexedCommit);
+    db.prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`).run("index_partial", indexPartial);
     const integrity = db.query("PRAGMA integrity_check").get() as Record<string, unknown> | null;
     if (!integrity || integrity.integrity_check !== "ok") {
       throw new Error(`Search index integrity check failed: ${JSON.stringify(integrity)}`);
@@ -1438,6 +1633,7 @@ export async function getHealth(repoRoot: string): Promise<HealthStatus> {
   let indexedDocs = 0;
   let lastReindexAt: string | null = null;
   let indexedCommit: string | null = null;
+  let indexPartial: string | null = null;
   if (existsSync(paths.searchDbPath)) {
     const db = new Database(paths.searchDbPath, { readonly: true });
     try {
@@ -1450,9 +1646,13 @@ export async function getHealth(repoRoot: string): Promise<HealthStatus> {
       const commitRow = db.prepare(`SELECT value FROM meta WHERE key = 'indexed_commit'`).get() as
         | { value: string }
         | undefined;
+      const partialRow = db.prepare(`SELECT value FROM meta WHERE key = 'index_partial'`).get() as
+        | { value: string }
+        | undefined;
       indexedDocs = Number(indexed?.value || 0);
       lastReindexAt = reindex?.value || null;
       indexedCommit = commitRow?.value || null;
+      indexPartial = partialRow?.value || null;
     } finally {
       db.close();
     }
@@ -1469,6 +1669,7 @@ export async function getHealth(repoRoot: string): Promise<HealthStatus> {
     indexed_docs: indexedDocs,
     last_reindex_at: lastReindexAt,
     indexed_commit: indexedCommit,
+    index_partial: indexPartial,
     repo_root: repoRoot
   };
 }

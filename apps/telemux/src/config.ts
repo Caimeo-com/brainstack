@@ -47,6 +47,7 @@ export interface FactoryConfig {
   managedScratchRoot: string;
   dashboardHost: string;
   dashboardPort: number;
+  dashboardToken: string | null;
   telegramBotToken: string;
   telegramBotUsername: string | null;
   telegramControlChatId: number | null;
@@ -336,6 +337,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
     managedScratchRoot,
     dashboardHost: env.FACTORY_DASHBOARD_HOST?.trim() || "127.0.0.1",
     dashboardPort: readNumber(env, "FACTORY_DASHBOARD_PORT", 8787),
+    dashboardToken: env.FACTORY_DASHBOARD_TOKEN?.trim() || null,
     telegramBotToken: env.FACTORY_TELEGRAM_BOT_TOKEN?.trim() || "",
     telegramBotUsername: env.FACTORY_TELEGRAM_BOT_USERNAME?.trim().replace(/^@/, "").toLowerCase() || null,
     telegramControlChatId: readOptionalNumber(env, "FACTORY_TELEGRAM_CONTROL_CHAT_ID"),

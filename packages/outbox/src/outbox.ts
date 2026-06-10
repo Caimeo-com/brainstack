@@ -54,12 +54,16 @@ export interface OutboxLimits {
   compressAboveBytes: number;
   softWarnBytes: number;
   hardMaxBytes: number;
+  maxQueuedItems: number;
+  maxQueuedTotalBytes: number;
 }
 
 export const DEFAULT_OUTBOX_LIMITS: OutboxLimits = {
   compressAboveBytes: 1 * 1024 * 1024,
   softWarnBytes: 10 * 1024 * 1024,
-  hardMaxBytes: 250 * 1024 * 1024
+  hardMaxBytes: 250 * 1024 * 1024,
+  maxQueuedItems: 2_000,
+  maxQueuedTotalBytes: 1024 * 1024 * 1024
 };
 const OUTBOX_FILE_OVERHEAD_BYTES = 1024 * 1024;
 
@@ -71,8 +75,59 @@ export function outboxLimitsFromEnv(env: Record<string, string | undefined> = pr
   return {
     compressAboveBytes: numberFromEnv("BRAINSTACK_OUTBOX_COMPRESS_ABOVE_BYTES", DEFAULT_OUTBOX_LIMITS.compressAboveBytes),
     softWarnBytes: numberFromEnv("BRAINSTACK_OUTBOX_SOFT_WARN_BYTES", DEFAULT_OUTBOX_LIMITS.softWarnBytes),
-    hardMaxBytes: numberFromEnv("BRAINSTACK_OUTBOX_HARD_MAX_BYTES", DEFAULT_OUTBOX_LIMITS.hardMaxBytes)
+    hardMaxBytes: numberFromEnv("BRAINSTACK_OUTBOX_HARD_MAX_BYTES", DEFAULT_OUTBOX_LIMITS.hardMaxBytes),
+    maxQueuedItems: numberFromEnv("BRAINSTACK_OUTBOX_MAX_ITEMS", DEFAULT_OUTBOX_LIMITS.maxQueuedItems),
+    maxQueuedTotalBytes: numberFromEnv("BRAINSTACK_OUTBOX_MAX_TOTAL_BYTES", DEFAULT_OUTBOX_LIMITS.maxQueuedTotalBytes)
   };
+}
+
+export class OutboxQueueFullError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OutboxQueueFullError";
+  }
+}
+
+/**
+ * Enforce namespace-level growth caps before enqueueing a new item. Updates to an
+ * already-queued item (same path) never count against the item cap so retry metadata
+ * can still be persisted when the queue is full. Pass the encoded size of the
+ * incoming item via `incomingBytes` so the byte cap accounts for the write itself.
+ */
+export async function assertOutboxCapacity(
+  root: string,
+  existingPath: string | null,
+  incomingBytes = 0,
+  limits: OutboxLimits = outboxLimitsFromEnv()
+): Promise<void> {
+  if (!existsSync(root)) {
+    return;
+  }
+  const names = (await readdir(root).catch(() => [] as string[])).filter((name) => name.endsWith(".json"));
+  let totalBytes = 0;
+  let count = 0;
+  for (const name of names) {
+    const path = join(root, name);
+    if (existingPath && resolve(path) === resolve(existingPath)) {
+      continue;
+    }
+    const info = await lstat(path).catch(() => null);
+    if (!info || !info.isFile()) {
+      continue;
+    }
+    count += 1;
+    totalBytes += info.size;
+  }
+  if (count + 1 > limits.maxQueuedItems) {
+    throw new OutboxQueueFullError(
+      `outbox queue is full: ${count} queued item(s) reached cap ${limits.maxQueuedItems}; flush or purge before queueing new writes`
+    );
+  }
+  if (totalBytes + incomingBytes > limits.maxQueuedTotalBytes) {
+    throw new OutboxQueueFullError(
+      `outbox queue is full: ${totalBytes} queued byte(s) plus ${incomingBytes} incoming byte(s) exceed cap ${limits.maxQueuedTotalBytes}; flush or purge before queueing new writes`
+    );
+  }
 }
 
 export function sha256Hex(text: string | Uint8Array): string {
@@ -97,7 +152,7 @@ export function outboxItemKey(endpoint: BrainEndpoint, payload: Record<string, u
   return sha256Hex(canonicalJson({ endpoint, payload, destination: destination || null }));
 }
 
-function outboxDestinationForKey(item: Pick<OutboxItem, "brain_id" | "url">): Record<string, unknown> {
+export function outboxDestinationForKey(item: Pick<OutboxItem, "brain_id" | "url">): Record<string, unknown> {
   return {
     brain_id: item.brain_id || null,
     url: item.url || null
@@ -364,11 +419,25 @@ export async function scanOutbox(root: string, limits: OutboxLimits = outboxLimi
       corrupt.push({ path, name, error: error instanceof Error ? error.message : String(error) });
     }
   }
+  // Replay in enqueue order, not filename/hash order, so earlier writes flush first.
+  items.sort((a, b) => {
+    const createdA = a.item.created_at || "";
+    const createdB = b.item.created_at || "";
+    if (createdA !== createdB) {
+      return createdA < createdB ? -1 : 1;
+    }
+    return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+  });
   return { root, items, corrupt };
 }
 
 export async function writeOutboxItem(path: string, item: OutboxItem, limits: OutboxLimits = outboxLimitsFromEnv()): Promise<void> {
   await atomicWritePrivateJson(path, normalizeOutboxItem(item, limits));
+}
+
+/** Exact on-disk byte size that writeOutboxItem will produce for this item. */
+export function outboxItemFileBytes(item: OutboxItem, limits: OutboxLimits = outboxLimitsFromEnv()): number {
+  return Buffer.byteLength(`${JSON.stringify(normalizeOutboxItem(item, limits), null, 2)}\n`, "utf8");
 }
 
 export function buildOutboxItem(

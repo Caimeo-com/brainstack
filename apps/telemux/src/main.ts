@@ -21,7 +21,24 @@ const dispatcher = new Dispatcher(config, db, contexts, workers, telegram, cronM
 const cronScheduler = new CronScheduler(config, db, cronManager, dispatcher, workers, telegram);
 const commands = new CommandHandler(config, db, telegram, contexts, workers, dispatcher, cronManager, cronScheduler);
 
-startDashboard(config, db, workers);
+startDashboard(config, db, workers, telegram);
+
+try {
+  const pruned = db.pruneHistory();
+  if (pruned.queuedTurns || pruned.cronRuns) {
+    console.log(`pruned job history: ${pruned.queuedTurns} queued turn(s), ${pruned.cronRuns} cron run(s)`);
+  }
+} catch (error) {
+  console.error("job history pruning failed", error);
+}
+
+setInterval(() => {
+  try {
+    db.pruneHistory();
+  } catch (error) {
+    console.error("scheduled job history pruning failed", error);
+  }
+}, 24 * 60 * 60 * 1000);
 
 void workers.refreshWorkers().catch((error) => {
   console.error("initial worker refresh failed", error);

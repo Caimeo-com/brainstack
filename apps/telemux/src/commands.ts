@@ -130,6 +130,33 @@ function artifactSendIntentFromText(text: string): ArtifactSendIntent | null {
 
 const LOG_TAIL_READ_BYTES = 2 * 1024 * 1024;
 
+// Harness logs can echo env vars, provider keys, and token-shaped strings. Redact
+// the common shapes before any log content leaves the trusted host into Telegram.
+const LOG_SECRET_PATTERNS: Array<{ pattern: RegExp; replacement: string }> = [
+  { pattern: /\b\d{6,12}:[A-Za-z0-9_-]{30,}\b/g, replacement: "[redacted-telegram-token]" },
+  { pattern: /\b(sk|rk|pk)-[A-Za-z0-9_-]{16,}\b/g, replacement: "[redacted-api-key]" },
+  { pattern: /\b(sk|rk|pk|whsec)_(?:live|test|prod)?_?[A-Za-z0-9]{16,}\b/g, replacement: "[redacted-api-key]" },
+  { pattern: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, replacement: "[redacted-github-token]" },
+  { pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, replacement: "[redacted-slack-token]" },
+  { pattern: /\bbs1_[A-Za-z0-9+/=_-]{16,}\b/g, replacement: "[redacted-invite]" },
+  { pattern: /\bAKIA[0-9A-Z]{16}\b/g, replacement: "[redacted-aws-key]" },
+  { pattern: /\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, replacement: "[redacted-jwt]" },
+  {
+    pattern: /\b([A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIALS?)[A-Z0-9_]*)\s*[=:]\s*\S+/g,
+    replacement: "$1=[redacted]"
+  },
+  { pattern: /(Authorization:\s*Bearer\s+)\S+/gi, replacement: "$1[redacted]" },
+  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: "[redacted-private-key]" }
+];
+
+export function redactLogSecrets(text: string): string {
+  let redacted = text;
+  for (const { pattern, replacement } of LOG_SECRET_PATTERNS) {
+    redacted = redacted.replace(pattern, replacement);
+  }
+  return redacted;
+}
+
 async function readTail(path: string, lines = 40): Promise<string> {
   const file = Bun.file(path);
   if (!(await file.exists())) {
@@ -151,7 +178,7 @@ async function readTail(path: string, lines = 40): Promise<string> {
     await handle.close();
   }
   const tail = text.split("\n").slice(-lines).join("\n").trim();
-  return tail || "(log is empty)";
+  return tail ? redactLogSecrets(tail) : "(log is empty)";
 }
 
 function messageTarget(message: TelegramMessage): TelegramTarget {
@@ -425,18 +452,33 @@ export class CommandHandler {
     if (parsed?.mention && this.config.telegramBotUsername && parsed.mention !== this.config.telegramBotUsername) {
       return;
     }
+
+    // Authorization must gate before any processing (pending-text flush, context
+    // lookup, command handling) so unauthorized senders cannot trigger side effects
+    // or learn operator/control metadata.
+    const allowed = message.from?.id === this.config.allowedTelegramUserId;
+    if (!allowed) {
+      if (parsed?.command === "/whoami") {
+        // Discovery aid: echo only the caller's own identity, never configured ids,
+        // chat topology, or bound context state.
+        await this.telegram.sendText(target, [`Access: denied`, `From user id: ${message.from?.id ?? "unknown"}`].join("\n"));
+        return;
+      }
+      console.warn("ignoring telegram message from unauthorized user", message.from?.id);
+      return;
+    }
+
     const hasAttachments = Boolean(rawTelegramInput?.attachments.length);
     if (parsed || hasAttachments) {
       await this.flushPendingText(target, message.from?.id ?? null);
     }
     const boundContext = this.contexts.getContextByTopic(target.chatId, target.threadId);
-    const allowed = message.from?.id === this.config.allowedTelegramUserId;
 
     if (parsed?.command === "/whoami") {
       await this.telegram.sendText(
         target,
         [
-          `Access: ${allowed ? "allowed" : "denied"}`,
+          `Access: allowed`,
           `Allowed user id: ${this.config.allowedTelegramUserId}`,
           `From user id: ${message.from?.id ?? "unknown"}`,
           `Chat id: ${message.chat.id}`,
@@ -445,11 +487,6 @@ export class CommandHandler {
           `Bound context: ${formatBoundContext(boundContext)}`
         ].join("\n")
       );
-      return;
-    }
-
-    if (!allowed) {
-      console.warn("ignoring telegram message from unauthorized user", message.from?.id);
       return;
     }
 
@@ -768,7 +805,11 @@ export class CommandHandler {
           const logPath = `${this.config.logsDir}/manual-update-check-${Date.now()}.log`;
           let result;
           try {
-            result = await this.dispatcher.withContextLock(updateContext, () => this.workers.runUpdateCheck(updateContext, logPath));
+            result = await this.dispatcher.withContextLock(updateContext, () => this.workers.runUpdateCheck(updateContext, logPath), {
+              mode: "update-check",
+              logPath,
+              target
+            });
           } catch (error) {
             await this.telegram.sendText(target, `Update check could not start: ${error instanceof Error ? error.message : String(error)}`);
             return;

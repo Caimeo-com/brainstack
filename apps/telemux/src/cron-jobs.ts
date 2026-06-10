@@ -72,7 +72,7 @@ export interface CronRunRecord {
   scheduledFor: string | null;
   startedAt: string;
   finishedAt: string | null;
-  status: "claimed" | "queued" | "sent" | "dispatched" | "skipped" | "failed";
+  status: "claimed" | "queued" | "sent" | "completed_notification_failed" | "dispatched" | "skipped" | "failed";
   note: string | null;
 }
 

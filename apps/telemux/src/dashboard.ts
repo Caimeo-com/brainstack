@@ -1,6 +1,19 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import { FactoryDb } from "./db";
 import { WorkerService } from "./workers";
 import type { FactoryConfig } from "./config";
+import type { TelegramBot } from "./telegram";
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost" || normalized.startsWith("127.");
+}
+
+function tokenMatches(presented: string, expected: string): boolean {
+  const presentedHash = createHash("sha256").update(presented).digest();
+  const expectedHash = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(presentedHash, expectedHash);
+}
 
 function escapeHtml(value: string): string {
   return value
@@ -34,12 +47,27 @@ function badge(status: string): string {
   )}</span>`;
 }
 
-export function startDashboard(config: FactoryConfig, db: FactoryDb, workers: WorkerService): void {
+export function startDashboard(config: FactoryConfig, db: FactoryDb, workers: WorkerService, telegram?: TelegramBot): void {
+  // The dashboard exposes operational metadata (worktree paths, session ids,
+  // summaries) without auth, so a non-loopback bind requires an explicit token.
+  if (!isLoopbackHost(config.dashboardHost) && !config.dashboardToken) {
+    throw new Error(
+      `refusing to bind dashboard to non-loopback host ${config.dashboardHost} without FACTORY_DASHBOARD_TOKEN; set a token or bind to 127.0.0.1`
+    );
+  }
+
   Bun.serve({
     hostname: config.dashboardHost,
     port: config.dashboardPort,
     fetch(request) {
       const url = new URL(request.url);
+
+      if (config.dashboardToken) {
+        const presented = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
+        if (!presented || !tokenMatches(presented, config.dashboardToken)) {
+          return new Response("unauthorized", { status: 401 });
+        }
+      }
 
       if (url.pathname === "/healthz") {
         const cronRows = db.listCronJobs();
@@ -55,6 +83,7 @@ export function startDashboard(config: FactoryConfig, db: FactoryDb, workers: Wo
           ok: true,
           dashboard: `${config.dashboardHost}:${config.dashboardPort}`,
           telegramConfigured: Boolean(config.telegramBotToken),
+          telegramPollConflictAt: telegram?.pollConflictAt() ?? null,
           workers: workers.knownHosts().length,
           workerHealthRows: workerRows.length,
           workerDegraded: degradedWorkers,

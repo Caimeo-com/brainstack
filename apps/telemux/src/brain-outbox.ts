@@ -2,9 +2,12 @@ import { rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { FactoryConfig } from "./config";
 import {
+  assertOutboxCapacity,
   buildOutboxItem,
   ensurePrivateOutboxDir,
   normalizeOutboxItem,
+  outboxDestinationForKey,
+  outboxItemFileBytes,
   outboxLimitsFromEnv,
   outboxItemKey,
   sanitizedHttpError,
@@ -16,8 +19,12 @@ import {
   type OutboxItem as QueuedBrainWrite
 } from "../../../packages/outbox/src/outbox";
 
-function idempotencyKeyFor(endpoint: BrainEndpoint, payload: Record<string, unknown>): string {
-  return outboxItemKey(endpoint, payload);
+/**
+ * Direct sends and queued replays must share one destination-aware idempotency key so
+ * braind can recognize an outbox replay of a request that already reached the server.
+ */
+function idempotencyKeyFor(config: FactoryConfig, endpoint: BrainEndpoint, payload: Record<string, unknown>): string {
+  return outboxItemKey(endpoint, payload, outboxDestinationForKey({ url: config.brainBaseUrl }));
 }
 
 function isRetryableBrainWriteStatus(status: number): boolean {
@@ -83,7 +90,7 @@ async function findMatchingQueuedWrite(root: string, endpoint: BrainEndpoint, id
 }
 
 async function queueBrainWrite(config: FactoryConfig, endpoint: BrainEndpoint, payload: Record<string, unknown>, error: string): Promise<string> {
-  const idempotencyKey = idempotencyKeyFor(endpoint, payload);
+  const idempotencyKey = idempotencyKeyFor(config, endpoint, payload);
   const created = new Date().toISOString();
   const id = `${endpoint}-${idempotencyKey.slice(0, 32)}`;
   const root = outboxRoot(config);
@@ -107,6 +114,7 @@ async function queueBrainWrite(config: FactoryConfig, endpoint: BrainEndpoint, p
     error,
     existing
   );
+  await assertOutboxCapacity(root, existing ? path : null, outboxItemFileBytes(queuedItem));
   await writeOutboxItem(path, queuedItem);
   const storage = queuedItem.payload_storage;
   const limits = outboxLimitsFromEnv();
@@ -123,7 +131,7 @@ export async function postBrainImportOrQueue(config: FactoryConfig, payload: Rec
   }
 
   const endpoint: BrainEndpoint = "import";
-  const idempotencyKey = idempotencyKeyFor(endpoint, payload);
+  const idempotencyKey = idempotencyKeyFor(config, endpoint, payload);
   try {
     const response = await fetch(new URL("/api/import", config.brainBaseUrl).toString(), {
       method: "POST",

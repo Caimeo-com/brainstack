@@ -53,9 +53,12 @@ export async function summarizeManualUsage(context: ContextRecord): Promise<stri
 
       if (parsed.type === "turn.completed" && parsed.usage) {
         turns += 1;
-        inputTokens += parsed.usage.input_tokens || 0;
-        cachedInputTokens += parsed.usage.cached_input_tokens || 0;
-        outputTokens += parsed.usage.output_tokens || 0;
+        // Log lines are untrusted input: a string or NaN token field would corrupt
+        // the running totals through JS coercion.
+        const tokenCount = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0);
+        inputTokens += tokenCount(parsed.usage.input_tokens);
+        cachedInputTokens += tokenCount(parsed.usage.cached_input_tokens);
+        outputTokens += tokenCount(parsed.usage.output_tokens);
       }
     } catch {
       continue;

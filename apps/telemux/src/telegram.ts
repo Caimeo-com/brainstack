@@ -237,6 +237,8 @@ function chunkText(text: string, limit = 3500): string[] {
 export class TelegramBot {
   private running = false;
 
+  private lastPollConflictAt: string | null = null;
+
   constructor(
     private readonly config: FactoryConfig,
     private readonly db: FactoryDb
@@ -470,20 +472,42 @@ export class TelegramBot {
           },
           this.config.telegramPollTimeoutSeconds * 1000 + 5_000
         );
+        this.lastPollConflictAt = null;
 
         for (const update of updates) {
           nextOffset = update.update_id;
-          this.db.setSetting("telegram.last_update_id", String(update.update_id));
 
           if (update.message) {
-            await onMessage(update.message);
+            try {
+              await onMessage(update.message);
+            } catch (error) {
+              // Handler bugs must not poison the poll loop into redelivering the same
+              // update forever; log and advance past it.
+              console.error(`telegram update ${update.update_id} handler failed`, compactError(error));
+            }
           }
+          // Persist the offset only after the handler ran, so a crash mid-dispatch
+          // redelivers the update instead of silently dropping operator work.
+          this.db.setSetting("telegram.last_update_id", String(update.update_id));
         }
       } catch (error) {
-        console.error("telegram poll failed", compactError(error));
+        const message = compactError(error);
+        if (message.includes("getUpdates") && message.includes("409")) {
+          // 409 means another process is polling this bot token; back off hard and
+          // surface a specific operator diagnosis instead of churning every 3 seconds.
+          this.lastPollConflictAt = new Date().toISOString();
+          console.error("telegram getUpdates conflict (409): another poller is using this bot token; backing off 30s");
+          await sleep(30_000);
+          continue;
+        }
+        console.error("telegram poll failed", message);
         await sleep(3000);
       }
     }
+  }
+
+  pollConflictAt(): string | null {
+    return this.lastPollConflictAt;
   }
 
   private commandScopes(currentChatId: number | null): TelegramBotCommandScope[] {

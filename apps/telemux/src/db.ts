@@ -72,6 +72,15 @@ export interface QueuedTurnRecord {
   lastError: string | null;
 }
 
+export interface ActiveRunRecord {
+  contextSlug: string;
+  mode: string;
+  logPath: string | null;
+  chatId: number | null;
+  threadId: number | null;
+  startedAt: string;
+}
+
 export interface PendingTextRecord {
   key: string;
   contextSlug: string;
@@ -394,6 +403,15 @@ export class FactoryDb {
       CREATE INDEX IF NOT EXISTS queued_turns_status_idx
       ON queued_turns(status, received_at);
 
+      CREATE TABLE IF NOT EXISTS active_runs (
+        context_slug TEXT PRIMARY KEY,
+        mode TEXT NOT NULL,
+        log_path TEXT,
+        chat_id INTEGER,
+        thread_id INTEGER,
+        started_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS pending_text_prompts (
         key TEXT PRIMARY KEY,
         context_slug TEXT NOT NULL,
@@ -618,6 +636,64 @@ export class FactoryDb {
       .query("UPDATE queued_turns SET status = 'abandoned', finished_at = ?, updated_at = ?, last_error = COALESCE(last_error, 'telemux restarted while this queued turn was starting') WHERE status = 'running'")
       .run(now, now);
     return running;
+  }
+
+  recordActiveRun(input: { contextSlug: string; mode: string; logPath: string | null; chatId: number | null; threadId: number | null }): void {
+    this.db
+      .query(`
+        INSERT INTO active_runs (context_slug, mode, log_path, chat_id, thread_id, started_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(context_slug) DO UPDATE SET
+          mode = excluded.mode,
+          log_path = excluded.log_path,
+          chat_id = excluded.chat_id,
+          thread_id = excluded.thread_id,
+          started_at = excluded.started_at
+      `)
+      .run(input.contextSlug, input.mode, input.logPath, input.chatId, input.threadId, nowIso());
+  }
+
+  clearActiveRun(contextSlug: string): void {
+    this.db.query("DELETE FROM active_runs WHERE context_slug = ?").run(contextSlug);
+  }
+
+  takeStaleActiveRuns(): ActiveRunRecord[] {
+    const rows = this.db.query("SELECT * FROM active_runs ORDER BY started_at").all() as Array<Record<string, unknown>>;
+    const runs = rows.map((row) => ({
+      contextSlug: String(row.context_slug),
+      mode: String(row.mode),
+      logPath: readNullableString(row, "log_path"),
+      chatId: readNullableNumber(row, "chat_id"),
+      threadId: readNullableNumber(row, "thread_id"),
+      startedAt: String(row.started_at)
+    }));
+    if (runs.length) {
+      this.db.exec("DELETE FROM active_runs");
+    }
+    return runs;
+  }
+
+  /**
+   * Bound job-history growth: terminal queued turns and cron runs are operational
+   * telemetry, not durable state, so age them out and cap per-job cron history.
+   */
+  pruneHistory(maxAgeDays = 30, maxCronRunsPerJob = 200): { queuedTurns: number; cronRuns: number } {
+    const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    const queuedTurns = this.db
+      .query("DELETE FROM queued_turns WHERE status IN ('finished', 'failed', 'abandoned', 'skipped') AND updated_at < ?")
+      .run(cutoff).changes;
+    const cronRunsByAge = this.db.query("DELETE FROM cron_runs WHERE started_at < ?").run(cutoff).changes;
+    const cronRunsByCount = this.db
+      .query(`
+        DELETE FROM cron_runs WHERE id IN (
+          SELECT id FROM (
+            SELECT id, ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY started_at DESC) AS rn
+            FROM cron_runs
+          ) WHERE rn > ?
+        )
+      `)
+      .run(maxCronRunsPerJob).changes;
+    return { queuedTurns: Number(queuedTurns || 0), cronRuns: Number(cronRunsByAge || 0) + Number(cronRunsByCount || 0) };
   }
 
   saveContext(context: ContextRecord): ContextRecord {
