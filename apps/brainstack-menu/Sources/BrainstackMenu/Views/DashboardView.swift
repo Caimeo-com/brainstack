@@ -12,11 +12,11 @@ private struct ScrollContentHeightKey: PreferenceKey {
 struct DashboardView: View {
   @ObservedObject var model: AppModel
   var openPreferences: () -> Void
+  var openOperatorConsole: () -> Void
   // Start with a plausible height so the popover doesn't open tiny and balloon a
   // moment later (which can make AppKit re-place it).
   @State private var scrollContentHeight: CGFloat = 360
   @State private var showDetails = false
-  @State private var showMoreActions = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
@@ -32,10 +32,6 @@ struct DashboardView: View {
           } else {
             attentionSummary
             actions
-            if model.operatorModeEnabled {
-              Divider()
-              OperatorView(model: model)
-            }
             DisclosureGroup("Details", isExpanded: $showDetails) {
               sectionList
             }
@@ -105,6 +101,61 @@ struct DashboardView: View {
         .buttonStyle(.borderless)
         .help("Refresh Status")
       }
+      overflowMenu
+    }
+  }
+
+  /// Everything that is not primary or contextually actionable lives here, grouped
+  /// by intent, instead of as button rows in the popover body.
+  private var overflowMenu: some View {
+    Menu {
+      Section("Open") {
+        Button("Wiki") { model.openWiki() }
+        Button("Shared Brain Folder") { model.openSharedBrainFolder() }
+        Button("Config Folder") { model.openConfigFolder() }
+        if model.operatorModeEnabled {
+          Button("Curation Page") { model.openCurationPage() }
+        }
+      }
+      Section("Maintain") {
+        Button("Run Doctor") { performRepair(.doctor) }
+        Button("Check Stack Updates") { performRepair(.checkUpdates) }
+        Button("Flush Outbox…") { performRepair(.flushOutbox) }
+        Button("Refresh Skills…") { performRepair(.refreshSkills) }
+        Button("Install/Restart Daemon…") { performRepair(.restartDaemon) }
+        Button("Install/Repair Hooks…") { performRepair(.repairHooks) }
+      }
+      Section {
+        Button("Copy Diagnostics") { model.copyDiagnostics() }
+      }
+    } label: {
+      Image(systemName: "ellipsis.circle")
+    }
+    .menuStyle(.borderlessButton)
+    .menuIndicator(.hidden)
+    .frame(width: 24)
+    .help("More actions")
+    .disabled(model.busyAction != nil)
+  }
+
+  /// Run a repair action, with confirmation when it mutates state.
+  private func performRepair(_ kind: RepairKind) {
+    if let confirmation = kind.confirmation, !Confirm.ask(title: confirmation.title, message: confirmation.message) {
+      return
+    }
+    switch kind {
+    case .doctor:
+      model.runAction("Doctor") { await $0.doctor() }
+    case .checkUpdates:
+      model.runAction("Check Stack Updates", refreshAfter: false) { await $0.updates() }
+    case .flushOutbox:
+      model.runAction("Flush Outbox") { await $0.outboxFlush() }
+    case .refreshSkills:
+      model.runAction("Refresh Skills") { await $0.skillsRefresh() }
+    case .restartDaemon:
+      model.runAction("Install/Restart Daemon") { await $0.daemonInstall() }
+    case .repairHooks:
+      model.runAction("Install/Repair Hooks") { await $0.hooksInstall() }
     }
   }
 
@@ -180,7 +231,21 @@ struct DashboardView: View {
         )
       } else {
         ForEach(items.prefix(4)) { item in
-          AttentionRowView(item: item)
+          if item.detail.contains("Operator Console") && model.operatorModeEnabled {
+            Button {
+              openOperatorConsole()
+            } label: {
+              AttentionRowView(item: item)
+            }
+            .buttonStyle(.plain)
+            .help("Open the Operator Console")
+          } else {
+            AttentionRowView(item: item, repairTitle: item.repair?.buttonTitle, isBusy: model.busyAction != nil) {
+              if let repair = item.repair {
+                performRepair(repair)
+              }
+            }
+          }
         }
         if let report = model.lastReport, curatorRoutineMissing(report) {
           curatorInstallGuidance
@@ -228,8 +293,9 @@ struct DashboardView: View {
     if controlHostLooksOld(report) {
       items.append(AttentionItem(
         title: "Control host needs update",
-        detail: "Valkyrie is missing curator/proposal API endpoints. Update the control host, then refresh.",
-        severity: .warn
+        detail: "The control host is missing curator/proposal API endpoints. Update it, then refresh.",
+        severity: .warn,
+        repair: .checkUpdates
       ))
     }
     if let curator = report.sections["curator"], curator.state == .ok {
@@ -245,7 +311,7 @@ struct DashboardView: View {
       if open > 0 {
         items.append(AttentionItem(
           title: "\(open) proposal\(open == 1 ? "" : "s") awaiting review",
-          detail: model.operatorModeEnabled ? "Use Operator Mode to review, approve, reject, or apply them." : "Enable Operator Mode in Preferences to review them here.",
+          detail: model.operatorModeEnabled ? "Review them in the Operator Console." : "Enable Operator Mode in Preferences to review them.",
           severity: .info
         ))
       }
@@ -255,9 +321,9 @@ struct DashboardView: View {
         continue
       }
       if section.state == .fail {
-        items.append(AttentionItem(title: "\(sectionLabel(name)) failed", detail: sectionMessage(name: name, section: section), severity: .fail))
+        items.append(AttentionItem(title: "\(sectionLabel(name)) failed", detail: sectionMessage(name: name, section: section), severity: .fail, repair: repairKind(forSection: name)))
       } else if section.state == .warn && !isBenignProductWarning(name: name, section: section) && !isOldControlEndpointWarning(section) {
-        items.append(AttentionItem(title: "\(sectionLabel(name)) needs attention", detail: sectionMessage(name: name, section: section), severity: .warn))
+        items.append(AttentionItem(title: "\(sectionLabel(name)) needs attention", detail: sectionMessage(name: name, section: section), severity: .warn, repair: repairKind(forSection: name)))
       }
     }
     return uniqueAttentionItems(items)
@@ -291,27 +357,26 @@ struct DashboardView: View {
     }
   }
 
+  /// Exactly two visible buttons: the everyday destination and the operator surface.
+  /// Repairs appear inline on attention rows; the rest is in the overflow menu.
   private var actions: some View {
     VStack(alignment: .leading, spacing: 6) {
       HStack(spacing: 8) {
-        Button("Open Wiki") { model.openWiki() }
+        Button {
+          model.openWiki()
+        } label: {
+          Label("Open Wiki", systemImage: "globe")
+        }
         if model.operatorModeEnabled {
-          Button("Review Proposals") {
-            showDetails = false
-            model.loadProposals()
+          Button {
+            openOperatorConsole()
+          } label: {
+            Label("Operator Console", systemImage: "checklist")
           }
-          .disabled(model.isLoadingProposals || model.busyAction != nil)
         }
-        Button("Diagnostics") { model.copyDiagnostics() }
-        Button(showMoreActions ? "Less" : "More...") {
-          showMoreActions.toggle()
-        }
-        .disabled(model.busyAction != nil)
+        Spacer()
       }
       .controlSize(.small)
-      if showMoreActions {
-        secondaryActions
-      }
       if let busy = model.busyAction {
         HStack(spacing: 6) {
           ProgressView().controlSize(.small)
@@ -324,38 +389,6 @@ struct DashboardView: View {
         }
       }
     }
-  }
-
-  private var secondaryActions: some View {
-    let columns = [GridItem(.adaptive(minimum: 110), spacing: 6)]
-    return LazyVGrid(columns: columns, alignment: .leading, spacing: 6) {
-      Button("Shared Brain") { model.openSharedBrainFolder() }
-      Button("Config") { model.openConfigFolder() }
-      Button("Run Doctor") { model.runAction("Doctor") { await $0.doctor() } }
-      Button("Check Updates") { model.runAction("Check Stack Updates", refreshAfter: false) { await $0.updates() } }
-      Button("Flush Outbox") {
-        if Confirm.ask(title: "Flush Outbox", message: "Flush queued outbox writes to the brain now?") {
-          model.runAction("Flush Outbox") { await $0.outboxFlush() }
-        }
-      }
-      Button("Refresh Skills") {
-        if Confirm.ask(title: "Refresh Skills", message: "Refresh shared skills from the shared brain?") {
-          model.runAction("Refresh Skills") { await $0.skillsRefresh() }
-        }
-      }
-      Button("Daemon") {
-        if Confirm.ask(title: "Install/Restart Daemon", message: "Install (or reinstall and restart) the brainstackd user service?") {
-          model.runAction("Install/Restart Daemon") { await $0.daemonInstall() }
-        }
-      }
-      Button("Hooks") {
-        if Confirm.ask(title: "Install/Repair Hooks", message: "Install or repair Brainstack hooks for Codex, Claude, and Cursor?") {
-          model.runAction("Install/Repair Hooks") { await $0.hooksInstall() }
-        }
-      }
-    }
-    .controlSize(.small)
-    .disabled(model.busyAction != nil)
   }
 
   private func lastActionView(_ action: ActionOutcome) -> some View {
@@ -468,6 +501,9 @@ struct SectionRowView: View {
 
 struct AttentionRowView: View {
   let item: AttentionItem
+  var repairTitle: String?
+  var isBusy = false
+  var onRepair: () -> Void = {}
 
   var body: some View {
     HStack(alignment: .top, spacing: 8) {
@@ -484,6 +520,13 @@ struct AttentionRowView: View {
           .fixedSize(horizontal: false, vertical: true)
       }
       Spacer(minLength: 0)
+      if let repairTitle {
+        // The fix lives on the problem, not in a button farm below it.
+        Button(repairTitle) { onRepair() }
+          .controlSize(.small)
+          .disabled(isBusy)
+          .padding(.top, 1)
+      }
     }
     .padding(8)
     .background(color.opacity(0.12))

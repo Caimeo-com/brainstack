@@ -86,6 +86,25 @@ final class ProposalTests: XCTestCase {
   }
 }
 
+final class ProposalDetailTests: XCTestCase {
+  func testParseDetail() {
+    let json = """
+    {"ok": true,
+     "proposal": {"id": "p1", "title": "T", "status": "pending", "target_page": "wiki/Status/A.md", "risk": "low", "confidence": 0.85, "created_at": "2026-06-11T00:00:00Z", "source_ids": ["a", "b"], "reason": "why"},
+     "body": "## Request\\n\\ncontent",
+     "diff": "+ added line"}
+    """
+    let detail = ProposalDetail.parse(json)
+    XCTAssertEqual(detail?.summary.id, "p1")
+    XCTAssertEqual(detail?.diff, "+ added line")
+    XCTAssertEqual(detail?.reason, "why")
+    XCTAssertEqual(detail?.sourceIds, ["a", "b"])
+    XCTAssertEqual(detail?.confidence, 0.85)
+    XCTAssertNil(ProposalDetail.parse("not json"))
+    XCTAssertNil(ProposalDetail.parse(#"{"ok": true}"#))
+  }
+}
+
 final class TransitionDetectorTests: XCTestCase {
   private func snapshot(_ overall: OverallState, outbox: Bool = false, curator: Bool = false, open: Int = 0) -> TransitionDetector.Snapshot {
     TransitionDetector.Snapshot(overall: overall, outboxTerminalOrCorrupt: outbox, curatorFailing: curator, openProposals: open)

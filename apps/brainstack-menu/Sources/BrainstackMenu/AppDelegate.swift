@@ -29,9 +29,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     popover.behavior = .transient
     popover.delegate = self
     popover.contentViewController = NSHostingController(
-      rootView: DashboardView(model: model, openPreferences: { [weak self] in
-        self?.openPreferences()
-      })
+      rootView: DashboardView(
+        model: model,
+        openPreferences: { [weak self] in
+          self?.openPreferences()
+        },
+        openOperatorConsole: { [weak self] in
+          self?.openOperatorConsole()
+        }
+      )
     )
 
     model.onStateChange = { [weak self] in
@@ -102,7 +108,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         print("BRAINSTACK_MENU_SNAPSHOT failed")
       }
     }
-    if env["BRAINSTACK_MENU_EXIT_AFTER_REPORT"] == "1" {
+    if let consolePath = env["BRAINSTACK_MENU_CONSOLE_SNAPSHOT_PATH"], !consolePath.isEmpty {
+      openOperatorConsole()
+      // Select the first proposal and let the detail load before snapshotting.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+        guard let self, let view = self.operatorConsoleWindow?.contentView,
+              let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+          print("BRAINSTACK_MENU_CONSOLE_SNAPSHOT failed")
+          self?.finishDebugReport()
+          return
+        }
+        view.cacheDisplay(in: view.bounds, to: bitmap)
+        if let png = bitmap.representation(using: .png, properties: [:]) {
+          try? png.write(to: URL(fileURLWithPath: consolePath))
+          print("BRAINSTACK_MENU_CONSOLE_SNAPSHOT \(consolePath)")
+        } else {
+          print("BRAINSTACK_MENU_CONSOLE_SNAPSHOT failed")
+        }
+        self.finishDebugReport()
+      }
+      return
+    }
+    finishDebugReport()
+  }
+
+  private func finishDebugReport() {
+    if ProcessInfo.processInfo.environment["BRAINSTACK_MENU_EXIT_AFTER_REPORT"] == "1" {
       NSApp.terminate(nil)
     }
   }
@@ -227,6 +258,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
     preferencesWindow?.center()
     preferencesWindow?.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
+
+  private var operatorConsoleWindow: NSWindow?
+
+  /// The dedicated operator window: full proposal review surface, kept out of the
+  /// popover so the menu stays a status glance.
+  func openOperatorConsole() {
+    if popover.isShown {
+      popover.performClose(nil)
+    }
+    if operatorConsoleWindow == nil {
+      let hosting = NSHostingController(rootView: OperatorConsoleView(model: model))
+      let window = NSWindow(contentViewController: hosting)
+      window.title = "Brainstack Operator Console"
+      window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
+      window.setContentSize(NSSize(width: 880, height: 560))
+      window.isReleasedWhenClosed = false
+      window.center()
+      operatorConsoleWindow = window
+    }
+    model.loadProposals()
+    operatorConsoleWindow?.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
   }
 

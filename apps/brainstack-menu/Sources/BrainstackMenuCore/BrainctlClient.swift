@@ -236,6 +236,20 @@ public struct BrainctlClient: Sendable {
     await runAction(title: "Show Proposal", arguments: ["proposals", "show", id, "--json", "--config", configPath], timeout: 20)
   }
 
+  /// Show + parse in one step; parses raw stdout before redaction (see fetchOpenProposals).
+  public func fetchProposalDetail(id: String) async -> (detail: ProposalDetail?, outcome: ActionOutcome) {
+    let result = await CommandRunner.run(
+      executable: binaryPath,
+      arguments: ["proposals", "show", id, "--json", "--config", configPath],
+      timeout: 20
+    )
+    let outcome = Self.outcome(title: "Show Proposal", result: result, timeout: 20)
+    guard result.succeeded else {
+      return (nil, outcome)
+    }
+    return (ProposalDetail.parse(result.stdout), outcome)
+  }
+
   public func proposalDecision(id: String, action: String) async -> ActionOutcome {
     await runAction(title: "\(action.capitalized) Proposal", arguments: ["proposals", action, id, "--config", configPath], timeout: 60)
   }

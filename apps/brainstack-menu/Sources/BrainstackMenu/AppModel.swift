@@ -18,6 +18,9 @@ final class AppModel: ObservableObject {
   @Published private(set) var proposalsError: String?
   @Published private(set) var isLoadingProposals = false
   @Published private(set) var adminAvailability: AdminAvailability = .unknown
+  @Published private(set) var proposalDetails: [String: ProposalDetail] = [:]
+  @Published private(set) var loadingDetailId: String?
+  @Published private(set) var detailErrors: [String: String] = [:]
 
   @Published var binaryPathPreference: String? {
     didSet { preferences.binaryPathPreference = binaryPathPreference }
@@ -270,9 +273,40 @@ final class AppModel: ObservableObject {
         } else {
           self.adminAvailability = .unavailable
         }
+        // The decision changed proposal state; the cached detail is stale.
+        self.proposalDetails[proposal.id] = nil
         // Applying or rejecting changes proposal/wiki state; refresh both surfaces.
         self.refresh()
         self.loadProposals()
+      }
+    }
+  }
+
+  /// Fetch the full proposal body/diff for the console detail pane (cached per id).
+  func loadProposalDetail(_ id: String, force: Bool = false) {
+    guard operatorModeEnabled, let client = client() else {
+      return
+    }
+    if !force, proposalDetails[id] != nil {
+      return
+    }
+    guard loadingDetailId != id else {
+      return
+    }
+    loadingDetailId = id
+    Task {
+      let (detail, outcome) = await client.fetchProposalDetail(id: id)
+      await MainActor.run {
+        if self.loadingDetailId == id {
+          self.loadingDetailId = nil
+        }
+        self.lastDurations["proposal show"] = outcome.duration
+        if let detail {
+          self.proposalDetails[id] = detail
+          self.detailErrors[id] = nil
+        } else {
+          self.detailErrors[id] = outcome.succeeded ? "Could not parse proposal detail." : outcome.summary
+        }
       }
     }
   }

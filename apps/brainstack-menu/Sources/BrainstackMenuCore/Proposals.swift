@@ -28,6 +28,36 @@ public struct ProposalSummary: Identifiable, Sendable, Equatable {
   }
 }
 
+/// Full proposal detail parsed from `brainctl proposals show <id> --json`.
+public struct ProposalDetail: Sendable, Equatable {
+  public let summary: ProposalSummary
+  public let body: String
+  public let diff: String?
+  public let reason: String?
+  public let sourceIds: [String]
+  public let confidence: Double?
+
+  public static func parse(_ text: String) -> ProposalDetail? {
+    guard let data = text.data(using: .utf8),
+          let decoded = try? JSONDecoder().decode(JSONValue.self, from: data),
+          let proposal = decoded["proposal"] else {
+      return nil
+    }
+    let summary = ProposalSummary(json: proposal)
+    guard !summary.id.isEmpty else {
+      return nil
+    }
+    return ProposalDetail(
+      summary: summary,
+      body: decoded["body"]?.stringValue ?? "",
+      diff: decoded["diff"]?.stringValue,
+      reason: proposal["reason"]?.stringValue,
+      sourceIds: proposal["source_ids"]?.arrayValue?.compactMap(\.stringValue) ?? [],
+      confidence: proposal["confidence"]?.numberValue
+    )
+  }
+}
+
 /// Notification policy: notify only on meaningful state transitions, never repeatedly
 /// for an unchanged degraded state.
 public struct TransitionDetector: Sendable {

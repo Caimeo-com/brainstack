@@ -8,10 +8,61 @@ enum AttentionSeverity: Sendable {
   case fail
 }
 
+/// A one-click fix attached to an attention row. Buttons only appear when the
+/// matching problem is present, which keeps the popover calm when healthy.
+enum RepairKind: Equatable, Sendable {
+  case doctor
+  case flushOutbox
+  case refreshSkills
+  case restartDaemon
+  case repairHooks
+  case checkUpdates
+
+  var buttonTitle: String {
+    switch self {
+    case .doctor: return "Run Doctor"
+    case .flushOutbox: return "Flush"
+    case .refreshSkills: return "Refresh"
+    case .restartDaemon: return "Restart"
+    case .repairHooks: return "Repair"
+    case .checkUpdates: return "Check Updates"
+    }
+  }
+
+  /// Confirmation copy for mutating repairs; nil means run immediately.
+  var confirmation: (title: String, message: String)? {
+    switch self {
+    case .doctor, .checkUpdates:
+      return nil
+    case .flushOutbox:
+      return ("Flush Outbox", "Flush queued outbox writes to the brain now?")
+    case .refreshSkills:
+      return ("Refresh Skills", "Refresh shared skills from the shared brain?")
+    case .restartDaemon:
+      return ("Install/Restart Daemon", "Install (or reinstall and restart) the brainstackd user service?")
+    case .repairHooks:
+      return ("Install/Repair Hooks", "Install or repair Brainstack hooks for Codex, Claude, and Cursor?")
+    }
+  }
+}
+
+/// Map a degraded section to its local one-click repair, if one exists.
+func repairKind(forSection name: String) -> RepairKind? {
+  switch name {
+  case "daemon": return .restartDaemon
+  case "outbox": return .flushOutbox
+  case "hooks": return .repairHooks
+  case "skills": return .refreshSkills
+  case "shared_brain", "config": return .doctor
+  default: return nil
+  }
+}
+
 struct AttentionItem: Identifiable, Equatable, Sendable {
   let title: String
   let detail: String
   let severity: AttentionSeverity
+  var repair: RepairKind? = nil
 
   var id: String {
     "\(title)\n\(detail)\n\(severity)"
