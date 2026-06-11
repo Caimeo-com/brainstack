@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { appendFile, chmod, cp, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
@@ -5556,6 +5556,9 @@ function searchLocalBrain(brain: ProjectBrain, query: string): Array<{ brain: st
   if (!scopes.length) {
     return [];
   }
+  if (!commandPath("rg")) {
+    return searchLocalBrainWithoutRg(brain, query, scopes);
+  }
   const result = run(["rg", "-n", "-i", "--fixed-strings", "--", query, ...scopes], {
     cwd: brain.localPath,
     check: false,
@@ -5572,6 +5575,63 @@ function searchLocalBrain(brain: ProjectBrain, query: string): Array<{ brain: st
       const [path = "", lineNo = "0", ...rest] = line.split(":");
       return { brain: brain.id, label: brain.label, classification: brain.classification, path, line: Number(lineNo) || 0, text: rest.join(":").trim() };
     });
+}
+
+function searchLocalBrainWithoutRg(brain: ProjectBrain, query: string, scopes: string[]): Array<{ brain: string; label: string; classification: string; path: string; line: number; text: string }> {
+  const needle = query.toLocaleLowerCase();
+  const results: Array<{ brain: string; label: string; classification: string; path: string; line: number; text: string }> = [];
+  const maxFileBytes = 2 * 1024 * 1024;
+  const visit = (relDir: string): void => {
+    if (results.length >= 100) {
+      return;
+    }
+    const absDir = join(brain.localPath, relDir);
+    let entries: ReturnType<typeof readdirSync>;
+    try {
+      entries = readdirSync(absDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (results.length >= 100) {
+        return;
+      }
+      const relPath = join(relDir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === ".git" || entry.name === "node_modules" || entry.name === "dist") {
+          continue;
+        }
+        visit(relPath);
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+      const absPath = join(brain.localPath, relPath);
+      try {
+        const info = statSync(absPath);
+        if (info.size > maxFileBytes) {
+          continue;
+        }
+        const text = readFileSync(absPath, "utf8");
+        const lines = text.split(/\r?\n/);
+        for (let index = 0; index < lines.length; index += 1) {
+          if (lines[index]?.toLocaleLowerCase().includes(needle)) {
+            results.push({ brain: brain.id, label: brain.label, classification: brain.classification, path: relPath, line: index + 1, text: lines[index]?.trim() || "" });
+            if (results.length >= 100) {
+              return;
+            }
+          }
+        }
+      } catch {
+        continue;
+      }
+    }
+  };
+  for (const scope of scopes) {
+    visit(scope);
+  }
+  return results;
 }
 
 function titleCaseBrainKey(value: string): string {

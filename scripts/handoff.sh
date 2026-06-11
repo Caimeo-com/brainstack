@@ -365,8 +365,8 @@ if ! command -v bun >/dev/null 2>&1; then
   echo "handoff refused: bun is required" >&2
   exit 1
 fi
-if ! command -v rg >/dev/null 2>&1; then
-  echo "handoff refused: ripgrep (rg) is required for secret scanning" >&2
+if ! command -v rg >/dev/null 2>&1 && ! command -v grep >/dev/null 2>&1; then
+  echo "handoff refused: rg or grep is required for safety scanning" >&2
   exit 1
 fi
 if ! command -v zip >/dev/null 2>&1; then
@@ -377,6 +377,16 @@ if ! command -v curl >/dev/null 2>&1; then
   echo "handoff refused: curl is required for local HTTP smoke checks" >&2
   exit 1
 fi
+
+grep_file_i() {
+  local pattern="$1"
+  local file="$2"
+  if command -v rg >/dev/null 2>&1; then
+    rg -n -i -e "$pattern" "$file"
+  else
+    grep -Eni -- "$pattern" "$file"
+  fi
+}
 
 utc="${BRAINSTACK_HANDOFF_UTC:-$(date -u +%Y%m%dT%H%M%SZ)}"
 if ! printf '%s\n' "$utc" | grep -Eq '^[0-9]{8}T[0-9]{6}Z$'; then
@@ -629,7 +639,7 @@ collect_docs_presence() {
       echo "MISSING file: $file ($label)" >&2
       return 1
     fi
-    if ! rg -n -i -e "$pattern" "$file"; then
+    if ! grep_file_i "$pattern" "$file"; then
       echo "MISSING claim: $label in $file" >&2
       return 1
     fi
@@ -1224,17 +1234,31 @@ if find "$bundle_dir" -type l -print -quit | grep -q .; then
   exit 1
 fi
 
-local_hygiene_hits="$(
-  rg --hidden --no-ignore \
-    -g '!**/.git/**' \
-    -g '!**/node_modules/**' \
-    -g '!**/dist/**' \
-    -n \
-    -P -e '/Users/(?!operator\b)[A-Za-z0-9._-]+' \
-    -e '/home/(?!operator\b|factory\b|brainstack\b)[A-Za-z0-9._-]+' \
-    -e 'migration-from-current-[A-Za-z0-9._-]+\.md' \
-    "$bundle_dir" 2>/dev/null || true
-)"
+scan_local_hygiene() {
+  if command -v rg >/dev/null 2>&1; then
+    rg --hidden --no-ignore \
+      -g '!**/.git/**' \
+      -g '!**/node_modules/**' \
+      -g '!**/dist/**' \
+      -n \
+      -P -e '/Users/(?!operator\b)[A-Za-z0-9._-]+' \
+      -e '/home/(?!operator\b|factory\b|brainstack\b)[A-Za-z0-9._-]+' \
+      -e 'migration-from-current-[A-Za-z0-9._-]+\.md' \
+      "$bundle_dir" 2>/dev/null || true
+    return
+  fi
+  find "$bundle_dir" -type f \
+    ! -path '*/.git/*' \
+    ! -path '*/node_modules/*' \
+    ! -path '*/dist/*' \
+    -print0 |
+    while IFS= read -r -d '' file; do
+      LC_ALL=C grep -HInE '/Users/[A-Za-z0-9._-]+|/home/[A-Za-z0-9._-]+|migration-from-current-[A-Za-z0-9._-]+\.md' "$file" 2>/dev/null || true
+    done |
+    grep -Ev '/Users/operator\b|/home/(operator|factory|brainstack)\b' || true
+}
+
+local_hygiene_hits="$(scan_local_hygiene)"
 if [ -n "$local_hygiene_hits" ]; then
   echo "handoff refused: local/private identifiers detected" >&2
   echo "$local_hygiene_hits" >&2
@@ -1244,12 +1268,25 @@ fi
 scan_secret_detector() {
   detector="$1"
   pattern="$2"
-  rg --hidden --no-ignore \
-    -g '!**/.git/**' \
-    -g '!**/node_modules/**' \
-    -g '!**/dist/**' \
-    -n -e "$pattern" "$bundle_dir" 2>/dev/null \
-    | awk -F: -v detector="$detector" '{print $1 ":" $2 ": [REDACTED " detector "]"}' \
+  if command -v rg >/dev/null 2>&1; then
+    rg --hidden --no-ignore \
+      -g '!**/.git/**' \
+      -g '!**/node_modules/**' \
+      -g '!**/dist/**' \
+      -n -e "$pattern" "$bundle_dir" 2>/dev/null \
+      | awk -F: -v detector="$detector" '{print $1 ":" $2 ": [REDACTED " detector "]"}' \
+      || true
+    return
+  fi
+  find "$bundle_dir" -type f \
+    ! -path '*/.git/*' \
+    ! -path '*/node_modules/*' \
+    ! -path '*/dist/*' \
+    -print0 |
+    while IFS= read -r -d '' file; do
+      LC_ALL=C grep -HInE "$pattern" "$file" 2>/dev/null || true
+    done |
+    awk -F: -v detector="$detector" '{print $1 ":" $2 ": [REDACTED " detector "]"}' \
     || true
 }
 

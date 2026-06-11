@@ -85,6 +85,40 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
+async function writeExecutable(path: string, contents: string): Promise<void> {
+  await writeFile(path, contents);
+  await chmod(path, 0o755);
+}
+
+async function writeFakeTailscale(binDir: string): Promise<void> {
+  await writeExecutable(
+    join(binDir, "tailscale"),
+    [
+      "#!/usr/bin/env sh",
+      "if [ \"${1:-}\" = \"version\" ] || [ \"${1:-}\" = \"--version\" ]; then echo 'tailscale fake'; exit 0; fi",
+      "if [ \"${1:-}\" = \"status\" ]; then echo 'tailscale fake'; exit 0; fi",
+      "echo 'tailscale fake'",
+      ""
+    ].join("\n")
+  );
+}
+
+async function writeFakeDoctorCodex(binDir: string): Promise<void> {
+  await writeExecutable(
+    join(binDir, "codex"),
+    [
+      "#!/usr/bin/env sh",
+      "if [ \"${1:-}\" = \"--version\" ]; then echo 'codex fake'; exit 0; fi",
+      "if [ \"${1:-}\" = \"exec\" ] && [ \"${2:-}\" = \"--help\" ]; then",
+      "  echo '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --output-last-message'",
+      "  exit 0",
+      "fi",
+      "exit 0",
+      ""
+    ].join("\n")
+  );
+}
+
 async function readQueuedPayloadFromOutput(output: string): Promise<Record<string, unknown>> {
   const queuedPath = output
     .split(/\r?\n/)
@@ -710,6 +744,7 @@ describe("brainctl install safety", () => {
       );
       await chmod(fakeSudo, 0o755);
       await chmod(fakeCodex, 0o755);
+      await writeFakeTailscale(binDir);
 
       const result = runBrainctl(
         [
@@ -754,6 +789,7 @@ describe("brainctl install safety", () => {
         await writeFile(path, "#!/usr/bin/env sh\nexit 0\n");
         await chmod(path, 0o755);
       }
+      await writeFakeTailscale(binDir);
       const result = runBrainctl(["provision", "--profile", "client-macos", "--out", join(dir, "brainstack.yaml")], {
         PATH: `${binDir}:${process.env.PATH || ""}`
       });
@@ -785,6 +821,7 @@ describe("brainctl install safety", () => {
       await writeFile(join(binDir, "sudo"), "#!/usr/bin/env sh\necho 'sudo should not run for client-macos provision' >&2\nexit 42\n");
       await chmod(join(binDir, "codex"), 0o755);
       await chmod(join(binDir, "sudo"), 0o755);
+      await writeFakeTailscale(binDir);
 
       const result = runBrainctl(
         [
@@ -4536,6 +4573,10 @@ describe("public release hygiene", () => {
   test("doctor explains trusted-tailnet posture and rejects accidental non-loopback bind", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-posture-doctor-"));
     try {
+      const binDir = join(dir, "bin");
+      await mkdir(binDir, { recursive: true });
+      await writeFakeDoctorCodex(binDir);
+      await writeFakeTailscale(binDir);
       const configPath = join(dir, "config.yaml");
       const base = [
         "schema_version: 1",
@@ -4554,25 +4595,33 @@ describe("public release hygiene", () => {
         ""
       ].join("\n");
       await writeFile(configPath, base);
-      const ok = runBrainctl(["doctor", "--config", configPath]);
+      const ok = runBrainctl(["doctor", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      });
       expectSuccess(ok);
       expect(ok.stdout).toContain("read-auth: disabled by design in trusted-tailnet mode");
       expect(ok.stdout).toContain("trust-boundary: private network reachability");
       expect(ok.stdout).toContain("do not expose trusted-tailnet mode to the public internet");
 
       await writeFile(configPath, base.replace("bindHost: 127.0.0.1", "bindHost: 192.168.1.10").replace("trustedExposure: vpn", "trustedExposure: none"));
-      const badBind = runBrainctl(["doctor", "--config", configPath]);
+      const badBind = runBrainctl(["doctor", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      });
       expect(badBind.code).not.toBe(0);
       expect(badBind.stdout).toContain("FAIL [security] posture: trusted-tailnet bind=192.168.1.10");
 
       await writeFile(configPath, base.replace("bindHost: 127.0.0.1", "bindHost: 0.0.0.0").replace("trustedExposure: vpn", "trustedExposure: manual"));
-      const wildcardManual = runBrainctl(["doctor", "--config", configPath]);
+      const wildcardManual = runBrainctl(["doctor", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      });
       expect(wildcardManual.code).not.toBe(0);
       expect(wildcardManual.stdout).toContain("FAIL [security] posture: trusted-tailnet bind=0.0.0.0; exposure=manual");
       expect(wildcardManual.stdout).toContain("Wildcard trusted-tailnet binds are too broad");
 
       await writeFile(configPath, base.replace("trustedExposure: vpn", "trustedExposure: public"));
-      const badExposure = runBrainctl(["doctor", "--config", configPath]);
+      const badExposure = runBrainctl(["doctor", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      });
       expect(badExposure.code).not.toBe(0);
       expect(badExposure.stderr).toContain("Expected none, tailscale-serve, vpn, or manual");
     } finally {
@@ -4583,6 +4632,10 @@ describe("public release hygiene", () => {
   test("doctor skips missing guidance for unused harnesses", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-guidance-doctor-"));
     try {
+      const binDir = join(dir, "bin");
+      await mkdir(binDir, { recursive: true });
+      await writeFakeDoctorCodex(binDir);
+      await writeFakeTailscale(binDir);
       const configPath = join(dir, "config.yaml");
       await writeFile(
         configPath,
@@ -4602,14 +4655,18 @@ describe("public release hygiene", () => {
         ].join("\n")
       );
 
-      const missingClaude = runBrainctl(["doctor", "--config", configPath]);
+      const missingClaude = runBrainctl(["doctor", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      });
       expectSuccess(missingClaude);
       expect(missingClaude.stdout).toContain("WARN [guidance] codex-agents:");
       expect(missingClaude.stdout).not.toContain("[guidance] claude");
 
       await mkdir(join(dir, ".claude"), { recursive: true });
       await writeFile(join(dir, ".claude", "CLAUDE.md"), "# Existing Claude\n");
-      const existingClaude = runBrainctl(["doctor", "--config", configPath]);
+      const existingClaude = runBrainctl(["doctor", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      });
       expectSuccess(existingClaude);
       expect(existingClaude.stdout).toContain("WARN [guidance] claude:");
     } finally {
@@ -5221,6 +5278,8 @@ describe("public release hygiene", () => {
       async function seedBare(remote: string, filePath: string, contents: string) {
         const clone = join(dir, `seed-${basename(remote)}`);
         git(["clone", remote, clone], dir);
+        git(["config", "user.email", "operator@example.test"], clone);
+        git(["config", "user.name", "Operator"], clone);
         await mkdir(dirname(join(clone, filePath)), { recursive: true });
         await writeFile(join(clone, filePath), contents);
         git(["add", filePath], clone);
@@ -6743,6 +6802,8 @@ describe("public release hygiene", () => {
       const remoteBin = join(dir, "remote-bin");
       await mkdir(controlBin, { recursive: true });
       await mkdir(remoteBin, { recursive: true });
+      await writeFakeDoctorCodex(controlBin);
+      await writeFakeTailscale(controlBin);
 
       const fakeCodex = join(remoteBin, "codex");
       await writeFile(
@@ -7039,6 +7100,8 @@ describe("public release hygiene", () => {
     try {
       const binDir = join(dir, "bin");
       await mkdir(binDir, { recursive: true });
+      await writeFakeDoctorCodex(binDir);
+      await writeFakeTailscale(binDir);
       const argsCapture = join(dir, "ssh-args.txt");
       const fakeSsh = join(binDir, "ssh");
       await writeFile(
