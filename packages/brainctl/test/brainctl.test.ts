@@ -4460,6 +4460,9 @@ describe("public release hygiene", () => {
       expect(runtimeEnv).toContain("FACTORY_PRE_DISPATCH_CLASSIFIER_TIMEOUT_MS=800");
       const secretsEnv = await readFile(join(out, "env", "telemux.secrets.env.example"), "utf8");
       expect(secretsEnv).toContain("FACTORY_PRE_DISPATCH_CLASSIFIER_API_KEY=");
+      const telemuxService = await readFile(join(out, "systemd", "user", "telemux.service"), "utf8");
+      expect(telemuxService).toContain("EnvironmentFile=/home/operator/.config/brainstack/telemux.secrets.env");
+      expect(telemuxService).toContain("EnvironmentFile=/home/operator/.config/brainstack/braind.secrets.env");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

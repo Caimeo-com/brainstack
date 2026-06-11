@@ -612,6 +612,19 @@ function setPendingTextGenerationForTest(fixture: Awaited<ReturnType<typeof crea
   rawDb.query("UPDATE pending_text_prompts SET generation_id = ? WHERE key = ?").run(generationId, key);
 }
 
+test("config accepts BRAIN_ADMIN_TOKEN as Telemux curator admin fallback", async () => {
+  const fixture = await createFixture({
+    BRAIN_ADMIN_TOKEN: "brain-admin-token",
+    FACTORY_BRAIN_ADMIN_TOKEN: ""
+  });
+  try {
+    expect(fixture.config.brainAdminToken).toBe("brain-admin-token");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("telemux state database and runtime roots are private under permissive umask", async () => {
   const previousUmask = process.umask(0o000);
   let fixture: Awaited<ReturnType<typeof createFixture>> | null = null;

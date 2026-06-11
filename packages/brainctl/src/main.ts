@@ -1978,6 +1978,7 @@ function telemuxService(cfg: BrainstackConfig): string {
     `WorkingDirectory=${join(cfg.paths.productRepo, "apps", "telemux")}`,
     `EnvironmentFile=${join(cfg.paths.configRoot, "telemux.runtime.env")}`,
     `EnvironmentFile=${join(cfg.paths.configRoot, "telemux.secrets.env")}`,
+    `EnvironmentFile=${join(cfg.paths.configRoot, "braind.secrets.env")}`,
     `ExecStart=${cfg.runtime.bunBin} --no-env-file run ${join(cfg.paths.productRepo, "apps", "telemux", "src", "main.ts")}`,
     "UMask=0077",
     "Restart=on-failure",
@@ -3435,6 +3436,15 @@ async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Pro
 
   if (cfg.telemux.enabled) {
     checks.push(envHasKey(join(cfg.paths.configRoot, "telemux.secrets.env"), "FACTORY_TELEGRAM_BOT_TOKEN") ? check("PASS", "secrets", "telegram-token", "present") : check("WARN", "secrets", "telegram-token", "missing or empty"));
+    const telemuxServicePath = join(cfg.paths.systemdUserRoot, "telemux.service");
+    const telemuxServiceText = existsSync(telemuxServicePath) ? readFileSync(telemuxServicePath, "utf8") : "";
+    const telemuxHasFactoryAdmin = envHasKey(join(cfg.paths.configRoot, "telemux.secrets.env"), "FACTORY_BRAIN_ADMIN_TOKEN");
+    const telemuxHasBrainAdmin = envHasKey(join(cfg.paths.configRoot, "braind.secrets.env"), "BRAIN_ADMIN_TOKEN") && telemuxServiceText.includes("braind.secrets.env");
+    checks.push(
+      telemuxHasFactoryAdmin || telemuxHasBrainAdmin
+        ? check("PASS", "secrets", "telemux-admin-token", telemuxHasFactoryAdmin ? "FACTORY_BRAIN_ADMIN_TOKEN present" : "BRAIN_ADMIN_TOKEN loaded from braind.secrets.env")
+        : check("WARN", "secrets", "telemux-admin-token", "missing; curator status reporting and Telegram proposal approval are disabled", `Run brainctl apply-runtime --config ${requireFlagValue(args, "config") || brainstackDefaultConfigPath()} and restart telemux, or set FACTORY_BRAIN_ADMIN_TOKEN in telemux.secrets.env.`)
+    );
     try {
       const response = await fetch(`http://${cfg.telemux.dashboardHost}:${cfg.telemux.dashboardPort}/health`, { signal: AbortSignal.timeout(1500) });
       checks.push(response.ok ? check("PASS", "health", "telemux-health", `HTTP ${response.status}`) : check("WARN", "health", "telemux-health", `HTTP ${response.status}`));
