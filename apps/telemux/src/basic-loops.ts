@@ -8,6 +8,7 @@ import {
   DETERMINISTIC_UPDATE_CHECK_RUNNER,
   getBuiltinRoutine
 } from "./routine-builtins";
+import { reportCuratorStatus } from "./curator-report";
 import type { WorkerService } from "./workers";
 
 export async function ensureBasicLoops(
@@ -121,13 +122,14 @@ async function ensureCuratorRoutine(config: FactoryConfig, cronManager: CronMana
         job.executionContextSlug === context.slug
     );
   if (existing) {
-    await cronManager.updateJob(existing, {
+    const updated = await cronManager.updateJob(existing, {
       executionContextSlug: context.slug,
       targetChatId: config.telegramControlChatId!,
       targetThreadId: null,
       instruction: curator.instruction || null
     });
-    return `curator updated: ${existing.id}`;
+    await reportCuratorStatus(config, { installed: true, next_run_at: updated.nextRunAt ?? null });
+    return `curator updated: ${updated.id}`;
   }
   const schedule = defaultBuiltinSchedule(curator);
   const draft = builtinRoutineDraft(curator, schedule, context.slug);
@@ -142,5 +144,6 @@ async function ensureCuratorRoutine(config: FactoryConfig, cronManager: CronMana
       target: { chatId: config.telegramControlChatId!, threadId: null }
     }
   );
+  await reportCuratorStatus(config, { installed: true, next_run_at: created.nextRunAt ?? null });
   return `curator created: ${created.id}`;
 }

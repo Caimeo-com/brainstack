@@ -7008,6 +7008,66 @@ describe("public release hygiene", () => {
     }
   }, 10_000);
 
+  test("curator install forwards from client config to the control host over pinned SSH", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-curator-install-client-"));
+    try {
+      const binDir = join(dir, "bin");
+      const configRoot = join(dir, "config");
+      await mkdir(binDir, { recursive: true });
+      await mkdir(configRoot, { recursive: true });
+      const argsCapture = join(dir, "ssh-args.txt");
+      await writeFile(join(configRoot, "ssh_known_hosts"), "control.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeBrainstackControlKeyForTestsOnly\n");
+      const fakeSsh = join(binDir, "ssh");
+      await writeFile(
+        fakeSsh,
+        [
+          "#!/usr/bin/env bash",
+          "set -euo pipefail",
+          `printf '<%s>\\n' "$@" > '${argsCapture}'`,
+          "echo 'curator install requested remotely'",
+          ""
+        ].join("\n")
+      );
+      await chmod(fakeSsh, 0o755);
+
+      const configPath = join(dir, "client.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: mac-client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  configRoot: ${configRoot}`,
+          "client:",
+          "  remoteSsh: operator@control.example:/home/operator/shared-brain/bare/shared-brain.git",
+          "  telegramVia: operator@control.example",
+          "  telegramRemoteRepo: /home/operator/brainstack",
+          ""
+        ].join("\n")
+      );
+
+      const result = runBrainctl(["curator", "install", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      });
+      expectSuccess(result);
+      expect(result.stdout).toContain("curator install requested remotely");
+      const sshArgs = await readFile(argsCapture, "utf8");
+      expect(sshArgs).toContain("BatchMode=yes");
+      expect(sshArgs).toContain("ConnectTimeout=8");
+      expect(sshArgs).toContain("StrictHostKeyChecking=yes");
+      expect(sshArgs).toContain(`UserKnownHostsFile=${join(configRoot, "ssh_known_hosts")}`);
+      expect(sshArgs).toContain("operator@control.example");
+      expect(sshArgs).toContain("/home/operator/brainstack");
+      expect(sshArgs).toContain("curator install --config");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
   test("telegram send-file rejects unsafe local files before opening SSH", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-telegram-send-file-unsafe-"));
     try {

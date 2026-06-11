@@ -25,6 +25,12 @@ struct OperatorView: View {
               model.runAction("Curator Run") { await $0.curatorRun() }
             }
           }
+          Button("Install Curator") {
+            if Confirm.ask(title: "Install Curator", message: "Install the brain-curator routine on the control host? It schedules proposal generation; it does not approve or apply wiki edits.") {
+              model.runAction("Install Curator") { await $0.curatorInstall() }
+            }
+          }
+          Button("Copy Install Command") { model.copyCuratorInstallCommand() }
         }
       }
       .controlSize(.small)

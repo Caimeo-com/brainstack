@@ -209,6 +209,10 @@ public struct BrainctlClient: Sendable {
     await runAction(title: "Curator Run", arguments: ["curator", "run", "--config", configPath])
   }
 
+  public func curatorInstall() async -> ActionOutcome {
+    await runAction(title: "Install Curator", arguments: ["curator", "install", "--config", configPath])
+  }
+
   public func proposalsList() async -> ActionOutcome {
     await runAction(title: "List Proposals", arguments: ["proposals", "list", "--status", "open", "--json", "--config", configPath], timeout: 20)
   }

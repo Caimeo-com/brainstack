@@ -180,6 +180,9 @@ struct DashboardView: View {
         ForEach(items.prefix(4)) { item in
           AttentionRowView(item: item)
         }
+        if let report = model.lastReport, curatorRoutineMissing(report) {
+          curatorInstallGuidance
+        }
         if items.count > 4 {
           Text("\(items.count - 4) more item(s) in Details")
             .font(.caption2)
@@ -187,6 +190,32 @@ struct DashboardView: View {
         }
       }
     }
+  }
+
+  private var curatorInstallGuidance: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      Text("Click Install Curator below. It schedules proposal generation; it will not approve or apply wiki edits.")
+        .font(.caption2)
+        .foregroundColor(.secondary)
+      Text(model.curatorInstallCommand)
+        .font(.system(size: 10, design: .monospaced))
+        .foregroundColor(.secondary)
+        .lineLimit(2)
+        .truncationMode(.middle)
+        .textSelection(.enabled)
+      HStack(spacing: 8) {
+        Button("Install Curator") {
+          if Confirm.ask(title: "Install Curator", message: "Install the brain-curator routine on the control host? It schedules proposal generation; it does not approve or apply wiki edits.") {
+            model.runAction("Install Curator") { await $0.curatorInstall() }
+          }
+        }
+        Button("Copy Command") { model.copyCuratorInstallCommand() }
+      }
+      .controlSize(.small)
+      .disabled(model.busyAction != nil)
+    }
+    .padding(.horizontal, 8)
+    .padding(.bottom, 2)
   }
 
   private var attentionItems: [AttentionItem] {
@@ -274,6 +303,12 @@ struct DashboardView: View {
           Divider()
           Button("Run Doctor") { model.runAction("Doctor") { await $0.doctor() } }
           Button("Check Stack Updates") { model.runAction("Check Stack Updates", refreshAfter: false) { await $0.updates() } }
+          Button("Install Curator") {
+            if Confirm.ask(title: "Install Curator", message: "Install the brain-curator routine on the control host? It schedules proposal generation; it does not approve or apply wiki edits.") {
+              model.runAction("Install Curator") { await $0.curatorInstall() }
+            }
+          }
+          Button("Copy Curator Install Command") { model.copyCuratorInstallCommand() }
           Divider()
           Button("Flush Outbox") {
             if Confirm.ask(title: "Flush Outbox", message: "Flush queued outbox writes to the brain now?") {

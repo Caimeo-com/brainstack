@@ -319,6 +319,22 @@ final class AppModel: ObservableObject {
     pasteboard.clearContents()
     pasteboard.setString("curl -fsSL https://github.com/Caimeo-com/brainstack/releases/latest/download/install.sh | sh", forType: .string)
   }
+
+  var curatorInstallCommand: String {
+    let binary = resolvedBinaryPath ?? "brainctl"
+    return "\(shellQuote(binary)) curator install --config \(shellQuote((configPath as NSString).expandingTildeInPath))"
+  }
+
+  func copyCuratorInstallCommand() {
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+    pasteboard.setString(curatorInstallCommand, forType: .string)
+    record(ActionOutcome(title: "Copy Curator Install Command", succeeded: true, unsupported: false, adminUnavailable: false, summary: "Curator install command copied to clipboard.", output: curatorInstallCommand, duration: 0))
+  }
+}
+
+private func shellQuote(_ value: String) -> String {
+  "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
 }
 
 enum AppVersion {

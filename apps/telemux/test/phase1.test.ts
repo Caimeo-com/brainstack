@@ -1941,6 +1941,10 @@ test("basic loops install the brain-curator routine and curator commands work en
   try {
     const result = await ensureBasicLoops(fixture.config, fixture.contexts, fixture.workers, fixture.cronManager);
     expect(result).toContain("curator created:");
+    expect(statusPosts.length).toBeGreaterThanOrEqual(1);
+    expect(statusPosts.at(-1)?.auth).toBe("Bearer brain-admin-token");
+    expect(statusPosts.at(-1)?.body.installed).toBe(true);
+    expect(typeof statusPosts.at(-1)?.body.next_run_at).toBe("string");
     const curatorJob = fixture.db.listCronJobs().find((job) => job.label === "brain-curator");
     expect(curatorJob?.kind).toBe("codex");
     expect(curatorJob?.runner).toBeNull();
@@ -1950,6 +1954,8 @@ test("basic loops install the brain-curator routine and curator commands work en
     // Re-running basic loops updates the existing curator job instead of duplicating it.
     const second = await ensureBasicLoops(fixture.config, fixture.contexts, fixture.workers, fixture.cronManager);
     expect(second).toContain("curator updated:");
+    expect(statusPosts.length).toBeGreaterThanOrEqual(2);
+    expect(statusPosts.at(-1)?.body.installed).toBe(true);
     expect(fixture.db.listCronJobs().filter((job) => job.label === "brain-curator").length).toBe(1);
 
     await fixture.commands.handleMessage(telegramMessage("/curator_status", 90));
@@ -1984,7 +1990,7 @@ test("basic loops install the brain-curator routine and curator commands work en
 
     // Manual curator run dispatches the codex routine and reports status to braind.
     await fixture.commands.handleMessage(telegramMessage("/curator_run", 90));
-    await waitFor(() => statusPosts.length >= 1, 20_000);
+    await waitFor(() => statusPosts.length >= 3, 20_000);
     const reported = statusPosts.at(-1)!;
     expect(reported.auth).toBe("Bearer brain-admin-token");
     expect(reported.body.installed).toBe(true);

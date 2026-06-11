@@ -105,6 +105,14 @@ final class CommandRunnerTests: XCTestCase {
     XCTAssertFalse(outcome.succeeded)
   }
 
+  func testCuratorInstallUsesNamedArguments() async throws {
+    let argsPath = scratch.appendingPathComponent("args.txt")
+    let binary = try fakeBrainctl("printf '%s\\n' \"$@\" > '\(argsPath.path)'; echo 'installed'")
+    let outcome = await client(binary).curatorInstall()
+    XCTAssertTrue(outcome.succeeded)
+    XCTAssertEqual(try String(contentsOf: argsPath), "curator\ninstall\n--config\n/tmp/test.yaml\n")
+  }
+
   func testActionOutputIsRedacted() async throws {
     let binary = try fakeBrainctl("echo 'BRAIN_ADMIN_TOKEN=8f14e45fceea167a5a36dedd4bea2543aa758ff6cc9929d8efaf3279a3e9b414'")
     let outcome = await client(binary).runAction(title: "Doctor", arguments: ["doctor"])

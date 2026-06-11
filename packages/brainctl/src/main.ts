@@ -9553,10 +9553,74 @@ async function telemuxControlRequest(cfg: BrainstackConfig, path: string): Promi
   return parsed;
 }
 
+function curatorControlSshTarget(cfg: BrainstackConfig, args: ParsedArgs): string | null {
+  const via = requireFlagValue(args, "via") || process.env.BRAINSTACK_TELEGRAM_VIA?.trim() || cfg.client.telegramVia || sshTargetFromRemoteSsh(cfg.client.remoteSsh);
+  return via ? validateInviteSshTarget(via, "curator control SSH target") : null;
+}
+
+function curatorRemoteControlScript(remoteRepo: string, subcommand: "run" | "install"): string {
+  return `
+set -euo pipefail
+brainstack_expand_home() {
+  case "$1" in
+    "~") printf '%s\\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
+    *) printf '%s\\n' "$1" ;;
+  esac
+}
+repo="$(brainstack_expand_home ${quoteForBash(remoteRepo)})"
+cd "$repo"
+if [ -x "$HOME/.bun/bin/bun" ]; then
+  bun_bin="$HOME/.bun/bin/bun"
+else
+  bun_bin="$(command -v bun)"
+fi
+"$bun_bin" --no-env-file run packages/brainctl/src/main.ts curator ${subcommand} --config "$HOME/.config/brainstack/brainstack.yaml"
+`.trim();
+}
+
+async function maybeRunRemoteCuratorControl(cfg: BrainstackConfig, args: ParsedArgs, subcommand: "run" | "install"): Promise<boolean> {
+  if (cfg.telemux.enabled) {
+    return false;
+  }
+  const via = curatorControlSshTarget(cfg, args);
+  if (!via) {
+    return false;
+  }
+  const worker = telegramControlWorker(via);
+  const remoteRepo = requireFlagValue(args, "remote-repo") || process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() || cfg.client.telegramRemoteRepo || "~/brainstack";
+  const knownHostsPath = telegramKnownHostsPath(cfg, args);
+  const sshTrustMode = telegramSshTrustMode(args);
+  if (sshTrustMode === "accept-new") {
+    await ensureDir(dirname(knownHostsPath));
+  }
+  const remoteScript = curatorRemoteControlScript(remoteRepo, subcommand);
+  const result = run(
+    [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=8",
+      ...telegramSshTrustArgs(sshTrustMode, knownHostsPath),
+      ...workerSshPortArgs(worker),
+      workerRemoteTarget(worker),
+      `bash -lc ${quoteForBash(remoteScript)}`
+    ],
+    { check: false, timeoutMs: 120_000 }
+  );
+  if (result.code !== 0) {
+    throw new Error(`curator ${subcommand} failed over ssh with exit ${result.code}\n${result.stderr || result.stdout}`);
+  }
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  return true;
+}
+
 async function commandCurator(args: ParsedArgs): Promise<void> {
   const sub = args.positional[0] || "status";
   if (sub === "help" || sub === "--help" || sub === "-h") {
-    console.log("Usage: brainctl curator status [--json]\n       brainctl curator run\n       brainctl curator install");
+    console.log("Usage: brainctl curator status [--json]\n       brainctl curator run [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl curator install [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]");
     return;
   }
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
@@ -9590,11 +9654,17 @@ async function commandCurator(args: ParsedArgs): Promise<void> {
       return;
     }
     case "run": {
+      if (await maybeRunRemoteCuratorControl(cfg, args, "run")) {
+        return;
+      }
       const result = await telemuxControlRequest(cfg, "/control/curator/run");
       console.log(String(result.message || "curator run requested"));
       return;
     }
     case "install": {
+      if (await maybeRunRemoteCuratorControl(cfg, args, "install")) {
+        return;
+      }
       const result = await telemuxControlRequest(cfg, "/control/curator/install");
       console.log(String(result.message || "curator install requested"));
       return;
