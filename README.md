@@ -31,6 +31,7 @@ bun run packages/brainctl/src/main.ts skills install --target codex --profile cl
 bun run packages/brainctl/src/main.ts skills doctor --dir ~/.codex/skills
 bun run packages/brainctl/src/main.ts import skills --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts import skill ~/.codex/skills/brainstack/SKILL.md --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts status --json --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts daemon status --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts hooks status --target all
 bun run packages/brainctl/src/main.ts upgrade --profile control --config examples/control.yaml
@@ -40,6 +41,8 @@ bun run packages/brainctl/src/main.ts destroy --config ~/.config/brainstack/brai
 `init` is fresh-install only. Use `upgrade` or `apply-runtime` for existing installs; those commands do not silently seed or rewrite canonical shared-brain content.
 
 The normal installed config path is `~/.config/brainstack/brainstack.yaml`. If a command points at a missing config, `brainctl` prints the provision command to create it and lists nearby existing `*.brainstack.yaml` candidates instead of surfacing a raw filesystem `ENOENT`.
+
+Use `brainctl status --json` as the stable machine-facing status surface for local UI, menu bar, and automation consumers. It is read-only, uses short bounded checks, reports daemon, shared-brain, outbox, hooks, skills, brain API, curator, proposals, telemux, and product-git state, and exits successfully with degraded section details when optional services are offline.
 
 Build a current-platform standalone CLI:
 
@@ -87,6 +90,7 @@ See [`docs/fresh-machine-install.md`](./docs/fresh-machine-install.md) for boots
 See [`docs/portable-skills.md`](./docs/portable-skills.md) for installing Brainstack's public Codex skill/runbook bundle, importing local or URL skills into the shared brain, refreshing shared skills, and installing fail-open harness hooks. See [`docs/daemon.md`](./docs/daemon.md) for the local `brainctl daemon` mode that keeps client/worker clones, outbox, and shared skills fresh in the background.
 See [`docs/diagrams.md`](./docs/diagrams.md) for the read/write/outbox, Telegram coalescing, and control/client/worker topology diagrams.
 See [`docs/routines.md`](./docs/routines.md) for scheduled routines, built-in update checks, brain-curator setup, and daily check-ins.
+See [`docs/curation.md`](./docs/curation.md) for the proposal state model, curation policy (`manual`/`approval`/`auto`), curator automation, and the `brainctl proposals`/`curator` and Telegram proposal commands.
 See [`docs/security-postures.md`](./docs/security-postures.md), [`docs/tailscale-exposure.md`](./docs/tailscale-exposure.md), [`docs/multi-brain.md`](./docs/multi-brain.md), and [`docs/outbox-security.md`](./docs/outbox-security.md) for the current posture, exposure, project-context, and outbox boundaries.
 
 `provision` is a first-stage checker/config generator. It does not install Bun, Git, SSH, Tailscale, Codex, or Claude; it fails with install hints when they are missing.

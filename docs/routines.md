@@ -104,7 +104,11 @@ The routine does not install, upgrade, remove, reboot, restart, or mutate packag
 
 ### `brain-curator`
 
-Runs a shared-brain curator pass. It preserves raw imports and proposals, reviews recent raw/proposal/log material, writes a sourced curation report, and submits proposals when the local `brainctl propose` path is configured.
+Runs a shared-brain curator pass. It is installed automatically (daily by default) into the `brainstack-routines` context whenever `FACTORY_TELEGRAM_CONTROL_CHAT_ID` is set, alongside `update-check`.
+
+The curator reads new imports/logs/proposals since its last cursor (`GET /api/curator/status`), groups them by topic/source type, and submits machine proposals (`brainctl propose --target-page ... --content-file ... --risk ...`) carrying full proposed page contents. Proposal generation is automatic; wiki mutation is policy-controlled by the brain's `curation.mode` (see `docs/curation.md`). After each run telemux reports run status and cursor back to the brain when `FACTORY_BRAIN_ADMIN_TOKEN` is configured.
+
+Inspect and drive it with `/curator_status`, `/curator_run`, and `/proposals` in Telegram, or `brainctl curator status|run|install` from the control host.
 
 This routine should not mix private-journal material into the shared dev brain.
 

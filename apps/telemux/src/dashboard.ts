@@ -47,7 +47,18 @@ function badge(status: string): string {
   )}</span>`;
 }
 
-export function startDashboard(config: FactoryConfig, db: FactoryDb, workers: WorkerService, telegram?: TelegramBot): void {
+export interface DashboardControls {
+  runCurator: () => Promise<string>;
+  installCurator: () => Promise<string>;
+}
+
+export function startDashboard(
+  config: FactoryConfig,
+  db: FactoryDb,
+  workers: WorkerService,
+  telegram?: TelegramBot,
+  controls?: DashboardControls
+): void {
   // The dashboard exposes operational metadata (worktree paths, session ids,
   // summaries) without auth, so a non-loopback bind requires an explicit token.
   if (!isLoopbackHost(config.dashboardHost) && !config.dashboardToken) {
@@ -59,7 +70,7 @@ export function startDashboard(config: FactoryConfig, db: FactoryDb, workers: Wo
   Bun.serve({
     hostname: config.dashboardHost,
     port: config.dashboardPort,
-    fetch(request) {
+    async fetch(request) {
       const url = new URL(request.url);
 
       if (config.dashboardToken) {
@@ -67,6 +78,24 @@ export function startDashboard(config: FactoryConfig, db: FactoryDb, workers: Wo
         if (!presented || !tokenMatches(presented, config.dashboardToken)) {
           return new Response("unauthorized", { status: 401 });
         }
+      }
+
+      // Loopback (or token-gated) control endpoints used by `brainctl curator ...`.
+      if (request.method === "POST" && url.pathname.startsWith("/control/curator/")) {
+        if (!controls) {
+          return Response.json({ error: "curator controls are unavailable; telemux started without Telegram configuration" }, { status: 503 });
+        }
+        try {
+          if (url.pathname === "/control/curator/run") {
+            return Response.json({ ok: true, message: await controls.runCurator() });
+          }
+          if (url.pathname === "/control/curator/install") {
+            return Response.json({ ok: true, message: await controls.installCurator() });
+          }
+        } catch (error) {
+          return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 409 });
+        }
+        return Response.json({ error: `unknown control route: ${url.pathname}` }, { status: 404 });
       }
 
       if (url.pathname === "/healthz") {

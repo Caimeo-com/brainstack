@@ -11,6 +11,7 @@ import {
 } from "./codex-runtime";
 import { formatControlMetaResponse, resolveControlMetaKind } from "./control-meta";
 import { CronManager } from "./cron-manager";
+import { decideProposal, fetchCuratorStatus, fetchOpenProposals, type BrainProposalSummary } from "./curator-report";
 import { ContextRecord, FactoryDb, type PendingTextRecord } from "./db";
 import { ContextService, nextRecommendedAction, normalizeSlug } from "./contexts";
 import { Dispatcher } from "./dispatcher";
@@ -248,6 +249,12 @@ interface ArtifactShortcutSnapshot {
   createdAt: number;
 }
 
+interface ProposalShortcutSnapshot {
+  targetKey: string;
+  proposals: BrainProposalSummary[];
+  createdAt: number;
+}
+
 interface PlainTextHandlingResult {
   accepted: boolean;
 }
@@ -256,6 +263,8 @@ const CRON_SHORTCUT_TTL_MS = 15 * 60 * 1000;
 const CRON_SHORTCUT_MAX_SNAPSHOTS = 50;
 const ARTIFACT_SHORTCUT_TTL_MS = 15 * 60 * 1000;
 const ARTIFACT_SHORTCUT_MAX_SNAPSHOTS = 50;
+const PROPOSAL_SHORTCUT_TTL_MS = 15 * 60 * 1000;
+const PROPOSAL_SHORTCUT_MAX_SNAPSHOTS = 50;
 const TEXT_COALESCE_MAX_PARTS = 25;
 const TEXT_COALESCE_MAX_CHARS = 120_000;
 const TEXT_COALESCE_MAX_PENDING = 100;
@@ -426,6 +435,7 @@ export class CommandHandler {
   private readonly flushingPendingTextKeys = new Set<string>();
   private readonly cronShortcutSnapshots = new Map<string, CronShortcutSnapshot>();
   private readonly artifactShortcutSnapshots = new Map<string, ArtifactShortcutSnapshot>();
+  private readonly proposalShortcutSnapshots = new Map<string, ProposalShortcutSnapshot>();
 
   constructor(
     private readonly config: FactoryConfig,
@@ -647,6 +657,17 @@ export class CommandHandler {
         return;
       }
 
+      const proposalShortcut = parsed.command.match(/^\/proposal_(approve|reject)_([a-z0-9]{6,10})_(\d+)$/);
+      if (proposalShortcut) {
+        const proposal = this.resolveProposalSnapshotShortcut(proposalShortcut[2] || "", proposalShortcut[3] || "", target);
+        if (!proposal) {
+          await this.telegram.sendText(target, "That proposal shortcut expired or the list changed. Use /proposals to refresh.");
+          return;
+        }
+        await this.handleProposalDecision(proposalShortcut[1] === "approve" ? "approve" : "reject", proposal, target, message.from?.id ?? null);
+        return;
+      }
+
       switch (parsed.command) {
         case "/help":
           await this.telegram.sendText(
@@ -673,6 +694,9 @@ export class CommandHandler {
               "/crons",
               "/cron <subcommand>",
               "/cron_run <id|label>",
+              "/curator_status",
+              "/curator_run",
+              "/proposals",
               "/mode [fast|normal|max|clear]",
               "/model [model-id|clear]",
               "/effort [low|medium|high|xhigh|clear]",
@@ -868,6 +892,29 @@ export class CommandHandler {
 
         case "/crons": {
           await this.telegram.sendText(target, this.formatCronOverview(boundContext, target));
+          return;
+        }
+
+        case "/curator_status": {
+          await this.telegram.sendText(target, await this.formatCuratorStatus(target));
+          return;
+        }
+
+        case "/curator_run": {
+          const job = this.findCuratorJob();
+          if (!job) {
+            await this.telegram.sendText(
+              target,
+              "No brain-curator job is installed. Use /cron_install_brain_curator, or set FACTORY_TELEGRAM_CONTROL_CHAT_ID so it installs automatically."
+            );
+            return;
+          }
+          await this.handleCronJobAction("run", job, target);
+          return;
+        }
+
+        case "/proposals": {
+          await this.telegram.sendText(target, await this.formatProposalList(target));
           return;
         }
 
@@ -2260,6 +2307,142 @@ export class CommandHandler {
       }
       this.artifactShortcutSnapshots.delete(oldest);
     }
+  }
+
+  private findCuratorJob(): CronJobRecord | null {
+    const jobs = this.cronManager
+      .listJobs()
+      .filter((job) => job.kind === "codex" && !job.runner && job.label.toLowerCase() === "brain-curator");
+    return jobs.find((job) => job.executionContextSlug === "brainstack-routines") || jobs[0] || null;
+  }
+
+  private async formatCuratorStatus(target: TelegramTarget): Promise<string> {
+    const job = this.findCuratorJob();
+    const lines: string[] = [];
+    lines.push(`Curator installed: ${job ? "yes" : "no"}`);
+    if (job) {
+      lines.push(`Job: ${job.id} (${job.enabled ? "enabled" : "paused"})`);
+      lines.push(`Next run: ${job.nextRunAt || job.pendingRunAt || "n/a"}`);
+      lines.push(`Last run: ${job.lastRunAt || "never"}`);
+      if (job.lastError) {
+        lines.push(`Last error: ${snippet(job.lastError)}`);
+      }
+    }
+    const remote = await fetchCuratorStatus(this.config);
+    if (remote) {
+      const curator = (remote.curator || {}) as Record<string, unknown>;
+      const counts = (remote.proposal_counts || {}) as Record<string, number>;
+      lines.push(`Mode: ${String(remote.mode || "unknown")}`);
+      lines.push(
+        `Proposals: ${counts.pending || 0} pending, ${counts.approved || 0} approved, ${counts["needs-human"] || 0} needs-human, ${counts.applied || 0} applied`
+      );
+      if (curator.cursor) {
+        lines.push(`Cursor: ${String(curator.cursor)}`);
+      }
+      const failures = Array.isArray(curator.last_run_failures) ? (curator.last_run_failures as string[]) : [];
+      if (failures.length) {
+        lines.push("Last run failures:");
+        for (const failure of failures.slice(0, 5)) {
+          lines.push(`- ${snippet(failure)}`);
+        }
+      }
+    } else if (this.config.brainBaseUrl) {
+      lines.push("Brain curator status is unreachable; is braind running?");
+    } else {
+      lines.push("BRAIN_BASE_URL is not configured; only local job state is shown.");
+    }
+    if (!this.config.brainAdminToken) {
+      lines.push("Note: FACTORY_BRAIN_ADMIN_TOKEN is not set, so approve/reject from Telegram is disabled.");
+    }
+    return lines.join("\n");
+  }
+
+  private async formatProposalList(target: TelegramTarget): Promise<string> {
+    const proposals = await fetchOpenProposals(this.config);
+    if (proposals === null) {
+      return this.config.brainBaseUrl
+        ? "Could not list proposals; is braind running?"
+        : "BRAIN_BASE_URL is not configured; proposals live in the shared brain service.";
+    }
+    if (!proposals.length) {
+      return "No open proposals.";
+    }
+    const limited = proposals.slice(0, 15);
+    const token = this.createProposalShortcutSnapshot(limited, target);
+    const lines = [`Open proposals (${proposals.length}):`];
+    limited.forEach((proposal, index) => {
+      lines.push(
+        `${index + 1}. [${proposal.status}] ${proposal.title}${proposal.target_page ? ` → ${proposal.target_page}` : ""}${
+          proposal.risk ? ` (risk: ${proposal.risk})` : ""
+        }`
+      );
+      lines.push(`   /proposal_approve_${token}_${index + 1}  /proposal_reject_${token}_${index + 1}`);
+    });
+    if (!this.config.brainAdminToken) {
+      lines.push("");
+      lines.push("FACTORY_BRAIN_ADMIN_TOKEN is not set, so the shortcuts above will be refused. Use `brainctl proposals` on the control host.");
+    } else {
+      lines.push("");
+      lines.push("Approve applies the proposed wiki change when the proposal carries one; drift parks it as needs-human.");
+    }
+    return lines.join("\n");
+  }
+
+  private createProposalShortcutSnapshot(proposals: BrainProposalSummary[], target: TelegramTarget): string {
+    this.pruneProposalShortcutSnapshots();
+    let token = "";
+    do {
+      token = Math.random().toString(36).slice(2, 8).padEnd(6, "0");
+    } while (this.proposalShortcutSnapshots.has(token));
+    this.proposalShortcutSnapshots.set(token, {
+      targetKey: telegramTargetKey(target),
+      proposals,
+      createdAt: Date.now()
+    });
+    return token;
+  }
+
+  private resolveProposalSnapshotShortcut(token: string, selector: string, target: TelegramTarget): BrainProposalSummary | null {
+    this.pruneProposalShortcutSnapshots();
+    const snapshot = this.proposalShortcutSnapshots.get(token);
+    if (!snapshot || snapshot.targetKey !== telegramTargetKey(target)) {
+      return null;
+    }
+    const index = Number(selector) - 1;
+    if (!Number.isInteger(index) || index < 0 || index >= snapshot.proposals.length) {
+      return null;
+    }
+    return snapshot.proposals[index];
+  }
+
+  private pruneProposalShortcutSnapshots(): void {
+    const now = Date.now();
+    for (const [token, snapshot] of this.proposalShortcutSnapshots) {
+      if (now - snapshot.createdAt > PROPOSAL_SHORTCUT_TTL_MS) {
+        this.proposalShortcutSnapshots.delete(token);
+      }
+    }
+    while (this.proposalShortcutSnapshots.size > PROPOSAL_SHORTCUT_MAX_SNAPSHOTS) {
+      const oldest = [...this.proposalShortcutSnapshots.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0]?.[0];
+      if (!oldest) {
+        break;
+      }
+      this.proposalShortcutSnapshots.delete(oldest);
+    }
+  }
+
+  private async handleProposalDecision(
+    action: "approve" | "reject",
+    proposal: BrainProposalSummary,
+    target: TelegramTarget,
+    userId: number | null
+  ): Promise<void> {
+    const decidedBy = `telegram:${userId ?? "unknown"}`;
+    // Telegram approval means "make it canon": apply when the proposal carries a
+    // wiki change, otherwise record approval only.
+    const effectiveAction = action === "approve" && proposal.target_page ? "apply" : action;
+    const result = await decideProposal(this.config, proposal.id, effectiveAction, decidedBy);
+    await this.telegram.sendText(target, result.message);
   }
 
   private artifactEntriesForSend(artifacts: string | null, filterText: string | null, latestOnly: boolean): ArtifactEntry[] {

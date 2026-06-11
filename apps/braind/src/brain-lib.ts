@@ -1863,34 +1863,58 @@ export async function ingestArtifacts(repoRoot: string, artifactIds: string[]): 
   };
 }
 
+export interface CreateProposalInput {
+  title: string;
+  body: string;
+  source_harness: string;
+  source_machine: string;
+  target_page?: string;
+  tags?: string[];
+  /** Full proposed content for target_page; stored as a sidecar and used by apply. */
+  proposed_content?: string;
+  /** Drift guard: sha256 of the target page content the proposal was computed against, or "absent". */
+  base_sha256?: string;
+  risk?: "low" | "medium" | "high";
+  confidence?: number;
+  curator_run_id?: string;
+  reason?: string;
+  /** Curators may park a proposal straight into needs-human. */
+  status?: "pending" | "needs-human";
+  source_ids?: string[];
+}
+
 export async function createProposal(
   repoRoot: string,
-  input: {
-    title: string;
-    body: string;
-    source_harness: string;
-    source_machine: string;
-    target_page?: string;
-    tags?: string[];
-  },
+  input: CreateProposalInput,
   hooks: MutationHooks = {}
-): Promise<{ proposalPath: string; touchedFiles: string[] }> {
+): Promise<{ proposalPath: string; proposalId: string; touchedFiles: string[] }> {
   if (!input.title.trim() || !input.body.trim()) {
     throw new Error("Proposal title and body are required");
   }
   const paths = getRepoPaths(repoRoot);
-  const fileName = `${isoNow().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z").toLowerCase()}-${slugify(input.title)}.md`;
+  const proposalId = `${isoNow().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z").toLowerCase()}-${slugify(input.title)}`;
+  const fileName = `${proposalId}.md`;
   const absolutePath = join(paths.proposalsPendingDir, fileName);
+  const status = input.status === "needs-human" ? "needs-human" : "pending";
   const frontmatter: FrontmatterData = {
     title: input.title.trim(),
     type: "proposal",
+    proposal_id: proposalId,
     created_at: isoNow(),
     updated_at: isoNow(),
-    status: "pending",
+    status,
     tags: uniqueStrings(["proposal", ...(input.tags || [])]),
     aliases: [],
-    source_ids: []
+    source_ids: uniqueStrings((input.source_ids || []).filter((id) => isSafeManifestId(id)))
   };
+  if (input.target_page) frontmatter.target_page = input.target_page;
+  if (input.base_sha256) frontmatter.base_sha256 = input.base_sha256;
+  if (input.risk === "low" || input.risk === "medium" || input.risk === "high") frontmatter.risk = input.risk;
+  if (typeof input.confidence === "number" && Number.isFinite(input.confidence)) {
+    frontmatter.confidence = Math.max(0, Math.min(1, input.confidence));
+  }
+  if (input.curator_run_id?.trim()) frontmatter.curator_run_id = input.curator_run_id.trim().slice(0, 200);
+  if (input.reason?.trim()) frontmatter.reason = input.reason.trim().slice(0, 2_000);
   const body = [
     `# ${input.title.trim()}`,
     "",
@@ -1908,6 +1932,12 @@ export async function createProposal(
   await hooks.beforeMutation?.();
   await writeText(absolutePath, stringifyFrontmatter(frontmatter, body));
   const proposalPath = toRepoRelative(repoRoot, absolutePath);
+  const touchedFiles = [proposalPath];
+  if (typeof input.proposed_content === "string" && input.proposed_content.length) {
+    const sidecarPath = join(paths.proposalsPendingDir, `${proposalId}.content.md`);
+    await writeText(sidecarPath, input.proposed_content);
+    touchedFiles.push(toRepoRelative(repoRoot, sidecarPath));
+  }
   const logPath = await appendLogEntry(repoRoot, "propose", proposalPath, input.title.trim(), [
     `operation: propose`,
     `inputs: source_machine=${input.source_machine}; source_harness=${input.source_harness}`,
@@ -1915,7 +1945,8 @@ export async function createProposal(
     `commit: pending`,
     `summary: Stored proposal in proposals/pending and left it unapplied.`
   ]);
-  return { proposalPath, touchedFiles: [proposalPath, logPath] };
+  touchedFiles.push(logPath);
+  return { proposalPath, proposalId, touchedFiles };
 }
 
 function findBrokenInternalLinks(pagePath: string, raw: string, knownPaths: Set<string>): string[] {
@@ -2164,8 +2195,16 @@ export async function gitCommitAndPush(repoRoot: string, touchedFiles: string[],
   if (!uniqueFiles.length) {
     return null;
   }
-  await runCommandAsync(["git", "add", "-A", "--", ...uniqueFiles], repoRoot);
-  const changed = await runCommandAsync(["git", "status", "--porcelain", "--", ...uniqueFiles], repoRoot, false);
+  // `git add -A -- <path>` fails when a pathspec matches neither the worktree nor the
+  // index (e.g. a file created and then moved away within one mutation, like a
+  // proposal applied in the same request). Stage such removals via their parent
+  // directory instead; mutations run on a verified-clean tree under the repo lock,
+  // so directory pathspecs cannot pick up unrelated changes.
+  const pathspecs = uniqueStrings(
+    uniqueFiles.map((file) => (existsSync(join(repoRoot, file)) ? file : normalizeRepoPath(dirname(file)) || "."))
+  );
+  await runCommandAsync(["git", "add", "-A", "--", ...pathspecs], repoRoot);
+  const changed = await runCommandAsync(["git", "status", "--porcelain", "--", ...pathspecs], repoRoot, false);
   if (!changed.trim()) {
     return null;
   }

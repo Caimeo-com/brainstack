@@ -318,6 +318,258 @@ telemux:
     }
   });
 
+  test("curation config parses with safe defaults and validates inputs", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-curation-config-"));
+    try {
+      const defaultsPath = join(dir, "defaults.yaml");
+      await writeFile(defaultsPath, ["schema_version: 1", "profile: control", ""].join("\n"));
+      const defaults = await loadConfig(defaultsPath, "control");
+      expect(defaults.curation.mode).toBe("approval");
+      expect(defaults.curation.autoApply.allowedPaths).toEqual(["wiki/Status/**", "wiki/Sources/**"]);
+      expect(defaults.curation.autoApply.maxChangedLines).toBe(40);
+      expect(defaults.curation.autoApply.allowDeletes).toBe(false);
+
+      const explicitPath = join(dir, "explicit.yaml");
+      await writeFile(
+        explicitPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "curation:",
+          "  mode: auto",
+          "  autoApply:",
+          "    allowedPaths:",
+          "      - wiki/Status/**",
+          "    maxChangedLines: 10",
+          "    allowDeletes: true",
+          ""
+        ].join("\n")
+      );
+      const explicit = await loadConfig(explicitPath, "control");
+      expect(explicit.curation.mode).toBe("auto");
+      expect(explicit.curation.autoApply.allowedPaths).toEqual(["wiki/Status/**"]);
+      expect(explicit.curation.autoApply.maxChangedLines).toBe(10);
+      expect(explicit.curation.autoApply.allowDeletes).toBe(true);
+
+      const badModePath = join(dir, "bad-mode.yaml");
+      await writeFile(badModePath, ["schema_version: 1", "profile: control", "curation:", "  mode: yolo", ""].join("\n"));
+      await expect(loadConfig(badModePath, "control")).rejects.toThrow("curation.mode must be one of manual|approval|auto");
+
+      const badPathPath = join(dir, "bad-path.yaml");
+      await writeFile(
+        badPathPath,
+        ["schema_version: 1", "profile: control", "curation:", "  autoApply:", "    allowedPaths:", "      - wiki/../escape/**", ""].join("\n")
+      );
+      await expect(loadConfig(badPathPath, "control")).rejects.toThrow("allowedPaths");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("proposals and curator CLI commands talk to the brain API with correct auth", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-proposals-cli-"));
+    const port = 46_000 + Math.floor(Math.random() * 1_000);
+    // The fake brain runs as a separate process: runBrainctl uses spawnSync, which
+    // would deadlock an in-test Bun.serve.
+    const receivedPath = join(dir, "received.jsonl");
+    const serverScript = join(dir, "fake-brain.ts");
+    await writeFile(
+      serverScript,
+      [
+        `const receivedPath = ${JSON.stringify(receivedPath)};`,
+        `Bun.serve({`,
+        `  hostname: "127.0.0.1",`,
+        `  port: ${port},`,
+        `  async fetch(req) {`,
+        `    const url = new URL(req.url);`,
+        `    const body = req.method === "POST" ? await req.json().catch(() => null) : null;`,
+        `    const existing = (await Bun.file(receivedPath).exists()) ? await Bun.file(receivedPath).text() : "";`,
+        `    await Bun.write(receivedPath, existing + JSON.stringify({ method: req.method, path: url.pathname + url.search, auth: req.headers.get("authorization"), body }) + "\\n");`,
+        `    if (req.method === "GET" && url.pathname === "/healthz") {`,
+        `      return Response.json({ ok: true, service: "braind" });`,
+        `    }`,
+        `    if (req.method === "GET" && url.pathname === "/readyz") {`,
+        `      return Response.json({ ok: true, service: "braind", search_ready: true, pending_reindex: { present: false } });`,
+        `    }`,
+        `    if (req.method === "GET" && url.pathname === "/api/proposals") {`,
+        `      return Response.json({ ok: true, mode: "approval", proposals: [{ id: "20260611t000000z-cli-proposal", title: "CLI proposal", status: "pending", target_page: "wiki/Status/CLI.md", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:00:00Z" }] });`,
+        `    }`,
+        `    if (req.method === "GET" && url.pathname.startsWith("/api/proposals/")) {`,
+        `      return Response.json({ ok: true, proposal: { id: "20260611t000000z-cli-proposal", title: "CLI proposal", status: "pending", created_at: "2026-06-11T00:00:00Z" }, body: "## Request\\n\\nbody", diff: "+ new line" });`,
+        `    }`,
+        `    if (req.method === "POST" && url.pathname.endsWith("/approve")) {`,
+        `      return Response.json({ ok: true, status: "approved" });`,
+        `    }`,
+        `    if (req.method === "GET" && url.pathname === "/api/curator/status") {`,
+        `      return Response.json({ ok: true, mode: "approval", curator: { installed: true, last_run_finished_at: "2026-06-11T00:00:00Z", last_run_ok: true, last_run_failures: [], cursor: null, next_run_at: null }, proposal_counts: { pending: 1, approved: 0, applied: 0, rejected: 0, superseded: 0, "needs-human": 0 } });`,
+        `    }`,
+        `    if (req.method === "POST" && url.pathname === "/api/propose") {`,
+        `      return Response.json({ ok: true, proposal_id: "x", status: "pending", auto_applied: false });`,
+        `    }`,
+        `    return Response.json({ error: "unexpected" }, { status: 500 });`,
+        `  }`,
+        `});`
+      ].join("\n")
+    );
+    const server = Bun.spawn(["bun", "run", serverScript], { stdout: "ignore", stderr: "ignore" });
+    const readRequests = async (): Promise<Array<{ method: string; path: string; auth: string | null; body: Record<string, unknown> | null }>> =>
+      (await Bun.file(receivedPath).exists())
+        ? (await readFile(receivedPath, "utf8"))
+            .trim()
+            .split(/\r?\n/)
+            .filter(Boolean)
+            .map((line) => JSON.parse(line) as { method: string; path: string; auth: string | null; body: Record<string, unknown> | null })
+        : [];
+    try {
+      await waitForCondition(async () => {
+        try {
+          await fetch(`http://127.0.0.1:${port}/api/curator/status`);
+          return true;
+        } catch {
+          return false;
+        }
+      }, "fake brain server startup");
+      const configPath = join(dir, "config.yaml");
+      await writeFixtureConfig(configPath);
+      const env = { HOME: dir, BRAIN_BASE_URL: `http://127.0.0.1:${port}`, BRAIN_IMPORT_TOKEN: "cli-import-token", BRAIN_ADMIN_TOKEN: "" };
+
+      const list = runBrainctl(["proposals", "list", "--config", configPath], env);
+      expectSuccess(list);
+      expect(list.stdout).toContain("20260611t000000z-cli-proposal");
+      expect(list.stdout).toContain("status=pending");
+      expect((await readRequests()).at(-1)?.auth).toBeNull();
+
+      const show = runBrainctl(["proposals", "show", "20260611t000000z-cli-proposal", "--config", configPath], env);
+      expectSuccess(show);
+      expect(show.stdout).toContain("+ new line");
+
+      const approveDenied = runBrainctl(["proposals", "approve", "20260611t000000z-cli-proposal", "--config", configPath], env);
+      expect(approveDenied.code).not.toBe(0);
+      expect(approveDenied.stderr).toContain("BRAIN_ADMIN_TOKEN is required");
+
+      const approved = runBrainctl(["proposals", "approve", "20260611t000000z-cli-proposal", "--config", configPath], {
+        ...env,
+        BRAIN_ADMIN_TOKEN: "cli-admin-token"
+      });
+      expectSuccess(approved);
+      const approveRequest = (await readRequests()).find((entry) => entry.path.endsWith("/approve"));
+      expect(approveRequest?.auth).toBe("Bearer cli-admin-token");
+      expect(String(approveRequest?.body?.decided_by || "")).toContain("@brain-control");
+
+      const status = runBrainctl(["curator", "status", "--config", configPath], env);
+      expectSuccess(status);
+      expect(status.stdout).toContain("mode=approval");
+      expect(status.stdout).toContain("installed=yes");
+      expect(status.stdout).toContain("pending=1");
+
+      const aggregateStatus = runBrainctl(["status", "--json", "--config", configPath, "--timeout-ms", "500"], env);
+      expectSuccess(aggregateStatus);
+      const aggregate = JSON.parse(aggregateStatus.stdout) as Record<string, any>;
+      expect(aggregate.product).toBe("brainstack");
+      expect(aggregate.sections.brain_api.state).toBe("ok");
+      expect(aggregate.sections.curator.state).toBe("ok");
+      expect(aggregate.sections.curator.data.open_proposals).toBe(1);
+      expect(aggregate.sections.proposals.state).toBe("ok");
+      expect(aggregate.sections.proposals.data.count).toBe(1);
+
+      // propose with machine fields posts them to /api/propose.
+      const contentFile = join(dir, "proposed.md");
+      await writeFile(contentFile, "# Proposed\n");
+      const propose = runBrainctl(
+        [
+          "propose",
+          "--config",
+          configPath,
+          "--title",
+          "Machine proposal",
+          "--body",
+          "why",
+          "--target-page",
+          "wiki/Status/CLI.md",
+          "--content-file",
+          contentFile,
+          "--base-sha256",
+          "absent",
+          "--risk",
+          "low",
+          "--confidence",
+          "0.8",
+          "--curator-run-id",
+          "run-1",
+          "--source-ids",
+          "art-1,art-2"
+        ],
+        env
+      );
+      expectSuccess(propose);
+      const proposeRequest = (await readRequests()).find((entry) => entry.path === "/api/propose");
+      expect(proposeRequest?.body?.target_page).toBe("wiki/Status/CLI.md");
+      expect(proposeRequest?.body?.proposed_content).toBe("# Proposed\n");
+      expect(proposeRequest?.body?.base_sha256).toBe("absent");
+      expect(proposeRequest?.body?.risk).toBe("low");
+      expect(proposeRequest?.body?.confidence).toBe(0.8);
+      expect(proposeRequest?.body?.curator_run_id).toBe("run-1");
+      expect(proposeRequest?.body?.source_ids).toEqual(["art-1", "art-2"]);
+    } finally {
+      server.kill();
+      await server.exited;
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("status json degrades quickly when brain endpoints do not answer", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-status-timeout-"));
+    const port = 47_000 + Math.floor(Math.random() * 1_000);
+    const serverScript = join(dir, "slow-brain.ts");
+    await writeFile(
+      serverScript,
+      [
+        `Bun.serve({`,
+        `  hostname: "127.0.0.1",`,
+        `  port: ${port},`,
+        `  fetch(req) {`,
+        `    const url = new URL(req.url);`,
+        `    if (url.pathname === "/ping") return Response.json({ ok: true });`,
+        `    return new Promise(() => {});`,
+        `  }`,
+        `});`
+      ].join("\n")
+    );
+    const server = Bun.spawn(["bun", "run", serverScript], { stdout: "ignore", stderr: "ignore" });
+    try {
+      await waitForCondition(async () => {
+        try {
+          return (await fetch(`http://127.0.0.1:${port}/ping`)).ok;
+        } catch {
+          return false;
+        }
+      }, "slow fake brain server startup");
+      const configPath = join(dir, "config.yaml");
+      await writeFixtureConfig(configPath);
+      const started = Date.now();
+      const result = runBrainctl(["status", "--json", "--config", configPath, "--timeout-ms", "150"], {
+        HOME: dir,
+        BRAIN_BASE_URL: `http://127.0.0.1:${port}`,
+        BRAINSTACK_STATUS_TIMEOUT_MS: "150"
+      });
+      const elapsedMs = Date.now() - started;
+      expectSuccess(result);
+      expect(elapsedMs).toBeLessThan(5000);
+      const parsed = JSON.parse(result.stdout) as Record<string, any>;
+      expect(parsed.sections.config.state).toBe("ok");
+      expect(parsed.sections.brain_api.state).toBe("warn");
+      expect(parsed.sections.brain_api.available).toBe(false);
+      expect(parsed.sections.curator.state).toBe("warn");
+      expect(parsed.sections.curator.available).toBe(false);
+      expect(parsed.sections.proposals.state).toBe("warn");
+      expect(parsed.sections.proposals.available).toBe(false);
+    } finally {
+      server.kill();
+      await server.exited;
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
   test("rejects private-journal until separate private-brain routing is implemented", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-private-profile-"));
     try {
@@ -1383,7 +1635,12 @@ describe("brainctl install safety", () => {
       expect(git(["rev-parse", "HEAD"], staging)).toBe(headBefore);
       expect(await readFile(join(staging, "wiki", "Home.md"), "utf8")).toBe(homeBefore);
       expect(git(["status", "--porcelain"], staging)).toBe("");
-      expect(await readFile(join(configRoot, "braind.runtime.env"), "utf8")).toContain("BRAIN_BIND=127.0.0.1");
+      const runtimeEnv = await readFile(join(configRoot, "braind.runtime.env"), "utf8");
+      expect(runtimeEnv).toContain("BRAIN_BIND=127.0.0.1");
+      expect(runtimeEnv).toContain("BRAIN_CURATION_MODE=approval");
+      expect(runtimeEnv).toContain("BRAIN_CURATION_ALLOWED_PATHS=wiki/Status/**,wiki/Sources/**");
+      expect(runtimeEnv).toContain("BRAIN_CURATION_MAX_CHANGED_LINES=40");
+      expect(runtimeEnv).toContain("BRAIN_CURATION_ALLOW_DELETES=0");
       expect(await readFile(join(configRoot, "braind.secrets.env"), "utf8")).toContain("BRAIN_IMPORT_TOKEN=operator-owned");
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -2524,6 +2781,323 @@ describe("braind write safety", () => {
       const record = JSON.parse(await readFile(recordPath, "utf8")) as { status?: string; error?: string };
       expect(record.status).toBe("review_required");
       expect(record.error || "").toContain("persisted past its lease");
+    } finally {
+      await stopBraind(proc);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("proposal lifecycle: machine proposals, approval, drift, supersede, reject, and curator status", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-proposal-lifecycle-"));
+    const port = 44_000 + Math.floor(Math.random() * 4_000);
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const root = await createSingleNodeInstall(dir);
+      proc = await startBraind(root, port);
+      const staging = join(root, "shared-brain", "staging", "shared-brain");
+      const targetPage = "wiki/Status/Curation-Lifecycle.md";
+      const proposedContent = "---\ntitle: Curation Lifecycle\n---\n\n# Curation Lifecycle\n\n- first applied fact\n";
+
+      const propose = async (payload: Record<string, unknown>, key: string) =>
+        await fetch(`http://127.0.0.1:${port}/api/propose`, {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer import-test-token",
+            "Content-Type": "application/json",
+            "Idempotency-Key": key
+          },
+          body: JSON.stringify(payload)
+        });
+      const decide = async (id: string, action: string, body: Record<string, unknown> = {}, token = "admin-test-token") =>
+        await fetch(`http://127.0.0.1:${port}/api/proposals/${encodeURIComponent(id)}/${action}`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+
+      // Machine proposal in approval mode (default): stored pending, never auto-applied.
+      const first = await propose(
+        {
+          title: "Curation Lifecycle",
+          body: "Track the lifecycle test status.",
+          source_harness: "test-harness",
+          source_machine: "test-machine",
+          target_page: targetPage,
+          proposed_content: proposedContent,
+          base_sha256: "absent",
+          risk: "low",
+          confidence: 0.9,
+          curator_run_id: "curator-run-1",
+          source_ids: ["art-test-1"]
+        },
+        "proposal-lifecycle-1"
+      );
+      expect(first.status).toBe(200);
+      const firstBody = (await first.json()) as Record<string, unknown>;
+      expect(firstBody.auto_applied).toBe(false);
+      expect(firstBody.status).toBe("pending");
+      const firstId = String(firstBody.proposal_id);
+
+      // Listed as open; show returns a diff.
+      const openList = (await (await fetch(`http://127.0.0.1:${port}/api/proposals?status=open`)).json()) as {
+        proposals: Array<Record<string, unknown>>;
+        mode: string;
+      };
+      expect(openList.mode).toBe("approval");
+      expect(openList.proposals.some((proposal) => proposal.id === firstId)).toBe(true);
+      const shown = (await (await fetch(`http://127.0.0.1:${port}/api/proposals/${firstId}`)).json()) as Record<string, unknown>;
+      expect(String(shown.diff)).toContain("+ - first applied fact");
+
+      // Decisions require admin auth; the import token is insufficient.
+      const unauthorized = await decide(firstId, "approve", {}, "import-test-token");
+      expect(unauthorized.status).toBe(403);
+
+      const approved = await decide(firstId, "approve", { decided_by: "tester" });
+      expect(approved.status).toBe(200);
+      expect(((await approved.json()) as Record<string, unknown>).status).toBe("approved");
+
+      const applied = await decide(firstId, "apply", { decided_by: "tester" });
+      expect(applied.status).toBe(200);
+      const appliedBody = (await applied.json()) as Record<string, unknown>;
+      expect(appliedBody.status).toBe("applied");
+      expect(await readFile(join(staging, targetPage), "utf8")).toBe(proposedContent);
+      expect(existsSync(join(staging, "proposals", "applied", `${firstId}.md`))).toBe(true);
+      expect(existsSync(join(staging, "proposals", "pending", `${firstId}.md`))).toBe(false);
+
+      // A stale proposal (base says the page is absent, but it now exists) is parked
+      // as needs-human instead of clobbering the page.
+      const stale = await propose(
+        {
+          title: "Stale Curation Update",
+          body: "Generated against an outdated base.",
+          source_harness: "test-harness",
+          source_machine: "test-machine",
+          target_page: targetPage,
+          proposed_content: "# Stale\n",
+          base_sha256: "absent",
+          risk: "low"
+        },
+        "proposal-lifecycle-stale"
+      );
+      const staleId = String(((await stale.json()) as Record<string, unknown>).proposal_id);
+      const staleApply = await decide(staleId, "apply", { decided_by: "tester" });
+      expect(staleApply.status).toBe(200);
+      const staleApplyBody = (await staleApply.json()) as Record<string, unknown>;
+      expect(staleApplyBody.applied).toBe(false);
+      expect(staleApplyBody.status).toBe("needs-human");
+      expect(await readFile(join(staging, targetPage), "utf8")).toBe(proposedContent);
+
+      // Applying a fresh proposal for the same target supersedes the parked one.
+      const currentSha = createHash("sha256").update(proposedContent).digest("hex");
+      const fresh = await propose(
+        {
+          title: "Fresh Curation Update",
+          body: "Generated against the current base.",
+          source_harness: "test-harness",
+          source_machine: "test-machine",
+          target_page: targetPage,
+          proposed_content: `${proposedContent}- second applied fact\n`,
+          base_sha256: currentSha,
+          risk: "low"
+        },
+        "proposal-lifecycle-fresh"
+      );
+      const freshId = String(((await fresh.json()) as Record<string, unknown>).proposal_id);
+      const freshApply = await decide(freshId, "apply", { decided_by: "tester" });
+      const freshApplyBody = (await freshApply.json()) as Record<string, unknown>;
+      expect(freshApplyBody.applied).toBe(true);
+      expect(freshApplyBody.superseded_ids).toContain(staleId);
+      expect(existsSync(join(staging, "proposals", "superseded", `${staleId}.md`))).toBe(true);
+
+      // Reject moves proposals to proposals/rejected with a reason.
+      const rejectable = await propose(
+        {
+          title: "Rejectable Proposal",
+          body: "Should be rejected.",
+          source_harness: "test-harness",
+          source_machine: "test-machine"
+        },
+        "proposal-lifecycle-reject"
+      );
+      const rejectableId = String(((await rejectable.json()) as Record<string, unknown>).proposal_id);
+      const rejected = await decide(rejectableId, "reject", { decided_by: "tester", reason: "not canon-worthy" });
+      expect(((await rejected.json()) as Record<string, unknown>).status).toBe("rejected");
+      expect(existsSync(join(staging, "proposals", "rejected", `${rejectableId}.md`))).toBe(true);
+      const rejectedList = (await (await fetch(`http://127.0.0.1:${port}/api/proposals?status=rejected`)).json()) as {
+        proposals: Array<Record<string, unknown>>;
+      };
+      expect(rejectedList.proposals.some((proposal) => proposal.id === rejectableId)).toBe(true);
+
+      // needs-human can be set at proposal time.
+      const parked = await propose(
+        {
+          title: "Contradictory Material",
+          body: "Curator could not resolve a contradiction.",
+          source_harness: "test-harness",
+          source_machine: "test-machine",
+          status: "needs-human"
+        },
+        "proposal-lifecycle-needs-human"
+      );
+      expect(((await parked.json()) as Record<string, unknown>).status).toBe("needs-human");
+
+      // Curator status: admin-only POST, public GET, persisted fields.
+      const statusBefore = (await (await fetch(`http://127.0.0.1:${port}/api/curator/status`)).json()) as Record<string, unknown>;
+      expect(((statusBefore.curator || {}) as Record<string, unknown>).installed).toBe(false);
+      const statusUnauthorized = await fetch(`http://127.0.0.1:${port}/api/curator/status`, {
+        method: "POST",
+        headers: { Authorization: "Bearer import-test-token", "Content-Type": "application/json" },
+        body: JSON.stringify({ installed: true })
+      });
+      expect(statusUnauthorized.status).toBe(403);
+      const statusUpdate = await fetch(`http://127.0.0.1:${port}/api/curator/status`, {
+        method: "POST",
+        headers: { Authorization: "Bearer admin-test-token", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          installed: true,
+          last_run_id: "curator-run-1",
+          last_run_ok: true,
+          last_run_finished_at: "2026-06-11T00:00:00Z",
+          next_run_at: "2026-06-12T06:30:00Z",
+          cursor: "2026-06-11T00:00:00Z"
+        })
+      });
+      expect(statusUpdate.status).toBe(200);
+      const statusAfter = (await (await fetch(`http://127.0.0.1:${port}/api/curator/status`)).json()) as Record<string, unknown>;
+      const curator = (statusAfter.curator || {}) as Record<string, unknown>;
+      expect(curator.installed).toBe(true);
+      expect(curator.last_run_ok).toBe(true);
+      expect(curator.cursor).toBe("2026-06-11T00:00:00Z");
+      const counts = (statusAfter.proposal_counts || {}) as Record<string, number>;
+      expect(counts.applied).toBe(2);
+      expect(counts.rejected).toBe(1);
+      expect(counts.superseded).toBe(1);
+
+      // Wiki home shows the curation panel.
+      const home = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+      expect(home).toContain("Curation");
+      expect(home).toContain("Mode:");
+
+      // Unsafe target pages are rejected before any side effect.
+      const badTarget = await propose(
+        {
+          title: "Bad Target",
+          body: "Path escape attempt.",
+          source_harness: "test-harness",
+          source_machine: "test-machine",
+          target_page: "wiki/../secrets.md",
+          proposed_content: "# nope\n"
+        },
+        "proposal-lifecycle-bad-target"
+      );
+      expect(badTarget.status).toBe(400);
+    } finally {
+      await stopBraind(proc);
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 12_000);
+
+  test("auto curation mode applies only low-risk policy-conforming proposals", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-auto-curation-"));
+    const port = 44_000 + Math.floor(Math.random() * 4_000);
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const root = await createSingleNodeInstall(dir);
+      proc = await startBraind(root, port, {
+        BRAIN_CURATION_MODE: "auto",
+        BRAIN_CURATION_ALLOWED_PATHS: "wiki/Status/**,wiki/Sources/**",
+        BRAIN_CURATION_MAX_CHANGED_LINES: "40",
+        BRAIN_CURATION_ALLOW_DELETES: "0"
+      });
+      const staging = join(root, "shared-brain", "staging", "shared-brain");
+      const propose = async (payload: Record<string, unknown>, key: string) =>
+        await fetch(`http://127.0.0.1:${port}/api/propose`, {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer import-test-token",
+            "Content-Type": "application/json",
+            "Idempotency-Key": key
+          },
+          body: JSON.stringify(payload)
+        });
+
+      // Low-risk additive change inside allowedPaths auto-applies.
+      const allowed = await propose(
+        {
+          title: "Auto Status",
+          body: "Low-risk status update.",
+          source_harness: "test-harness",
+          source_machine: "test-machine",
+          target_page: "wiki/Status/Auto-Status.md",
+          proposed_content: "# Auto Status\n\n- machine ok\n",
+          base_sha256: "absent",
+          risk: "low",
+          confidence: 0.95
+        },
+        "auto-curation-allowed"
+      );
+      const allowedBody = (await allowed.json()) as Record<string, unknown>;
+      expect(allowedBody.auto_applied).toBe(true);
+      expect(allowedBody.status).toBe("applied");
+      expect(await readFile(join(staging, "wiki", "Status", "Auto-Status.md"), "utf8")).toBe("# Auto Status\n\n- machine ok\n");
+
+      // Medium/high risk stays pending with explicit reasons.
+      const risky = await propose(
+        {
+          title: "Risky Change",
+          body: "High-risk change must not auto-apply.",
+          source_harness: "test-harness",
+          source_machine: "test-machine",
+          target_page: "wiki/Status/Risky.md",
+          proposed_content: "# Risky\n",
+          base_sha256: "absent",
+          risk: "high"
+        },
+        "auto-curation-risky"
+      );
+      const riskyBody = (await risky.json()) as Record<string, unknown>;
+      expect(riskyBody.auto_applied).toBe(false);
+      expect(riskyBody.status).toBe("pending");
+      expect(JSON.stringify(riskyBody.auto_apply_reasons)).toContain("risk");
+      expect(existsSync(join(staging, "wiki", "Status", "Risky.md"))).toBe(false);
+
+      // Low risk outside allowedPaths stays pending.
+      const outside = await propose(
+        {
+          title: "Outside Allowed Paths",
+          body: "Low risk but not in the allowlist.",
+          source_harness: "test-harness",
+          source_machine: "test-machine",
+          target_page: "wiki/Decisions/Outside.md",
+          proposed_content: "# Outside\n",
+          base_sha256: "absent",
+          risk: "low"
+        },
+        "auto-curation-outside"
+      );
+      const outsideBody = (await outside.json()) as Record<string, unknown>;
+      expect(outsideBody.auto_applied).toBe(false);
+      expect(JSON.stringify(outsideBody.auto_apply_reasons)).toContain("allowedPaths");
+      expect(existsSync(join(staging, "wiki", "Decisions", "Outside.md"))).toBe(false);
+
+      // Oversized diffs stay pending even when low risk and inside allowedPaths.
+      const bigContent = `# Big\n\n${Array.from({ length: 60 }, (_, index) => `- line ${index}`).join("\n")}\n`;
+      const big = await propose(
+        {
+          title: "Big Change",
+          body: "Too many changed lines.",
+          source_harness: "test-harness",
+          source_machine: "test-machine",
+          target_page: "wiki/Status/Big.md",
+          proposed_content: bigContent,
+          base_sha256: "absent",
+          risk: "low"
+        },
+        "auto-curation-big"
+      );
+      const bigBody = (await big.json()) as Record<string, unknown>;
+      expect(bigBody.auto_applied).toBe(false);
+      expect(JSON.stringify(bigBody.auto_apply_reasons)).toContain("maxChangedLines");
     } finally {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });

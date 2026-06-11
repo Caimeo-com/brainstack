@@ -32,6 +32,23 @@ import {
   syncWritableRepoAsync,
   withRepoLock
 } from "./brain-lib";
+import {
+  OPEN_PROPOSAL_STATUSES,
+  PROPOSAL_STATUSES,
+  applyProposal,
+  approveProposal,
+  curationOverview,
+  curationPolicyFromEnv,
+  evaluateAutoApply,
+  findProposal,
+  isSafeProposalId,
+  listProposals,
+  readProposedContent,
+  rejectProposal,
+  renderUnifiedDiff,
+  validateProposalTargetPage,
+  writeCuratorStatus
+} from "./curation";
 
 class HttpError extends Error {
   constructor(
@@ -1938,13 +1955,48 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
 
 async function proposeFromRequest(request: Request, authScope: AuthScope): Promise<Record<string, unknown>> {
   const body = await readJsonBody(request);
+  const proposedContent = typeof body.proposed_content === "string" ? body.proposed_content : undefined;
+  if (proposedContent !== undefined) {
+    assertImportSize(new TextEncoder().encode(proposedContent).byteLength, "proposed_content");
+  }
+  const targetPageRaw = typeof body.target_page === "string" && body.target_page.trim() ? body.target_page.trim() : undefined;
+  if (targetPageRaw) {
+    try {
+      validateProposalTargetPage(writeRepoRoot, targetPageRaw);
+    } catch (error) {
+      reject(400, error instanceof Error ? error.message : String(error));
+    }
+  }
+  if (proposedContent !== undefined && !targetPageRaw) {
+    reject(400, "proposed_content requires target_page");
+  }
+  const riskRaw = typeof body.risk === "string" ? body.risk : undefined;
+  if (riskRaw !== undefined && !["low", "medium", "high"].includes(riskRaw)) {
+    reject(400, "risk must be low, medium, or high");
+  }
+  const statusRaw = typeof body.status === "string" ? body.status : undefined;
+  if (statusRaw !== undefined && !["pending", "needs-human"].includes(statusRaw)) {
+    reject(400, "status must be pending or needs-human");
+  }
+  const confidenceRaw = body.confidence !== undefined ? Number(body.confidence) : undefined;
+  if (confidenceRaw !== undefined && (!Number.isFinite(confidenceRaw) || confidenceRaw < 0 || confidenceRaw > 1)) {
+    reject(400, "confidence must be a number between 0 and 1");
+  }
   const input = {
     title: String(body.title || ""),
     body: String(body.body || ""),
     source_harness: String(body.source_harness || ""),
     source_machine: String(body.source_machine || ""),
-    target_page: typeof body.target_page === "string" ? body.target_page : undefined,
-    tags: Array.isArray(body.tags) ? body.tags.map(String) : []
+    target_page: targetPageRaw,
+    tags: Array.isArray(body.tags) ? body.tags.map(String) : [],
+    proposed_content: proposedContent,
+    base_sha256: typeof body.base_sha256 === "string" && body.base_sha256.trim() ? body.base_sha256.trim().slice(0, 128) : undefined,
+    risk: riskRaw as "low" | "medium" | "high" | undefined,
+    confidence: confidenceRaw,
+    curator_run_id: typeof body.curator_run_id === "string" ? body.curator_run_id : undefined,
+    reason: typeof body.reason === "string" ? body.reason : undefined,
+    status: statusRaw as "pending" | "needs-human" | undefined,
+    source_ids: Array.isArray(body.source_ids) ? body.source_ids.map(String) : undefined
   };
   const requestHash = requestHashFor({ endpoint: "propose", input });
   const replay = await completedIdempotencyReplay(request, "propose", requestHash);
@@ -1957,16 +2009,47 @@ async function proposeFromRequest(request: Request, authScope: AuthScope): Promi
       await withRepoLock(writeRepoRoot, async () => {
         await syncWritableRepoAsync(writeRepoRoot);
         const proposal = await createProposal(writeRepoRoot, input, { beforeMutation: markSideEffectStarted });
+        const touchedFiles = [...proposal.touchedFiles];
+
+        // Policy-gated auto-apply: proposal generation is always automatic; wiki
+        // mutation only happens under the configured curation policy.
+        let autoApplied = false;
+        let autoApplyReasons: string[] = [];
+        const policy = curationPolicyFromEnv();
+        if (policy.mode === "auto" && input.status !== "needs-human" && targetPageRaw && proposedContent !== undefined) {
+          const targetAbsolute = safeRepoPath(writeRepoRoot, targetPageRaw);
+          const currentContent = existsSync(targetAbsolute) ? await readFile(targetAbsolute, "utf8") : null;
+          const decision = evaluateAutoApply(
+            policy,
+            { targetPage: targetPageRaw, baseSha256: input.base_sha256 || null, risk: input.risk || null },
+            currentContent,
+            proposedContent
+          );
+          autoApplyReasons = decision.reasons;
+          if (decision.allowed) {
+            const applyResult = await applyProposal(writeRepoRoot, proposal.proposalId, "auto-policy");
+            touchedFiles.push(...applyResult.touchedFiles);
+            autoApplied = applyResult.applied;
+            if (!applyResult.applied && applyResult.blockedReason) {
+              autoApplyReasons = [applyResult.blockedReason];
+            }
+          }
+        }
+
         const commit = await gitCommitAndPush(
           writeRepoRoot,
-          proposal.touchedFiles,
-          `brain: propose ${input.title || "proposal"}`
+          touchedFiles,
+          `brain: propose ${input.title || "proposal"}${autoApplied ? " (auto-applied)" : ""}`
         );
         return {
           ok: true,
+          proposal_id: proposal.proposalId,
           proposal_path: proposal.proposalPath,
+          status: autoApplied ? "applied" : input.status || "pending",
+          auto_applied: autoApplied,
+          auto_apply_reasons: autoApplyReasons,
           commit,
-          touched_files: proposal.touchedFiles,
+          touched_files: touchedFiles,
           search_index: await refreshSearchAfterWrite(commit)
         };
       })
@@ -1974,11 +2057,207 @@ async function proposeFromRequest(request: Request, authScope: AuthScope): Promi
   });
 }
 
+const PROPOSAL_DECISION_ACTIONS = new Set(["approve", "reject", "apply"]);
+
+async function proposalDecisionFromRequest(request: Request, id: string, action: string): Promise<Record<string, unknown>> {
+  if (!PROPOSAL_DECISION_ACTIONS.has(action)) {
+    reject(404, `unknown proposal action: ${action}`);
+  }
+  if (!isSafeProposalId(id)) {
+    reject(400, "proposal id is not a valid identifier");
+  }
+  const body = await readJsonBody(request).catch(() => ({}) as Record<string, unknown>);
+  const decidedBy = typeof body.decided_by === "string" && body.decided_by.trim() ? body.decided_by.trim().slice(0, 120) : "admin";
+  const reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim().slice(0, 2_000) : null;
+  return await withMutationGate(async () =>
+    await withRepoLock(writeRepoRoot, async () => {
+      await syncWritableRepoAsync(writeRepoRoot);
+      let result:
+        | { record: import("./curation").ProposalRecord; touchedFiles: string[]; applied?: boolean; blockedReason?: string | null; supersededIds?: string[] }
+        | null = null;
+      try {
+        if (action === "approve") {
+          result = await approveProposal(writeRepoRoot, id, decidedBy);
+        } else if (action === "reject") {
+          result = await rejectProposal(writeRepoRoot, id, decidedBy, reason);
+        } else {
+          const applyResult = await applyProposal(writeRepoRoot, id, decidedBy);
+          result = applyResult;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        reject(message.startsWith("proposal not found") ? 404 : 409, message);
+      }
+      const commit = await gitCommitAndPush(writeRepoRoot, result!.touchedFiles, `brain: proposal ${action} ${id}`);
+      return {
+        ok: true,
+        proposal_id: id,
+        action,
+        status: result!.record.status,
+        applied: result!.applied ?? undefined,
+        blocked_reason: result!.blockedReason ?? undefined,
+        superseded_ids: result!.supersededIds ?? undefined,
+        commit,
+        search_index: await refreshSearchAfterWrite(commit)
+      };
+    })
+  );
+}
+
+function proposalToJson(record: import("./curation").ProposalRecord): Record<string, unknown> {
+  return {
+    id: record.id,
+    title: record.title,
+    status: record.status,
+    created_at: record.createdAt,
+    updated_at: record.updatedAt,
+    target_page: record.targetPage,
+    base_sha256: record.baseSha256,
+    risk: record.risk,
+    confidence: record.confidence,
+    curator_run_id: record.curatorRunId,
+    reason: record.reason,
+    source_ids: record.sourceIds,
+    decided_at: record.decidedAt,
+    decided_by: record.decidedBy,
+    path: record.path,
+    has_proposed_content: record.hasProposedContent
+  };
+}
+
+async function listProposalsResponse(url: URL): Promise<Response> {
+  // Proposal workflow state lives in the write repo; the serve clone syncs lazily.
+  const statusParam = url.searchParams.get("status");
+  let statuses: import("./curation").ProposalStatus[] | null = null;
+  if (statusParam === "open") {
+    statuses = [...OPEN_PROPOSAL_STATUSES];
+  } else if (statusParam) {
+    const requested = statusParam.split(",").map((value) => value.trim()) as import("./curation").ProposalStatus[];
+    const invalid = requested.filter((value) => !PROPOSAL_STATUSES.includes(value));
+    if (invalid.length) {
+      reject(400, `unknown proposal status filter: ${invalid.join(", ")}`);
+    }
+    statuses = requested;
+  }
+  const records = await listProposals(writeRepoRoot, statuses);
+  const policy = curationPolicyFromEnv();
+  return json({
+    ok: true,
+    mode: policy.mode,
+    proposals: records.map(proposalToJson)
+  });
+}
+
+async function showProposalResponse(id: string): Promise<Response> {
+  if (!isSafeProposalId(id)) {
+    reject(400, "proposal id is not a valid identifier");
+  }
+  const found = await findProposal(writeRepoRoot, id);
+  if (!found) {
+    reject(404, `proposal not found: ${id}`);
+  }
+  const record = found!.record;
+  let diff: string | null = null;
+  const proposedContent = await readProposedContent(writeRepoRoot, record);
+  if (record.targetPage && proposedContent !== null) {
+    try {
+      const targetAbsolute = safeRepoPath(writeRepoRoot, record.targetPage);
+      const currentContent = existsSync(targetAbsolute) ? await readFile(targetAbsolute, "utf8") : null;
+      diff = renderUnifiedDiff(currentContent, proposedContent);
+    } catch {
+      diff = "(target page path is invalid)";
+    }
+  }
+  return json({
+    ok: true,
+    proposal: proposalToJson(record),
+    body: record.body,
+    diff
+  });
+}
+
+async function curatorStatusResponse(): Promise<Response> {
+  const overview = await curationOverview(writeRepoRoot, repoRoot);
+  return json({
+    ok: true,
+    mode: overview.policy.mode,
+    policy: {
+      mode: overview.policy.mode,
+      allowed_paths: overview.policy.allowedPaths,
+      max_changed_lines: overview.policy.maxChangedLines,
+      allow_deletes: overview.policy.allowDeletes
+    },
+    curator: overview.status,
+    proposal_counts: overview.counts
+  });
+}
+
+async function updateCuratorStatusFromRequest(request: Request): Promise<Record<string, unknown>> {
+  const body = await readJsonBody(request);
+  const status = await writeCuratorStatus(repoRoot, body as Partial<import("./curation").CuratorStatus>);
+  return { ok: true, curator: status };
+}
+
+function renderCurationPanel(overview: Awaited<ReturnType<typeof curationOverview>>, imports: Awaited<ReturnType<typeof getRecentImports>>): string {
+  const status = overview.status;
+  const cursor = status.cursor || status.last_run_finished_at;
+  const awaitingCuration = cursor ? imports.filter((manifest) => manifest.created_at > cursor) : imports;
+  const proposalLine = (record: (typeof overview.openProposals)[number]): string =>
+    `<li><strong>${htmlEscape(record.status)}</strong> ${htmlEscape(record.title)}${
+      record.targetPage ? ` → <code>${htmlEscape(record.targetPage)}</code>` : ""
+    } <span class="pill">${htmlEscape(record.risk || "risk n/a")}</span> <span class="pill">${htmlEscape(record.createdAt)}</span></li>`;
+  return `<div class="grid cols">
+      <section class="card">
+        <h2>Curation</h2>
+        <div class="status">
+          <div>Mode: <code>${htmlEscape(overview.policy.mode)}</code></div>
+          <div>Curator installed: <code>${status.installed ? "yes" : "no"}</code></div>
+          <div>Last run: <code>${htmlEscape(status.last_run_finished_at || "(never)")}</code>${
+            status.last_run_ok === false ? ' <span class="pill">failed</span>' : ""
+          }</div>
+          <div>Next run: <code>${htmlEscape(status.next_run_at || "(not scheduled)")}</code></div>
+          <div>Open proposals: <code>${overview.counts.pending} pending, ${overview.counts.approved} approved, ${overview.counts["needs-human"]} needs-human</code></div>
+          <div>Imports awaiting curation: <code>${awaitingCuration.length}</code></div>
+        </div>
+        ${
+          status.last_run_failures.length
+            ? `<h3>Last run failures</h3><ul>${status.last_run_failures
+                .slice(0, 5)
+                .map((failure) => `<li>${htmlEscape(failure)}</li>`)
+                .join("")}</ul>`
+            : ""
+        }
+      </section>
+      <section class="card">
+        <h2>Pending proposals</h2>
+        <ul>
+          ${overview.openProposals.length ? overview.openProposals.map(proposalLine).join("") : "<li>None.</li>"}
+        </ul>
+        <h2>Recently applied</h2>
+        <ul>
+          ${
+            overview.recentlyApplied.length
+              ? overview.recentlyApplied
+                  .map(
+                    (record) =>
+                      `<li>${htmlEscape(record.title)}${
+                        record.targetPage ? ` → <a href="${pageHref(record.targetPage)}">${htmlEscape(record.targetPage)}</a>` : ""
+                      } <span class="pill">${htmlEscape(record.decidedAt || record.updatedAt)}</span></li>`
+                  )
+                  .join("")
+              : "<li>None.</li>"
+          }
+        </ul>
+      </section>
+    </div>`;
+}
+
 async function renderHome(): Promise<Response> {
   const health = await getHealth(repoRoot);
   const logEntries = await getRecentLogEntries(repoRoot, 8);
   const imports = await getRecentImports(repoRoot, 8);
   const sections = await discoverHomeSections();
+  const overview = await curationOverview(writeRepoRoot, repoRoot);
   return layout(
     "Shared Brain",
     `<section class="masthead">
@@ -2021,6 +2300,7 @@ async function renderHome(): Promise<Response> {
         </div>
       </aside>
     </div>
+    ${renderCurationPanel(overview, imports)}
     <div class="grid cols">
       <section class="card">
         <h2>Recent imports</h2>
@@ -2288,6 +2568,29 @@ const server = Bun.serve({
         const authScope = assertImportAuth(request);
         assertPreBodyWriteRateLimit(request, authScope, "propose");
         return json(await proposeFromRequest(request, authScope));
+      }
+      if (request.method === "GET" && url.pathname === "/api/proposals") {
+        return await listProposalsResponse(url);
+      }
+      {
+        const proposalShow = request.method === "GET" ? url.pathname.match(/^\/api\/proposals\/([^/]+)$/) : null;
+        if (proposalShow) {
+          return await showProposalResponse(decodeURIComponent(proposalShow[1]));
+        }
+        const proposalAction = request.method === "POST" ? url.pathname.match(/^\/api\/proposals\/([^/]+)\/(approve|reject|apply)$/) : null;
+        if (proposalAction) {
+          assertAdminAuth(request);
+          assertWriteRateLimit(request, "admin", "proposal-decision", null);
+          return json(await proposalDecisionFromRequest(request, decodeURIComponent(proposalAction[1]), proposalAction[2]));
+        }
+      }
+      if (request.method === "GET" && url.pathname === "/api/curator/status") {
+        return await curatorStatusResponse();
+      }
+      if (request.method === "POST" && url.pathname === "/api/curator/status") {
+        assertAdminAuth(request);
+        assertWriteRateLimit(request, "admin", "curator-status", null);
+        return json(await updateCuratorStatusFromRequest(request));
       }
       if (request.method === "POST" && url.pathname === "/api/lint") {
         assertAdminAuth(request);

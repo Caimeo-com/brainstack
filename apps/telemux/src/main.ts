@@ -9,6 +9,7 @@ import { startDashboard } from "./dashboard";
 import { TelegramBot } from "./telegram";
 import { WorkerService } from "./workers";
 import { ensureBasicLoops } from "./basic-loops";
+import { reportCuratorStatus } from "./curator-report";
 
 ensureProjectPaths();
 
@@ -21,7 +22,25 @@ const dispatcher = new Dispatcher(config, db, contexts, workers, telegram, cronM
 const cronScheduler = new CronScheduler(config, db, cronManager, dispatcher, workers, telegram);
 const commands = new CommandHandler(config, db, telegram, contexts, workers, dispatcher, cronManager, cronScheduler);
 
-startDashboard(config, db, workers, telegram);
+const curatorControls = telegram.isConfigured()
+  ? {
+      runCurator: async (): Promise<string> => {
+        const job = db
+          .listCronJobs()
+          .filter((entry) => entry.kind === "codex" && !entry.runner && entry.label.toLowerCase() === "brain-curator")
+          .sort((a, b) => (a.executionContextSlug === "brainstack-routines" ? -1 : b.executionContextSlug === "brainstack-routines" ? 1 : 0))[0];
+        if (!job) {
+          throw new Error("no brain-curator job is installed; run `brainctl curator install` or /cron_install_brain_curator first");
+        }
+        return await cronScheduler.runJobNow(job);
+      },
+      installCurator: async (): Promise<string> => {
+        return await ensureBasicLoops(config, contexts, workers, cronManager);
+      }
+    }
+  : undefined;
+
+startDashboard(config, db, workers, telegram, curatorControls);
 
 try {
   const pruned = db.pruneHistory();
@@ -54,8 +73,14 @@ if (telegram.isConfigured()) {
   dispatcher.recoverQueuedTurns();
   commands.recoverPendingText();
   void ensureBasicLoops(config, contexts, workers, cronManager)
-    .then((result) => {
+    .then(async (result) => {
       console.log(`basic loops: ${result}`);
+      const curatorJob = db
+        .listCronJobs()
+        .find((entry) => entry.kind === "codex" && !entry.runner && entry.label.toLowerCase() === "brain-curator" && entry.executionContextSlug === "brainstack-routines");
+      if (curatorJob) {
+        await reportCuratorStatus(config, { installed: true, next_run_at: curatorJob.nextRunAt ?? null });
+      }
     })
     .catch((error) => {
       console.error("basic loops bootstrap failed", error);

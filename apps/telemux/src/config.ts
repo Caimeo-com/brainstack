@@ -69,6 +69,7 @@ export interface FactoryConfig {
   codexBin: string;
   brainBaseUrl: string;
   brainImportToken: string;
+  brainAdminToken: string;
   allowAbsoluteArtifactPaths: boolean;
   textCoalesceMs: number;
   pendingTextRecoveryMaxAgeMs: number;
@@ -359,6 +360,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
     codexBin: env.FACTORY_CODEX_BIN?.trim() || (harness === "codex" ? harnessBin : "codex"),
     brainBaseUrl: env.BRAIN_BASE_URL?.trim() || "",
     brainImportToken: env.BRAIN_IMPORT_TOKEN?.trim() || "",
+    brainAdminToken: env.FACTORY_BRAIN_ADMIN_TOKEN?.trim() || "",
     allowAbsoluteArtifactPaths: ["1", "true", "yes", "on"].includes((env.FACTORY_ALLOW_ABSOLUTE_ARTIFACT_PATHS || "").toLowerCase()),
     textCoalesceMs: readNumber(env, "FACTORY_TEXT_COALESCE_MS", 1500),
     pendingTextRecoveryMaxAgeMs: readNumber(env, "FACTORY_TEXT_COALESCE_RECOVERY_MAX_AGE_MS", 5 * 60_000),

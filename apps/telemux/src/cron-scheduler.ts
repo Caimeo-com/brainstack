@@ -1,11 +1,16 @@
 import { CronManager } from "./cron-manager";
 import { nextCronRunAt, type CronJobRecord, type CronRunRecord } from "./cron-jobs";
 import type { FactoryConfig } from "./config";
+import { reportCuratorStatus } from "./curator-report";
 import type { ContextRecord, FactoryDb } from "./db";
-import type { Dispatcher } from "./dispatcher";
+import type { DispatchOptions, Dispatcher } from "./dispatcher";
 import { isDeterministicRoutine } from "./routine-builtins";
 import type { TelegramBot } from "./telegram";
 import type { WorkerService } from "./workers";
+
+function isCuratorJob(job: CronJobRecord): boolean {
+  return job.kind === "codex" && !job.runner && job.label.toLowerCase() === "brain-curator";
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -110,6 +115,31 @@ export class CronScheduler {
 
   private claimRunId(jobId: string, scheduledFor: string): string {
     return `cron-claim-${jobId}-${scheduledFor.replace(/[^0-9]/g, "")}`;
+  }
+
+  /**
+   * Curator runs report their outcome to braind so the wiki home and
+   * `brainctl curator status` reflect installed/last/next run state.
+   */
+  private curatorFinishHook(job: CronJobRecord, scheduledFor: string): DispatchOptions["onFinished"] | undefined {
+    if (!isCuratorJob(job)) {
+      return undefined;
+    }
+    const startedAt = nowIso();
+    return async (status) => {
+      const refreshed = this.db.getCronJob(job.id);
+      await reportCuratorStatus(this.config, {
+        installed: true,
+        last_run_id: this.claimRunId(job.id, scheduledFor),
+        last_run_started_at: startedAt,
+        last_run_finished_at: nowIso(),
+        last_run_ok: status === "finished",
+        last_run_failures: status === "finished" ? [] : [`curator run ${status}; see ${this.db.getContextBySlug(job.executionContextSlug || "")?.latestRunLogPath || "telemux logs"}`],
+        next_run_at: refreshed?.nextRunAt ?? null,
+        // Material older than this run's start has been reviewed on success.
+        ...(status === "finished" ? { cursor: startedAt } : {})
+      });
+    };
   }
 
   private buildClaimRun(job: CronJobRecord, scheduledFor: string): CronRunRecord {
@@ -254,7 +284,8 @@ export class CronScheduler {
         allowQueue: false,
         modelOverride: claimed.modelOverride,
         reasoningEffortOverride: claimed.reasoningEffortOverride,
-        sourceLabel: `manual cron run ${claimed.id}`
+        sourceLabel: `manual cron run ${claimed.id}`,
+        onFinished: this.curatorFinishHook(claimed, manual.scheduledFor)
       }
     );
 
@@ -544,7 +575,8 @@ export class CronScheduler {
         allowQueue: false,
         modelOverride: claimed.modelOverride,
         reasoningEffortOverride: claimed.reasoningEffortOverride,
-        sourceLabel: `scheduled cron ${claimed.id}`
+        sourceLabel: `scheduled cron ${claimed.id}`,
+        onFinished: this.curatorFinishHook(claimed, scheduledFor)
       }
     );
 

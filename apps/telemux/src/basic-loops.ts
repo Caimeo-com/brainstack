@@ -1,6 +1,7 @@
 import type { FactoryConfig } from "./config";
 import type { ContextService } from "./contexts";
 import type { CronManager } from "./cron-manager";
+import type { ContextRecord } from "./db";
 import {
   builtinRoutineDraft,
   defaultBuiltinSchedule,
@@ -58,6 +59,8 @@ export async function ensureBasicLoops(
     return `skipped: ${slug} context is ${context.state}`;
   }
 
+  const notes: string[] = [];
+
   const existingJob = cronManager.listJobs().find((job) => {
     if (job.runner !== DETERMINISTIC_UPDATE_CHECK_RUNNER || job.label.toLowerCase() !== routine.label.toLowerCase()) {
       return false;
@@ -74,22 +77,70 @@ export async function ensureBasicLoops(
       instruction: routine.instruction || null,
       runner: DETERMINISTIC_UPDATE_CHECK_RUNNER
     });
-    return `updated: ${existingJob.id}`;
+    notes.push(`updated: ${existingJob.id}`);
+  } else {
+    const schedule = defaultBuiltinSchedule(routine);
+    const draft = builtinRoutineDraft(routine, schedule, context.slug);
+    const created = await cronManager.createJob(
+      {
+        ...draft,
+        targetChatId: config.telegramControlChatId,
+        targetThreadId: null
+      },
+      {
+        context,
+        target: { chatId: config.telegramControlChatId, threadId: null }
+      }
+    );
+    notes.push(`created: ${created.id}`);
   }
 
-  const schedule = defaultBuiltinSchedule(routine);
-  const draft = builtinRoutineDraft(routine, schedule, context.slug);
+  notes.push(await ensureCuratorRoutine(config, cronManager, context));
+
+  return notes.join("; ");
+}
+
+/**
+ * The brain-curator routine is installed automatically for the routines context so
+ * proposal generation is always on; wiki mutation stays policy-controlled in braind.
+ */
+async function ensureCuratorRoutine(config: FactoryConfig, cronManager: CronManager, context: ContextRecord): Promise<string> {
+  const curator = getBuiltinRoutine("brain-curator");
+  if (!curator) {
+    throw new Error("built-in brain-curator routine is missing");
+  }
+  // Only manage the routines-context copy; user-owned curator jobs elsewhere are
+  // never retargeted.
+  const existing = cronManager
+    .listJobs()
+    .find(
+      (job) =>
+        job.kind === "codex" &&
+        !job.runner &&
+        job.label.toLowerCase() === curator.label.toLowerCase() &&
+        job.executionContextSlug === context.slug
+    );
+  if (existing) {
+    await cronManager.updateJob(existing, {
+      executionContextSlug: context.slug,
+      targetChatId: config.telegramControlChatId!,
+      targetThreadId: null,
+      instruction: curator.instruction || null
+    });
+    return `curator updated: ${existing.id}`;
+  }
+  const schedule = defaultBuiltinSchedule(curator);
+  const draft = builtinRoutineDraft(curator, schedule, context.slug);
   const created = await cronManager.createJob(
     {
       ...draft,
-      targetChatId: config.telegramControlChatId,
+      targetChatId: config.telegramControlChatId!,
       targetThreadId: null
     },
     {
       context,
-      target: { chatId: config.telegramControlChatId, threadId: null }
+      target: { chatId: config.telegramControlChatId!, threadId: null }
     }
   );
-
-  return `created: ${created.id}`;
+  return `curator created: ${created.id}`;
 }

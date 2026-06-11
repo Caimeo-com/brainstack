@@ -111,6 +111,30 @@ interface DoctorCheck {
   remediation?: string;
 }
 
+type BrainctlStatusState = "ok" | "warn" | "fail" | "disabled";
+
+interface BrainctlStatusSection<T = unknown> {
+  state: BrainctlStatusState;
+  ok: boolean | null;
+  available: boolean;
+  detail: string;
+  data?: T;
+  error?: string;
+  duration_ms?: number;
+}
+
+interface BrainctlStatusReport {
+  schema_version: 1;
+  product: "brainstack";
+  generated_at: string;
+  config_path: string;
+  profile: Profile | null;
+  machine: string | null;
+  ok: boolean;
+  degraded: boolean;
+  sections: Record<string, BrainctlStatusSection>;
+}
+
 interface BrainstackConfig {
   schemaVersion: number;
   profile: Profile;
@@ -179,7 +203,19 @@ interface BrainstackConfig {
     telegramRemoteRepo: string;
     telegramVia: string;
   };
+  curation: {
+    mode: CurationMode;
+    autoApply: {
+      allowedPaths: string[];
+      maxChangedLines: number;
+      allowDeletes: boolean;
+    };
+  };
 }
+
+type CurationMode = "manual" | "approval" | "auto";
+const CURATION_MODES: CurationMode[] = ["manual", "approval", "auto"];
+const DEFAULT_CURATION_ALLOWED_PATHS = ["wiki/Status/**", "wiki/Sources/**"];
 
 interface BrainstackClientInvite {
   schema_version: 1;
@@ -268,7 +304,8 @@ const ALLOWED_TOP_LEVEL_CONFIG_KEYS = new Set([
   "repos",
   "telemux",
   "tailscale",
-  "client"
+  "client",
+  "curation"
 ]);
 
 function usage(): string {
@@ -278,6 +315,7 @@ function usage(): string {
   brainctl upgrade --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
   brainctl apply-runtime --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
   brainctl doctor --config brainstack.yaml [--profile ...] [--json] [--workers] [--deep] [--write-smoke]
+  brainctl status --config brainstack.yaml [--json] [--timeout-ms N]
   brainctl daemon run|once|status|install|uninstall|logs --config brainstack.yaml [--json]
   brainctl updates --config brainstack.yaml [--profile ...]
   brainctl expose tailscale --config brainstack.yaml --dry-run|--apply
@@ -303,7 +341,9 @@ function usage(): string {
   brainctl rotate-token --kind import|admin|telegram-placeholder --config brainstack.yaml [--env FILE]
   brainctl telegram send-file --file PATH [--config brainstack.yaml] [--via SSH_TARGET] [--remote-repo PATH] [--caption TEXT] [--context SLUG|--chat-id ID] [--thread-id ID] [--kind document|photo] [--max-bytes N] [--allow-sensitive] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default] [--json]
   brainctl import-text --config brainstack.yaml --title TITLE --text TEXT --source-harness HARNESS --source-machine MACHINE [--source-type note]
-  brainctl propose --config brainstack.yaml --title TITLE --body BODY
+  brainctl propose --config brainstack.yaml --title TITLE --body BODY [--target-page wiki/PATH.md] [--content-file FILE] [--base-sha256 HASH|absent] [--risk low|medium|high] [--confidence 0..1] [--curator-run-id ID] [--reason TEXT] [--needs-human] [--source-ids id1,id2]
+  brainctl proposals list|show|approve|reject|apply [...]
+  brainctl curator status|run|install [--config brainstack.yaml]
   brainctl context --repo PATH [--config brainstack.yaml] [--json] [--sync|--no-sync]
   brainctl search --repo PATH "query" [--config brainstack.yaml] [--json] [--wait-fresh]
   brainctl remember --repo PATH --summary TEXT [--target BRAIN_ID] [--confirm-cross-brain]
@@ -765,7 +805,7 @@ function validateRawConfig(raw: Record<string, unknown>): void {
 }
 
 function resolveBunBin(): string {
-  const proc = run(["bash", "-c", "command -v bun"], { check: false });
+  const proc = run(["bash", "-c", "command -v bun"], { check: false, timeoutMs: 2000 });
   const bunBin = proc.stdout.trim();
   if (proc.code !== 0 || !bunBin) {
     throw new Error("Bun binary not found; install Bun and ensure `command -v bun` works before running brainctl.");
@@ -793,6 +833,18 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
   const telemux = objectAt(raw, "telemux");
   const tailscale = objectAt(raw, "tailscale");
   const client = objectAt(raw, "client");
+  const curation = objectAt(raw, "curation");
+  const curationAutoApply = objectAt(curation, "autoApply");
+  const curationModeRaw = stringAt(curation, "mode", "approval").trim().toLowerCase();
+  if (!CURATION_MODES.includes(curationModeRaw as CurationMode)) {
+    throw new Error(`curation.mode must be one of ${CURATION_MODES.join("|")}; found ${curationModeRaw}`);
+  }
+  const curationAllowedPaths = arrayAt(curationAutoApply, "allowedPaths").map(String).filter(Boolean);
+  for (const pattern of curationAllowedPaths) {
+    if (!pattern.startsWith("wiki/") || pattern.includes("..") || pattern.includes(",")) {
+      throw new Error(`curation.autoApply.allowedPaths entries must be wiki/ glob patterns without '..' or ',': ${pattern}`);
+    }
+  }
   const home = abs(stringAt(paths, "home", process.env.HOME || "."));
   const root = rootOverride ? abs(rootOverride) : "";
   const stateRoot = root ? join(root, "state") : absWithHome(stringAt(paths, "stateRoot", "~/.local/state/brainstack"), home);
@@ -893,6 +945,14 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
       remoteSsh: stringAt(client, "remoteSsh", remoteSsh),
       telegramRemoteRepo: stringAt(client, "telegramRemoteRepo", "~/brainstack"),
       telegramVia: stringAt(client, "telegramVia", "")
+    },
+    curation: {
+      mode: curationModeRaw as CurationMode,
+      autoApply: {
+        allowedPaths: curationAllowedPaths.length ? curationAllowedPaths : [...DEFAULT_CURATION_ALLOWED_PATHS],
+        maxChangedLines: numberAt(curationAutoApply, "maxChangedLines", 40),
+        allowDeletes: booleanAt(curationAutoApply, "allowDeletes", false)
+      }
     }
   };
   cfg.telemux.workers = workerInputs.map((entry) => normalizeWorkerConfig(entry, cfg));
@@ -1577,7 +1637,12 @@ function sharedBrainSeedFiles(cfg: BrainstackConfig): Record<string, string> {
       "- `GET /raw/*path`",
       "- `GET /search?q=...&scope=wiki|raw|all`",
       "- `POST /api/import` requires import or admin bearer token.",
-      "- `POST /api/propose` requires import or admin bearer token.",
+      "- `POST /api/propose` requires import or admin bearer token; accepts machine proposal fields (`target_page`, `proposed_content`, `base_sha256`, `risk`, `confidence`, `curator_run_id`, `source_ids`).",
+      "- `GET /api/proposals[?status=...]` lists proposals.",
+      "- `GET /api/proposals/ID` shows one proposal with a diff.",
+      "- `POST /api/proposals/ID/approve|reject|apply` requires admin bearer token.",
+      "- `GET /api/curator/status` shows curation mode, curator runs, and proposal counts.",
+      "- `POST /api/curator/status` requires admin bearer token.",
       "- `POST /api/ingest` requires admin bearer token.",
       "- `POST /api/lint` requires admin bearer token.",
       ""
@@ -1630,6 +1695,8 @@ function sharedBrainSeedFiles(cfg: BrainstackConfig): Record<string, string> {
     "raw/assets/.gitkeep": "",
     "proposals/pending/.gitkeep": "",
     "proposals/applied/.gitkeep": "",
+    "proposals/rejected/.gitkeep": "",
+    "proposals/superseded/.gitkeep": "",
     "manifests/machines/.gitkeep": "",
     "manifests/harnesses/.gitkeep": "",
     "manifests/sources/.gitkeep": "",
@@ -1668,6 +1735,10 @@ function braindRuntimeEnv(cfg: BrainstackConfig): string {
     "BRAIN_ALLOW_PRIVATE_URL_IMPORTS=false",
     "BRAIN_URL_FETCH_TIMEOUT_MS=15000",
     `BRAIN_ORGANIZER_LABEL=${cfg.machine.name}`,
+    `BRAIN_CURATION_MODE=${cfg.curation.mode}`,
+    `BRAIN_CURATION_ALLOWED_PATHS=${cfg.curation.autoApply.allowedPaths.join(",")}`,
+    `BRAIN_CURATION_MAX_CHANGED_LINES=${cfg.curation.autoApply.maxChangedLines}`,
+    `BRAIN_CURATION_ALLOW_DELETES=${cfg.curation.autoApply.allowDeletes ? "1" : "0"}`,
     ""
   ].join("\n");
 }
@@ -1732,6 +1803,8 @@ function telemuxSecretsEnv(): string {
     "FACTORY_ALLOWED_TELEGRAM_USER_ID=0",
     "FACTORY_PRE_DISPATCH_CLASSIFIER_API_KEY=",
     "BRAIN_IMPORT_TOKEN=",
+    "# Optional: enables /proposals approve/reject and curator status reporting from Telegram.",
+    "# FACTORY_BRAIN_ADMIN_TOKEN=",
     ""
   ].join("\n");
 }
@@ -3945,6 +4018,441 @@ async function commandDoctor(args: ParsedArgs): Promise<void> {
   const failures = checks.filter((item) => item.status === "FAIL");
   if (failures.length) {
     throw new Error(`doctor failed: ${failures.map((item) => item.name).join(", ")}`);
+  }
+}
+
+function statusTimeoutMs(args: ParsedArgs): number {
+  const raw = requireFlagValue(args, "timeout-ms") || process.env.BRAINSTACK_STATUS_TIMEOUT_MS || "";
+  if (!raw) {
+    return 1500;
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error("--timeout-ms must be a positive integer");
+  }
+  return Math.min(Math.max(parsed, 100), 30_000);
+}
+
+function sanitizeStatusError(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 500);
+}
+
+function statusSection<T>(
+  state: BrainctlStatusState,
+  detail: string,
+  data?: T,
+  options: { available?: boolean; error?: string; durationMs?: number } = {}
+): BrainctlStatusSection<T> {
+  const available = options.available ?? (state === "ok" || state === "warn");
+  return {
+    state,
+    ok: state === "disabled" ? null : state === "ok",
+    available,
+    detail,
+    ...(data === undefined ? {} : { data }),
+    ...(options.error ? { error: options.error } : {}),
+    ...(options.durationMs === undefined ? {} : { duration_ms: options.durationMs })
+  };
+}
+
+async function collectStatusSection<T>(
+  collector: () => Promise<BrainctlStatusSection<T>>,
+  timeoutMs: number,
+  fallbackState: BrainctlStatusState = "warn"
+): Promise<BrainctlStatusSection<T>> {
+  const started = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timed = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out after ${timeoutMs}ms`)), timeoutMs);
+    });
+    const section = await Promise.race([collector(), timed]);
+    return { ...section, duration_ms: Date.now() - started };
+  } catch (error) {
+    return statusSection(fallbackState, "unavailable", undefined, {
+      available: false,
+      error: sanitizeStatusError(error),
+      durationMs: Date.now() - started
+    });
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+function finalizeBrainctlStatus(report: BrainctlStatusReport): BrainctlStatusReport {
+  const sections = Object.values(report.sections);
+  report.ok = !sections.some((section) => section.state === "fail");
+  report.degraded = sections.some((section) => section.state === "warn" || section.state === "fail");
+  return report;
+}
+
+function safeBrainApiBaseUrl(cfg: BrainstackConfig): { baseUrl: string; error?: string } {
+  try {
+    return { baseUrl: brainApiBaseUrl(cfg) };
+  } catch (error) {
+    return { baseUrl: "", error: sanitizeStatusError(error) };
+  }
+}
+
+function safeBrainWriteStatus(cfg: BrainstackConfig): { baseUrlConfigured: boolean; importTokenPresent: boolean; error?: string } {
+  try {
+    const write = brainWriteConfig(cfg);
+    return { baseUrlConfigured: Boolean(write.baseUrl), importTokenPresent: Boolean(write.token) };
+  } catch (error) {
+    return { baseUrlConfigured: false, importTokenPresent: false, error: sanitizeStatusError(error) };
+  }
+}
+
+function gitStatusProbe(args: string[], cwd: string, timeoutMs: number): { ok: boolean; output: string; code: number; timedOut: boolean } {
+  const result = run(["git", ...args], { cwd, check: false, timeoutMs });
+  return {
+    ok: result.code === 0,
+    output: (result.stdout || result.stderr).trim(),
+    code: result.code,
+    timedOut: result.timedOut
+  };
+}
+
+async function localGitSnapshot(path: string, timeoutMs: number): Promise<Record<string, unknown>> {
+  const info = await lstat(path).catch(() => null);
+  if (!info) {
+    return { path, exists: false, is_git: false, detail: "missing" };
+  }
+  if (info.isSymbolicLink()) {
+    return { path, exists: true, is_git: false, detail: "refusing symlink" };
+  }
+  if (!info.isDirectory()) {
+    return { path, exists: true, is_git: false, detail: "not a directory" };
+  }
+  if (!gitExists(path)) {
+    return { path, exists: true, is_git: false, detail: "not a git checkout" };
+  }
+  const branch = gitStatusProbe(["rev-parse", "--abbrev-ref", "HEAD"], path, timeoutMs);
+  const head = gitStatusProbe(["rev-parse", "HEAD"], path, timeoutMs);
+  const dirty = gitStatusProbe(["status", "--porcelain"], path, timeoutMs);
+  return {
+    path,
+    exists: true,
+    is_git: true,
+    branch: branch.ok ? branch.output || null : null,
+    head: head.ok ? head.output || null : null,
+    clean: dirty.ok ? dirty.output.length === 0 : null,
+    dirty_count: dirty.ok && dirty.output ? dirty.output.split(/\r?\n/).filter(Boolean).length : 0,
+    errors: [branch.ok ? null : `branch: ${branch.output || `exit ${branch.code}`}`, head.ok ? null : `head: ${head.output || `exit ${head.code}`}`, dirty.ok ? null : `status: ${dirty.output || `exit ${dirty.code}`}`].filter(Boolean)
+  };
+}
+
+async function collectSharedBrainStatus(cfg: BrainstackConfig, timeoutMs: number): Promise<BrainctlStatusSection> {
+  const snapshots: Record<string, unknown>[] = [];
+  if (cfg.profile === "client-macos" || cfg.profile === "worker") {
+    snapshots.push(await localGitSnapshot(clientLocalPathAbs(cfg), timeoutMs));
+  }
+  if (runsBraind(cfg)) {
+    snapshots.push(await localGitSnapshot(cfg.repos.serve, timeoutMs));
+    snapshots.push(await localGitSnapshot(cfg.repos.staging, timeoutMs));
+  }
+  if (!snapshots.length) {
+    return statusSection("disabled", "no shared-brain checkout role for this profile", { snapshots });
+  }
+  const unhealthy = snapshots.filter((snapshot) => snapshot.exists !== true || snapshot.is_git !== true || snapshot.clean === false || Array.isArray(snapshot.errors) && snapshot.errors.length > 0);
+  const state: BrainctlStatusState = unhealthy.length ? "warn" : "ok";
+  return statusSection(state, `checkouts=${snapshots.length} unhealthy=${unhealthy.length}`, { snapshots });
+}
+
+async function collectOutboxStatusSection(cfg: BrainstackConfig): Promise<BrainctlStatusSection> {
+  const scans = await scanAllOutboxes(cfg);
+  const items = scans.flatMap((scan) => scan.items.map((entry) => ({ ...entry, item: normalizeOutboxItem(entry.item) })));
+  const corrupt = scans.flatMap((scan) => scan.corrupt);
+  const terminal = items.filter((entry) => entry.item.terminal_error).length;
+  const state: BrainctlStatusState = corrupt.length ? "fail" : terminal ? "warn" : "ok";
+  return statusSection(state, `queued=${items.length} terminal=${terminal} corrupt=${corrupt.length}`, {
+    roots: scans.map((scan) => scan.root),
+    queued: items.length,
+    terminal,
+    corrupt: corrupt.length
+  });
+}
+
+async function collectHooksStatusSection(cfg: BrainstackConfig): Promise<BrainctlStatusSection> {
+  const targets: HookTarget[] = ["codex", "claude", "cursor"];
+  const hooks: Array<Record<string, unknown>> = [];
+  for (const target of targets) {
+    const path = hookConfigPath(target);
+    let count = 0;
+    let error: string | null = null;
+    try {
+      const raw = await readJsonObject(path).catch(() => ({}));
+      count = target === "cursor" ? countCursorManagedHooks(raw, target) : countCodexStyleManagedHooks(raw, target);
+    } catch (hookError) {
+      error = sanitizeStatusError(hookError);
+    }
+    hooks.push({ target, path, hooks: count, installed: count > 0, ...(error ? { error } : {}) });
+  }
+  const selected = hooks.find((entry) => entry.target === cfg.harness.name);
+  const selectedInstalled = Boolean(selected?.installed);
+  return statusSection(selectedInstalled ? "ok" : "warn", `${cfg.harness.name} hooks ${selectedInstalled ? "installed" : "missing"}`, {
+    selected_target: cfg.harness.name,
+    hooks
+  });
+}
+
+async function collectSkillsStatusSection(cfg: BrainstackConfig): Promise<BrainctlStatusSection> {
+  const targets: HookTarget[] = ["codex", "claude", "cursor"];
+  const roots: Array<Record<string, unknown>> = [];
+  for (const target of targets) {
+    try {
+      const root = skillInstallRootForTarget(target, { command: "status", positional: [], flags: {} });
+      const dirs = await skillDirsForDoctor(root);
+      roots.push({ target, root, skills: dirs.length, installed: dirs.map((dir) => basename(dir)).slice(0, 100) });
+    } catch (error) {
+      roots.push({ target, root: null, skills: 0, error: sanitizeStatusError(error) });
+    }
+  }
+  const selected = roots.find((entry) => entry.target === cfg.harness.name);
+  const count = Number(selected?.skills || 0);
+  return statusSection(count > 0 ? "ok" : "warn", `${cfg.harness.name} skills=${count}`, {
+    selected_target: cfg.harness.name,
+    roots
+  });
+}
+
+async function statusFetchJson(baseUrl: string, path: string, timeoutMs: number): Promise<Record<string, unknown>> {
+  const response = await fetch(new URL(path, baseUrl).toString(), {
+    signal: AbortSignal.timeout(timeoutMs)
+  });
+  const text = await response.text();
+  let body: unknown = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = null;
+  }
+  return {
+    ok: response.ok,
+    http_status: response.status,
+    body,
+    content_type: response.headers.get("content-type") || null,
+    ...(body === null && text ? { text: text.slice(0, 500) } : {})
+  };
+}
+
+async function collectBrainApiStatusSection(cfg: BrainstackConfig, timeoutMs: number): Promise<BrainctlStatusSection> {
+  const base = safeBrainApiBaseUrl(cfg);
+  if (!base.baseUrl) {
+    return statusSection("disabled", "brain API base URL unavailable", { base_url_configured: false }, { available: false, error: base.error });
+  }
+  const [health, ready] = await Promise.allSettled([
+    statusFetchJson(base.baseUrl, "/healthz", timeoutMs),
+    statusFetchJson(base.baseUrl, "/readyz", timeoutMs)
+  ]);
+  const healthData = health.status === "fulfilled" ? health.value : { ok: false, error: sanitizeStatusError(health.reason) };
+  const readyData = ready.status === "fulfilled" ? ready.value : { ok: false, error: sanitizeStatusError(ready.reason) };
+  const healthOk = Boolean(healthData.ok);
+  const readyOk = Boolean(readyData.ok);
+  const state: BrainctlStatusState = healthOk && readyOk ? "ok" : "warn";
+  return statusSection(state, `base_url=${base.baseUrl} health=${healthOk ? "ok" : "unavailable"} ready=${readyOk ? "ok" : "unavailable"}`, {
+    base_url: base.baseUrl,
+    health: healthData,
+    ready: readyData
+  }, { available: healthOk || readyOk });
+}
+
+async function collectCuratorStatusSection(cfg: BrainstackConfig, timeoutMs: number): Promise<BrainctlStatusSection> {
+  const base = safeBrainApiBaseUrl(cfg);
+  if (!base.baseUrl) {
+    return statusSection("disabled", "curator status unavailable without brain API base URL", undefined, { available: false, error: base.error });
+  }
+  const response = await statusFetchJson(base.baseUrl, "/api/curator/status", timeoutMs);
+  if (!response.ok) {
+    return statusSection("warn", `curator status unavailable HTTP ${response.http_status}`, response, { available: false });
+  }
+  const body = response.body && typeof response.body === "object" && !Array.isArray(response.body) ? (response.body as Record<string, unknown>) : {};
+  const curator = body.curator && typeof body.curator === "object" && !Array.isArray(body.curator) ? (body.curator as Record<string, unknown>) : {};
+  const counts = body.proposal_counts && typeof body.proposal_counts === "object" && !Array.isArray(body.proposal_counts) ? (body.proposal_counts as Record<string, unknown>) : {};
+  const open = Number(counts.pending || 0) + Number(counts.approved || 0) + Number(counts["needs-human"] || 0);
+  const installed = Boolean(curator.installed);
+  return statusSection("ok", `mode=${String(body.mode || cfg.curation.mode)} installed=${installed} open_proposals=${open}`, {
+    mode: body.mode || cfg.curation.mode,
+    curator,
+    proposal_counts: counts,
+    open_proposals: open
+  });
+}
+
+async function collectProposalsStatusSection(cfg: BrainstackConfig, timeoutMs: number): Promise<BrainctlStatusSection> {
+  const base = safeBrainApiBaseUrl(cfg);
+  if (!base.baseUrl) {
+    return statusSection("disabled", "proposal status unavailable without brain API base URL", undefined, { available: false, error: base.error });
+  }
+  const response = await statusFetchJson(base.baseUrl, "/api/proposals?status=open", timeoutMs);
+  if (!response.ok) {
+    return statusSection("warn", `open proposal list unavailable HTTP ${response.http_status}`, response, { available: false });
+  }
+  const body = response.body && typeof response.body === "object" && !Array.isArray(response.body) ? (response.body as Record<string, unknown>) : {};
+  const proposals = Array.isArray(body.proposals) ? (body.proposals as Array<Record<string, unknown>>) : [];
+  const byStatus: Record<string, number> = {};
+  for (const proposal of proposals) {
+    const proposalStatus = String(proposal.status || "unknown");
+    byStatus[proposalStatus] = (byStatus[proposalStatus] || 0) + 1;
+  }
+  return statusSection("ok", `open_proposals=${proposals.length}`, {
+    count: proposals.length,
+    by_status: byStatus,
+    proposals: proposals.slice(0, 25)
+  });
+}
+
+async function collectTelemuxStatusSection(cfg: BrainstackConfig, timeoutMs: number): Promise<BrainctlStatusSection> {
+  if (!cfg.telemux.enabled) {
+    return statusSection("disabled", "telemux disabled in config", { enabled: false });
+  }
+  const baseUrl = `http://${cfg.telemux.dashboardHost}:${cfg.telemux.dashboardPort}`;
+  const response = await statusFetchJson(baseUrl, "/healthz", timeoutMs);
+  if (!response.ok) {
+    return statusSection("warn", `telemux healthz unavailable HTTP ${response.http_status}`, response, { available: false });
+  }
+  const body = response.body && typeof response.body === "object" && !Array.isArray(response.body) ? (response.body as Record<string, unknown>) : {};
+  const due = Number(body.cronDue || 0);
+  const pending = Number(body.cronPending || 0);
+  const workerDegraded = Number(body.workerDegraded || 0);
+  const state: BrainctlStatusState = due > 0 || pending > 0 || workerDegraded > 0 ? "warn" : "ok";
+  return statusSection(state, `crons=${String(body.crons ?? "unknown")} due=${due} pending=${pending} worker_degraded=${workerDegraded}`, {
+    base_url: baseUrl,
+    healthz: body
+  });
+}
+
+async function collectDaemonStatusSection(cfg: BrainstackConfig, args: ParsedArgs, timeoutMs: number): Promise<BrainctlStatusSection> {
+  if (!usesBrainstackDaemon(cfg)) {
+    return statusSection("disabled", "brainstackd not used by this profile", { profile: cfg.profile });
+  }
+  const status = await readDaemonStatus(cfg);
+  const platform = daemonPlatform(args);
+  const servicePath = daemonServicePath(cfg, platform);
+  const pidAlive = typeof status?.pid === "number" ? processAlive(status.pid) : null;
+  const fresh = daemonStatusFresh(status, 10 * 60_000);
+  const service =
+    fresh
+      ? {
+          platform,
+          installed: existsSync(servicePath),
+          running: pidAlive === true ? true : null,
+          path: servicePath,
+          detail: pidAlive === true ? "pid alive from daemon status" : "fresh daemon status; service-manager probe skipped"
+        }
+      : await daemonServiceStatus(cfg, args, timeoutMs);
+  const state: BrainctlStatusState = status?.ok && fresh ? "ok" : service.running === true && fresh ? "ok" : "warn";
+  return statusSection(state, `service=${service.running === true ? "running" : service.running === false ? "stopped" : "unknown"} fresh=${fresh}`, {
+    service,
+    status,
+    fresh
+  }, { available: Boolean(status) || service.running === true });
+}
+
+async function collectProductStatusSection(timeoutMs: number): Promise<BrainctlStatusSection> {
+  if (!gitExists(PRODUCT_ROOT)) {
+    return statusSection("warn", "product repo is not a git checkout", { path: PRODUCT_ROOT }, { available: false });
+  }
+  const branch = gitStatusProbe(["rev-parse", "--abbrev-ref", "HEAD"], PRODUCT_ROOT, timeoutMs);
+  const head = gitStatusProbe(["rev-parse", "HEAD"], PRODUCT_ROOT, timeoutMs);
+  const dirty = gitStatusProbe(["status", "--porcelain"], PRODUCT_ROOT, timeoutMs);
+  const remoteRef = ["origin/main", "refs/remotes/https-main"].find((candidate) => gitStatusProbe(["rev-parse", "--verify", candidate], PRODUCT_ROOT, timeoutMs).ok) || null;
+  const aheadBehind = remoteRef ? gitStatusProbe(["rev-list", "--left-right", "--count", `HEAD...${remoteRef}`], PRODUCT_ROOT, timeoutMs) : null;
+  const dirtyCount = dirty.ok && dirty.output ? dirty.output.split(/\r?\n/).filter(Boolean).length : 0;
+  const state: BrainctlStatusState = dirtyCount > 0 || branch.ok === false || head.ok === false ? "warn" : "ok";
+  return statusSection(state, `branch=${branch.output || "unknown"} dirty=${dirtyCount}`, {
+    path: PRODUCT_ROOT,
+    branch: branch.ok ? branch.output : null,
+    head: head.ok ? head.output : null,
+    dirty_count: dirtyCount,
+    remote_ref: remoteRef,
+    ahead_behind: aheadBehind?.ok ? aheadBehind.output : null
+  });
+}
+
+function formatBrainctlStatusReport(report: BrainctlStatusReport): string {
+  const lines = [
+    `brainstack status: ok=${report.ok} degraded=${report.degraded} profile=${report.profile || "unknown"} machine=${report.machine || "unknown"}`,
+    `config=${report.config_path}`
+  ];
+  for (const [name, section] of Object.entries(report.sections)) {
+    lines.push(`${section.state.toUpperCase()} ${name}: ${section.detail}${section.error ? ` (${section.error})` : ""}`);
+  }
+  return lines.join("\n");
+}
+
+async function commandStatus(args: ParsedArgs): Promise<void> {
+  const configPath = abs(requireFlagValue(args, "config") || brainstackDefaultConfigPath());
+  const timeoutMs = statusTimeoutMs(args);
+  const report: BrainctlStatusReport = {
+    schema_version: 1,
+    product: "brainstack",
+    generated_at: new Date().toISOString(),
+    config_path: configPath,
+    profile: null,
+    machine: null,
+    ok: false,
+    degraded: true,
+    sections: {}
+  };
+
+  let cfg: BrainstackConfig | null = null;
+  try {
+    cfg = await loadConfig(configPath, flag(args, "profile"), flag(args, "root"));
+    report.profile = cfg.profile;
+    report.machine = cfg.machine.name;
+    const write = safeBrainWriteStatus(cfg);
+    report.sections.config = statusSection(write.error ? "warn" : "ok", write.error ? "config loaded with write env warning" : "config loaded", {
+      profile: cfg.profile,
+      machine: cfg.machine,
+      harness: cfg.harness,
+      paths: {
+        product_repo: cfg.paths.productRepo,
+        state_root: cfg.paths.stateRoot,
+        config_root: cfg.paths.configRoot,
+        shared_brain_root: cfg.paths.sharedBrainRoot,
+        client_local_path: clientLocalPathAbs(cfg),
+        client_env_path: clientEnvPathAbs(cfg)
+      },
+      brain: {
+        public_base_url_configured: Boolean(cfg.brain.publicBaseUrl),
+        write_base_url_configured: write.baseUrlConfigured,
+        import_token_present: write.importTokenPresent
+      },
+      curation: cfg.curation
+    }, write.error ? { error: write.error } : {});
+  } catch (error) {
+    report.sections.config = statusSection("fail", "config load failed", undefined, {
+      available: false,
+      error: sanitizeStatusError(error)
+    });
+    finalizeBrainctlStatus(report);
+    console.log(hasFlag(args, "json") ? JSON.stringify(report, null, 2) : formatBrainctlStatusReport(report));
+    if (hasFlag(args, "strict")) {
+      throw new Error("brainctl status failed: config");
+    }
+    return;
+  }
+
+  report.sections.daemon = await collectStatusSection(() => collectDaemonStatusSection(cfg!, args, timeoutMs), timeoutMs);
+  report.sections.shared_brain = await collectStatusSection(() => collectSharedBrainStatus(cfg!, Math.min(timeoutMs, 2000)), timeoutMs);
+  report.sections.outbox = await collectStatusSection(() => collectOutboxStatusSection(cfg!), timeoutMs, "fail");
+  report.sections.hooks = await collectStatusSection(() => collectHooksStatusSection(cfg!), timeoutMs);
+  report.sections.skills = await collectStatusSection(() => collectSkillsStatusSection(cfg!), timeoutMs);
+  report.sections.brain_api = await collectStatusSection(() => collectBrainApiStatusSection(cfg!, timeoutMs), timeoutMs + 250);
+  report.sections.curator = await collectStatusSection(() => collectCuratorStatusSection(cfg!, timeoutMs), timeoutMs + 250);
+  report.sections.proposals = await collectStatusSection(() => collectProposalsStatusSection(cfg!, timeoutMs), timeoutMs + 250);
+  report.sections.telemux = await collectStatusSection(() => collectTelemuxStatusSection(cfg!, timeoutMs), timeoutMs + 250);
+  report.sections.product = await collectStatusSection(() => collectProductStatusSection(Math.min(timeoutMs, 2000)), timeoutMs);
+  finalizeBrainctlStatus(report);
+  console.log(hasFlag(args, "json") ? JSON.stringify(report, null, 2) : formatBrainctlStatusReport(report));
+  if (hasFlag(args, "strict") && !report.ok) {
+    const failures = Object.entries(report.sections)
+      .filter(([, section]) => section.state === "fail")
+      .map(([name]) => name);
+    throw new Error(`brainctl status failed: ${failures.join(", ") || "unknown"}`);
   }
 }
 
@@ -8426,15 +8934,16 @@ async function commandDaemonRun(args: ParsedArgs): Promise<void> {
   }
 }
 
-async function daemonServiceStatus(cfg: BrainstackConfig, args: ParsedArgs): Promise<DaemonServiceStatus> {
+async function daemonServiceStatus(cfg: BrainstackConfig, args: ParsedArgs, timeoutMs = 2000): Promise<DaemonServiceStatus> {
   const platform = daemonPlatform(args);
   const path = daemonServicePath(cfg, platform);
   const installed = existsSync(path);
+  const probeTimeoutMs = Math.min(Math.max(timeoutMs, 100), 10_000);
   if (platform === "systemd") {
     if (!commandPath("systemctl")) {
       return { platform, installed, running: null, path, detail: "systemctl unavailable" };
     }
-    const active = run(["systemctl", "--user", "is-active", "--quiet", BRAINSTACK_DAEMON_SERVICE], { check: false, timeoutMs: 2000 });
+    const active = run(["systemctl", "--user", "is-active", "--quiet", BRAINSTACK_DAEMON_SERVICE], { check: false, timeoutMs: probeTimeoutMs });
     return { platform, installed, running: active.code === 0, path, detail: active.code === 0 ? "active" : "not active" };
   }
   if (!commandPath("launchctl")) {
@@ -8442,7 +8951,7 @@ async function daemonServiceStatus(cfg: BrainstackConfig, args: ParsedArgs): Pro
   }
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
   const domain = uid === null ? `gui/${process.env.UID || ""}` : `gui/${uid}`;
-  const result = run(["launchctl", "print", `${domain}/${BRAINSTACK_DAEMON_LABEL}`], { check: false, timeoutMs: 2000 });
+  const result = run(["launchctl", "print", `${domain}/${BRAINSTACK_DAEMON_LABEL}`], { check: false, timeoutMs: probeTimeoutMs });
   return { platform, installed, running: result.code === 0, path, detail: result.code === 0 ? "loaded" : "not loaded" };
 }
 
@@ -8600,12 +9109,289 @@ async function commandPropose(args: ParsedArgs): Promise<void> {
   if (!title || !body) {
     throw new Error("propose requires --title and --body");
   }
-  await postBrainWriteOrQueue(cfg, "propose", {
+  const payload: Record<string, unknown> = {
     title,
     body,
     source_harness: flag(args, "source-harness") || cfg.harness.name,
     source_machine: flag(args, "source-machine") || cfg.machine.name
+  };
+  // Machine-proposal fields for curator-generated wiki changes.
+  const targetPage = requireFlagValue(args, "target-page");
+  if (targetPage) {
+    payload.target_page = targetPage;
+  }
+  const contentFile = requireFlagValue(args, "content-file");
+  if (contentFile) {
+    if (!targetPage) {
+      throw new Error("--content-file requires --target-page");
+    }
+    payload.proposed_content = await readFile(abs(contentFile), "utf8");
+  }
+  const baseSha = requireFlagValue(args, "base-sha256");
+  if (baseSha) {
+    payload.base_sha256 = baseSha;
+  }
+  const risk = requireFlagValue(args, "risk");
+  if (risk) {
+    if (!["low", "medium", "high"].includes(risk)) {
+      throw new Error("--risk must be low, medium, or high");
+    }
+    payload.risk = risk;
+  }
+  const confidence = requireFlagValue(args, "confidence");
+  if (confidence) {
+    const parsed = Number(confidence);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+      throw new Error("--confidence must be a number between 0 and 1");
+    }
+    payload.confidence = parsed;
+  }
+  const curatorRunId = requireFlagValue(args, "curator-run-id");
+  if (curatorRunId) {
+    payload.curator_run_id = curatorRunId;
+  }
+  const reason = requireFlagValue(args, "reason");
+  if (reason) {
+    payload.reason = reason;
+  }
+  if (hasFlag(args, "needs-human")) {
+    payload.status = "needs-human";
+  }
+  const sourceIds = requireFlagValue(args, "source-ids");
+  if (sourceIds) {
+    payload.source_ids = sourceIds.split(",").map((value) => value.trim()).filter(Boolean);
+  }
+  await postBrainWriteOrQueue(cfg, "propose", payload);
+}
+
+function brainApiBaseUrl(cfg: BrainstackConfig): string {
+  const env = clientEnv(cfg);
+  const fromEnv = process.env.BRAIN_BASE_URL || env.BRAIN_BASE_URL || cfg.brain.publicBaseUrl;
+  if (fromEnv) {
+    return fromEnv;
+  }
+  if (runsBraind(cfg)) {
+    return `http://${cfg.security.bindHost}:${cfg.brain.port}`;
+  }
+  throw new Error("no brain base URL configured; set brain.publicBaseUrl or BRAIN_BASE_URL");
+}
+
+function brainAdminToken(cfg: BrainstackConfig): string {
+  const token =
+    process.env.BRAIN_ADMIN_TOKEN || readEnvFile(join(cfg.paths.configRoot, "braind.secrets.env")).BRAIN_ADMIN_TOKEN || "";
+  if (!token) {
+    throw new Error("BRAIN_ADMIN_TOKEN is required for this action; run it on the control host or export BRAIN_ADMIN_TOKEN");
+  }
+  return token;
+}
+
+async function brainApiRequest(
+  cfg: BrainstackConfig,
+  method: "GET" | "POST",
+  path: string,
+  options: { admin?: boolean; body?: Record<string, unknown> } = {}
+): Promise<Record<string, unknown>> {
+  const baseUrl = brainApiBaseUrl(cfg);
+  const headers: Record<string, string> = {};
+  if (options.admin) {
+    headers.Authorization = `Bearer ${brainAdminToken(cfg)}`;
+  }
+  if (options.body) {
+    headers["Content-Type"] = "application/json";
+  }
+  const response = await fetch(new URL(path, baseUrl).toString(), {
+    method,
+    headers,
+    body: options.body ? JSON.stringify(options.body) : undefined,
+    signal: AbortSignal.timeout(brainWriteTimeoutMs())
   });
+  const text = await response.text();
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    throw new Error(`brain ${method} ${path} returned non-JSON HTTP ${response.status}`);
+  }
+  if (!response.ok) {
+    throw new Error(`brain ${method} ${path} failed with HTTP ${response.status}: ${String(parsed.error || "").slice(0, 500)}`);
+  }
+  return parsed;
+}
+
+function formatProposalLine(proposal: Record<string, unknown>): string {
+  return [
+    String(proposal.id),
+    `status=${String(proposal.status)}`,
+    proposal.target_page ? `target=${String(proposal.target_page)}` : null,
+    proposal.risk ? `risk=${String(proposal.risk)}` : null,
+    proposal.confidence !== null && proposal.confidence !== undefined ? `confidence=${String(proposal.confidence)}` : null,
+    `created=${String(proposal.created_at)}`,
+    `title=${String(proposal.title)}`
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+async function commandProposals(args: ParsedArgs): Promise<void> {
+  const sub = args.positional[0] || "list";
+  if (sub === "help" || sub === "--help" || sub === "-h") {
+    console.log(
+      "Usage: brainctl proposals list [--status open|pending|approved|applied|rejected|superseded|needs-human] [--json]\n       brainctl proposals show <id> [--json]\n       brainctl proposals approve <id>\n       brainctl proposals reject <id> [--reason TEXT]\n       brainctl proposals apply <id>"
+    );
+    return;
+  }
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  const decidedBy = `${process.env.USER || "operator"}@${cfg.machine.name}`;
+  switch (sub) {
+    case "list": {
+      const status = requireFlagValue(args, "status") || "open";
+      const result = await brainApiRequest(cfg, "GET", `/api/proposals?status=${encodeURIComponent(status)}`);
+      if (hasFlag(args, "json")) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      const proposals = Array.isArray(result.proposals) ? (result.proposals as Array<Record<string, unknown>>) : [];
+      console.log(`mode=${String(result.mode)} proposals=${proposals.length} (status filter: ${status})`);
+      for (const proposal of proposals) {
+        console.log(formatProposalLine(proposal));
+      }
+      return;
+    }
+    case "show": {
+      const id = args.positional[1];
+      if (!id) {
+        throw new Error("proposals show requires a proposal id");
+      }
+      const result = await brainApiRequest(cfg, "GET", `/api/proposals/${encodeURIComponent(id)}`);
+      if (hasFlag(args, "json")) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      const proposal = (result.proposal || {}) as Record<string, unknown>;
+      console.log(formatProposalLine(proposal));
+      if (proposal.reason) {
+        console.log(`reason: ${String(proposal.reason)}`);
+      }
+      if (Array.isArray(proposal.source_ids) && proposal.source_ids.length) {
+        console.log(`sources: ${(proposal.source_ids as string[]).join(", ")}`);
+      }
+      console.log("");
+      console.log(String(result.body || ""));
+      if (result.diff) {
+        console.log("");
+        console.log("--- proposed change ---");
+        console.log(String(result.diff));
+      }
+      return;
+    }
+    case "approve":
+    case "reject":
+    case "apply": {
+      const id = args.positional[1];
+      if (!id) {
+        throw new Error(`proposals ${sub} requires a proposal id`);
+      }
+      const body: Record<string, unknown> = { decided_by: decidedBy };
+      const reason = requireFlagValue(args, "reason");
+      if (reason) {
+        body.reason = reason;
+      }
+      const result = await brainApiRequest(cfg, "POST", `/api/proposals/${encodeURIComponent(id)}/${sub}`, { admin: true, body });
+      console.log(
+        [
+          `proposal=${id}`,
+          `action=${sub}`,
+          `status=${String(result.status)}`,
+          result.blocked_reason ? `blocked=${String(result.blocked_reason)}` : null,
+          Array.isArray(result.superseded_ids) && result.superseded_ids.length ? `superseded=${(result.superseded_ids as string[]).join(",")}` : null,
+          result.commit ? `commit=${String(result.commit)}` : null
+        ]
+          .filter(Boolean)
+          .join(" ")
+      );
+      return;
+    }
+    default:
+      throw new Error(`Unknown proposals subcommand: ${sub}`);
+  }
+}
+
+async function telemuxControlRequest(cfg: BrainstackConfig, path: string): Promise<Record<string, unknown>> {
+  if (!cfg.telemux.enabled) {
+    throw new Error("telemux is not enabled in this config; the curator routine runs through telemux. Enable telemux or run the brain-curator skill manually.");
+  }
+  const headers: Record<string, string> = {};
+  const dashboardToken = process.env.FACTORY_DASHBOARD_TOKEN?.trim();
+  if (dashboardToken) {
+    headers.Authorization = `Bearer ${dashboardToken}`;
+  }
+  const response = await fetch(`http://${cfg.telemux.dashboardHost}:${cfg.telemux.dashboardPort}${path}`, {
+    method: "POST",
+    headers,
+    signal: AbortSignal.timeout(120_000)
+  });
+  const text = await response.text();
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    throw new Error(`telemux control ${path} returned non-JSON HTTP ${response.status}; is telemux running?`);
+  }
+  if (!response.ok) {
+    throw new Error(`telemux control ${path} failed with HTTP ${response.status}: ${String(parsed.error || "").slice(0, 500)}`);
+  }
+  return parsed;
+}
+
+async function commandCurator(args: ParsedArgs): Promise<void> {
+  const sub = args.positional[0] || "status";
+  if (sub === "help" || sub === "--help" || sub === "-h") {
+    console.log("Usage: brainctl curator status [--json]\n       brainctl curator run\n       brainctl curator install");
+    return;
+  }
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
+  switch (sub) {
+    case "status": {
+      const result = await brainApiRequest(cfg, "GET", "/api/curator/status");
+      if (hasFlag(args, "json")) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      const curator = (result.curator || {}) as Record<string, unknown>;
+      const counts = (result.proposal_counts || {}) as Record<string, number>;
+      console.log(`mode=${String(result.mode)}`);
+      console.log(`installed=${curator.installed ? "yes" : "no"}`);
+      console.log(`last_run=${String(curator.last_run_finished_at || "(never)")} ok=${curator.last_run_ok === null || curator.last_run_ok === undefined ? "n/a" : String(curator.last_run_ok)}`);
+      console.log(`next_run=${String(curator.next_run_at || "(not scheduled)")}`);
+      console.log(`cursor=${String(curator.cursor || "(none)")}`);
+      console.log(
+        `proposals: pending=${counts.pending || 0} approved=${counts.approved || 0} needs-human=${counts["needs-human"] || 0} applied=${counts.applied || 0} rejected=${counts.rejected || 0} superseded=${counts.superseded || 0}`
+      );
+      const failures = Array.isArray(curator.last_run_failures) ? (curator.last_run_failures as string[]) : [];
+      if (failures.length) {
+        console.log("last run failures:");
+        for (const failure of failures) {
+          console.log(`  - ${failure}`);
+        }
+      }
+      if (curator.last_run_summary) {
+        console.log(`last run summary: ${String(curator.last_run_summary)}`);
+      }
+      return;
+    }
+    case "run": {
+      const result = await telemuxControlRequest(cfg, "/control/curator/run");
+      console.log(String(result.message || "curator run requested"));
+      return;
+    }
+    case "install": {
+      const result = await telemuxControlRequest(cfg, "/control/curator/install");
+      console.log(String(result.message || "curator install requested"));
+      return;
+    }
+    default:
+      throw new Error(`Unknown curator subcommand: ${sub}`);
+  }
 }
 
 async function commandOutbox(args: ParsedArgs): Promise<void> {
@@ -9877,6 +10663,8 @@ async function main(): Promise<void> {
       return await commandApplyRuntime(args, false);
     case "doctor":
       return await commandDoctor(args);
+    case "status":
+      return await commandStatus(args);
     case "daemon":
       return await commandDaemon(args);
     case "updates":
@@ -9889,6 +10677,10 @@ async function main(): Promise<void> {
       return await commandImportText(args);
     case "propose":
       return await commandPropose(args);
+    case "proposals":
+      return await commandProposals(args);
+    case "curator":
+      return await commandCurator(args);
     case "context":
       return await commandContext(args);
     case "search":

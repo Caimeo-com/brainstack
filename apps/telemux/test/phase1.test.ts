@@ -1867,6 +1867,189 @@ test("basic loops do not retarget user-owned update-check jobs", async () => {
   }
 }, 30_000);
 
+test("basic loops install the brain-curator routine and curator commands work end to end", async () => {
+  const statusPosts: Array<{ auth: string | null; body: Record<string, unknown> }> = [];
+  const decisions: Array<{ path: string; auth: string | null; body: Record<string, unknown> }> = [];
+  const port = 35_000 + Math.floor(Math.random() * 5_000);
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (req.method === "GET" && url.pathname === "/api/curator/status") {
+        return Response.json({
+          ok: true,
+          mode: "approval",
+          curator: {
+            installed: true,
+            last_run_finished_at: "2026-06-10T06:30:00Z",
+            last_run_ok: true,
+            last_run_failures: [],
+            cursor: "2026-06-10T06:30:00Z"
+          },
+          proposal_counts: { pending: 2, approved: 0, applied: 1, rejected: 0, superseded: 0, "needs-human": 1 }
+        });
+      }
+      if (req.method === "POST" && url.pathname === "/api/curator/status") {
+        statusPosts.push({ auth: req.headers.get("authorization"), body: (await req.json()) as Record<string, unknown> });
+        return Response.json({ ok: true });
+      }
+      if (req.method === "GET" && url.pathname === "/api/proposals") {
+        return Response.json({
+          ok: true,
+          mode: "approval",
+          proposals: [
+            {
+              id: "20260610t060000z-status-update",
+              title: "Status update",
+              status: "pending",
+              target_page: "wiki/Status/Machines.md",
+              risk: "low",
+              created_at: "2026-06-10T06:00:00Z"
+            },
+            {
+              id: "20260610t061000z-note-only",
+              title: "Note only",
+              status: "pending",
+              target_page: null,
+              risk: null,
+              created_at: "2026-06-10T06:10:00Z"
+            }
+          ]
+        });
+      }
+      if (req.method === "POST" && url.pathname === "/api/import") {
+        return Response.json({ ok: true, artifact_id: "curator-run-notes" });
+      }
+      const decision = url.pathname.match(/^\/api\/proposals\/([^/]+)\/(approve|reject|apply)$/);
+      if (req.method === "POST" && decision) {
+        decisions.push({ path: url.pathname, auth: req.headers.get("authorization"), body: (await req.json()) as Record<string, unknown> });
+        return Response.json({ ok: true, proposal_id: decision[1], action: decision[2], status: decision[2] === "reject" ? "rejected" : "applied", commit: "abc1234" });
+      }
+      return Response.json({ error: `unexpected ${req.method} ${url.pathname}` }, { status: 500 });
+    }
+  });
+  const curatorStateRoot = await mkdtemp(join(tmpdir(), "telemux-curator-state-"));
+  const fixture = await createFixture({
+    FACTORY_TELEGRAM_CONTROL_CHAT_ID: "4242",
+    BRAINSTACK_STATE_ROOT: curatorStateRoot,
+    BRAIN_BASE_URL: `http://127.0.0.1:${port}`,
+    BRAIN_IMPORT_TOKEN: "brain-import-token",
+    FACTORY_BRAIN_ADMIN_TOKEN: "brain-admin-token"
+  });
+
+  try {
+    const result = await ensureBasicLoops(fixture.config, fixture.contexts, fixture.workers, fixture.cronManager);
+    expect(result).toContain("curator created:");
+    const curatorJob = fixture.db.listCronJobs().find((job) => job.label === "brain-curator");
+    expect(curatorJob?.kind).toBe("codex");
+    expect(curatorJob?.runner).toBeNull();
+    expect(curatorJob?.executionContextSlug).toBe("brainstack-routines");
+    expect(curatorJob?.schedule.type).toBe("daily");
+
+    // Re-running basic loops updates the existing curator job instead of duplicating it.
+    const second = await ensureBasicLoops(fixture.config, fixture.contexts, fixture.workers, fixture.cronManager);
+    expect(second).toContain("curator updated:");
+    expect(fixture.db.listCronJobs().filter((job) => job.label === "brain-curator").length).toBe(1);
+
+    await fixture.commands.handleMessage(telegramMessage("/curator_status", 90));
+    const statusText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(statusText).toContain("Curator installed: yes");
+    expect(statusText).toContain("Mode: approval");
+    expect(statusText).toContain("needs-human");
+
+    await fixture.commands.handleMessage(telegramMessage("/proposals", 90));
+    const listText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(listText).toContain("Status update");
+    const shortcut = listText.match(/\/proposal_approve_([a-z0-9]{6,10})_1/);
+    expect(shortcut).not.toBeNull();
+    const token = shortcut![1];
+
+    // Approving a proposal that carries a wiki change applies it.
+    await fixture.commands.handleMessage(telegramMessage(`/proposal_approve_${token}_1`, 90));
+    await waitFor(() => decisions.length === 1);
+    expect(decisions[0].path).toBe("/api/proposals/20260610t060000z-status-update/apply");
+    expect(decisions[0].auth).toBe("Bearer brain-admin-token");
+    expect(String(decisions[0].body.decided_by)).toContain("telegram:");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("status=applied");
+
+    // Approving a note-only proposal records approval without an apply.
+    await fixture.commands.handleMessage(telegramMessage(`/proposal_approve_${token}_2`, 90));
+    await waitFor(() => decisions.length === 2);
+    expect(decisions[1].path).toBe("/api/proposals/20260610t061000z-note-only/approve");
+
+    await fixture.commands.handleMessage(telegramMessage(`/proposal_reject_${token}_1`, 90));
+    await waitFor(() => decisions.length === 3);
+    expect(decisions[2].path).toBe("/api/proposals/20260610t060000z-status-update/reject");
+
+    // Manual curator run dispatches the codex routine and reports status to braind.
+    await fixture.commands.handleMessage(telegramMessage("/curator_run", 90));
+    await waitFor(() => statusPosts.length >= 1, 20_000);
+    const reported = statusPosts.at(-1)!;
+    expect(reported.auth).toBe("Bearer brain-admin-token");
+    expect(reported.body.installed).toBe(true);
+    expect(reported.body.last_run_ok).toBe(true);
+    expect(typeof reported.body.cursor).toBe("string");
+  } finally {
+    server.stop(true);
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+    await rm(curatorStateRoot, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("telegram proposal approvals are refused without the brain admin token", async () => {
+  const port = 35_000 + Math.floor(Math.random() * 5_000);
+  let decisionAttempts = 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port,
+    fetch(req) {
+      const url = new URL(req.url);
+      if (req.method === "GET" && url.pathname === "/api/proposals") {
+        return Response.json({
+          ok: true,
+          mode: "approval",
+          proposals: [
+            {
+              id: "20260610t060000z-status-update",
+              title: "Status update",
+              status: "pending",
+              target_page: "wiki/Status/Machines.md",
+              risk: "low",
+              created_at: "2026-06-10T06:00:00Z"
+            }
+          ]
+        });
+      }
+      if (req.method === "POST") {
+        decisionAttempts += 1;
+      }
+      return Response.json({ error: "unexpected" }, { status: 500 });
+    }
+  });
+  const fixture = await createFixture({
+    FACTORY_TELEGRAM_CONTROL_CHAT_ID: "4242",
+    BRAIN_BASE_URL: `http://127.0.0.1:${port}`,
+    BRAIN_IMPORT_TOKEN: "brain-import-token"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/proposals", 91));
+    const listText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(listText).toContain("FACTORY_BRAIN_ADMIN_TOKEN is not set");
+    const token = listText.match(/\/proposal_approve_([a-z0-9]{6,10})_1/)![1];
+
+    await fixture.commands.handleMessage(telegramMessage(`/proposal_approve_${token}_1`, 91));
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("approve/reject from Telegram is disabled");
+    expect(decisionAttempts).toBe(0);
+  } finally {
+    server.stop(true);
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
 test("worker config reload fails closed after malformed or deleted workers file", async () => {
   const fixture = await createFixture();
 

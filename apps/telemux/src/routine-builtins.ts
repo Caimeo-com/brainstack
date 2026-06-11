@@ -41,15 +41,17 @@ function brainCuratorInstruction(): string {
     "- Use the `brain-curator` skill if it is installed or visible in this repo.",
     "- Preserve raw imports and proposals. Do not rewrite raw artifacts.",
     "- Do not mix private-journal material into the shared dev brain.",
-    "- Prefer proposals or clearly sourced wiki edits over unsourced summary dumping.",
+    "- Proposal generation is automatic; wiki mutation is policy-controlled by braind. Never edit canonical wiki pages directly: submit proposals and let the curation policy decide.",
     "",
     "Checklist:",
-    "1. Inspect the shared-brain clone locations under `~/shared-brain`, especially staging/serve clones if present.",
-    "2. Sync only with safe fast-forward commands when the tree is clean. If dirty or diverged, report the blocker instead of forcing.",
-    "3. Review recent raw imports, proposals, logs, and prior curator state. Keep a small cursor in this workspace if useful.",
-    "4. Produce a sourced curation report with: accepted/suggested wiki updates, contradictions, stale facts, skipped private-sensitive items, and exact source paths/ids.",
-    "5. If `brainctl propose` is configured, submit concise proposals for worthwhile wiki updates; otherwise record proposal drafts as artifacts.",
-    "6. Update `.factory/SUMMARY.md`, `.factory/TODO.md`, and `.factory/ARTIFACTS.md` so the next curator pass can resume."
+    "1. Read the curation cursor first: `GET /api/curator/status` on the brain (or `brainctl curator status`). Review imports, logs, and proposals newer than the cursor.",
+    "2. Inspect the shared-brain clone locations under `~/shared-brain`, especially staging/serve clones if present.",
+    "3. Sync only with safe fast-forward commands when the tree is clean. If dirty or diverged, report the blocker instead of forcing.",
+    "4. Group new material by topic/source type and draft sourced wiki diffs as full proposed page contents.",
+    "5. Submit machine proposals with `brainctl propose --title ... --body ... --target-page wiki/... --content-file <full proposed page> --base-sha256 <sha256 of current page, or absent> --risk low|medium|high --confidence 0..1 --source-ids id1,id2 --curator-run-id <this run>`. Use --needs-human for anything contradictory or ambiguous.",
+    "6. Risk guidance: low = additive, sourced, small (status/source pages); medium = restructures or edits prose; high = deletes content, changes decisions, or touches runbooks.",
+    "7. Produce a sourced curation report with: submitted proposals, contradictions, stale facts, skipped private-sensitive items, and exact source paths/ids.",
+    "8. Update `.factory/SUMMARY.md`, `.factory/TODO.md`, and `.factory/ARTIFACTS.md` so the next curator pass can resume."
   ].join("\n");
 }
 

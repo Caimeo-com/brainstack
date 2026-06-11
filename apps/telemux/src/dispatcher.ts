@@ -45,6 +45,11 @@ export interface DispatchOptions {
   sourceLabel?: string | null;
   queuedTurnId?: string | null;
   userId?: number | null;
+  /**
+   * Completion hook for callers that need run outcomes (e.g. curator status
+   * reporting). Not serializable: queued-turn replays drop it.
+   */
+  onFinished?: (status: Exclude<QueuedTurnStatus, "queued" | "running" | "abandoned">) => Promise<void> | void;
 }
 
 function nowStamp(): string {
@@ -491,6 +496,15 @@ export class Dispatcher {
     }
 
     const job = this.runJob(mode, savedContext, trimmedInstruction, replyTarget, logPath, options.telegramInput || null, options);
+    if (options.onFinished) {
+      const hook = options.onFinished;
+      void job
+        .then(
+          (status) => hook(status),
+          () => hook("failed")
+        )
+        .catch((error) => console.error("dispatch onFinished hook failed", error));
+    }
     if (options.queuedTurnId) {
       void job
         .then((status) => {
