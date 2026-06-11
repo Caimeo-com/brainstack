@@ -16,6 +16,7 @@ final class AppModel: ObservableObject {
   @Published private(set) var actionLog: [ActionOutcome] = []
   @Published private(set) var proposals: [ProposalSummary] = []
   @Published private(set) var proposalsError: String?
+  @Published private(set) var isLoadingProposals = false
   @Published private(set) var adminAvailability: AdminAvailability = .unknown
 
   @Published var binaryPathPreference: String? {
@@ -227,9 +228,14 @@ final class AppModel: ObservableObject {
     guard operatorModeEnabled, let client = client() else {
       return
     }
+    guard !isLoadingProposals else {
+      return
+    }
+    isLoadingProposals = true
     Task {
       let (parsed, outcome) = await client.fetchOpenProposals()
       await MainActor.run {
+        self.isLoadingProposals = false
         self.lastDurations["proposals list"] = outcome.duration
         if outcome.unsupported {
           self.proposalsError = "Proposals are unsupported by the installed brainctl/control host."
@@ -261,6 +267,8 @@ final class AppModel: ObservableObject {
           self.adminAvailability = .unavailable
         } else if outcome.succeeded {
           self.adminAvailability = .available
+        } else {
+          self.adminAvailability = .unavailable
         }
         // Applying or rejecting changes proposal/wiki state; refresh both surfaces.
         self.refresh()
@@ -272,11 +280,28 @@ final class AppModel: ObservableObject {
   // MARK: - Open / copy helpers
 
   func openWiki() {
-    guard let base = lastReport?.sections["brain_api"]?.data?["base_url"]?.stringValue, let url = URL(string: base) else {
+    guard let url = brainURL() else {
       record(ActionOutcome(title: "Open Wiki", succeeded: false, unsupported: false, adminUnavailable: false, summary: "Brain API base URL is unavailable in the last status.", output: "", duration: 0))
       return
     }
     NSWorkspace.shared.open(url)
+  }
+
+  func openCurationPage() {
+    guard let url = brainURL(fragment: "curation") else {
+      record(ActionOutcome(title: "Open Curation Page", succeeded: false, unsupported: false, adminUnavailable: false, summary: "Brain API base URL is unavailable in the last status.", output: "", duration: 0))
+      return
+    }
+    NSWorkspace.shared.open(url)
+  }
+
+  private func brainURL(fragment: String? = nil) -> URL? {
+    guard let base = lastReport?.sections["brain_api"]?.data?["base_url"]?.stringValue,
+          var components = URLComponents(string: base) else {
+      return nil
+    }
+    components.fragment = fragment
+    return components.url
   }
 
   func openSharedBrainFolder() {

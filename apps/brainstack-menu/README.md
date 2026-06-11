@@ -20,7 +20,7 @@ Refresh, Open Wiki, Open Shared Brain/Config folders, Copy Redacted Diagnostics,
 
 ## Operator Mode
 
-Opt-in via Preferences. Adds curator status/run and proposal list/approve/reject/apply. Every wiki-mutating action shows a confirmation dialog with the proposal id, title, and target. The app never auto-approves or auto-applies anything, and it never stores or prints tokens — admin actions work only when `brainctl` can already reach `BRAIN_ADMIN_TOKEN` on the machine (control-host secrets env or shell env). When it cannot, the app shows an unavailable state with setup guidance.
+Opt-in via Preferences. Adds curator status/run and proposal list/approve/reject/apply. Every wiki-mutating action shows a confirmation dialog with the proposal id, title, and target. The app never auto-approves or auto-applies anything, and it never stores or prints tokens. Admin actions work when `brainctl` can reach `BRAIN_ADMIN_TOKEN` locally, or when an enrolled client config has an explicit control-host SSH route so `brainctl` can forward the proposal decision to the control host. When neither path works, the app shows the decision path as blocked with command output for diagnosis.
 
 ## Build, sign, and distribute
 

@@ -41,7 +41,11 @@ struct PreferencesView: View {
           set: { updateLaunchAtLogin($0) }
         ))
         if let launchAtLoginError {
-          Text(launchAtLoginError).font(.caption).foregroundColor(.orange)
+          Text(launchAtLoginError)
+            .font(.caption)
+            .foregroundColor(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+            .textSelection(.enabled)
         }
         Toggle("Enable notifications", isOn: $model.notificationsEnabled)
         Text("Notifications fire only on state transitions (broken, recovered, outbox stuck, curator failing).")
@@ -53,7 +57,7 @@ struct PreferencesView: View {
 
       Section {
         Toggle("Enable Operator Mode", isOn: $model.operatorModeEnabled)
-        Text("Operator Mode exposes curator runs and proposal approve/reject/apply. Actions only work when brainctl can already reach admin auth on this machine; the app never stores tokens.")
+        Text("Operator Mode exposes curator runs and proposal approve/reject/apply. Actions work when brainctl can reach admin auth locally or through the enrolled control host; the app never stores tokens.")
           .font(.caption)
           .foregroundColor(.secondary)
       } header: {
@@ -113,7 +117,7 @@ struct PreferencesView: View {
     case .requiresApproval:
       launchAtLoginError = "macOS requires approval in System Settings > General > Login Items."
     case .notFound:
-      launchAtLoginError = "Login item registration is unavailable for this app bundle."
+      launchAtLoginError = "macOS cannot register this app copy as a login item. Use a notarized release in /Applications; local signed-only builds can run manually but may still be rejected by ServiceManagement."
     @unknown default:
       launchAtLoginError = "Unknown login item status: \(status.rawValue)"
     }

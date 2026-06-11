@@ -16,6 +16,7 @@ struct DashboardView: View {
   // moment later (which can make AppKit re-place it).
   @State private var scrollContentHeight: CGFloat = 360
   @State private var showDetails = false
+  @State private var showMoreActions = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
@@ -31,14 +32,14 @@ struct DashboardView: View {
           } else {
             attentionSummary
             actions
+            if model.operatorModeEnabled {
+              Divider()
+              OperatorView(model: model)
+            }
             DisclosureGroup("Details", isExpanded: $showDetails) {
               sectionList
             }
             .font(.caption)
-          }
-          if model.operatorModeEnabled {
-            Divider()
-            OperatorView(model: model)
           }
           if let action = model.lastAction {
             Divider()
@@ -83,9 +84,10 @@ struct DashboardView: View {
           if let profile = model.lastReport?.profile {
             Text(profile)
               .font(.caption)
+              .foregroundColor(.black)
               .padding(.horizontal, 6)
               .padding(.vertical, 1)
-              .background(Color.secondary.opacity(0.15))
+              .background(Color.white.opacity(0.88))
               .clipShape(Capsule())
           }
         }
@@ -294,53 +296,66 @@ struct DashboardView: View {
       HStack(spacing: 8) {
         Button("Open Wiki") { model.openWiki() }
         if model.operatorModeEnabled {
-          Button("Review Proposals") { model.loadProposals() }
+          Button("Review Proposals") {
+            showDetails = false
+            model.loadProposals()
+          }
+          .disabled(model.isLoadingProposals || model.busyAction != nil)
         }
         Button("Diagnostics") { model.copyDiagnostics() }
-        Menu("More") {
-          Button("Open Shared Brain") { model.openSharedBrainFolder() }
-          Button("Open Config Folder") { model.openConfigFolder() }
-          Divider()
-          Button("Run Doctor") { model.runAction("Doctor") { await $0.doctor() } }
-          Button("Check Stack Updates") { model.runAction("Check Stack Updates", refreshAfter: false) { await $0.updates() } }
-          Button("Install Curator") {
-            if Confirm.ask(title: "Install Curator", message: "Install the brain-curator routine on the control host? It schedules proposal generation; it does not approve or apply wiki edits.") {
-              model.runAction("Install Curator") { await $0.curatorInstall() }
-            }
-          }
-          Button("Copy Curator Install Command") { model.copyCuratorInstallCommand() }
-          Divider()
-          Button("Flush Outbox") {
-            if Confirm.ask(title: "Flush Outbox", message: "Flush queued outbox writes to the brain now?") {
-              model.runAction("Flush Outbox") { await $0.outboxFlush() }
-            }
-          }
-          Button("Refresh Skills") {
-            if Confirm.ask(title: "Refresh Skills", message: "Refresh shared skills from the shared brain?") {
-              model.runAction("Refresh Skills") { await $0.skillsRefresh() }
-            }
-          }
-          Button("Install/Restart Daemon") {
-            if Confirm.ask(title: "Install/Restart Daemon", message: "Install (or reinstall and restart) the brainstackd user service?") {
-              model.runAction("Install/Restart Daemon") { await $0.daemonInstall() }
-            }
-          }
-          Button("Install/Repair Hooks") {
-            if Confirm.ask(title: "Install/Repair Hooks", message: "Install or repair Brainstack hooks for Codex, Claude, and Cursor?") {
-              model.runAction("Install/Repair Hooks") { await $0.hooksInstall() }
-            }
-          }
+        Button(showMoreActions ? "Less" : "More...") {
+          showMoreActions.toggle()
         }
         .disabled(model.busyAction != nil)
       }
       .controlSize(.small)
+      if showMoreActions {
+        secondaryActions
+      }
       if let busy = model.busyAction {
         HStack(spacing: 6) {
           ProgressView().controlSize(.small)
           Text("Running: \(busy)…").font(.caption).foregroundColor(.secondary)
         }
+      } else if model.isLoadingProposals {
+        HStack(spacing: 6) {
+          ProgressView().controlSize(.small)
+          Text("Loading proposals…").font(.caption).foregroundColor(.secondary)
+        }
       }
     }
+  }
+
+  private var secondaryActions: some View {
+    let columns = [GridItem(.adaptive(minimum: 110), spacing: 6)]
+    return LazyVGrid(columns: columns, alignment: .leading, spacing: 6) {
+      Button("Shared Brain") { model.openSharedBrainFolder() }
+      Button("Config") { model.openConfigFolder() }
+      Button("Run Doctor") { model.runAction("Doctor") { await $0.doctor() } }
+      Button("Check Updates") { model.runAction("Check Stack Updates", refreshAfter: false) { await $0.updates() } }
+      Button("Flush Outbox") {
+        if Confirm.ask(title: "Flush Outbox", message: "Flush queued outbox writes to the brain now?") {
+          model.runAction("Flush Outbox") { await $0.outboxFlush() }
+        }
+      }
+      Button("Refresh Skills") {
+        if Confirm.ask(title: "Refresh Skills", message: "Refresh shared skills from the shared brain?") {
+          model.runAction("Refresh Skills") { await $0.skillsRefresh() }
+        }
+      }
+      Button("Daemon") {
+        if Confirm.ask(title: "Install/Restart Daemon", message: "Install (or reinstall and restart) the brainstackd user service?") {
+          model.runAction("Install/Restart Daemon") { await $0.daemonInstall() }
+        }
+      }
+      Button("Hooks") {
+        if Confirm.ask(title: "Install/Repair Hooks", message: "Install or repair Brainstack hooks for Codex, Claude, and Cursor?") {
+          model.runAction("Install/Repair Hooks") { await $0.hooksInstall() }
+        }
+      }
+    }
+    .controlSize(.small)
+    .disabled(model.busyAction != nil)
   }
 
   private func lastActionView(_ action: ActionOutcome) -> some View {
@@ -418,11 +433,12 @@ struct SectionRowView: View {
       Text(sectionMessage(name: name, section: section))
         .font(.system(size: 11))
         .foregroundColor(.secondary)
-        .lineLimit(1)
-        .truncationMode(.tail)
+        .lineLimit(2)
+        .truncationMode(.middle)
         .help(helpText)
       Spacer(minLength: 0)
     }
+    .help(helpText)
   }
 
   private var label: String {

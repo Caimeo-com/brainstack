@@ -58,15 +58,15 @@ The wiki home page shows the curation panel: mode, curator installed, last/next 
 ```bash
 brainctl proposals list [--status open|pending|approved|applied|rejected|superseded|needs-human] [--json]
 brainctl proposals show <id> [--json]
-brainctl proposals approve <id>
-brainctl proposals reject <id> [--reason TEXT]
-brainctl proposals apply <id>
+brainctl proposals approve <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
+brainctl proposals reject <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
+brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
 brainctl curator status [--json]
 brainctl curator run
 brainctl curator install
 ```
 
-Reads are unauthenticated within the tailnet; approve/reject/apply require `BRAIN_ADMIN_TOKEN` (control host). `curator run`/`curator install` talk to the local telemux dashboard control endpoints.
+Reads are unauthenticated within the tailnet; approve/reject/apply require `BRAIN_ADMIN_TOKEN` on the control host. On an enrolled client, proposal decision commands can forward over the explicit control SSH route from `--via`, `BRAINSTACK_TELEGRAM_VIA`, or `client.telegramVia`, using the configured pinned known-hosts file by default. `curator run`/`curator install` talk to the local telemux dashboard control endpoints.
 
 Telegram mirrors the basics:
 

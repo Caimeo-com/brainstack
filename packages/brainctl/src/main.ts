@@ -9452,11 +9452,78 @@ function formatProposalLine(proposal: Record<string, unknown>): string {
     .join(" ");
 }
 
+type ProposalDecisionAction = "approve" | "reject" | "apply";
+
+function proposalDecisionControlSshTarget(cfg: BrainstackConfig, args: ParsedArgs): string | null {
+  const via = requireFlagValue(args, "via") || process.env.BRAINSTACK_TELEGRAM_VIA?.trim() || cfg.client.telegramVia;
+  return via ? validateInviteSshTarget(via, "proposal decision SSH target") : null;
+}
+
+function proposalDecisionRemoteScript(remoteRepo: string, action: ProposalDecisionAction, id: string, reason?: string): string {
+  const reasonArgs = reason ? ` --reason ${quoteForBash(reason)}` : "";
+  return `
+set -euo pipefail
+brainstack_expand_home() {
+  case "$1" in
+    "~") printf '%s\\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
+    *) printf '%s\\n' "$1" ;;
+  esac
+}
+repo="$(brainstack_expand_home ${quoteForBash(remoteRepo)})"
+cd "$repo"
+if [ -x "$HOME/.bun/bin/bun" ]; then
+  bun_bin="$HOME/.bun/bin/bun"
+else
+  bun_bin="$(command -v bun)"
+fi
+"$bun_bin" --no-env-file run packages/brainctl/src/main.ts proposals ${action} ${quoteForBash(id)} --config "$HOME/.config/brainstack/brainstack.yaml"${reasonArgs}
+`.trim();
+}
+
+async function maybeRunRemoteProposalDecision(cfg: BrainstackConfig, args: ParsedArgs, action: ProposalDecisionAction, id: string, reason?: string): Promise<boolean> {
+  if (cfg.telemux.enabled || process.env.BRAIN_ADMIN_TOKEN || readEnvFile(join(cfg.paths.configRoot, "braind.secrets.env")).BRAIN_ADMIN_TOKEN) {
+    return false;
+  }
+  const via = proposalDecisionControlSshTarget(cfg, args);
+  if (!via) {
+    return false;
+  }
+  const worker = telegramControlWorker(via);
+  const remoteRepo = requireFlagValue(args, "remote-repo") || process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() || cfg.client.telegramRemoteRepo || "~/brainstack";
+  const knownHostsPath = telegramKnownHostsPath(cfg, args);
+  const sshTrustMode = telegramSshTrustMode(args);
+  if (sshTrustMode === "accept-new") {
+    await ensureDir(dirname(knownHostsPath));
+  }
+  const remoteScript = proposalDecisionRemoteScript(remoteRepo, action, id, reason);
+  const result = run(
+    [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=8",
+      ...telegramSshTrustArgs(sshTrustMode, knownHostsPath),
+      ...workerSshPortArgs(worker),
+      workerRemoteTarget(worker),
+      `bash -lc ${quoteForBash(remoteScript)}`
+    ],
+    { check: false, timeoutMs: 120_000 }
+  );
+  if (result.code !== 0) {
+    throw new Error(`proposal ${action} failed over ssh with exit ${result.code}\n${result.stderr || result.stdout}`);
+  }
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  return true;
+}
+
 async function commandProposals(args: ParsedArgs): Promise<void> {
   const sub = args.positional[0] || "list";
   if (sub === "help" || sub === "--help" || sub === "-h") {
     console.log(
-      "Usage: brainctl proposals list [--status open|pending|approved|applied|rejected|superseded|needs-human] [--json]\n       brainctl proposals show <id> [--json]\n       brainctl proposals approve <id>\n       brainctl proposals reject <id> [--reason TEXT]\n       brainctl proposals apply <id>"
+      "Usage: brainctl proposals list [--status open|pending|approved|applied|rejected|superseded|needs-human] [--json]\n       brainctl proposals show <id> [--json]\n       brainctl proposals approve <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals reject <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]"
     );
     return;
   }
@@ -9515,6 +9582,9 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
       const reason = requireFlagValue(args, "reason");
       if (reason) {
         body.reason = reason;
+      }
+      if (await maybeRunRemoteProposalDecision(cfg, args, sub, id, reason)) {
+        return;
       }
       const result = await brainApiRequest(cfg, "POST", `/api/proposals/${encodeURIComponent(id)}/${sub}`, { admin: true, body });
       console.log(

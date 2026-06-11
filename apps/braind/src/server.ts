@@ -2206,7 +2206,7 @@ function renderCurationPanel(overview: Awaited<ReturnType<typeof curationOvervie
     `<li><strong>${htmlEscape(record.status)}</strong> ${htmlEscape(record.title)}${
       record.targetPage ? ` → <code>${htmlEscape(record.targetPage)}</code>` : ""
     } <span class="pill">${htmlEscape(record.risk || "risk n/a")}</span> <span class="pill">${htmlEscape(record.createdAt)}</span></li>`;
-  return `<div class="grid cols">
+  return `<div id="curation" class="grid cols">
       <section class="card">
         <h2>Curation</h2>
         <div class="status">

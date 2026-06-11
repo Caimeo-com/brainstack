@@ -3083,6 +3083,7 @@ describe("braind write safety", () => {
       // Wiki home shows the curation panel.
       const home = await (await fetch(`http://127.0.0.1:${port}/`)).text();
       expect(home).toContain("Curation");
+      expect(home).toContain('id="curation"');
       expect(home).toContain("Mode:");
 
       // Unsafe target pages are rejected before any side effect.
@@ -7066,6 +7067,68 @@ describe("public release hygiene", () => {
       expect(sshArgs).toContain("operator@control.example");
       expect(sshArgs).toContain("/home/operator/brainstack");
       expect(sshArgs).toContain("curator install --config");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("proposal decisions forward from client config to the control host over pinned SSH", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-proposal-decision-client-"));
+    try {
+      const binDir = join(dir, "bin");
+      const configRoot = join(dir, "config");
+      await mkdir(binDir, { recursive: true });
+      await mkdir(configRoot, { recursive: true });
+      const argsCapture = join(dir, "ssh-args.txt");
+      await writeFile(join(configRoot, "ssh_known_hosts"), "control.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeBrainstackControlKeyForTestsOnly\n");
+      const fakeSsh = join(binDir, "ssh");
+      await writeFile(
+        fakeSsh,
+        [
+          "#!/usr/bin/env bash",
+          "set -euo pipefail",
+          `printf '<%s>\\n' "$@" > '${argsCapture}'`,
+          "echo 'proposal=proposal-1 action=reject status=rejected'",
+          ""
+        ].join("\n")
+      );
+      await chmod(fakeSsh, 0o755);
+
+      const configPath = join(dir, "client.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: mac-client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  configRoot: ${configRoot}`,
+          "client:",
+          "  remoteSsh: operator@control.example:/home/operator/shared-brain/bare/shared-brain.git",
+          "  telegramVia: operator@control.example",
+          "  telegramRemoteRepo: /home/operator/brainstack",
+          ""
+        ].join("\n")
+      );
+
+      const result = runBrainctl(["proposals", "reject", "proposal-1", "--reason", "not useful", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAIN_ADMIN_TOKEN: ""
+      });
+      expectSuccess(result);
+      expect(result.stdout).toContain("status=rejected");
+      const sshArgs = await readFile(argsCapture, "utf8");
+      expect(sshArgs).toContain("BatchMode=yes");
+      expect(sshArgs).toContain("ConnectTimeout=8");
+      expect(sshArgs).toContain("StrictHostKeyChecking=yes");
+      expect(sshArgs).toContain(`UserKnownHostsFile=${join(configRoot, "ssh_known_hosts")}`);
+      expect(sshArgs).toContain("operator@control.example");
+      expect(sshArgs).toContain("/home/operator/brainstack");
+      expect(sshArgs).toContain("proposals reject '\\''proposal-1'\\'' --config");
+      expect(sshArgs).toContain("--reason '\\''not useful'\\''");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
