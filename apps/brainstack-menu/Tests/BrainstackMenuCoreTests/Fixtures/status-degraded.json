@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "product": "brainstack",
+  "generated_at": "2026-06-11T07:00:00Z",
+  "config_path": "/Users/operator/.config/brainstack/brainstack.yaml",
+  "profile": "client-macos",
+  "machine": "mac-client",
+  "ok": true,
+  "degraded": true,
+  "sections": {
+    "config": { "state": "ok", "ok": true, "available": true, "detail": "config loaded" },
+    "daemon": { "state": "warn", "ok": false, "available": true, "detail": "service=stopped fresh=false" },
+    "shared_brain": { "state": "ok", "ok": true, "available": true, "detail": "checkouts=1 unhealthy=0" },
+    "outbox": { "state": "ok", "ok": true, "available": true, "detail": "queued=3 terminal=0 corrupt=0" },
+    "hooks": { "state": "warn", "ok": false, "available": true, "detail": "codex hooks missing" },
+    "brain_api": { "state": "warn", "ok": false, "available": false, "detail": "base_url=https://brain.example health=unavailable ready=unavailable" },
+    "curator": { "state": "warn", "ok": false, "available": false, "detail": "curator status unavailable HTTP 0" }
+  }
+}

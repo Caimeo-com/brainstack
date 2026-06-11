@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "product": "brainstack",
+  "generated_at": "2026-06-11T07:00:00Z",
+  "config_path": "/Users/operator/.config/brainstack/brainstack.yaml",
+  "profile": "client-macos",
+  "machine": "mac-client",
+  "ok": true,
+  "degraded": true,
+  "sections": {
+    "config": { "state": "ok", "ok": true, "available": true, "detail": "config loaded" },
+    "daemon": { "state": "ok", "ok": true, "available": true, "detail": "service=running fresh=true" },
+    "shared_brain": { "state": "ok", "ok": true, "available": true, "detail": "checkouts=1 unhealthy=0" },
+    "outbox": { "state": "ok", "ok": true, "available": true, "detail": "queued=0 terminal=0 corrupt=0" },
+    "brain_api": { "state": "ok", "ok": true, "available": true, "detail": "base_url=https://brain.example health=ok ready=ok" },
+    "curator": { "state": "warn", "ok": false, "available": false, "detail": "curator status unavailable HTTP 404" },
+    "proposals": { "state": "warn", "ok": false, "available": false, "detail": "open proposal list unavailable HTTP 404" }
+  }
+}

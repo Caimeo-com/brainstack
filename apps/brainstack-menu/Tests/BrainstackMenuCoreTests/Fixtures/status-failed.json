@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "product": "brainstack",
+  "generated_at": "2026-06-11T07:00:00Z",
+  "config_path": "/Users/operator/.config/brainstack/brainstack.yaml",
+  "profile": "client-macos",
+  "machine": "mac-client",
+  "ok": false,
+  "degraded": true,
+  "sections": {
+    "config": { "state": "ok", "ok": true, "available": true, "detail": "config loaded" },
+    "outbox": { "state": "fail", "ok": false, "available": false, "detail": "queued=4 terminal=1 corrupt=2" },
+    "shared_brain": { "state": "warn", "ok": false, "available": true, "detail": "checkouts=1 unhealthy=1" }
+  }
+}

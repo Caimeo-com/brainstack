@@ -3,6 +3,7 @@
 !.env.example
 *.pem
 *.key
+*.p8
 *.token
 node_modules/
 .bun/

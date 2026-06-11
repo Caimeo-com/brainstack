@@ -136,7 +136,10 @@ async function writeFixtureConfig(path: string): Promise<void> {
   );
 }
 
-async function writeFixtureClientConfig(path: string, options: { home: string; stateRoot: string; localPath?: string }): Promise<void> {
+async function writeFixtureClientConfig(
+  path: string,
+  options: { home: string; stateRoot: string; localPath?: string; productRepo?: string; telegramVia?: string; telegramRemoteRepo?: string }
+): Promise<void> {
   await writeFile(
     path,
     [
@@ -148,9 +151,12 @@ async function writeFixtureClientConfig(path: string, options: { home: string; s
       "paths:",
       `  home: ${options.home}`,
       `  stateRoot: ${options.stateRoot}`,
+      ...(options.productRepo ? [`  productRepo: ${options.productRepo}`] : []),
       "client:",
       `  localPath: ${options.localPath || join(options.home, "shared-brain")}`,
       "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+      ...(options.telegramVia ? [`  telegramVia: ${options.telegramVia}`] : []),
+      ...(options.telegramRemoteRepo ? [`  telegramRemoteRepo: ${options.telegramRemoteRepo}`] : []),
       ""
     ].join("\n")
   );
@@ -232,7 +238,7 @@ async function listFiles(root: string): Promise<string[]> {
   for (const entry of entries) {
     const fullPath = join(root, entry.name);
     if (entry.isDirectory()) {
-      if (["node_modules", "dist", ".git"].includes(entry.name)) {
+      if (["node_modules", "dist", ".git", ".build"].includes(entry.name)) {
         continue;
       }
       files.push(...(await listFiles(fullPath)));
@@ -569,6 +575,70 @@ telemux:
       await rm(dir, { recursive: true, force: true });
     }
   }, 10_000);
+
+  test("status json treats missing product checkout as informational for clients", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-status-client-product-"));
+    try {
+      const configPath = join(dir, "client.yaml");
+      await writeFixtureClientConfig(configPath, {
+        home: join(dir, "home"),
+        stateRoot: join(dir, "state")
+      });
+      const status = runBrainctl(["status", "--json", "--config", configPath, "--timeout-ms", "200"], { HOME: join(dir, "home") });
+      expectSuccess(status);
+      const aggregate = JSON.parse(status.stdout) as Record<string, any>;
+      expect(aggregate.sections.product.state).toBe("disabled");
+      expect(aggregate.sections.product.detail).toContain("source checkout not installed");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("status json reports client control source state", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-status-control-source-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const binDir = join(dir, "bin");
+      const configPath = join(dir, "client.yaml");
+      await mkdir(binDir, { recursive: true });
+      await writeFile(
+        join(binDir, "ssh"),
+        [
+          "#!/usr/bin/env bash",
+          "printf 'repo=/home/operator/brainstack\\n'",
+          "printf 'state=ok\\n'",
+          "printf 'branch=main\\n'",
+          "printf 'head=abcdef0123456789\\n'",
+          "printf 'short=abcdef0\\n'",
+          "printf 'dirty_count=0\\n'",
+          "printf 'remote_ref=origin/main\\n'",
+          "printf 'origin_head=abcdef0123456789\\n'",
+          "printf 'ahead_behind=0\\t0\\n'"
+        ].join("\n")
+      );
+      await chmod(join(binDir, "ssh"), 0o755);
+      await writeFixtureClientConfig(configPath, {
+        home,
+        stateRoot,
+        productRepo: join(dir, "missing-product"),
+        telegramVia: "operator@brain-control",
+        telegramRemoteRepo: "~/brainstack"
+      });
+      const status = runBrainctl(["status", "--json", "--config", configPath, "--timeout-ms", "500"], {
+        HOME: home,
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      });
+      expectSuccess(status);
+      const aggregate = JSON.parse(status.stdout) as Record<string, any>;
+      expect(aggregate.sections.control_source.state).toBe("ok");
+      expect(aggregate.sections.control_source.detail).toContain("control host up to date");
+      expect(aggregate.sections.control_source.data.machine).toBe("operator@brain-control");
+      expect(aggregate.sections.control_source.data.short).toBe("abcdef0");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 
   test("rejects private-journal until separate private-brain routing is implemented", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-private-profile-"));
@@ -6418,10 +6488,20 @@ describe("public release hygiene", () => {
       await chmod(join(binDir, "brew"), 0o755);
       await chmod(join(binDir, "pacman"), 0o755);
       await chmod(join(binDir, "sleepy-shell"), 0o755);
+      const productRepo = join(dir, "product");
+      await mkdir(productRepo, { recursive: true });
+      git(["init"], productRepo);
+      git(["config", "user.email", "operator@example.test"], productRepo);
+      git(["config", "user.name", "Operator"], productRepo);
+      await writeFile(join(productRepo, "README.md"), "# product\n");
+      git(["add", "README.md"], productRepo);
+      git(["commit", "-m", "initial"], productRepo);
+      const productHead = git(["rev-parse", "HEAD"], productRepo);
       await writeFixtureConfig(configPath);
+      const fixtureConfig = await readFile(configPath, "utf8");
       await writeFile(
         configPath,
-        `${await readFile(configPath, "utf8")}harness:\n  name: codex\n  bin: ${join(binDir, "codex")}\n`
+        `${fixtureConfig.replace("paths:\n  home: /tmp/brainstack-test-home\n", `paths:\n  home: /tmp/brainstack-test-home\n  productRepo: ${productRepo}\n`)}harness:\n  name: codex\n  bin: ${join(binDir, "codex")}\n`
       );
       const result = runBrainctl(["updates", "--config", configPath], {
         PATH: `${binDir}:${process.env.PATH || ""}`,
@@ -6429,6 +6509,8 @@ describe("public release hygiene", () => {
         BRAINSTACK_UPDATE_PROBE_COMMANDS: "brew,pacman"
       });
       expectSuccess(result);
+      expect(result.stdout).toContain(`brainstack_source=${productRepo}`);
+      expect(result.stdout).toContain(`brainstack_head=${productHead}`);
       expect(result.stdout).toContain("brainstack_head=");
       expect(result.stdout).toContain("remote_main_ref=");
       expect(result.stdout).toContain("os_update_checks:");
@@ -6437,6 +6519,7 @@ describe("public release hygiene", () => {
       expect(result.stdout).toContain("pacman -Qu:");
       expect(result.stdout).toContain("codex-cli 0.134.0-1 -> 0.135.0-1");
       expect(result.stdout).toContain("manual_update_commands:");
+      expect(result.stdout).toContain(`brainstack: cd ${productRepo} && git pull --ff-only`);
       expect(result.stdout).toContain("selected harness:");
 
       await writeFile(
@@ -6543,7 +6626,7 @@ describe("public release hygiene", () => {
       });
       expectSuccess(gitTimeout);
       expect(gitTimeout.stdout).toContain("brainstack_branch=unknown");
-      expect(gitTimeout.stdout).toContain("brainstack_head=unknown");
+      expect(gitTimeout.stdout).toContain("brainstack_head=unavailable");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

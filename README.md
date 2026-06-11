@@ -91,6 +91,7 @@ See [`docs/portable-skills.md`](./docs/portable-skills.md) for installing Brains
 See [`docs/diagrams.md`](./docs/diagrams.md) for the read/write/outbox, Telegram coalescing, and control/client/worker topology diagrams.
 See [`docs/routines.md`](./docs/routines.md) for scheduled routines, built-in update checks, brain-curator setup, and daily check-ins.
 See [`docs/curation.md`](./docs/curation.md) for the proposal state model, curation policy (`manual`/`approval`/`auto`), curator automation, and the `brainctl proposals`/`curator` and Telegram proposal commands.
+See [`apps/brainstack-menu/README.md`](./apps/brainstack-menu/README.md) for the macOS menu bar companion app that surfaces `brainctl status --json` with safe one-click actions and an opt-in Operator Mode.
 See [`docs/security-postures.md`](./docs/security-postures.md), [`docs/tailscale-exposure.md`](./docs/tailscale-exposure.md), [`docs/multi-brain.md`](./docs/multi-brain.md), and [`docs/outbox-security.md`](./docs/outbox-security.md) for the current posture, exposure, project-context, and outbox boundaries.
 
 `provision` is a first-stage checker/config generator. It does not install Bun, Git, SSH, Tailscale, Codex, or Claude; it fails with install hints when they are missing.

@@ -1,0 +1,15 @@
+{
+  "schema_version": 2,
+  "product": "brainstack",
+  "generated_at": "2026-06-11T07:00:00Z",
+  "config_path": "/Users/operator/.config/brainstack/brainstack.yaml",
+  "profile": "client-macos",
+  "machine": "mac-client",
+  "ok": true,
+  "degraded": false,
+  "sections": {
+    "config": { "state": "ok", "ok": true, "available": true, "detail": "config loaded" },
+    "quantum_sync": { "state": "ok", "ok": true, "available": true, "detail": "entangled=42", "data": { "nested": { "weird": [1, 2, {"deep": true}] } } },
+    "future_thing": { "state": "mystery-state", "detail": "novel state value", "extra_field": {"a": 1} }
+  }
+}

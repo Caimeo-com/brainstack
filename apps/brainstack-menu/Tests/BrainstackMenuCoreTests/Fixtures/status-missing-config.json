@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "product": "brainstack",
+  "generated_at": "2026-06-11T07:00:00Z",
+  "config_path": "/Users/operator/.config/brainstack/brainstack.yaml",
+  "profile": null,
+  "machine": null,
+  "ok": false,
+  "degraded": true,
+  "sections": {
+    "config": { "state": "fail", "ok": false, "available": false, "detail": "config load failed", "error": "Brainstack config not found: /Users/operator/.config/brainstack/brainstack.yaml" }
+  }
+}

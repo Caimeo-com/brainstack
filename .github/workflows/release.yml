@@ -1,0 +1,159 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example 0.1.0. Defaults to the short commit SHA."
+        required: false
+        type: string
+      publish_release:
+        description: "Create or update a GitHub Release with the generated assets."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build signed release assets
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.10"
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            publish="true"
+          elif [ -n "${INPUT_VERSION:-}" ]; then
+            version="$INPUT_VERSION"
+            publish="${{ inputs.publish_release }}"
+          else
+            version="${GITHUB_SHA::7}"
+            publish="${{ inputs.publish_release }}"
+          fi
+          case "$version" in
+            ""|*[!A-Za-z0-9._-]*)
+              echo "invalid release version: $version" >&2
+              exit 1
+              ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release secrets
+        shell: bash
+        env:
+          MACOS_DEVELOPER_ID_CERT_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_CERT_P12_BASE64 }}
+          MACOS_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_CERT_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+          APP_STORE_CONNECT_API_KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in \
+            MACOS_DEVELOPER_ID_CERT_P12_BASE64 \
+            MACOS_DEVELOPER_ID_CERT_PASSWORD \
+            MACOS_KEYCHAIN_PASSWORD \
+            MACOS_CODESIGN_IDENTITY \
+            APP_STORE_CONNECT_API_KEY_P8_BASE64 \
+            APP_STORE_CONNECT_API_KEY_ID \
+            APP_STORE_CONNECT_API_ISSUER_ID
+          do
+            if [ -z "${!name:-}" ]; then
+              echo "missing secret: $name" >&2
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Import Developer ID certificate
+        shell: bash
+        env:
+          MACOS_DEVELOPER_ID_CERT_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_CERT_P12_BASE64 }}
+          MACOS_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_CERT_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cert_path="$RUNNER_TEMP/brainstack-developer-id.p12"
+          keychain_path="$RUNNER_TEMP/brainstack-signing.keychain-db"
+          printf '%s' "$MACOS_DEVELOPER_ID_CERT_P12_BASE64" | base64 --decode > "$cert_path"
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$cert_path" -P "$MACOS_DEVELOPER_ID_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security default-keychain -s "$keychain_path"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$MACOS_KEYCHAIN_PASSWORD" "$keychain_path"
+
+      - name: Write App Store Connect API key
+        id: notary-key
+        shell: bash
+        env:
+          APP_STORE_CONNECT_API_KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$APP_STORE_CONNECT_API_KEY_P8_BASE64" | base64 --decode > "$key_path"
+          chmod 600 "$key_path"
+          echo "path=$key_path" >> "$GITHUB_OUTPUT"
+
+      - name: Build, sign, notarize, and staple release assets
+        shell: bash
+        env:
+          BRAINSTACK_RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          BRAINSTACK_RELEASE_MENU_APP: "1"
+          CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+          APP_STORE_CONNECT_API_KEY_PATH: ${{ steps.notary-key.outputs.path }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          scripts/release.sh
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: brainstack-${{ steps.version.outputs.version }}-release-assets
+          path: |
+            dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: steps.version.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="$([ "${GITHUB_REF_TYPE:-}" = "tag" ] && printf '%s' "$GITHUB_REF_NAME" || printf 'v%s' "$VERSION")"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --title "$tag" --generate-notes
+          fi

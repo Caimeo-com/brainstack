@@ -93,6 +93,25 @@ archive="dist/brainstack-${version}.tar.gz"
 git archive --format=tar.gz --prefix="brainstack-${version}/" HEAD > "$archive"
 printf '%s  %s\n' "$(checksum "$archive")" "$(basename "$archive")" > "${archive}.sha256"
 
+# Optional: package the notarized macOS menu bar app as a release asset.
+# Opt-in because it needs macOS, Xcode CLTs, a Developer ID cert, and NOTARY_PROFILE.
+menu_app_zip=""
+menu_app_dmg=""
+if [ "${BRAINSTACK_RELEASE_MENU_APP:-0}" = "1" ]; then
+  if [ "$(uname -s)" != "Darwin" ]; then
+    echo "release refused: BRAINSTACK_RELEASE_MENU_APP=1 requires macOS" >&2
+    exit 1
+  fi
+  rm -f dist/BrainstackMenu-*.zip dist/BrainstackMenu-*.zip.sha256 dist/BrainstackMenu-*.dmg dist/BrainstackMenu-*.dmg.sha256
+  BRAINSTACK_MENU_VERSION="$version" apps/brainstack-menu/scripts/make-app.sh --notarize
+  menu_app_zip="dist/BrainstackMenu-${version}.zip"
+  menu_app_dmg="dist/BrainstackMenu-${version}.dmg"
+  cp "apps/brainstack-menu/dist/BrainstackMenu-${version}.zip" "$menu_app_zip"
+  cp "apps/brainstack-menu/dist/BrainstackMenu-${version}.dmg" "$menu_app_dmg"
+  printf '%s  %s\n' "$(checksum "$menu_app_zip")" "$(basename "$menu_app_zip")" > "${menu_app_zip}.sha256"
+  printf '%s  %s\n' "$(checksum "$menu_app_dmg")" "$(basename "$menu_app_dmg")" > "${menu_app_dmg}.sha256"
+fi
+
 echo "brainctl assets:"
 for target in $targets; do
   echo "  dist/brainctl-${target}"
@@ -100,3 +119,7 @@ done
 echo "installer: dist/install.sh"
 echo "manifest: dist/manifest.json"
 echo "source archive: $archive"
+if [ -n "$menu_app_zip" ]; then
+  echo "menu bar app: $menu_app_zip (signed + notarized)"
+  echo "menu bar dmg: $menu_app_dmg (signed + notarized + stapled)"
+fi

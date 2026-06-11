@@ -1206,7 +1206,7 @@ if [ "$source_reps" -ne 1 ]; then
   exit 1
 fi
 
-for forbidden in ".git" "dist" "node_modules" ".bun" "__MACOSX"; do
+for forbidden in ".git" "dist" "node_modules" ".bun" "__MACOSX" ".build"; do
   if find "$bundle_dir" -name "$forbidden" -print -quit | grep -q .; then
     echo "handoff refused: forbidden path found: $forbidden" >&2
     exit 1

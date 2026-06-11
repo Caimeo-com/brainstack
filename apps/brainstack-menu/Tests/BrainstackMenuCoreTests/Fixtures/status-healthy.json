@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "product": "brainstack",
+  "generated_at": "2026-06-11T07:00:00Z",
+  "config_path": "/Users/operator/.config/brainstack/brainstack.yaml",
+  "profile": "client-macos",
+  "machine": "mac-client",
+  "ok": true,
+  "degraded": false,
+  "sections": {
+    "config": { "state": "ok", "ok": true, "available": true, "detail": "config loaded", "data": { "paths": { "config_root": "/Users/operator/.config/brainstack", "client_local_path": "/Users/operator/shared-brain" } } },
+    "daemon": { "state": "ok", "ok": true, "available": true, "detail": "service=running fresh=true", "duration_ms": 12 },
+    "shared_brain": { "state": "ok", "ok": true, "available": true, "detail": "checkouts=1 unhealthy=0" },
+    "outbox": { "state": "ok", "ok": true, "available": true, "detail": "queued=0 terminal=0 corrupt=0" },
+    "hooks": { "state": "ok", "ok": true, "available": true, "detail": "codex hooks installed" },
+    "skills": { "state": "ok", "ok": true, "available": true, "detail": "codex skills=4" },
+    "brain_api": { "state": "ok", "ok": true, "available": true, "detail": "base_url=https://brain.example health=ok ready=ok", "data": { "base_url": "https://brain.example" } },
+    "curator": { "state": "ok", "ok": true, "available": true, "detail": "mode=approval installed=true open_proposals=0", "data": { "open_proposals": 0, "curator": { "installed": true, "last_run_ok": true } } },
+    "proposals": { "state": "ok", "ok": true, "available": true, "detail": "open_proposals=0", "data": { "count": 0 } },
+    "product": { "state": "ok", "ok": true, "available": true, "detail": "branch=main dirty=0" }
+  }
+}

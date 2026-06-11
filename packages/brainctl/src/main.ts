@@ -4351,24 +4351,172 @@ async function collectDaemonStatusSection(cfg: BrainstackConfig, args: ParsedArg
   }, { available: Boolean(status) || service.running === true });
 }
 
-async function collectProductStatusSection(timeoutMs: number): Promise<BrainctlStatusSection> {
-  if (!gitExists(PRODUCT_ROOT)) {
-    return statusSection("warn", "product repo is not a git checkout", { path: PRODUCT_ROOT }, { available: false });
+async function collectProductStatusSection(cfg: BrainstackConfig, timeoutMs: number): Promise<BrainctlStatusSection> {
+  const productRoot = cfg.paths.productRepo || PRODUCT_ROOT;
+  if (!gitExists(productRoot)) {
+    const clientProfile = cfg.profile.startsWith("client");
+    return statusSection(
+      clientProfile ? "disabled" : "warn",
+      clientProfile ? "source checkout not installed for this client" : "product repo is not a git checkout",
+      { path: productRoot },
+      { available: false }
+    );
   }
-  const branch = gitStatusProbe(["rev-parse", "--abbrev-ref", "HEAD"], PRODUCT_ROOT, timeoutMs);
-  const head = gitStatusProbe(["rev-parse", "HEAD"], PRODUCT_ROOT, timeoutMs);
-  const dirty = gitStatusProbe(["status", "--porcelain"], PRODUCT_ROOT, timeoutMs);
-  const remoteRef = ["origin/main", "refs/remotes/https-main"].find((candidate) => gitStatusProbe(["rev-parse", "--verify", candidate], PRODUCT_ROOT, timeoutMs).ok) || null;
-  const aheadBehind = remoteRef ? gitStatusProbe(["rev-list", "--left-right", "--count", `HEAD...${remoteRef}`], PRODUCT_ROOT, timeoutMs) : null;
+  const branch = gitStatusProbe(["rev-parse", "--abbrev-ref", "HEAD"], productRoot, timeoutMs);
+  const head = gitStatusProbe(["rev-parse", "HEAD"], productRoot, timeoutMs);
+  const dirty = gitStatusProbe(["status", "--porcelain"], productRoot, timeoutMs);
+  const remoteRef = ["origin/main", "refs/remotes/https-main"].find((candidate) => gitStatusProbe(["rev-parse", "--verify", candidate], productRoot, timeoutMs).ok) || null;
+  const aheadBehind = remoteRef ? gitStatusProbe(["rev-list", "--left-right", "--count", `HEAD...${remoteRef}`], productRoot, timeoutMs) : null;
   const dirtyCount = dirty.ok && dirty.output ? dirty.output.split(/\r?\n/).filter(Boolean).length : 0;
   const state: BrainctlStatusState = dirtyCount > 0 || branch.ok === false || head.ok === false ? "warn" : "ok";
   return statusSection(state, `branch=${branch.output || "unknown"} dirty=${dirtyCount}`, {
-    path: PRODUCT_ROOT,
+    path: productRoot,
     branch: branch.ok ? branch.output : null,
     head: head.ok ? head.output : null,
     dirty_count: dirtyCount,
     remote_ref: remoteRef,
     ahead_behind: aheadBehind?.ok ? aheadBehind.output : null
+  });
+}
+
+function parseKeyValueLines(text: string): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const line of text.split(/\r?\n/)) {
+    const index = line.indexOf("=");
+    if (index <= 0) {
+      continue;
+    }
+    values[line.slice(0, index)] = line.slice(index + 1).trim();
+  }
+  return values;
+}
+
+function parseAheadBehind(value: string | undefined): { ahead: number; behind: number } | null {
+  const match = (value || "").trim().match(/^(\d+)\s+(\d+)$/);
+  if (!match) {
+    return null;
+  }
+  return { ahead: Number(match[1]), behind: Number(match[2]) };
+}
+
+function clientControlSshTarget(cfg: BrainstackConfig): string | null {
+  return cfg.client.telegramVia || null;
+}
+
+function remoteControlSourceScript(remoteRepo: string): string {
+  return `
+set -u
+repo=${quoteForBash(remoteRepo || "~/brainstack")}
+case "$repo" in
+  "~") repo="$HOME" ;;
+  "~/"*) repo="$HOME/\${repo#~/}" ;;
+esac
+printf 'repo=%s\\n' "$repo"
+if [ ! -d "$repo/.git" ]; then
+  printf 'state=missing\\n'
+  exit 20
+fi
+cd "$repo" || exit 21
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+head="$(git rev-parse HEAD 2>/dev/null || true)"
+short="$(git rev-parse --short HEAD 2>/dev/null || true)"
+dirty_count="$(git status --porcelain 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
+remote_ref=""
+for candidate in origin/main refs/remotes/https-main; do
+  if git rev-parse --verify "$candidate" >/dev/null 2>&1; then
+    remote_ref="$candidate"
+    break
+  fi
+done
+origin_head=""
+ahead_behind=""
+if [ -n "$remote_ref" ]; then
+  origin_head="$(git rev-parse --verify "$remote_ref" 2>/dev/null || true)"
+  ahead_behind="$(git rev-list --left-right --count "HEAD...$remote_ref" 2>/dev/null || true)"
+fi
+printf 'state=ok\\n'
+printf 'branch=%s\\n' "$branch"
+printf 'head=%s\\n' "$head"
+printf 'short=%s\\n' "$short"
+printf 'dirty_count=%s\\n' "$dirty_count"
+printf 'remote_ref=%s\\n' "$remote_ref"
+printf 'origin_head=%s\\n' "$origin_head"
+printf 'ahead_behind=%s\\n' "$ahead_behind"
+`.trim();
+}
+
+async function collectControlSourceStatusSection(cfg: BrainstackConfig, timeoutMs: number): Promise<BrainctlStatusSection> {
+  if (!cfg.profile.startsWith("client")) {
+    return statusSection("disabled", "local profile owns product source status", { profile: cfg.profile });
+  }
+  const target = clientControlSshTarget(cfg);
+  if (!target) {
+    return statusSection("disabled", "control SSH target not configured", { remote_repo: cfg.client.telegramRemoteRepo }, { available: false });
+  }
+
+  const worker = telegramControlWorker(target);
+  const script = remoteControlSourceScript(cfg.client.telegramRemoteRepo || "~/brainstack");
+  const sshBin = Bun.which("ssh") || "ssh";
+  const result = run(
+    [
+      sshBin,
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=3",
+      ...workerSshTrustArgs(cfg, worker),
+      ...workerSshPortArgs(worker),
+      workerRemoteTarget(worker),
+      "bash",
+      "-lc",
+      script
+    ],
+    { check: false, timeoutMs }
+  );
+  const combined = `${result.stdout}\n${result.stderr}`.trim();
+  if (result.timedOut || result.code === 124) {
+    return statusSection("warn", "control host source probe timed out", { machine: target, remote_repo: cfg.client.telegramRemoteRepo }, { available: false, error: "timeout" });
+  }
+  const values = parseKeyValueLines(result.stdout);
+  if (result.code !== 0) {
+    const missing = values.state === "missing";
+    return statusSection(
+      "warn",
+      missing ? "control host source checkout missing" : "control host source probe failed",
+      { machine: target, remote_repo: cfg.client.telegramRemoteRepo, ...values },
+      { available: false, error: sanitizeStatusError(combined || `exit ${result.code}`) }
+    );
+  }
+  const dirtyCount = Number(values.dirty_count || "0");
+  const aheadBehind = parseAheadBehind(values.ahead_behind);
+  const short = values.short || (values.head ? values.head.slice(0, 7) : "unknown");
+  let state: BrainctlStatusState = "ok";
+  let detail = `control host up to date branch=${values.branch || "unknown"} head=${short}`;
+  if (Number.isFinite(dirtyCount) && dirtyCount > 0) {
+    state = "warn";
+    detail = `control host source dirty files=${dirtyCount} head=${short}`;
+  } else if (aheadBehind && aheadBehind.behind > 0) {
+    state = "warn";
+    detail = `control host behind origin by ${aheadBehind.behind} commit(s) head=${short}`;
+  } else if (aheadBehind && aheadBehind.ahead > 0) {
+    state = "warn";
+    detail = `control host has ${aheadBehind.ahead} unpushed commit(s) head=${short}`;
+  } else if (!values.remote_ref) {
+    state = "warn";
+    detail = `control host remote ref unavailable head=${short}`;
+  }
+  return statusSection(state, detail, {
+    machine: target,
+    remote_repo: cfg.client.telegramRemoteRepo,
+    repo: values.repo || null,
+    branch: values.branch || null,
+    head: values.head || null,
+    short,
+    dirty_count: Number.isFinite(dirtyCount) ? dirtyCount : null,
+    remote_ref: values.remote_ref || null,
+    origin_head: values.origin_head || null,
+    ahead: aheadBehind?.ahead ?? null,
+    behind: aheadBehind?.behind ?? null
   });
 }
 
@@ -4445,7 +4593,9 @@ async function commandStatus(args: ParsedArgs): Promise<void> {
   report.sections.curator = await collectStatusSection(() => collectCuratorStatusSection(cfg!, timeoutMs), timeoutMs + 250);
   report.sections.proposals = await collectStatusSection(() => collectProposalsStatusSection(cfg!, timeoutMs), timeoutMs + 250);
   report.sections.telemux = await collectStatusSection(() => collectTelemuxStatusSection(cfg!, timeoutMs), timeoutMs + 250);
-  report.sections.product = await collectStatusSection(() => collectProductStatusSection(Math.min(timeoutMs, 2000)), timeoutMs);
+  const controlSourceTimeoutMs = cfg.client.telegramVia ? Math.max(Math.min(timeoutMs, 3000), 2500) : timeoutMs;
+  report.sections.control_source = await collectStatusSection(() => collectControlSourceStatusSection(cfg!, controlSourceTimeoutMs), controlSourceTimeoutMs + 250);
+  report.sections.product = await collectStatusSection(() => collectProductStatusSection(cfg!, Math.min(timeoutMs, 2000)), timeoutMs);
   finalizeBrainctlStatus(report);
   console.log(hasFlag(args, "json") ? JSON.stringify(report, null, 2) : formatBrainctlStatusReport(report));
   if (hasFlag(args, "strict") && !report.ok) {
@@ -9584,8 +9734,8 @@ function collectOsUpdateProbes(): Array<{ label: string; code: number; output: s
   return probes;
 }
 
-function gitUpdateProbe(args: string[]): ReturnType<typeof run> {
-  return run(["git", ...args], { cwd: PRODUCT_ROOT, check: false, timeoutMs: updateProbeTimeoutMs() });
+function gitUpdateProbe(productRoot: string, args: string[]): ReturnType<typeof run> {
+  return run(["git", ...args], { cwd: productRoot, check: false, timeoutMs: updateProbeTimeoutMs() });
 }
 
 function harnessVersionSummary(item: DoctorCheck): string {
@@ -9597,14 +9747,16 @@ function harnessVersionSummary(item: DoctorCheck): string {
 
 async function commandUpdates(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
-  const branch = gitUpdateProbe(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.trim() || "unknown";
-  const head = gitUpdateProbe(["rev-parse", "HEAD"]).stdout.trim() || "unknown";
+  const productRoot = cfg.paths.productRepo || PRODUCT_ROOT;
+  const productGitAvailable = gitExists(productRoot);
+  const branch = productGitAvailable ? gitUpdateProbe(productRoot, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout.trim() || "unknown" : "unavailable";
+  const head = productGitAvailable ? gitUpdateProbe(productRoot, ["rev-parse", "HEAD"]).stdout.trim() || "unavailable" : "unavailable";
   const remoteCandidates = ["origin/main", "refs/remotes/https-main"];
   const remoteRef =
-    remoteCandidates.find((candidate) => gitUpdateProbe(["rev-parse", "--verify", candidate]).code === 0) || null;
-  const origin = remoteRef ? gitUpdateProbe(["rev-parse", "--verify", remoteRef]).stdout.trim() : "";
+    productGitAvailable ? remoteCandidates.find((candidate) => gitUpdateProbe(productRoot, ["rev-parse", "--verify", candidate]).code === 0) || null : null;
+  const origin = remoteRef ? gitUpdateProbe(productRoot, ["rev-parse", "--verify", remoteRef]).stdout.trim() : "";
   const aheadBehind = remoteRef
-    ? gitUpdateProbe(["rev-list", "--left-right", "--count", `HEAD...${remoteRef}`]).stdout.trim()
+    ? gitUpdateProbe(productRoot, ["rev-list", "--left-right", "--count", `HEAD...${remoteRef}`]).stdout.trim()
     : "unknown";
   const compat = [
     harnessCompatibility("codex", "codex", { required: cfg.harness.name === "codex" }),
@@ -9612,6 +9764,7 @@ async function commandUpdates(args: ParsedArgs): Promise<void> {
   ];
   const codex = harnessVersionSummary(compat[0]);
   const claude = harnessVersionSummary(compat[1]);
+  console.log(`brainstack_source=${productGitAvailable ? productRoot : "not-installed"}`);
   console.log(`brainstack_branch=${branch}`);
   console.log(`brainstack_head=${head}`);
   console.log(`origin_main=${origin || "unavailable"}`);
@@ -9636,7 +9789,13 @@ async function commandUpdates(args: ParsedArgs): Promise<void> {
     }
   }
   console.log("manual_update_commands:");
-  console.log("  brainstack: git pull --ff-only && bun install --frozen-lockfile && bun test");
+  if (productGitAvailable) {
+    console.log(`  brainstack: cd ${productRoot} && git pull --ff-only && bun install --frozen-lockfile && bun test`);
+  } else if (cfg.profile.startsWith("client")) {
+    console.log("  brainstack: rerun the Brainstack installer or replace ~/.local/bin/brainctl from a signed release");
+  } else {
+    console.log(`  brainstack: install or repair the product checkout at ${productRoot}`);
+  }
   console.log("  os packages: use your package manager manually after reviewing the read-only check above");
   console.log(`  selected harness: ${installHint(cfg.harness.name)}`);
 }
