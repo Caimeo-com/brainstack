@@ -32,6 +32,7 @@ bun run packages/brainctl/src/main.ts skills doctor --dir ~/.codex/skills
 bun run packages/brainctl/src/main.ts import skills --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts import skill ~/.codex/skills/brainstack/SKILL.md --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts status --json --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts proposals clusters --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts daemon status --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts hooks status --target all
 bun run packages/brainctl/src/main.ts upgrade --profile control --config examples/control.yaml

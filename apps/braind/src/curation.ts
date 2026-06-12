@@ -60,6 +60,27 @@ export interface ProposalRecord {
   status: ProposalStatus;
   createdAt: string;
   updatedAt: string;
+  tags: string[];
+  legacyFormat: boolean;
+  clusterKey: string | null;
+  clusterLabel: string | null;
+  sourceHarness: string | null;
+  sourceMachine: string | null;
+  sourceType: string | null;
+  relatedRepo: string | null;
+  project: string | null;
+  domain: string | null;
+  scope: string | null;
+  memoryKind: string | null;
+  context: string | null;
+  applicability: string | null;
+  nonApplicability: string | null;
+  evidenceRefs: string[];
+  reviewAfter: string | null;
+  expiresAt: string | null;
+  qualityScore: number | null;
+  qualityDecision: string | null;
+  qualityReasons: string[];
   targetPage: string | null;
   baseSha256: string | null;
   risk: ProposalRisk | null;
@@ -130,23 +151,176 @@ function riskOrNull(value: unknown): ProposalRisk | null {
   return value === "low" || value === "medium" || value === "high" ? value : null;
 }
 
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && Boolean(item.trim())).map((item) => item.trim()) : [];
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+const REMEMBER_TITLE_RE = /^remember(?:\s*\([^)]+\))?:/i;
+const CLUSTER_STOPWORDS = new Set([
+  "about",
+  "after",
+  "again",
+  "agent",
+  "agents",
+  "because",
+  "before",
+  "brainstack",
+  "can",
+  "during",
+  "for",
+  "from",
+  "into",
+  "lesson",
+  "lessons",
+  "memory",
+  "must",
+  "note",
+  "notes",
+  "remember",
+  "should",
+  "the",
+  "this",
+  "use",
+  "when",
+  "with"
+]);
+
+function hasReviewableMemoryEnvelope(data: FrontmatterData): boolean {
+  if (data.quality_decision || data.target_page) {
+    return true;
+  }
+  const hasSubject = Boolean(data.project || data.domain || data.related_repo);
+  const hasApplicability = Boolean(data.applicability || data.non_applicability);
+  return Boolean(hasSubject && data.scope && data.memory_kind && hasApplicability && stringArray(data.evidence_refs).length);
+}
+
+function isLegacyRememberProposal(title: string, data: FrontmatterData, body: string): boolean {
+  if (data.legacy_format === true || data.legacy_format === "true") {
+    return true;
+  }
+  const sourceType = stringOrNull(data.source_type)?.toLowerCase();
+  const tags = stringArray(data.tags).map((tag) => tag.toLowerCase());
+  const rememberish =
+    sourceType === "remember" ||
+    sourceType === "memory" ||
+    REMEMBER_TITLE_RE.test(title) ||
+    tags.includes("remember") ||
+    REMEMBER_TITLE_RE.test(body.trim().replace(/^#\s*/, ""));
+  if (!rememberish) {
+    return false;
+  }
+  return !hasReviewableMemoryEnvelope(data);
+}
+
+function stripRememberTitle(title: string): string {
+  return title.replace(REMEMBER_TITLE_RE, "").trim();
+}
+
+function clusterTopicFromText(title: string, body: string): { key: string; label: string } | null {
+  const source = stripRememberTitle(title) || body.split(/\r?\n/).find((line) => line.trim() && !line.trim().startsWith("#")) || title;
+  const tokens = source
+    .toLowerCase()
+    .replace(/['’]/g, "")
+    .split(/[^a-z0-9]+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length > 1 && !CLUSTER_STOPWORDS.has(token))
+    .slice(0, 3);
+  if (!tokens.length) {
+    return null;
+  }
+  const key = tokens.join("-");
+  const label = tokens.map((token) => (token.length <= 3 ? token.toUpperCase() : token[0]!.toUpperCase() + token.slice(1))).join(" ");
+  return { key, label };
+}
+
+function clusterHint(input: {
+  title: string;
+  body: string;
+  sourceType: string | null;
+  project: string | null;
+  domain: string | null;
+  scope: string | null;
+  memoryKind: string | null;
+  relatedRepo: string | null;
+  legacyFormat: boolean;
+}): { key: string; label: string } | null {
+  const sourceType = input.sourceType?.toLowerCase() || "";
+  const memoryLike = input.legacyFormat || sourceType === "remember" || sourceType === "memory" || Boolean(input.memoryKind);
+  if (!memoryLike) {
+    return null;
+  }
+  const topic = input.domain || input.project || (input.relatedRepo ? basename(input.relatedRepo).replace(/\.git$/i, "") : null);
+  const inferred = topic ? { key: topic.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""), label: topic } : clusterTopicFromText(input.title, input.body);
+  if (!inferred?.key) {
+    return null;
+  }
+  const scope = input.scope || (input.legacyFormat ? "needs-context" : "unspecified");
+  const kind = input.memoryKind || (input.legacyFormat ? "legacy-memory" : "memory");
+  return {
+    key: `${inferred.key}:${scope}:${kind}`,
+    label: `${inferred.label} / ${scope} / ${kind}`
+  };
+}
+
 function recordFromFile(repoRoot: string, absolutePath: string, raw: string): ProposalRecord {
   const { data, body } = parseFrontmatter(raw);
   const id = basename(absolutePath, ".md");
+  const title = stringOrNull(data.title) || id;
+  const legacyFormat = isLegacyRememberProposal(title, data, body);
+  const status = normalizeStatus(data.status);
   const confidenceRaw = typeof data.confidence === "number" ? data.confidence : Number(data.confidence ?? Number.NaN);
+  const qualityScoreRaw = typeof data.quality_score === "number" ? data.quality_score : Number(data.quality_score ?? Number.NaN);
+  const sourceType = stringOrNull(data.source_type) || (legacyFormat ? "remember" : null);
+  const relatedRepo = stringOrNull(data.related_repo);
+  const project = stringOrNull(data.project);
+  const domain = stringOrNull(data.domain);
+  const scope = stringOrNull(data.scope);
+  const memoryKind = stringOrNull(data.memory_kind) || (legacyFormat ? "legacy_memory" : null);
+  const cluster = clusterHint({ title, body, sourceType, project, domain, scope, memoryKind, relatedRepo, legacyFormat });
   return {
     id,
-    title: stringOrNull(data.title) || id,
-    status: normalizeStatus(data.status),
+    title,
+    status: legacyFormat && status === "pending" ? "needs-human" : status,
     createdAt: stringOrNull(data.created_at) || isoNow(),
     updatedAt: stringOrNull(data.updated_at) || isoNow(),
+    tags: uniqueStrings(["proposal", ...stringArray(data.tags)]),
+    legacyFormat,
+    clusterKey: cluster?.key || null,
+    clusterLabel: cluster?.label || null,
+    sourceHarness: stringOrNull(data.source_harness),
+    sourceMachine: stringOrNull(data.source_machine),
+    sourceType,
+    relatedRepo,
+    project,
+    domain,
+    scope,
+    memoryKind,
+    context: stringOrNull(data.context),
+    applicability: stringOrNull(data.applicability),
+    nonApplicability: stringOrNull(data.non_applicability),
+    evidenceRefs: stringArray(data.evidence_refs),
+    reviewAfter: stringOrNull(data.review_after),
+    expiresAt: stringOrNull(data.expires_at),
+    qualityScore: Number.isFinite(qualityScoreRaw) ? Math.max(0, Math.min(1, qualityScoreRaw)) : legacyFormat ? 0.2 : null,
+    qualityDecision: stringOrNull(data.quality_decision) || (legacyFormat ? "needs-context" : null),
+    qualityReasons: legacyFormat
+      ? uniqueStrings([
+          ...stringArray(data.quality_reasons),
+          "legacy remember proposal predates the structured memory envelope",
+          "missing project, scope, applicability, and evidence context"
+        ])
+      : stringArray(data.quality_reasons),
     targetPage: stringOrNull(data.target_page),
     baseSha256: stringOrNull(data.base_sha256),
     risk: riskOrNull(data.risk),
     confidence: Number.isFinite(confidenceRaw) ? Math.max(0, Math.min(1, confidenceRaw)) : null,
     curatorRunId: stringOrNull(data.curator_run_id),
     reason: stringOrNull(data.reason),
-    sourceIds: Array.isArray(data.source_ids) ? data.source_ids.filter((value): value is string => typeof value === "string") : [],
+    sourceIds: stringArray(data.source_ids),
     decidedAt: stringOrNull(data.decided_at),
     decidedBy: stringOrNull(data.decided_by),
     appliedCommit: stringOrNull(data.applied_commit),
@@ -154,6 +328,52 @@ function recordFromFile(repoRoot: string, absolutePath: string, raw: string): Pr
     hasProposedContent: existsSync(join(dirname(absolutePath), proposalContentFileName(id))),
     body
   };
+}
+
+export interface ProposalMemoryCluster {
+  id: string;
+  label: string;
+  count: number;
+  legacyCount: number;
+  needsContextCount: number;
+  proposalIds: string[];
+  titles: string[];
+  createdAtStart: string;
+  createdAtEnd: string;
+  suggestedTitle: string;
+  suggestedApplicability: string;
+}
+
+export function clusterMemoryProposals(records: ProposalRecord[], minSize = 2): ProposalMemoryCluster[] {
+  const groups = new Map<string, ProposalRecord[]>();
+  for (const record of records) {
+    if (!record.clusterKey) {
+      continue;
+    }
+    groups.set(record.clusterKey, [...(groups.get(record.clusterKey) || []), record]);
+  }
+  const clusters: ProposalMemoryCluster[] = [];
+  for (const [id, group] of groups) {
+    if (group.length < minSize) {
+      continue;
+    }
+    const sorted = [...group].sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
+    const label = sorted[0]?.clusterLabel || id;
+    clusters.push({
+      id,
+      label,
+      count: sorted.length,
+      legacyCount: sorted.filter((record) => record.legacyFormat).length,
+      needsContextCount: sorted.filter((record) => record.qualityDecision === "needs-context").length,
+      proposalIds: sorted.map((record) => record.id),
+      titles: sorted.map((record) => record.title),
+      createdAtStart: sorted[0]?.createdAt || isoNow(),
+      createdAtEnd: sorted.at(-1)?.createdAt || isoNow(),
+      suggestedTitle: `${label} implementation lessons`,
+      suggestedApplicability: `Review these ${sorted.length} related memory candidates together and promote only a scoped, sourced card with clear applicability.`
+    });
+  }
+  return clusters.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 }
 
 async function listProposalFiles(dir: string): Promise<string[]> {
@@ -216,10 +436,28 @@ function frontmatterFromRecord(record: ProposalRecord): FrontmatterData {
     created_at: record.createdAt,
     updated_at: isoNow(),
     status: record.status,
-    tags: ["proposal"],
+    tags: uniqueStrings(["proposal", ...record.tags]),
     aliases: [],
     source_ids: record.sourceIds
   };
+  if (record.sourceHarness) data.source_harness = record.sourceHarness;
+  if (record.sourceMachine) data.source_machine = record.sourceMachine;
+  if (record.legacyFormat) data.legacy_format = true;
+  if (record.sourceType) data.source_type = record.sourceType;
+  if (record.relatedRepo) data.related_repo = record.relatedRepo;
+  if (record.project) data.project = record.project;
+  if (record.domain) data.domain = record.domain;
+  if (record.scope) data.scope = record.scope;
+  if (record.memoryKind) data.memory_kind = record.memoryKind;
+  if (record.context) data.context = record.context;
+  if (record.applicability) data.applicability = record.applicability;
+  if (record.nonApplicability) data.non_applicability = record.nonApplicability;
+  if (record.evidenceRefs.length) data.evidence_refs = record.evidenceRefs;
+  if (record.reviewAfter) data.review_after = record.reviewAfter;
+  if (record.expiresAt) data.expires_at = record.expiresAt;
+  if (record.qualityScore !== null) data.quality_score = record.qualityScore;
+  if (record.qualityDecision) data.quality_decision = record.qualityDecision;
+  if (record.qualityReasons.length) data.quality_reasons = record.qualityReasons;
   if (record.targetPage) data.target_page = record.targetPage;
   if (record.baseSha256) data.base_sha256 = record.baseSha256;
   if (record.risk) data.risk = record.risk;

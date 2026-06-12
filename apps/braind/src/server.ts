@@ -37,6 +37,7 @@ import {
   PROPOSAL_STATUSES,
   applyProposal,
   approveProposal,
+  clusterMemoryProposals,
   curationOverview,
   curationPolicyFromEnv,
   evaluateAutoApply,
@@ -1982,11 +1983,18 @@ async function proposeFromRequest(request: Request, authScope: AuthScope): Promi
   if (confidenceRaw !== undefined && (!Number.isFinite(confidenceRaw) || confidenceRaw < 0 || confidenceRaw > 1)) {
     reject(400, "confidence must be a number between 0 and 1");
   }
+  const stringArray = (value: unknown): string[] | undefined => {
+    if (!Array.isArray(value)) {
+      return undefined;
+    }
+    return value.map(String).map((item) => item.trim()).filter(Boolean);
+  };
   const input = {
     title: String(body.title || ""),
     body: String(body.body || ""),
     source_harness: String(body.source_harness || ""),
     source_machine: String(body.source_machine || ""),
+    source_type: typeof body.source_type === "string" ? body.source_type : undefined,
     target_page: targetPageRaw,
     tags: Array.isArray(body.tags) ? body.tags.map(String) : [],
     proposed_content: proposedContent,
@@ -1996,7 +2004,18 @@ async function proposeFromRequest(request: Request, authScope: AuthScope): Promi
     curator_run_id: typeof body.curator_run_id === "string" ? body.curator_run_id : undefined,
     reason: typeof body.reason === "string" ? body.reason : undefined,
     status: statusRaw as "pending" | "needs-human" | undefined,
-    source_ids: Array.isArray(body.source_ids) ? body.source_ids.map(String) : undefined
+    source_ids: stringArray(body.source_ids),
+    related_repo: typeof body.related_repo === "string" ? body.related_repo : undefined,
+    project: typeof body.project === "string" ? body.project : undefined,
+    domain: typeof body.domain === "string" ? body.domain : undefined,
+    scope: typeof body.scope === "string" ? body.scope : undefined,
+    memory_kind: typeof body.memory_kind === "string" ? body.memory_kind : undefined,
+    context: typeof body.context === "string" ? body.context : undefined,
+    applicability: typeof body.applicability === "string" ? body.applicability : undefined,
+    non_applicability: typeof body.non_applicability === "string" ? body.non_applicability : undefined,
+    evidence_refs: stringArray(body.evidence_refs) || stringArray(body.evidence),
+    review_after: typeof body.review_after === "string" ? body.review_after : undefined,
+    expires_at: typeof body.expires_at === "string" ? body.expires_at : undefined
   };
   const requestHash = requestHashFor({ endpoint: "propose", input });
   const replay = await completedIdempotencyReplay(request, "propose", requestHash);
@@ -2016,7 +2035,7 @@ async function proposeFromRequest(request: Request, authScope: AuthScope): Promi
         let autoApplied = false;
         let autoApplyReasons: string[] = [];
         const policy = curationPolicyFromEnv();
-        if (policy.mode === "auto" && input.status !== "needs-human" && targetPageRaw && proposedContent !== undefined) {
+        if (policy.mode === "auto" && proposal.status !== "needs-human" && targetPageRaw && proposedContent !== undefined) {
           const targetAbsolute = safeRepoPath(writeRepoRoot, targetPageRaw);
           const currentContent = existsSync(targetAbsolute) ? await readFile(targetAbsolute, "utf8") : null;
           const decision = evaluateAutoApply(
@@ -2045,7 +2064,10 @@ async function proposeFromRequest(request: Request, authScope: AuthScope): Promi
           ok: true,
           proposal_id: proposal.proposalId,
           proposal_path: proposal.proposalPath,
-          status: autoApplied ? "applied" : input.status || "pending",
+          status: autoApplied ? "applied" : proposal.status,
+          quality_decision: proposal.quality.decision,
+          quality_score: proposal.quality.score,
+          quality_reasons: proposal.quality.reasons,
           auto_applied: autoApplied,
           auto_apply_reasons: autoApplyReasons,
           commit,
@@ -2111,6 +2133,27 @@ function proposalToJson(record: import("./curation").ProposalRecord): Record<str
     status: record.status,
     created_at: record.createdAt,
     updated_at: record.updatedAt,
+    tags: record.tags,
+    legacy_format: record.legacyFormat,
+    cluster_key: record.clusterKey,
+    cluster_label: record.clusterLabel,
+    source_harness: record.sourceHarness,
+    source_machine: record.sourceMachine,
+    source_type: record.sourceType,
+    related_repo: record.relatedRepo,
+    project: record.project,
+    domain: record.domain,
+    scope: record.scope,
+    memory_kind: record.memoryKind,
+    context: record.context,
+    applicability: record.applicability,
+    non_applicability: record.nonApplicability,
+    evidence_refs: record.evidenceRefs,
+    review_after: record.reviewAfter,
+    expires_at: record.expiresAt,
+    quality_score: record.qualityScore,
+    quality_decision: record.qualityDecision,
+    quality_reasons: record.qualityReasons,
     target_page: record.targetPage,
     base_sha256: record.baseSha256,
     risk: record.risk,
@@ -2144,7 +2187,32 @@ async function listProposalsResponse(url: URL): Promise<Response> {
   return json({
     ok: true,
     mode: policy.mode,
-    proposals: records.map(proposalToJson)
+    proposals: records.map(proposalToJson),
+    clusters: clusterMemoryProposals(records)
+  });
+}
+
+async function listProposalClustersResponse(url: URL): Promise<Response> {
+  const statusParam = url.searchParams.get("status") || "open";
+  let statuses: import("./curation").ProposalStatus[] | null = null;
+  if (statusParam === "open") {
+    statuses = [...OPEN_PROPOSAL_STATUSES];
+  } else {
+    const requested = statusParam.split(",").map((value) => value.trim()) as import("./curation").ProposalStatus[];
+    const invalid = requested.filter((value) => !PROPOSAL_STATUSES.includes(value));
+    if (invalid.length) {
+      reject(400, `unknown proposal status filter: ${invalid.join(", ")}`);
+    }
+    statuses = requested;
+  }
+  const minSizeRaw = Number(url.searchParams.get("min_size") || "2");
+  const minSize = Number.isFinite(minSizeRaw) && minSizeRaw > 0 ? Math.trunc(minSizeRaw) : 2;
+  const records = await listProposals(writeRepoRoot, statuses);
+  return json({
+    ok: true,
+    status: statusParam,
+    min_size: minSize,
+    clusters: clusterMemoryProposals(records, minSize)
   });
 }
 
@@ -2571,6 +2639,9 @@ const server = Bun.serve({
       }
       if (request.method === "GET" && url.pathname === "/api/proposals") {
         return await listProposalsResponse(url);
+      }
+      if (request.method === "GET" && url.pathname === "/api/proposals/clusters") {
+        return await listProposalClustersResponse(url);
       }
       {
         const proposalShow = request.method === "GET" ? url.pathname.match(/^\/api\/proposals\/([^/]+)$/) : null;

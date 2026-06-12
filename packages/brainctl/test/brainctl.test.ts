@@ -432,7 +432,10 @@ telemux:
         `      return Response.json({ ok: true, service: "braind", search_ready: true, pending_reindex: { present: false } });`,
         `    }`,
         `    if (req.method === "GET" && url.pathname === "/api/proposals") {`,
-        `      return Response.json({ ok: true, mode: "approval", proposals: [{ id: "20260611t000000z-cli-proposal", title: "CLI proposal", status: "pending", target_page: "wiki/Status/CLI.md", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:00:00Z" }] });`,
+        `      return Response.json({ ok: true, mode: "approval", proposals: [{ id: "20260611t000000z-cli-proposal", title: "CLI proposal", status: "pending", target_page: "wiki/Status/CLI.md", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:00:00Z" }], clusters: [{ id: "cli:repo:project_lesson", label: "CLI / repo / project_lesson", count: 2, legacyCount: 1, needsContextCount: 1, proposalIds: ["p1", "p2"] }] });`,
+        `    }`,
+        `    if (req.method === "GET" && url.pathname === "/api/proposals/clusters") {`,
+        `      return Response.json({ ok: true, status: url.searchParams.get("status") || "open", min_size: Number(url.searchParams.get("min_size") || "2"), clusters: [{ id: "cli:repo:project_lesson", label: "CLI / repo / project_lesson", count: 2, legacyCount: 1, needsContextCount: 1, proposalIds: ["p1", "p2"] }] });`,
         `    }`,
         `    if (req.method === "GET" && url.pathname.startsWith("/api/proposals/")) {`,
         `      return Response.json({ ok: true, proposal: { id: "20260611t000000z-cli-proposal", title: "CLI proposal", status: "pending", created_at: "2026-06-11T00:00:00Z" }, body: "## Request\\n\\nbody", diff: "+ new line" });`,
@@ -477,7 +480,13 @@ telemux:
       expectSuccess(list);
       expect(list.stdout).toContain("20260611t000000z-cli-proposal");
       expect(list.stdout).toContain("status=pending");
+      expect(list.stdout).toContain("memory_clusters=1");
       expect((await readRequests()).at(-1)?.auth).toBeNull();
+
+      const clusterList = runBrainctl(["proposals", "clusters", "--config", configPath], env);
+      expectSuccess(clusterList);
+      expect(clusterList.stdout).toContain("proposal memory clusters=1");
+      expect(clusterList.stdout).toContain("cli:repo:project_lesson");
 
       const show = runBrainctl(["proposals", "show", "20260611t000000z-cli-proposal", "--config", configPath], env);
       expectSuccess(show);
@@ -537,7 +546,23 @@ telemux:
           "--curator-run-id",
           "run-1",
           "--source-ids",
-          "art-1,art-2"
+          "art-1,art-2",
+          "--project",
+          "brainstack",
+          "--domain",
+          "curation",
+          "--scope",
+          "repo",
+          "--memory-kind",
+          "project_lesson",
+          "--applicability",
+          "Use for Brainstack curation proposals.",
+          "--non-applicability",
+          "Do not apply outside Brainstack without checking the target repo.",
+          "--evidence",
+          "repo:/tmp/brainstack",
+          "--evidence",
+          "default:wiki/Status/CLI.md:1"
         ],
         env
       );
@@ -550,6 +575,13 @@ telemux:
       expect(proposeRequest?.body?.confidence).toBe(0.8);
       expect(proposeRequest?.body?.curator_run_id).toBe("run-1");
       expect(proposeRequest?.body?.source_ids).toEqual(["art-1", "art-2"]);
+      expect(proposeRequest?.body?.project).toBe("brainstack");
+      expect(proposeRequest?.body?.domain).toBe("curation");
+      expect(proposeRequest?.body?.scope).toBe("repo");
+      expect(proposeRequest?.body?.memory_kind).toBe("project_lesson");
+      expect(proposeRequest?.body?.applicability).toBe("Use for Brainstack curation proposals.");
+      expect(proposeRequest?.body?.non_applicability).toBe("Do not apply outside Brainstack without checking the target repo.");
+      expect(proposeRequest?.body?.evidence_refs).toEqual(["repo:/tmp/brainstack", "default:wiki/Status/CLI.md:1"]);
     } finally {
       server.kill();
       await server.exited;
@@ -2954,6 +2986,64 @@ describe("braind write safety", () => {
       expect(openList.proposals.some((proposal) => proposal.id === firstId)).toBe(true);
       const shown = (await (await fetch(`http://127.0.0.1:${port}/api/proposals/${firstId}`)).json()) as Record<string, unknown>;
       expect(String(shown.diff)).toContain("+ - first applied fact");
+      const shownProposal = shown.proposal as Record<string, unknown>;
+      expect(shownProposal.quality_decision).toBe("ready");
+      expect(typeof shownProposal.quality_score).toBe("number");
+
+      // Memory-shaped proposals without scope/applicability context are parked for
+      // human review instead of entering the normal approval queue as vague canon.
+      const vagueMemory = await propose(
+        {
+          title: "Remember: Slack EA open-loop buttons",
+          body: "Slack EA open-loop interactivity should replace stale ephemeral buttons after terminal actions.",
+          source_harness: "codex",
+          source_machine: "test-machine",
+          source_type: "remember",
+          tags: ["remember"]
+        },
+        "proposal-lifecycle-vague-memory"
+      );
+      expect(vagueMemory.status).toBe(200);
+      const vagueMemoryBody = (await vagueMemory.json()) as Record<string, unknown>;
+      expect(vagueMemoryBody.status).toBe("needs-human");
+      const vagueShown = (await (await fetch(`http://127.0.0.1:${port}/api/proposals/${vagueMemoryBody.proposal_id}`)).json()) as Record<string, unknown>;
+      const vagueProposal = vagueShown.proposal as Record<string, unknown>;
+      expect(vagueProposal.quality_decision).toBe("needs-context");
+      expect(vagueProposal.quality_reasons).toContain("missing project, domain, related repo, or target page context");
+
+      // A structured memory proposal remains pending and carries review metadata.
+      const structuredMemory = await propose(
+        {
+          title: "Remember (lindy): Slack EA open-loop buttons",
+          body: "When working on Slack EA terminal action handling, replace the original ephemeral button offer with visible terminal status so the user does not see stale controls after state changes.",
+          source_harness: "codex",
+          source_machine: "test-machine",
+          source_type: "remember",
+          tags: ["remember", "lindy", "project_lesson", "repo"],
+          related_repo: "/work/lindy",
+          project: "lindy",
+          domain: "slack-ea",
+          scope: "repo",
+          memory_kind: "project_lesson",
+          context: "Captured during Slack EA hardening.",
+          applicability: "Use when working on Slack EA terminal actions or ephemeral button replacement.",
+          non_applicability: "Do not apply to unrelated Slack apps without checking their interaction response contract.",
+          evidence_refs: ["repo:/work/lindy", "default:raw/slack-ea.md:12"],
+          confidence: 0.9
+        },
+        "proposal-lifecycle-structured-memory"
+      );
+      expect(structuredMemory.status).toBe(200);
+      const structuredMemoryBody = (await structuredMemory.json()) as Record<string, unknown>;
+      expect(structuredMemoryBody.status).toBe("pending");
+      const structuredShown = (await (await fetch(`http://127.0.0.1:${port}/api/proposals/${structuredMemoryBody.proposal_id}`)).json()) as Record<string, unknown>;
+      const structuredProposal = structuredShown.proposal as Record<string, unknown>;
+      expect(structuredProposal.project).toBe("lindy");
+      expect(structuredProposal.scope).toBe("repo");
+      expect(structuredProposal.memory_kind).toBe("project_lesson");
+      expect(structuredProposal.quality_decision).toBe("ready");
+      expect(structuredProposal.evidence_refs).toEqual(["repo:/work/lindy", "default:raw/slack-ea.md:12"]);
+      expect(String(structuredShown.body)).toContain("## Quality Gate");
 
       // Decisions require admin auth; the import token is insufficient.
       const unauthorized = await decide(firstId, "approve", {}, "import-test-token");
@@ -3099,6 +3189,71 @@ describe("braind write safety", () => {
         "proposal-lifecycle-bad-target"
       );
       expect(badTarget.status).toBe(400);
+
+      // Legacy title/body-only remember proposals are not silently treated as
+      // ordinary pending canon candidates. They are synthesized as needs-human
+      // and grouped into deterministic cluster hints for batch review. This check
+      // runs after mutating lifecycle assertions because these direct fixtures are
+      // intentionally uncommitted legacy artifacts.
+      const legacyDir = join(staging, "proposals", "pending");
+      await writeFile(
+        join(legacyDir, "20260611t000001z-remember-slack-ea-buttons-a.md"),
+        [
+          "---",
+          "title: 'Remember: Slack EA buttons should not stay stale'",
+          "status: pending",
+          "legacy_format: true",
+          "source_type: remember",
+          "memory_kind: legacy_memory",
+          "quality_decision: needs-context",
+          "created_at: 2026-06-11T00:00:01Z",
+          "updated_at: 2026-06-11T00:00:01Z",
+          "---",
+          "",
+          "# Remember: Slack EA buttons should not stay stale",
+          "- Source harness: `codex`",
+          "- Source machine: `mac`",
+          "## Request",
+          "",
+          "Slack EA buttons should be replaced after terminal action completion.",
+          ""
+        ].join("\n")
+      );
+      await writeFile(
+        join(legacyDir, "20260611t000002z-remember-slack-ea-buttons-b.md"),
+        [
+          "---",
+          "title: 'Remember: Slack EA buttons need terminal status'",
+          "status: pending",
+          "source_type: remember",
+          "created_at: 2026-06-11T00:00:02Z",
+          "updated_at: 2026-06-11T00:00:02Z",
+          "---",
+          "",
+          "# Remember: Slack EA buttons need terminal status",
+          "- Source harness: `codex`",
+          "- Source machine: `mac`",
+          "## Request",
+          "",
+          "Slack EA buttons should show terminal status after completion.",
+          ""
+        ].join("\n")
+      );
+      const needsHumanList = (await (await fetch(`http://127.0.0.1:${port}/api/proposals?status=needs-human`)).json()) as {
+        proposals: Array<Record<string, unknown>>;
+      };
+      const legacyProposal = needsHumanList.proposals.find((proposal) => String(proposal.id).includes("remember-slack-ea-buttons-a"));
+      expect(legacyProposal?.status).toBe("needs-human");
+      expect(legacyProposal?.legacy_format).toBe(true);
+      expect(legacyProposal?.quality_decision).toBe("needs-context");
+      expect(legacyProposal?.cluster_label).toBe("Slack EA Buttons / needs-context / legacy_memory");
+      const clusters = (await (await fetch(`http://127.0.0.1:${port}/api/proposals/clusters?status=open&min_size=2`)).json()) as {
+        clusters: Array<Record<string, unknown>>;
+      };
+      const legacyCluster = clusters.clusters.find((cluster) => String(cluster.id).startsWith("slack-ea-buttons:"));
+      expect(legacyCluster?.count).toBe(2);
+      expect(legacyCluster?.legacyCount).toBe(2);
+      expect(legacyCluster?.needsContextCount).toBe(2);
     } finally {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });
@@ -3210,7 +3365,7 @@ describe("braind write safety", () => {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 12_000);
 
   test("braind escapes search snippets, allowlists external links, and serves active raw files inertly", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-content-safety-"));

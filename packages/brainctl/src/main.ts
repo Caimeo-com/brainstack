@@ -341,12 +341,12 @@ function usage(): string {
   brainctl rotate-token --kind import|admin|telegram-placeholder --config brainstack.yaml [--env FILE]
   brainctl telegram send-file --file PATH [--config brainstack.yaml] [--via SSH_TARGET] [--remote-repo PATH] [--caption TEXT] [--context SLUG|--chat-id ID] [--thread-id ID] [--kind document|photo] [--max-bytes N] [--allow-sensitive] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default] [--json]
   brainctl import-text --config brainstack.yaml --title TITLE --text TEXT --source-harness HARNESS --source-machine MACHINE [--source-type note]
-  brainctl propose --config brainstack.yaml --title TITLE --body BODY [--target-page wiki/PATH.md] [--content-file FILE] [--base-sha256 HASH|absent] [--risk low|medium|high] [--confidence 0..1] [--curator-run-id ID] [--reason TEXT] [--needs-human] [--source-ids id1,id2]
-  brainctl proposals list|show|approve|reject|apply [...]
+  brainctl propose --config brainstack.yaml --title TITLE --body BODY [--target-page wiki/PATH.md] [--content-file FILE] [--base-sha256 HASH|absent] [--risk low|medium|high] [--confidence 0..1] [--curator-run-id ID] [--reason TEXT] [--needs-human] [--source-ids id1,id2] [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF]
+  brainctl proposals list|clusters|show|approve|reject|apply [...]
   brainctl curator status|run|install [--config brainstack.yaml]
   brainctl context --repo PATH [--config brainstack.yaml] [--json] [--sync|--no-sync]
   brainctl search --repo PATH "query" [--config brainstack.yaml] [--json] [--wait-fresh]
-  brainctl remember --repo PATH --summary TEXT [--target BRAIN_ID] [--confirm-cross-brain]
+  brainctl remember --repo PATH --summary TEXT [--target BRAIN_ID] [--confirm-cross-brain] [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF]
   brainctl allow repo --repo PATH --brain BRAIN_ID [--sections a,b] --always|--once|--deny
   brainctl outbox status|list|flush|purge|purge-corrupt --config brainstack.yaml [--yes]
   brainctl destroy --config brainstack.yaml [--profile ...] --dry-run|--yes [--scope control|worker|client|all] [--remove-shared-brain] [--remove-private-brain] [--remove-tailscale-serve]
@@ -1637,8 +1637,9 @@ function sharedBrainSeedFiles(cfg: BrainstackConfig): Record<string, string> {
       "- `GET /raw/*path`",
       "- `GET /search?q=...&scope=wiki|raw|all`",
       "- `POST /api/import` requires import or admin bearer token.",
-      "- `POST /api/propose` requires import or admin bearer token; accepts machine proposal fields (`target_page`, `proposed_content`, `base_sha256`, `risk`, `confidence`, `curator_run_id`, `source_ids`).",
-      "- `GET /api/proposals[?status=...]` lists proposals.",
+      "- `POST /api/propose` requires import or admin bearer token; accepts machine proposal fields (`target_page`, `proposed_content`, `base_sha256`, `risk`, `confidence`, `curator_run_id`, `source_ids`) plus memory envelope fields (`project`, `domain`, `scope`, `memory_kind`, `applicability`, `non_applicability`, `evidence_refs`).",
+      "- `GET /api/proposals[?status=...]` lists proposals and memory cluster hints.",
+      "- `GET /api/proposals/clusters[?status=open&min_size=2]` lists deterministic memory-review clusters.",
       "- `GET /api/proposals/ID` shows one proposal with a diff.",
       "- `POST /api/proposals/ID/approve|reject|apply` requires admin bearer token.",
       "- `GET /api/curator/status` shows curation mode, curator runs, and proposal counts.",
@@ -4302,14 +4303,16 @@ async function collectProposalsStatusSection(cfg: BrainstackConfig, timeoutMs: n
   }
   const body = response.body && typeof response.body === "object" && !Array.isArray(response.body) ? (response.body as Record<string, unknown>) : {};
   const proposals = Array.isArray(body.proposals) ? (body.proposals as Array<Record<string, unknown>>) : [];
+  const clusters = Array.isArray(body.clusters) ? (body.clusters as Array<Record<string, unknown>>) : [];
   const byStatus: Record<string, number> = {};
   for (const proposal of proposals) {
     const proposalStatus = String(proposal.status || "unknown");
     byStatus[proposalStatus] = (byStatus[proposalStatus] || 0) + 1;
   }
-  return statusSection("ok", `open_proposals=${proposals.length}`, {
+  return statusSection("ok", `open_proposals=${proposals.length}${clusters.length ? ` clusters=${clusters.length}` : ""}`, {
     count: proposals.length,
     by_status: byStatus,
+    clusters: clusters.slice(0, 10),
     proposals: proposals.slice(0, 25)
   });
 }
@@ -5663,6 +5666,87 @@ function sourceRecordClassification(source: unknown): ProjectBrain["classificati
   return classifyProjectBrain(String(source || ""), String(source || ""));
 }
 
+function sourceRecordEvidenceRef(source: unknown): string {
+  const id = sourceRecordId(source);
+  if (!source || typeof source !== "object") {
+    return id;
+  }
+  const record = source as Record<string, unknown>;
+  const path = typeof record.path === "string" ? record.path : "";
+  const line = typeof record.line === "number" || typeof record.line === "string" ? String(record.line) : "";
+  if (id && path) {
+    return `${id}:${path}${line ? `:${line}` : ""}`;
+  }
+  if (id) {
+    return id;
+  }
+  return path;
+}
+
+function boundedCliString(value: string | undefined, maxLength: number): string | undefined {
+  const trimmed = value?.trim() || "";
+  return trimmed ? trimmed.slice(0, maxLength) : undefined;
+}
+
+function deriveProjectLabel(repo: string): string {
+  const label = basename(repo).replace(/\.git$/i, "").trim();
+  return label || "unknown-repo";
+}
+
+function validateMemoryScope(scope: string): string {
+  const normalized = scope.trim().toLowerCase();
+  if (!["repo", "project", "global", "machine", "harness"].includes(normalized)) {
+    throw new Error("--scope must be one of repo, project, global, machine, or harness");
+  }
+  return normalized;
+}
+
+function buildRememberBody(input: {
+  summary: string;
+  project: string;
+  domain?: string;
+  scope: string;
+  memoryKind: string;
+  context: string;
+  applicability: string;
+  nonApplicability: string;
+  evidenceRefs: string[];
+}): string {
+  const lines = [
+    "## Context",
+    "",
+    input.context,
+    "",
+    "## Lesson",
+    "",
+    input.summary.trim(),
+    "",
+    "## Applicability",
+    "",
+    input.applicability,
+    "",
+    "## Non-applicability",
+    "",
+    input.nonApplicability,
+    "",
+    "## Envelope",
+    "",
+    `- Project: \`${input.project}\``
+  ];
+  if (input.domain) {
+    lines.push(`- Domain: \`${input.domain}\``);
+  }
+  lines.push(
+    `- Scope: \`${input.scope}\``,
+    `- Memory kind: \`${input.memoryKind}\``,
+    "",
+    "## Evidence",
+    "",
+    ...(input.evidenceRefs.length ? input.evidenceRefs.map((ref) => `- \`${ref}\``) : ["- No explicit evidence reference was available."])
+  );
+  return lines.join("\n");
+}
+
 function crossBrainAllowKey(sourceId: string, targetId: string): string {
   return `cross:${sourceId}->${targetId}`;
 }
@@ -5855,17 +5939,53 @@ async function commandRemember(args: ParsedArgs): Promise<void> {
   if (target.write !== "false" && (!target.baseUrl || !target.importTokenEnv)) {
     throw new Error(`target brain ${targetId} is writable but missing explicit baseUrl/importTokenEnv`);
   }
+  const project = boundedCliString(flag(args, "project"), 120) || deriveProjectLabel(resolved.repo);
+  const domain = boundedCliString(flag(args, "domain"), 120) || project;
+  const scope = validateMemoryScope(flag(args, "scope") || "repo");
+  const memoryKind = boundedCliString(flag(args, "memory-kind") || flag(args, "kind"), 80) || "project_lesson";
+  const context = boundedCliString(flag(args, "context"), 1_000) || `Captured while working in repo ${resolved.repo}.`;
+  const applicability =
+    boundedCliString(flag(args, "applicability"), 1_000) ||
+    (scope === "global"
+      ? "Use only when the lesson is clearly independent of any project, harness, machine, or product domain."
+      : `Use when working on ${project} or directly related ${scope}-scoped work.`);
+  const nonApplicability =
+    boundedCliString(flag(args, "non-applicability") || flag(args, "non_applicability"), 1_000) ||
+    "Do not apply globally without checking the captured project and evidence context.";
+  const evidenceRefs = Array.from(
+    new Set(
+      [
+        `repo:${resolved.repo}`,
+        ...recentSources.map(sourceRecordEvidenceRef),
+        ...flagValues(args, "evidence")
+      ]
+        .map((ref) => ref.trim())
+        .filter(Boolean)
+    )
+  ).slice(0, 20);
+  const titlePrefix = project ? `Remember (${project})` : "Remember";
+  const proposalBody = buildRememberBody({ summary, project, domain, scope, memoryKind, context, applicability, nonApplicability, evidenceRefs });
   await postBrainWriteOrQueue(cfg, target.write === "true" ? "import" : "propose", {
-    title: `Remember: ${summary.slice(0, 80)}`,
-    text: summary,
-    body: summary,
+    title: `${titlePrefix}: ${summary.slice(0, 120)}`,
+    text: proposalBody,
+    body: proposalBody,
     source_harness: cfg.harness.name,
     source_machine: cfg.machine.name,
     source_type: "remember",
     related_repo: resolved.repo,
+    project,
+    domain,
+    scope,
+    memory_kind: memoryKind,
+    context,
+    applicability,
+    non_applicability: nonApplicability,
+    evidence_refs: evidenceRefs,
     recent_sources: recentSources,
     recent_context_sources: recentContextSources,
-    tags: ["remember", target.id]
+    tags: ["remember", target.id, project, memoryKind, scope],
+    review_after: boundedCliString(flag(args, "review-after"), 80),
+    expires_at: boundedCliString(flag(args, "expires-at"), 80)
   }, {
     baseUrl: target.baseUrl,
     importTokenEnv: target.importTokenEnv,
@@ -9381,6 +9501,54 @@ async function commandPropose(args: ParsedArgs): Promise<void> {
   if (sourceIds) {
     payload.source_ids = sourceIds.split(",").map((value) => value.trim()).filter(Boolean);
   }
+  const sourceType = requireFlagValue(args, "source-type");
+  if (sourceType) {
+    payload.source_type = sourceType;
+  }
+  const relatedRepo = requireFlagValue(args, "related-repo");
+  if (relatedRepo) {
+    payload.related_repo = relatedRepo;
+  }
+  const project = requireFlagValue(args, "project");
+  if (project) {
+    payload.project = project;
+  }
+  const domain = requireFlagValue(args, "domain");
+  if (domain) {
+    payload.domain = domain;
+  }
+  const scope = requireFlagValue(args, "scope");
+  if (scope) {
+    payload.scope = validateMemoryScope(scope);
+  }
+  const memoryKind = requireFlagValue(args, "memory-kind") || requireFlagValue(args, "kind");
+  if (memoryKind) {
+    payload.memory_kind = memoryKind;
+  }
+  const context = requireFlagValue(args, "context");
+  if (context) {
+    payload.context = context;
+  }
+  const applicability = requireFlagValue(args, "applicability");
+  if (applicability) {
+    payload.applicability = applicability;
+  }
+  const nonApplicability = requireFlagValue(args, "non-applicability") || requireFlagValue(args, "non_applicability");
+  if (nonApplicability) {
+    payload.non_applicability = nonApplicability;
+  }
+  const evidenceRefs = flagValues(args, "evidence");
+  if (evidenceRefs.length) {
+    payload.evidence_refs = evidenceRefs;
+  }
+  const reviewAfter = requireFlagValue(args, "review-after");
+  if (reviewAfter) {
+    payload.review_after = reviewAfter;
+  }
+  const expiresAt = requireFlagValue(args, "expires-at");
+  if (expiresAt) {
+    payload.expires_at = expiresAt;
+  }
   await postBrainWriteOrQueue(cfg, "propose", payload);
 }
 
@@ -9442,11 +9610,27 @@ function formatProposalLine(proposal: Record<string, unknown>): string {
   return [
     String(proposal.id),
     `status=${String(proposal.status)}`,
+    proposal.legacy_format ? "legacy=yes" : null,
+    proposal.cluster_label ? `cluster=${String(proposal.cluster_label)}` : null,
     proposal.target_page ? `target=${String(proposal.target_page)}` : null,
     proposal.risk ? `risk=${String(proposal.risk)}` : null,
+    proposal.quality_decision ? `quality=${String(proposal.quality_decision)}` : null,
     proposal.confidence !== null && proposal.confidence !== undefined ? `confidence=${String(proposal.confidence)}` : null,
     `created=${String(proposal.created_at)}`,
     `title=${String(proposal.title)}`
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function formatProposalClusterLine(cluster: Record<string, unknown>): string {
+  return [
+    String(cluster.id),
+    `count=${String(cluster.count)}`,
+    cluster.legacyCount !== undefined ? `legacy=${String(cluster.legacyCount)}` : null,
+    cluster.needsContextCount !== undefined ? `needs_context=${String(cluster.needsContextCount)}` : null,
+    cluster.label ? `label=${String(cluster.label)}` : null,
+    Array.isArray(cluster.proposalIds) ? `proposals=${(cluster.proposalIds as string[]).join(",")}` : null
   ]
     .filter(Boolean)
     .join(" ");
@@ -9523,7 +9707,7 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
   const sub = args.positional[0] || "list";
   if (sub === "help" || sub === "--help" || sub === "-h") {
     console.log(
-      "Usage: brainctl proposals list [--status open|pending|approved|applied|rejected|superseded|needs-human] [--json]\n       brainctl proposals show <id> [--json]\n       brainctl proposals approve <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals reject <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]"
+      "Usage: brainctl proposals list [--status open|pending|approved|applied|rejected|superseded|needs-human] [--json]\n       brainctl proposals clusters [--status open|pending|approved|applied|rejected|superseded|needs-human] [--min-size N] [--json]\n       brainctl proposals show <id> [--json]\n       brainctl proposals approve <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals reject <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]"
     );
     return;
   }
@@ -9541,6 +9725,32 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
       console.log(`mode=${String(result.mode)} proposals=${proposals.length} (status filter: ${status})`);
       for (const proposal of proposals) {
         console.log(formatProposalLine(proposal));
+      }
+      const clusters = Array.isArray(result.clusters) ? (result.clusters as Array<Record<string, unknown>>) : [];
+      if (clusters.length) {
+        console.log(`memory_clusters=${clusters.length}`);
+        for (const cluster of clusters) {
+          console.log(formatProposalClusterLine(cluster));
+        }
+      }
+      return;
+    }
+    case "clusters": {
+      const status = requireFlagValue(args, "status") || "open";
+      const minSize = requireFlagValue(args, "min-size") || requireFlagValue(args, "min") || "2";
+      const result = await brainApiRequest(
+        cfg,
+        "GET",
+        `/api/proposals/clusters?status=${encodeURIComponent(status)}&min_size=${encodeURIComponent(minSize)}`
+      );
+      if (hasFlag(args, "json")) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      const clusters = Array.isArray(result.clusters) ? (result.clusters as Array<Record<string, unknown>>) : [];
+      console.log(`proposal memory clusters=${clusters.length} (status filter: ${status}, min size: ${String(result.min_size || minSize)})`);
+      for (const cluster of clusters) {
+        console.log(formatProposalClusterLine(cluster));
       }
       return;
     }

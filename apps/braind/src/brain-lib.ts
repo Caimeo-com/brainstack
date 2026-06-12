@@ -1868,6 +1868,7 @@ export interface CreateProposalInput {
   body: string;
   source_harness: string;
   source_machine: string;
+  source_type?: string;
   target_page?: string;
   tags?: string[];
   /** Full proposed content for target_page; stored as a sidecar and used by apply. */
@@ -1881,13 +1882,127 @@ export interface CreateProposalInput {
   /** Curators may park a proposal straight into needs-human. */
   status?: "pending" | "needs-human";
   source_ids?: string[];
+  related_repo?: string;
+  project?: string;
+  domain?: string;
+  scope?: string;
+  memory_kind?: string;
+  context?: string;
+  applicability?: string;
+  non_applicability?: string;
+  evidence_refs?: string[];
+  review_after?: string;
+  expires_at?: string;
+}
+
+export type ProposalQualityDecision = "ready" | "needs-context" | "needs-evidence" | "too-vague";
+
+export interface ProposalQuality {
+  score: number;
+  decision: ProposalQualityDecision;
+  reasons: string[];
+}
+
+function boundedString(value: string | undefined, maxLength: number): string | undefined {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  return trimmed ? trimmed.slice(0, maxLength) : undefined;
+}
+
+function boundedStringArray(values: string[] | undefined, maxItems: number, maxLength: number): string[] {
+  return uniqueStrings((values || []).map((value) => boundedString(value, maxLength) || "").filter(Boolean)).slice(0, maxItems);
+}
+
+function isMemoryProposal(input: CreateProposalInput): boolean {
+  const sourceType = (input.source_type || "").trim().toLowerCase();
+  const tags = (input.tags || []).map((tag) => tag.trim().toLowerCase());
+  return sourceType === "remember" || sourceType === "memory" || tags.includes("remember") || Boolean(input.memory_kind?.trim());
+}
+
+function hasMeaningfulText(value: string | undefined, minLength = 12): boolean {
+  return Boolean(value && value.trim().replace(/\s+/g, " ").length >= minLength);
+}
+
+function roundedScore(value: number): number {
+  return Math.max(0, Math.min(1, Math.round(value * 100) / 100));
+}
+
+export function evaluateProposalQuality(input: CreateProposalInput): ProposalQuality {
+  const body = input.body.trim();
+  const reasons: string[] = [];
+  let score = 0;
+  const memory = isMemoryProposal(input);
+  const hasTargetContent = Boolean(input.target_page && input.proposed_content);
+  const hasProjectContext = hasMeaningfulText(input.project, 2) || hasMeaningfulText(input.domain, 2) || hasMeaningfulText(input.related_repo, 4) || Boolean(input.target_page);
+  const scope = (input.scope || "").trim().toLowerCase();
+  const hasBoundedScope = hasTargetContent || (Boolean(scope) && scope !== "global") || (memory && Boolean(input.related_repo));
+  const hasApplicability = hasTargetContent || hasMeaningfulText(input.applicability, 12);
+  const evidenceRefs = boundedStringArray([...(input.evidence_refs || []), ...(input.source_ids || [])], 20, 240);
+  const hasEvidence = hasTargetContent || evidenceRefs.length > 0 || hasMeaningfulText(input.related_repo, 4);
+
+  if (body.length >= 80) {
+    score += 0.2;
+  } else if (body.length >= 10) {
+    score += 0.1;
+    reasons.push("body is short; reviewer should verify enough detail is present");
+  } else {
+    reasons.push("body is too short to preserve the lesson safely");
+  }
+
+  if (hasTargetContent) {
+    score += 0.2;
+  }
+  if (hasProjectContext) {
+    score += 0.2;
+  } else {
+    reasons.push("missing project, domain, related repo, or target page context");
+  }
+  if (hasBoundedScope) {
+    score += 0.15;
+  } else {
+    reasons.push("scope is missing or global; narrow when the lesson is project-specific");
+  }
+  if (hasApplicability) {
+    score += 0.15;
+  } else {
+    reasons.push("missing applicability guidance");
+  }
+  if (hasEvidence) {
+    score += 0.15;
+  } else {
+    reasons.push("missing evidence refs or related repo");
+  }
+  if (typeof input.confidence === "number" && Number.isFinite(input.confidence)) {
+    score += Math.max(0, Math.min(0.15, input.confidence * 0.15));
+  }
+
+  let decision: ProposalQualityDecision = "ready";
+  if (body.length < 40) {
+    decision = "too-vague";
+  } else if (!hasProjectContext || !hasBoundedScope || !hasApplicability) {
+    decision = "needs-context";
+  } else if (!hasEvidence) {
+    decision = "needs-evidence";
+  }
+  if (!memory && hasTargetContent && body.length >= 10) {
+    // Concrete wiki-edit proposals already carry their target and diff sidecar; they
+    // can be reviewed even if they do not look like durable memory candidates.
+    decision = reasons.some((reason) => reason.startsWith("body is too short")) ? "too-vague" : "ready";
+  }
+  if (decision === "ready" && reasons.length === 0) {
+    reasons.push("proposal carries enough context, scope, applicability, and evidence for review");
+  }
+  return { score: roundedScore(score), decision, reasons: uniqueStrings(reasons).slice(0, 8) };
+}
+
+function metadataLine(label: string, value: string | undefined): string {
+  return value ? `- ${label}: \`${value}\`` : "";
 }
 
 export async function createProposal(
   repoRoot: string,
   input: CreateProposalInput,
   hooks: MutationHooks = {}
-): Promise<{ proposalPath: string; proposalId: string; touchedFiles: string[] }> {
+): Promise<{ proposalPath: string; proposalId: string; touchedFiles: string[]; status: "pending" | "needs-human"; quality: ProposalQuality }> {
   if (!input.title.trim() || !input.body.trim()) {
     throw new Error("Proposal title and body are required");
   }
@@ -1895,7 +2010,20 @@ export async function createProposal(
   const proposalId = `${isoNow().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z").toLowerCase()}-${slugify(input.title)}`;
   const fileName = `${proposalId}.md`;
   const absolutePath = join(paths.proposalsPendingDir, fileName);
-  const status = input.status === "needs-human" ? "needs-human" : "pending";
+  const quality = evaluateProposalQuality(input);
+  const status = input.status === "needs-human" || (isMemoryProposal(input) && quality.decision !== "ready") ? "needs-human" : "pending";
+  const sourceType = boundedString(input.source_type, 80);
+  const relatedRepo = boundedString(input.related_repo, 500);
+  const project = boundedString(input.project, 120);
+  const domain = boundedString(input.domain, 120);
+  const scope = boundedString(input.scope, 80);
+  const memoryKind = boundedString(input.memory_kind, 80);
+  const context = boundedString(input.context, 1_000);
+  const applicability = boundedString(input.applicability, 1_000);
+  const nonApplicability = boundedString(input.non_applicability, 1_000);
+  const evidenceRefs = boundedStringArray(input.evidence_refs, 20, 240);
+  const reviewAfter = boundedString(input.review_after, 80);
+  const expiresAt = boundedString(input.expires_at, 80);
   const frontmatter: FrontmatterData = {
     title: input.title.trim(),
     type: "proposal",
@@ -1905,8 +2033,25 @@ export async function createProposal(
     status,
     tags: uniqueStrings(["proposal", ...(input.tags || [])]),
     aliases: [],
-    source_ids: uniqueStrings((input.source_ids || []).filter((id) => isSafeManifestId(id)))
+    source_harness: boundedString(input.source_harness, 120),
+    source_machine: boundedString(input.source_machine, 120),
+    source_ids: uniqueStrings((input.source_ids || []).filter((id) => isSafeManifestId(id))),
+    quality_score: quality.score,
+    quality_decision: quality.decision,
+    quality_reasons: quality.reasons
   };
+  if (sourceType) frontmatter.source_type = sourceType;
+  if (relatedRepo) frontmatter.related_repo = relatedRepo;
+  if (project) frontmatter.project = project;
+  if (domain) frontmatter.domain = domain;
+  if (scope) frontmatter.scope = scope;
+  if (memoryKind) frontmatter.memory_kind = memoryKind;
+  if (context) frontmatter.context = context;
+  if (applicability) frontmatter.applicability = applicability;
+  if (nonApplicability) frontmatter.non_applicability = nonApplicability;
+  if (evidenceRefs.length) frontmatter.evidence_refs = evidenceRefs;
+  if (reviewAfter) frontmatter.review_after = reviewAfter;
+  if (expiresAt) frontmatter.expires_at = expiresAt;
   if (input.target_page) frontmatter.target_page = input.target_page;
   if (input.base_sha256) frontmatter.base_sha256 = input.base_sha256;
   if (input.risk === "low" || input.risk === "medium" || input.risk === "high") frontmatter.risk = input.risk;
@@ -1920,11 +2065,26 @@ export async function createProposal(
     "",
     `- Source harness: \`${input.source_harness}\``,
     `- Source machine: \`${input.source_machine}\``,
+    metadataLine("Source type", sourceType),
+    metadataLine("Project", project),
+    metadataLine("Domain", domain),
+    metadataLine("Scope", scope),
+    metadataLine("Memory kind", memoryKind),
+    metadataLine("Related repo", relatedRepo),
     input.target_page ? `- Target page: \`${input.target_page}\`` : "",
+    applicability ? `- Applicability: ${applicability}` : "",
+    nonApplicability ? `- Non-applicability: ${nonApplicability}` : "",
+    evidenceRefs.length ? `- Evidence refs: ${evidenceRefs.map((ref) => `\`${ref}\``).join(", ")}` : "",
     "",
     "## Request",
     "",
     input.body.trim(),
+    "",
+    "## Quality Gate",
+    "",
+    `- Decision: \`${quality.decision}\``,
+    `- Score: \`${quality.score.toFixed(2)}\``,
+    ...quality.reasons.map((reason) => `- ${reason}`),
     ""
   ]
     .filter(Boolean)
@@ -1946,7 +2106,7 @@ export async function createProposal(
     `summary: Stored proposal in proposals/pending and left it unapplied.`
   ]);
   touchedFiles.push(logPath);
-  return { proposalPath, proposalId, touchedFiles };
+  return { proposalPath, proposalId, touchedFiles, status, quality };
 }
 
 function findBrokenInternalLinks(pagePath: string, raw: string, knownPaths: Set<string>): string[] {

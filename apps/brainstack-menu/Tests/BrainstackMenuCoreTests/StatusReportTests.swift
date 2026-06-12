@@ -75,13 +75,16 @@ final class ProposalTests: XCTestCase {
     let json = """
     {"ok": true, "mode": "approval", "proposals": [
       {"id": "p1", "title": "First", "status": "pending", "target_page": "wiki/Status/A.md", "risk": "low", "created_at": "2026-06-11T00:00:00Z"},
-      {"id": "p2", "title": "Second", "status": "needs-human", "target_page": null, "risk": null, "created_at": "2026-06-11T01:00:00Z"}
+      {"id": "p2", "title": "Second", "status": "needs-human", "target_page": null, "risk": null, "created_at": "2026-06-11T01:00:00Z", "legacy_format": true, "cluster_key": "slack-ea:needs-context:legacy-memory", "cluster_label": "Slack EA / needs-context / legacy-memory"}
     ]}
     """
     let proposals = ProposalSummary.parseList(json)
     XCTAssertEqual(proposals?.count, 2)
     XCTAssertEqual(proposals?[0].targetPage, "wiki/Status/A.md")
     XCTAssertNil(proposals?[1].targetPage)
+    XCTAssertEqual(proposals?[1].legacyFormat, true)
+    XCTAssertEqual(proposals?[1].clusterLabel, "Slack EA / needs-context / legacy-memory")
+    XCTAssertNil(proposals?[0].qualityDecision)
     XCTAssertNil(ProposalSummary.parseList("not json"))
   }
 }
@@ -90,7 +93,7 @@ final class ProposalDetailTests: XCTestCase {
   func testParseDetail() {
     let json = """
     {"ok": true,
-     "proposal": {"id": "p1", "title": "T", "status": "pending", "target_page": "wiki/Status/A.md", "risk": "low", "confidence": 0.85, "created_at": "2026-06-11T00:00:00Z", "source_ids": ["a", "b"], "reason": "why"},
+     "proposal": {"id": "p1", "title": "T", "status": "pending", "target_page": "wiki/Status/A.md", "risk": "low", "confidence": 0.85, "created_at": "2026-06-11T00:00:00Z", "source_ids": ["a", "b"], "reason": "why", "source_harness": "codex", "source_machine": "mac", "source_type": "remember", "related_repo": "/repo/app", "project": "app", "domain": "product", "scope": "repo", "memory_kind": "project_lesson", "context": "during test", "applicability": "use for this app", "non_applicability": "do not use globally", "evidence_refs": ["repo:/repo/app"], "review_after": "2026-07-01", "expires_at": "2027-01-01", "quality_decision": "ready", "quality_score": 0.92, "quality_reasons": ["has context"], "legacy_format": true, "cluster_key": "app:repo:project_lesson", "cluster_label": "app / repo / project_lesson"},
      "body": "## Request\\n\\ncontent",
      "diff": "+ added line"}
     """
@@ -100,6 +103,26 @@ final class ProposalDetailTests: XCTestCase {
     XCTAssertEqual(detail?.reason, "why")
     XCTAssertEqual(detail?.sourceIds, ["a", "b"])
     XCTAssertEqual(detail?.confidence, 0.85)
+    XCTAssertEqual(detail?.sourceHarness, "codex")
+    XCTAssertEqual(detail?.sourceMachine, "mac")
+    XCTAssertEqual(detail?.sourceType, "remember")
+    XCTAssertEqual(detail?.relatedRepo, "/repo/app")
+    XCTAssertEqual(detail?.project, "app")
+    XCTAssertEqual(detail?.domain, "product")
+    XCTAssertEqual(detail?.scope, "repo")
+    XCTAssertEqual(detail?.memoryKind, "project_lesson")
+    XCTAssertEqual(detail?.context, "during test")
+    XCTAssertEqual(detail?.applicability, "use for this app")
+    XCTAssertEqual(detail?.nonApplicability, "do not use globally")
+    XCTAssertEqual(detail?.evidenceRefs, ["repo:/repo/app"])
+    XCTAssertEqual(detail?.reviewAfter, "2026-07-01")
+    XCTAssertEqual(detail?.expiresAt, "2027-01-01")
+    XCTAssertEqual(detail?.qualityDecision, "ready")
+    XCTAssertEqual(detail?.qualityScore, 0.92)
+    XCTAssertEqual(detail?.qualityReasons, ["has context"])
+    XCTAssertEqual(detail?.legacyFormat, true)
+    XCTAssertEqual(detail?.clusterKey, "app:repo:project_lesson")
+    XCTAssertEqual(detail?.clusterLabel, "app / repo / project_lesson")
     XCTAssertNil(ProposalDetail.parse("not json"))
     XCTAssertNil(ProposalDetail.parse(#"{"ok": true}"#))
   }

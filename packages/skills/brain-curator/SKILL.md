@@ -9,20 +9,26 @@ Use this skill when acting as the control/admin side of a shared brain.
 
 - Read raw artifacts and source manifests first.
 - Preserve originals; never rewrite raw imported artifacts.
-- Every nontrivial synthesized claim needs a source artifact id or source page.
+- Every nontrivial synthesized claim needs a source artifact id, source page, or explicit evidence ref.
 - Record contradictions and freshness notes instead of silently overwriting them.
 - Use the admin ingest/lint token only on the organizer/control host.
 - Append parseable log entries for imports, ingests, lint reports, and manual curation.
+- Treat raw `remember` imports as evidence, not canon. A durable memory must stand alone without the original thread context.
 
 ## Proposal workflow
 
 Proposal generation is automatic; wiki mutation is policy-controlled (`curation.mode`: `manual`, `approval`, or `auto`). Do not edit canonical wiki pages directly — submit machine proposals and let policy decide:
 
 1. Read the cursor: `brainctl curator status` (or `GET /api/curator/status`). Review imports/logs/proposals newer than it.
-2. Group new material by topic/source type and draft a full proposed page content per change.
+2. Group new material by topic/source type. Batch related memory candidates into one scoped card instead of producing many tiny global-looking fragments.
 3. Submit each change with:
    `brainctl propose --title T --body WHY --target-page wiki/PATH.md --content-file FILE --base-sha256 $(sha256sum current-page) --risk low|medium|high --confidence 0..1 --source-ids id1,id2 --curator-run-id RUN`
    Use `--base-sha256 absent` for new pages and `--needs-human` for contradictory or ambiguous material.
-4. Risk guidance: `low` = additive, sourced, small (Status/Sources pages); `medium` = restructuring or prose edits; `high` = deletions, decision changes, runbooks.
-5. In `auto` mode only low-risk proposals inside `curation.autoApply.allowedPaths` apply automatically; everything else stays `pending` or `needs-human` for `brainctl proposals approve|reject|apply`.
+4. For memory-shaped proposals, include the envelope:
+   `--project NAME --domain NAME --scope repo|project|global|machine|harness --memory-kind KIND --applicability TEXT --non-applicability TEXT --evidence REF`
+   Prefer `scope=repo` or `scope=project` unless the lesson is truly global. Add `--needs-human` when a future harness would not know where the lesson applies and where it does not.
+5. Run the intelligibility test before submitting memory: "Would a future harness, with no original thread context, know where this applies and where it does not?" If no, enrich it or park it as `needs-human`.
+6. Risk guidance: `low` = additive, sourced, small (Status/Sources pages); `medium` = restructuring or prose edits; `high` = deletions, decision changes, runbooks.
+7. In `auto` mode only low-risk proposals inside `curation.autoApply.allowedPaths` apply automatically; everything else stays `pending` or `needs-human` for `brainctl proposals approve|reject|apply`.
 
+Use `brainctl proposals clusters` to find related old or candidate memories that should be reviewed together. Legacy title/body-only `Remember:` proposals are expected to show as `needs-human`/`needs-context` until enriched.

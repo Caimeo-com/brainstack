@@ -156,6 +156,8 @@ struct DashboardView: View {
       model.runAction("Install/Restart Daemon") { await $0.daemonInstall() }
     case .repairHooks:
       model.runAction("Install/Repair Hooks") { await $0.hooksInstall() }
+    case .installCurator:
+      model.runAction("Install Curator") { await $0.curatorInstall() }
     }
   }
 
@@ -247,9 +249,6 @@ struct DashboardView: View {
             }
           }
         }
-        if let report = model.lastReport, curatorRoutineMissing(report) {
-          curatorInstallGuidance
-        }
         if items.count > 4 {
           Text("\(items.count - 4) more item(s) in Details")
             .font(.caption2)
@@ -257,32 +256,6 @@ struct DashboardView: View {
         }
       }
     }
-  }
-
-  private var curatorInstallGuidance: some View {
-    VStack(alignment: .leading, spacing: 4) {
-      Text("Click Install Curator below. It schedules proposal generation; it will not approve or apply wiki edits.")
-        .font(.caption2)
-        .foregroundColor(.secondary)
-      Text(model.curatorInstallCommand)
-        .font(.system(size: 10, design: .monospaced))
-        .foregroundColor(.secondary)
-        .lineLimit(2)
-        .truncationMode(.middle)
-        .textSelection(.enabled)
-      HStack(spacing: 8) {
-        Button("Install Curator") {
-          if Confirm.ask(title: "Install Curator", message: "Install the brain-curator routine on the control host? It schedules proposal generation; it does not approve or apply wiki edits.") {
-            model.runAction("Install Curator") { await $0.curatorInstall() }
-          }
-        }
-        Button("Copy Command") { model.copyCuratorInstallCommand() }
-      }
-      .controlSize(.small)
-      .disabled(model.busyAction != nil)
-    }
-    .padding(.horizontal, 8)
-    .padding(.bottom, 2)
   }
 
   private var attentionItems: [AttentionItem] {
@@ -303,8 +276,9 @@ struct DashboardView: View {
       if installed == false {
         items.append(AttentionItem(
           title: "Curator routine is not installed",
-          detail: "Proposal generation will not run automatically until the curator routine is installed.",
-          severity: .warn
+          detail: "Use Install to schedule proposal generation on the control host; wiki edits still require approval.",
+          severity: .warn,
+          repair: .installCurator
         ))
       }
       let open = Int(curator.data?["open_proposals"]?.numberValue ?? 0)

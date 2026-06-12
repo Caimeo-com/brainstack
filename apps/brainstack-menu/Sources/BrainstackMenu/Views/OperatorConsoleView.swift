@@ -204,8 +204,14 @@ private struct ProposalListRow: View {
     VStack(alignment: .leading, spacing: 3) {
       HStack(spacing: 6) {
         statusBadge(proposal.status)
+        if proposal.legacyFormat {
+          qualityBadge("legacy")
+        }
         if let risk = proposal.risk {
           riskBadge(risk)
+        }
+        if let quality = proposal.qualityDecision, quality != "ready" {
+          qualityBadge(quality)
         }
         Spacer()
         Text(shortDate(proposal.createdAt))
@@ -217,6 +223,12 @@ private struct ProposalListRow: View {
         .lineLimit(2)
       if let target = proposal.targetPage {
         Text(target)
+          .font(.system(size: 10, design: .monospaced))
+          .foregroundColor(.secondary)
+          .lineLimit(1)
+          .truncationMode(.middle)
+      } else if proposal.project != nil || proposal.scope != nil || proposal.clusterLabel != nil {
+        Text([proposal.project, proposal.scope, proposal.clusterLabel].compactMap { $0 }.joined(separator: " / "))
           .font(.system(size: 10, design: .monospaced))
           .foregroundColor(.secondary)
           .lineLimit(1)
@@ -245,6 +257,45 @@ private struct ProposalDetailPane: View {
           if let reason = detail?.reason, !reason.isEmpty {
             labeledBlock("Reason") {
               Text(reason).font(.callout).textSelection(.enabled)
+            }
+          }
+          if detail?.qualityDecision != nil || detail?.qualityScore != nil || !(detail?.qualityReasons ?? []).isEmpty {
+            labeledBlock("Quality Gate") {
+              VStack(alignment: .leading, spacing: 5) {
+                if let decision = detail?.qualityDecision {
+                  Text("Decision: \(decision)").font(.callout.weight(.medium)).textSelection(.enabled)
+                }
+                if let score = detail?.qualityScore {
+                  Text("Score: \(String(format: "%.0f%%", score * 100))").font(.caption).foregroundColor(.secondary)
+                }
+                ForEach(detail?.qualityReasons ?? [], id: \.self) { reason in
+                  Text("- \(reason)").font(.caption).foregroundColor(.secondary).textSelection(.enabled)
+                }
+              }
+            }
+          }
+          if let context = detail?.context, !context.isEmpty {
+            labeledBlock("Context") {
+              Text(context).font(.callout).textSelection(.enabled)
+            }
+          }
+          if detail?.applicability != nil || detail?.nonApplicability != nil {
+            labeledBlock("Applicability") {
+              VStack(alignment: .leading, spacing: 8) {
+                if let applicability = detail?.applicability {
+                  Text(applicability).font(.callout).textSelection(.enabled)
+                }
+                if let nonApplicability = detail?.nonApplicability {
+                  Text("Do not apply: \(nonApplicability)").font(.caption).foregroundColor(.secondary).textSelection(.enabled)
+                }
+              }
+            }
+          }
+          if let evidence = detail?.evidenceRefs, !evidence.isEmpty {
+            labeledBlock("Evidence") {
+              Text(evidence.joined(separator: "\n"))
+                .font(.system(size: 11, design: .monospaced))
+                .textSelection(.enabled)
             }
           }
           if let body = detail?.body, !body.isEmpty {
@@ -291,8 +342,14 @@ private struct ProposalDetailPane: View {
         .textSelection(.enabled)
       HStack(spacing: 8) {
         statusBadge(proposal.status)
+        if detail?.legacyFormat == true || proposal.legacyFormat {
+          qualityBadge("legacy")
+        }
         if let risk = proposal.risk {
           riskBadge(risk)
+        }
+        if let quality = detail?.qualityDecision ?? proposal.qualityDecision {
+          qualityBadge(quality)
         }
         if let confidence = detail?.confidence {
           Text("confidence \(String(format: "%.0f%%", confidence * 100))")
@@ -330,6 +387,40 @@ private struct ProposalDetailPane: View {
             .foregroundColor(.secondary)
             .textSelection(.enabled)
         }
+      }
+      if let source = sourceLabel {
+        GridRow {
+          Text("Source").font(.caption).foregroundColor(.secondary)
+          Text(source).font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary).textSelection(.enabled)
+        }
+      }
+      metadataRow("Type", detail?.sourceType)
+      metadataRow("Project", detail?.project ?? proposal.project)
+      metadataRow("Domain", detail?.domain)
+      metadataRow("Scope", detail?.scope ?? proposal.scope)
+      metadataRow("Kind", detail?.memoryKind ?? proposal.memoryKind)
+      metadataRow("Cluster", detail?.clusterLabel ?? proposal.clusterLabel)
+      metadataRow("Related repo", detail?.relatedRepo)
+      metadataRow("Review after", detail?.reviewAfter)
+      metadataRow("Expires", detail?.expiresAt)
+    }
+  }
+
+  private var sourceLabel: String? {
+    let parts = [detail?.sourceHarness, detail?.sourceMachine]
+      .compactMap { $0?.isEmpty == false ? $0 : nil }
+    return parts.isEmpty ? nil : parts.joined(separator: " @ ")
+  }
+
+  @ViewBuilder
+  private func metadataRow(_ label: String, _ value: String?) -> some View {
+    if let value, !value.isEmpty {
+      GridRow {
+        Text(label).font(.caption).foregroundColor(.secondary)
+        Text(value)
+          .font(.system(size: 11, design: .monospaced))
+          .foregroundColor(.secondary)
+          .textSelection(.enabled)
       }
     }
   }
@@ -432,7 +523,13 @@ private struct DiffView: View {
 /// Curator proposals are commonly titled "Remember: …"; strip the boilerplate prefix
 /// for display so the list reads as content, not ceremony.
 private func displayTitle(_ title: String) -> String {
-  title.hasPrefix("Remember: ") ? String(title.dropFirst("Remember: ".count)) : title
+  if title.hasPrefix("Remember: ") {
+    return String(title.dropFirst("Remember: ".count))
+  }
+  if title.hasPrefix("Remember ("), let range = title.range(of: "): ") {
+    return String(title[range.upperBound...])
+  }
+  return title
 }
 
 private func shortDate(_ iso: String) -> String {
@@ -473,6 +570,26 @@ private func riskBadge(_ risk: String) -> some View {
     .padding(.horizontal, 6)
     .padding(.vertical, 1)
     .background(tint.opacity(0.15))
+    .foregroundColor(tint)
+    .clipShape(Capsule())
+}
+
+private func qualityBadge(_ decision: String) -> some View {
+  let tint: Color = {
+    switch decision {
+    case "ready": return .green
+    case "legacy": return .secondary
+    case "needs-evidence": return .yellow
+    case "needs-context": return .orange
+    case "too-vague": return .red
+    default: return .secondary
+    }
+  }()
+  return Text(decision)
+    .font(.caption2.weight(.medium))
+    .padding(.horizontal, 6)
+    .padding(.vertical, 1)
+    .background(tint.opacity(0.16))
     .foregroundColor(tint)
     .clipShape(Capsule())
 }
