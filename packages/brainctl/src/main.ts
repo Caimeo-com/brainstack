@@ -329,6 +329,7 @@ function usage(): string {
   brainctl skills list
   brainctl import skill <SKILL.md|DIR|URL> --config brainstack.yaml [--title TITLE] [--source-harness HARNESS] [--source-machine MACHINE] [--max-bytes N] [--max-files N] [--allow-private-url] [--allow-ssh-git]
   brainctl import skills [--config brainstack.yaml] [--target codex|claude|cursor|all] [--scan-dir DIR] [--skill NAME] [--apply] [--json]
+  brainctl import codex-session <SESSION_ID|JSONL_PATH> [--config brainstack.yaml] [--include-transcript] [--max-bytes N] [--dry-run] [--json]
   brainctl hooks install|status|remove [--target codex|claude|cursor|all] [--config brainstack.yaml] [--brainctl PATH_OR_COMMAND] [--dry-run]
   brainctl hook run --harness codex|claude|cursor --event EVENT [--config brainstack.yaml]
   brainctl invite create --config brainstack.yaml [--import-token-file FILE|--import-token-env ENV] [--ssh-known-hosts-file FILE] [--control-ssh SSH_TARGET] [--control-repo PATH] [--skills-profile client|operator|control|worker|none] [--expires-hours N] [--install-url URL] [--json]
@@ -342,7 +343,7 @@ function usage(): string {
   brainctl telegram send-file --file PATH [--config brainstack.yaml] [--via SSH_TARGET] [--remote-repo PATH] [--caption TEXT] [--context SLUG|--chat-id ID] [--thread-id ID] [--kind document|photo] [--max-bytes N] [--allow-sensitive] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default] [--json]
   brainctl import-text --config brainstack.yaml --title TITLE --text TEXT --source-harness HARNESS --source-machine MACHINE [--source-type note]
   brainctl propose --config brainstack.yaml --title TITLE --body BODY [--target-page wiki/PATH.md] [--content-file FILE] [--base-sha256 HASH|absent] [--risk low|medium|high] [--confidence 0..1] [--curator-run-id ID] [--reason TEXT] [--needs-human] [--source-ids id1,id2] [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF]
-  brainctl proposals list|clusters|show|approve|reject|apply [...]
+  brainctl proposals list|clusters|show|enrich|reprocess|approve|reject|apply [...]
   brainctl curator status|run|install [--config brainstack.yaml]
   brainctl context --repo PATH [--config brainstack.yaml] [--json] [--sync|--no-sync]
   brainctl search --repo PATH "query" [--config brainstack.yaml] [--json] [--wait-fresh]
@@ -5747,6 +5748,148 @@ function buildRememberBody(input: {
   return lines.join("\n");
 }
 
+function stringFromRecord(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function stringArrayFromRecord(record: Record<string, unknown>, key: string): string[] {
+  const value = record[key];
+  return Array.isArray(value) ? value.map((item) => (typeof item === "string" ? item.trim() : "")).filter(Boolean) : [];
+}
+
+function uniqueNonEmptyStrings(values: Array<string | undefined | null>): string[] {
+  return Array.from(new Set(values.map((value) => value?.trim() || "").filter(Boolean)));
+}
+
+function collapseWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function stripMarkdownHeading(value: string): string {
+  return value.replace(/^#+\s+/, "").trim();
+}
+
+function firstUsefulProposalLine(body: string): string {
+  for (const line of body.split(/\r?\n/)) {
+    const trimmed = stripMarkdownHeading(line.trim());
+    if (!trimmed || trimmed.startsWith("---") || trimmed.startsWith("- Source ") || trimmed.startsWith("- Target ")) {
+      continue;
+    }
+    if (trimmed.length >= 20) {
+      return trimmed;
+    }
+  }
+  return "";
+}
+
+function proposalSummary(proposal: Record<string, unknown>, body: string, explicit?: string): string {
+  if (explicit?.trim()) {
+    return collapseWhitespace(explicit).slice(0, 1_000);
+  }
+  const title = stringFromRecord(proposal, "title") || "";
+  const titleSummary = collapseWhitespace(title.replace(/^remember(?:\s*\([^)]+\))?:/i, ""));
+  if (titleSummary.length >= 20) {
+    return titleSummary.slice(0, 1_000);
+  }
+  const line = firstUsefulProposalLine(body);
+  if (line) {
+    return collapseWhitespace(line).slice(0, 1_000);
+  }
+  return `Enriched memory candidate from proposal ${stringFromRecord(proposal, "id") || "unknown"}`;
+}
+
+function clusterSubject(proposal: Record<string, unknown>): string | undefined {
+  const cluster = stringFromRecord(proposal, "cluster_label");
+  if (!cluster) {
+    return undefined;
+  }
+  const subject = cluster.split("/")[0]?.trim();
+  return subject || undefined;
+}
+
+function inferProjectForProposal(proposal: Record<string, unknown>): string {
+  return (
+    stringFromRecord(proposal, "project") ||
+    stringFromRecord(proposal, "domain") ||
+    (stringFromRecord(proposal, "related_repo") ? deriveProjectLabel(stringFromRecord(proposal, "related_repo")!) : undefined) ||
+    clusterSubject(proposal) ||
+    "shared-brain"
+  );
+}
+
+function inferScopeForProposal(proposal: Record<string, unknown>): string {
+  const explicit = stringFromRecord(proposal, "scope");
+  if (explicit && explicit !== "needs-context") {
+    return validateMemoryScope(explicit);
+  }
+  return stringFromRecord(proposal, "related_repo") ? "repo" : "project";
+}
+
+function proposalEnrichmentPayload(
+  cfg: BrainstackConfig,
+  args: ParsedArgs,
+  proposal: Record<string, unknown>,
+  body: string
+): Record<string, unknown> {
+  const id = stringFromRecord(proposal, "id") || args.positional[1] || "unknown";
+  const project = boundedCliString(requireFlagValue(args, "project"), 120) || inferProjectForProposal(proposal);
+  const domain = boundedCliString(requireFlagValue(args, "domain"), 120) || stringFromRecord(proposal, "domain") || clusterSubject(proposal) || project;
+  const scope = validateMemoryScope(requireFlagValue(args, "scope") || inferScopeForProposal(proposal));
+  const memoryKind = boundedCliString(requireFlagValue(args, "memory-kind") || requireFlagValue(args, "kind"), 80) || stringFromRecord(proposal, "memory_kind") || "project_lesson";
+  const summary = proposalSummary(proposal, body, requireFlagValue(args, "summary"));
+  const relatedRepo = boundedCliString(requireFlagValue(args, "related-repo"), 500) || stringFromRecord(proposal, "related_repo");
+  const context =
+    boundedCliString(requireFlagValue(args, "context"), 1_000) ||
+    stringFromRecord(proposal, "context") ||
+    `Enriched from legacy or context-poor Brainstack proposal ${id}. Review the original proposal before applying this memory globally.`;
+  const applicability =
+    boundedCliString(requireFlagValue(args, "applicability"), 1_000) ||
+    stringFromRecord(proposal, "applicability") ||
+    (scope === "repo" && relatedRepo
+      ? `Use when working in ${relatedRepo} or directly related ${domain} work.`
+      : `Use for ${project}/${domain} work after verifying the same project and runtime context.`);
+  const nonApplicability =
+    boundedCliString(requireFlagValue(args, "non-applicability") || requireFlagValue(args, "non_applicability"), 1_000) ||
+    stringFromRecord(proposal, "non_applicability") ||
+    `Do not apply outside ${project}/${domain} without checking the original evidence and current system behavior.`;
+  const evidenceRefs = uniqueNonEmptyStrings([
+    `proposal:${id}`,
+    ...stringArrayFromRecord(proposal, "source_ids").map((sourceId) => `source:${sourceId}`),
+    ...stringArrayFromRecord(proposal, "evidence_refs"),
+    ...(relatedRepo ? [`repo:${relatedRepo}`] : []),
+    ...flagValues(args, "evidence")
+  ]).slice(0, 20);
+  const confidenceRaw = requireFlagValue(args, "confidence");
+  const confidence = confidenceRaw === undefined ? 0.55 : Number(confidenceRaw);
+  if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+    throw new Error("--confidence must be a number between 0 and 1");
+  }
+  const title = requireFlagValue(args, "title") || `Enriched memory (${project}): ${summary.slice(0, 120)}`;
+  const proposalBody = buildRememberBody({ summary, project, domain, scope, memoryKind, context, applicability, nonApplicability, evidenceRefs });
+  return {
+    title,
+    body: proposalBody,
+    source_harness: requireFlagValue(args, "source-harness") || cfg.harness.name,
+    source_machine: requireFlagValue(args, "source-machine") || cfg.machine.name,
+    source_type: "memory",
+    related_repo: relatedRepo,
+    project,
+    domain,
+    scope,
+    memory_kind: memoryKind,
+    context,
+    applicability,
+    non_applicability: nonApplicability,
+    evidence_refs: evidenceRefs,
+    source_ids: stringArrayFromRecord(proposal, "source_ids"),
+    tags: uniqueNonEmptyStrings(["remember", "enriched-memory", project, domain, memoryKind, scope]),
+    confidence,
+    review_after: boundedCliString(requireFlagValue(args, "review-after"), 80),
+    expires_at: boundedCliString(requireFlagValue(args, "expires-at"), 80)
+  };
+}
+
 function crossBrainAllowKey(sourceId: string, targetId: string): string {
   return `cross:${sourceId}->${targetId}`;
 }
@@ -6193,16 +6336,22 @@ function idempotencyPendingTerminalError(item: OutboxItem, status: number, respo
   return `HTTP 425 persisted after ${item.retry_count} flush attempt(s); operator review required before replaying this idempotent write. ${sanitizedHttpError(status, responseText)}`;
 }
 
+type BrainWriteOutcome =
+  | { status: "accepted" }
+  | { status: "queued"; path: string; reason: string };
+
 async function postBrainWriteOrQueue(
   cfg: BrainstackConfig,
   endpoint: "import" | "propose",
   payload: Record<string, unknown>,
-  overrides: { baseUrl?: string; importTokenEnv?: string; targetBrainId?: string } = {}
-): Promise<void> {
+  overrides: { baseUrl?: string; importTokenEnv?: string; targetBrainId?: string } = {},
+  options: { quiet?: boolean } = {}
+): Promise<BrainWriteOutcome> {
   const writeConfig = brainWriteConfig(cfg);
   const baseUrl = overrides.baseUrl || writeConfig.baseUrl;
   const writeToken = overrides.importTokenEnv ? resolveClientEnvValue(cfg, overrides.importTokenEnv) : writeConfig.token;
   if (!baseUrl || !writeToken) {
+    const reason = "brain base URL or import token is missing";
     const queued = await queueOutboxItem(
       cfg,
       {
@@ -6214,10 +6363,12 @@ async function postBrainWriteOrQueue(
         source_machine: String(payload.source_machine || cfg.machine.name),
         source_harness: String(payload.source_harness || cfg.harness.name)
       },
-      "brain base URL or import token is missing"
+      reason
     );
-    console.warn(`shared-brain write queued: ${queued}`);
-    return;
+    if (!options.quiet) {
+      console.warn(`shared-brain write queued: ${queued}`);
+    }
+    return { status: "queued", path: queued, reason };
   }
 
   try {
@@ -6241,7 +6392,10 @@ async function postBrainWriteOrQueue(
       }
       throw new Error(`brain rejected ${endpoint} with HTTP ${response.status}: ${sanitizedHttpError(response.status, text)}`);
     }
-    console.log(`shared-brain ${endpoint} accepted`);
+    if (!options.quiet) {
+      console.log(`shared-brain ${endpoint} accepted`);
+    }
+    return { status: "accepted" };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (message.startsWith("brain rejected ")) {
@@ -6260,8 +6414,31 @@ async function postBrainWriteOrQueue(
       },
       message
     );
-    console.warn(`shared-brain write queued: ${queued}`);
+    if (!options.quiet) {
+      console.warn(`shared-brain write queued: ${queued}`);
+    }
+    return { status: "queued", path: queued, reason: message };
   }
+}
+
+async function queueBrainWriteForBackgroundFlush(
+  cfg: BrainstackConfig,
+  endpoint: "import" | "propose",
+  payload: Record<string, unknown>,
+  reason: string
+): Promise<string> {
+  const writeConfig = brainWriteConfig(cfg);
+  return await queueOutboxItem(
+    cfg,
+    {
+      endpoint,
+      url: writeConfig.baseUrl || "",
+      payload,
+      source_machine: String(payload.source_machine || cfg.machine.name),
+      source_harness: String(payload.source_harness || cfg.harness.name)
+    },
+    reason
+  );
 }
 
 async function listOutboxEntries(cfg: BrainstackConfig): Promise<OutboxEntry[]> {
@@ -8227,9 +8404,12 @@ async function commandImport(args: ParsedArgs): Promise<void> {
   if (subcommand === "skills") {
     return await commandImportSkills(args);
   }
+  if (subcommand === "codex-session") {
+    return await commandImportCodexSession(args);
+  }
   if (subcommand !== "skill") {
     if (subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
-      console.log("Usage: brainctl import skill <SKILL.md|DIR|URL> --config brainstack.yaml [--title TITLE] [--source-harness HARNESS] [--source-machine MACHINE] [--max-bytes N] [--max-files N] [--allow-private-url] [--allow-ssh-git]\n       brainctl import skills [--config brainstack.yaml] [--target codex|claude|cursor|all] [--scan-dir DIR] [--skill NAME] [--apply] [--json]");
+      console.log("Usage: brainctl import skill <SKILL.md|DIR|URL> --config brainstack.yaml [--title TITLE] [--source-harness HARNESS] [--source-machine MACHINE] [--max-bytes N] [--max-files N] [--allow-private-url] [--allow-ssh-git]\n       brainctl import skills [--config brainstack.yaml] [--target codex|claude|cursor|all] [--scan-dir DIR] [--skill NAME] [--apply] [--json]\n       brainctl import codex-session <SESSION_ID|JSONL_PATH> [--config brainstack.yaml] [--include-transcript] [--max-bytes N] [--dry-run] [--json]");
       return;
     }
     throw new Error(`Unknown import subcommand: ${subcommand}`);
@@ -8268,6 +8448,258 @@ function safeRepoRelativeFile(repo: string, repoPath: string): string {
     throw new Error(`repo path escapes clone: ${repoPath}`);
   }
   return absolute;
+}
+
+interface CodexSessionSummary {
+  id: string;
+  threadName?: string;
+  path: string;
+  bytes: number;
+  sha256: string;
+  startedAt?: string;
+  updatedAt?: string;
+  cwd?: string;
+  originator?: string;
+  cliVersion?: string;
+  source?: string;
+  modelProvider?: string;
+  lastAgentMessage?: string;
+}
+
+function codexHomePath(): string {
+  return process.env.CODEX_HOME ? abs(process.env.CODEX_HOME) : process.env.HOME ? join(abs(process.env.HOME), ".codex") : ".codex";
+}
+
+function isCodexSessionId(value: string): boolean {
+  return /^[0-9a-f]{8,}-[0-9a-f-]{20,}$/i.test(value.trim());
+}
+
+async function findCodexSessionById(sessionId: string, codexHome: string): Promise<string | null> {
+  const roots = [join(codexHome, "sessions"), join(codexHome, "archived_sessions")];
+  const maxFiles = 25_000;
+  const maxDirs = 4_000;
+  const candidates: Array<{ path: string; mtimeMs: number }> = [];
+  let files = 0;
+  let dirs = 0;
+  for (const root of roots) {
+    if (!existsSync(root)) {
+      continue;
+    }
+    const stack = [root];
+    while (stack.length) {
+      const dir = stack.pop()!;
+      dirs += 1;
+      if (dirs > maxDirs) {
+        throw new Error(`Codex session search exceeded ${maxDirs} directories under ${codexHome}; pass the JSONL path explicitly`);
+      }
+      const info = await lstat(dir).catch(() => null);
+      if (!info?.isDirectory() || info.isSymbolicLink()) {
+        continue;
+      }
+      for (const name of await readdir(dir).catch(() => [])) {
+        const path = join(dir, name);
+        const entryInfo = await lstat(path).catch(() => null);
+        if (!entryInfo || entryInfo.isSymbolicLink()) {
+          continue;
+        }
+        if (entryInfo.isDirectory()) {
+          stack.push(path);
+          continue;
+        }
+        if (!entryInfo.isFile()) {
+          continue;
+        }
+        files += 1;
+        if (files > maxFiles) {
+          throw new Error(`Codex session search exceeded ${maxFiles} files under ${codexHome}; pass the JSONL path explicitly`);
+        }
+        if (name.endsWith(".jsonl") && name.includes(sessionId)) {
+          candidates.push({ path, mtimeMs: entryInfo.mtimeMs });
+        }
+      }
+    }
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || b.path.localeCompare(a.path));
+  return candidates[0]?.path || null;
+}
+
+async function codexThreadName(sessionId: string, codexHome: string): Promise<string | undefined> {
+  const indexPath = join(codexHome, "session_index.jsonl");
+  if (!existsSync(indexPath)) {
+    return undefined;
+  }
+  const indexInfo = await lstat(indexPath).catch(() => null);
+  if (!indexInfo?.isFile() || indexInfo.isSymbolicLink() || indexInfo.size > 10 * 1024 * 1024) {
+    return undefined;
+  }
+  let latestName: string | undefined;
+  for (const line of (await readFile(indexPath, "utf8")).split(/\r?\n/)) {
+    if (!line.includes(sessionId)) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      const name = typeof parsed.thread_name === "string" ? parsed.thread_name.trim() : "";
+      latestName = name || latestName;
+    } catch {
+      continue;
+    }
+  }
+  return latestName;
+}
+
+function cappedText(value: unknown, maxChars: number): string | undefined {
+  if (typeof value !== "string" || !value.trim()) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > maxChars ? `${trimmed.slice(0, maxChars)}\n[truncated]` : trimmed;
+}
+
+async function resolveCodexSessionPath(reference: string, codexHome: string): Promise<string> {
+  const expanded = expandHome(reference);
+  if (existsSync(expanded)) {
+    return abs(expanded);
+  }
+  if (!isCodexSessionId(reference)) {
+    throw new Error(`Codex session reference is neither an existing path nor a session id: ${reference}`);
+  }
+  const found = await findCodexSessionById(reference, codexHome);
+  if (!found) {
+    throw new Error(`Codex session not found: ${reference}. Pass the JSONL path explicitly or verify ${codexHome}/session_index.jsonl.`);
+  }
+  return found;
+}
+
+async function readCodexSessionSummary(reference: string, maxBytes: number): Promise<{ summary: CodexSessionSummary; transcript?: string }> {
+  const codexHome = codexHomePath();
+  const path = await resolveCodexSessionPath(reference, codexHome);
+  const info = await lstat(path);
+  if (!info.isFile() || info.isSymbolicLink()) {
+    throw new Error(`Codex session path must be a regular file: ${path}`);
+  }
+  if (info.size > maxBytes) {
+    throw new Error(`Codex session is too large: ${info.size} bytes > --max-bytes ${maxBytes}`);
+  }
+  const transcript = await readFile(path, "utf8");
+  const summary: CodexSessionSummary = {
+    id: reference,
+    path,
+    bytes: info.size,
+    sha256: createHash("sha256").update(transcript).digest("hex"),
+    updatedAt: info.mtime.toISOString()
+  };
+  for (const line of transcript.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const payload = parsed.payload && typeof parsed.payload === "object" && !Array.isArray(parsed.payload) ? (parsed.payload as Record<string, unknown>) : {};
+    if (parsed.type === "session_meta") {
+      summary.id = typeof payload.id === "string" ? payload.id : summary.id;
+      summary.startedAt = typeof payload.timestamp === "string" ? payload.timestamp : summary.startedAt;
+      summary.cwd = typeof payload.cwd === "string" ? payload.cwd : summary.cwd;
+      summary.originator = typeof payload.originator === "string" ? payload.originator : summary.originator;
+      summary.cliVersion = typeof payload.cli_version === "string" ? payload.cli_version : summary.cliVersion;
+      summary.source = typeof payload.source === "string" ? payload.source : summary.source;
+      summary.modelProvider = typeof payload.model_provider === "string" ? payload.model_provider : summary.modelProvider;
+    }
+    if (payload.type === "task_complete") {
+      summary.lastAgentMessage = cappedText(payload.last_agent_message, 8_000) || summary.lastAgentMessage;
+    }
+  }
+  summary.threadName = await codexThreadName(summary.id, codexHome);
+  return { summary, transcript };
+}
+
+function codexSessionImportText(summary: CodexSessionSummary, transcript: string | undefined, includeTranscript: boolean): string {
+  const lines = [
+    `# Codex session ${summary.id}`,
+    "",
+    `- Session id: \`${summary.id}\``,
+    summary.threadName ? `- Thread: ${summary.threadName}` : "",
+    summary.cwd ? `- Cwd: \`${summary.cwd}\`` : "",
+    summary.startedAt ? `- Started: \`${summary.startedAt}\`` : "",
+    summary.updatedAt ? `- Updated: \`${summary.updatedAt}\`` : "",
+    summary.originator ? `- Originator: \`${summary.originator}\`` : "",
+    summary.cliVersion ? `- CLI version: \`${summary.cliVersion}\`` : "",
+    summary.source ? `- Source: \`${summary.source}\`` : "",
+    summary.modelProvider ? `- Model provider: \`${summary.modelProvider}\`` : "",
+    `- Local transcript path: \`${summary.path}\``,
+    `- Transcript bytes: \`${summary.bytes}\``,
+    `- Transcript sha256: \`${summary.sha256}\``,
+    "",
+    "## Last Agent Message",
+    "",
+    summary.lastAgentMessage || "No task-complete final message was found in the imported JSONL.",
+    "",
+    "## Capture Note",
+    "",
+    includeTranscript
+      ? "The transcript below was explicitly included by the importing operator."
+      : "This import is a bounded session checkpoint. Re-import with `brainctl import codex-session ... --include-transcript` when full raw evidence is needed.",
+    ""
+  ].filter(Boolean);
+  if (includeTranscript && transcript !== undefined) {
+    lines.push("## Transcript", "", "```jsonl", transcript.trimEnd(), "```", "");
+  }
+  return lines.join("\n");
+}
+
+async function codexSessionImportPayload(
+  cfg: BrainstackConfig,
+  reference: string,
+  args: ParsedArgs,
+  options: { includeTranscript: boolean }
+): Promise<Record<string, unknown>> {
+  const maxBytes = parsePositiveIntegerFlag(args, "max-bytes", options.includeTranscript ? 20 * 1024 * 1024 : 5 * 1024 * 1024);
+  const { summary, transcript } = await readCodexSessionSummary(reference, maxBytes);
+  const title = requireFlagValue(args, "title") || `Codex session: ${summary.threadName || summary.id}`;
+  const text = codexSessionImportText(summary, transcript, options.includeTranscript);
+  const tags = uniqueNonEmptyStrings([
+    "codex-session",
+    options.includeTranscript ? "codex-transcript" : "codex-session-checkpoint",
+    `session:${summary.id}`,
+    summary.cwd ? `repo:${deriveProjectLabel(summary.cwd)}` : undefined,
+    ...flagValues(args, "tags")
+  ]);
+  return {
+    title,
+    text,
+    source_harness: requireFlagValue(args, "source-harness") || cfg.harness.name,
+    source_machine: requireFlagValue(args, "source-machine") || cfg.machine.name,
+    source_type: options.includeTranscript ? "codex-session-transcript" : "codex-session-checkpoint",
+    conversation_id: summary.id,
+    related_repo: summary.cwd,
+    transcript_path: summary.path,
+    transcript_bytes: summary.bytes,
+    transcript_sha256: summary.sha256,
+    started_at: summary.startedAt,
+    updated_at: summary.updatedAt,
+    tags
+  };
+}
+
+async function commandImportCodexSession(args: ParsedArgs): Promise<void> {
+  const reference = args.positional[1] || requireFlagValue(args, "session") || requireFlagValue(args, "source");
+  if (!reference) {
+    throw new Error("import codex-session requires a session id or JSONL path");
+  }
+  const cfg = await loadConfig(flag(args, "config"), flag(args, "profile") || "client-macos", flag(args, "root"));
+  const includeTranscript = hasFlag(args, "include-transcript");
+  const payload = await codexSessionImportPayload(cfg, reference, args, { includeTranscript });
+  if (hasFlag(args, "json") || hasFlag(args, "dry-run")) {
+    console.log(JSON.stringify({ dry_run: hasFlag(args, "dry-run"), payload }, null, 2));
+    if (hasFlag(args, "dry-run")) {
+      return;
+    }
+  }
+  await postBrainWriteOrQueue(cfg, "import", payload);
 }
 
 async function discoverSkillPackages(repo: string): Promise<SkillPackageWithManifest[]> {
@@ -8777,6 +9209,65 @@ function summarizeHookInput(input: unknown, stdinInfo: { bytes: number; truncate
   return summary;
 }
 
+function hookInputString(input: unknown, key: string): string | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return undefined;
+  }
+  const value = (input as Record<string, unknown>)[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function sessionIdFromTranscriptPath(path: string): string | undefined {
+  const match = basename(path).match(/([0-9a-f]{8,}-[0-9a-f-]{20,})/i);
+  return match?.[1];
+}
+
+async function hookSessionCheckpointPayload(
+  cfg: BrainstackConfig,
+  target: HookTarget,
+  event: string,
+  input: unknown
+): Promise<Record<string, unknown> | null> {
+  const transcriptPathRaw = hookInputString(input, "transcript_path");
+  if (!transcriptPathRaw) {
+    return null;
+  }
+  const transcriptPath = abs(expandHome(transcriptPathRaw));
+  const info = await lstat(transcriptPath).catch(() => null);
+  if (!info?.isFile() || info.isSymbolicLink()) {
+    return null;
+  }
+  const sessionId = hookInputString(input, "session_id") || sessionIdFromTranscriptPath(transcriptPath) || sha256Hex(transcriptPath).slice(0, 16);
+  const cwd = hookInputString(input, "cwd") || process.cwd();
+  const title = `Codex session checkpoint: ${sessionId}`;
+  const text = [
+    `# ${title}`,
+    "",
+    `- Session id: \`${sessionId}\``,
+    `- Harness: \`${target}\``,
+    `- Hook event: \`${event}\``,
+    `- Cwd: \`${cwd}\``,
+    `- Local transcript path: \`${transcriptPath}\``,
+    "",
+    "## Capture Note",
+    "",
+    "This is a hook-created checkpoint, not a transcript import. Use `brainctl import codex-session` from the machine that owns the transcript when full raw evidence is needed.",
+    ""
+  ].join("\n");
+  return {
+    title,
+    text,
+    source_harness: target,
+    source_machine: cfg.machine.name,
+    source_type: "codex-session-checkpoint",
+    conversation_id: sessionId,
+    related_repo: cwd,
+    transcript_path: transcriptPath,
+    transcript_bytes: info.size,
+    tags: uniqueNonEmptyStrings(["codex-session", "codex-session-checkpoint", `session:${sessionId}`, `repo:${deriveProjectLabel(cwd)}`])
+  };
+}
+
 async function commandHook(args: ParsedArgs): Promise<void> {
   const subcommand = args.positional[0] || "help";
   if (subcommand !== "run") {
@@ -8839,6 +9330,26 @@ async function commandHook(args: ParsedArgs): Promise<void> {
             });
           });
         }
+      }
+    }
+    if (event === "Stop" || event === "stop") {
+      const payload = await hookSessionCheckpointPayload(cfg, target, event, parsedInput);
+      if (payload) {
+        const queuedPath = await queueBrainWriteForBackgroundFlush(cfg, "import", payload, "queued by harness hook for daemon/outbox flush");
+        await appendHookEventLog(cfg.paths.stateRoot, {
+          ts: new Date().toISOString(),
+          harness: target,
+          event: "session-checkpoint-queued",
+          outbox: queuedPath,
+          session_id: payload.conversation_id || null
+        });
+      } else {
+        await appendHookEventLog(cfg.paths.stateRoot, {
+          ts: new Date().toISOString(),
+          harness: target,
+          event: "session-checkpoint-skipped",
+          reason: "no regular transcript_path in hook input"
+        });
       }
     }
   } catch (error) {
@@ -9606,6 +10117,32 @@ async function brainApiRequest(
   return parsed;
 }
 
+async function fetchProposalDetail(cfg: BrainstackConfig, id: string): Promise<{ proposal: Record<string, unknown>; body: string }> {
+  const result = await brainApiRequest(cfg, "GET", `/api/proposals/${encodeURIComponent(id)}`);
+  const proposal = result.proposal && typeof result.proposal === "object" && !Array.isArray(result.proposal) ? (result.proposal as Record<string, unknown>) : {};
+  return { proposal, body: typeof result.body === "string" ? result.body : "" };
+}
+
+function proposalNeedsContext(proposal: Record<string, unknown>): boolean {
+  const quality = stringFromRecord(proposal, "quality_decision") || "";
+  const status = stringFromRecord(proposal, "status") || "";
+  return Boolean(proposal.legacy_format) || quality === "needs-context" || status === "needs-human";
+}
+
+async function createEnrichedProposal(
+  cfg: BrainstackConfig,
+  args: ParsedArgs,
+  id: string
+): Promise<{ id: string; payload: Record<string, unknown>; dryRun: boolean; write?: BrainWriteOutcome }> {
+  const { proposal, body } = await fetchProposalDetail(cfg, id);
+  const payload = proposalEnrichmentPayload(cfg, args, { ...proposal, id: stringFromRecord(proposal, "id") || id }, body);
+  if (hasFlag(args, "dry-run")) {
+    return { id, payload, dryRun: true };
+  }
+  const write = await postBrainWriteOrQueue(cfg, "propose", payload, {}, { quiet: hasFlag(args, "json") });
+  return { id, payload, dryRun: false, write };
+}
+
 function formatProposalLine(proposal: Record<string, unknown>): string {
   return [
     String(proposal.id),
@@ -9708,6 +10245,8 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
   if (sub === "help" || sub === "--help" || sub === "-h") {
     console.log(
       "Usage: brainctl proposals list [--status open|pending|approved|applied|rejected|superseded|needs-human] [--json]\n       brainctl proposals clusters [--status open|pending|approved|applied|rejected|superseded|needs-human] [--min-size N] [--json]\n       brainctl proposals show <id> [--json]\n       brainctl proposals approve <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals reject <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]"
+        + "\n       brainctl proposals enrich <id> [--summary TEXT] [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF] [--dry-run|--json]"
+        + "\n       brainctl proposals reprocess [--status needs-human|open] [--cluster KEY] [--id ID] [--limit N] [--apply] [--json] [enrichment flags...]"
     );
     return;
   }
@@ -9778,6 +10317,62 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
         console.log("");
         console.log("--- proposed change ---");
         console.log(String(result.diff));
+      }
+      return;
+    }
+    case "enrich": {
+      const id = args.positional[1];
+      if (!id) {
+        throw new Error("proposals enrich requires a proposal id");
+      }
+      const result = await createEnrichedProposal(cfg, args, id);
+      if (hasFlag(args, "json")) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      console.log(
+        [
+          `proposal=${id}`,
+          result.dryRun ? "dry_run=true" : `enriched=${result.write?.status || "submitted"}`,
+          `title=${String(result.payload.title)}`,
+          `project=${String(result.payload.project)}`,
+          `scope=${String(result.payload.scope)}`,
+          `quality_input=evidence_refs:${Array.isArray(result.payload.evidence_refs) ? result.payload.evidence_refs.length : 0}`
+        ].join(" ")
+      );
+      return;
+    }
+    case "reprocess": {
+      const status = requireFlagValue(args, "status") || "needs-human";
+      const limit = parsePositiveIntegerFlag(args, "limit", 10);
+      const apply = hasFlag(args, "apply");
+      const result = await brainApiRequest(cfg, "GET", `/api/proposals?status=${encodeURIComponent(status)}`);
+      const proposals = Array.isArray(result.proposals) ? (result.proposals as Array<Record<string, unknown>>) : [];
+      const ids = new Set(flagValues(args, "id"));
+      const cluster = requireFlagValue(args, "cluster");
+      const selected = proposals
+        .filter((proposal) => !ids.size || ids.has(stringFromRecord(proposal, "id") || ""))
+        .filter((proposal) => !cluster || stringFromRecord(proposal, "cluster_key") === cluster || stringFromRecord(proposal, "cluster_label") === cluster)
+        .filter((proposal) => hasFlag(args, "all") || proposalNeedsContext(proposal))
+        .slice(0, limit);
+      const outputs: Array<{ id: string; payload: Record<string, unknown>; dryRun: boolean; write?: BrainWriteOutcome }> = [];
+      for (const proposal of selected) {
+        const id = stringFromRecord(proposal, "id");
+        if (!id) {
+          continue;
+        }
+        outputs.push(await createEnrichedProposal(cfg, { ...args, flags: apply ? args.flags : { ...args.flags, "dry-run": true } }, id));
+      }
+      if (hasFlag(args, "json")) {
+        console.log(JSON.stringify({ apply, status, selected: selected.length, results: outputs }, null, 2));
+        return;
+      }
+      console.log(`${apply ? "reprocessed" : "dry-run reprocess plan"} proposals=${outputs.length} status=${status}`);
+      for (const item of outputs) {
+        console.log(`${item.id} -> ${String(item.payload.title)} project=${String(item.payload.project)} scope=${String(item.payload.scope)}`);
+      }
+      if (!apply) {
+        console.log("No writes performed. Rerun with --apply to create enriched replacement proposals.");
       }
       return;
     }

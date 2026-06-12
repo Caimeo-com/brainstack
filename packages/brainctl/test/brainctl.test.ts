@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:net";
 import { hostname, tmpdir } from "node:os";
@@ -432,13 +432,13 @@ telemux:
         `      return Response.json({ ok: true, service: "braind", search_ready: true, pending_reindex: { present: false } });`,
         `    }`,
         `    if (req.method === "GET" && url.pathname === "/api/proposals") {`,
-        `      return Response.json({ ok: true, mode: "approval", proposals: [{ id: "20260611t000000z-cli-proposal", title: "CLI proposal", status: "pending", target_page: "wiki/Status/CLI.md", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:00:00Z" }], clusters: [{ id: "cli:repo:project_lesson", label: "CLI / repo / project_lesson", count: 2, legacyCount: 1, needsContextCount: 1, proposalIds: ["p1", "p2"] }] });`,
+        `      return Response.json({ ok: true, mode: "approval", proposals: [{ id: "20260611t000000z-cli-proposal", title: "Remember: CLI proposal needs context", status: "needs-human", legacy_format: true, quality_decision: "needs-context", cluster_key: "cli:needs-context:legacy_memory", cluster_label: "CLI / needs-context / legacy_memory", target_page: "wiki/Status/CLI.md", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:00:00Z" }], clusters: [{ id: "cli:repo:project_lesson", label: "CLI / repo / project_lesson", count: 2, legacyCount: 1, needsContextCount: 1, proposalIds: ["p1", "p2"] }] });`,
         `    }`,
         `    if (req.method === "GET" && url.pathname === "/api/proposals/clusters") {`,
         `      return Response.json({ ok: true, status: url.searchParams.get("status") || "open", min_size: Number(url.searchParams.get("min_size") || "2"), clusters: [{ id: "cli:repo:project_lesson", label: "CLI / repo / project_lesson", count: 2, legacyCount: 1, needsContextCount: 1, proposalIds: ["p1", "p2"] }] });`,
         `    }`,
         `    if (req.method === "GET" && url.pathname.startsWith("/api/proposals/")) {`,
-        `      return Response.json({ ok: true, proposal: { id: "20260611t000000z-cli-proposal", title: "CLI proposal", status: "pending", created_at: "2026-06-11T00:00:00Z" }, body: "## Request\\n\\nbody", diff: "+ new line" });`,
+        `      return Response.json({ ok: true, proposal: { id: "20260611t000000z-cli-proposal", title: "Remember: CLI proposal needs context", status: "needs-human", legacy_format: true, quality_decision: "needs-context", cluster_key: "cli:needs-context:legacy_memory", cluster_label: "CLI / needs-context / legacy_memory", created_at: "2026-06-11T00:00:00Z", source_ids: ["art-1"] }, body: "## Request\\n\\nCLI legacy lesson body", diff: "+ new line" });`,
         `    }`,
         `    if (req.method === "POST" && url.pathname.endsWith("/approve")) {`,
         `      return Response.json({ ok: true, status: "approved" });`,
@@ -479,7 +479,7 @@ telemux:
       const list = runBrainctl(["proposals", "list", "--config", configPath], env);
       expectSuccess(list);
       expect(list.stdout).toContain("20260611t000000z-cli-proposal");
-      expect(list.stdout).toContain("status=pending");
+      expect(list.stdout).toContain("status=needs-human");
       expect(list.stdout).toContain("memory_clusters=1");
       expect((await readRequests()).at(-1)?.auth).toBeNull();
 
@@ -582,6 +582,56 @@ telemux:
       expect(proposeRequest?.body?.applicability).toBe("Use for Brainstack curation proposals.");
       expect(proposeRequest?.body?.non_applicability).toBe("Do not apply outside Brainstack without checking the target repo.");
       expect(proposeRequest?.body?.evidence_refs).toEqual(["repo:/tmp/brainstack", "default:wiki/Status/CLI.md:1"]);
+
+      const enrich = runBrainctl(
+        [
+          "proposals",
+          "enrich",
+          "20260611t000000z-cli-proposal",
+          "--config",
+          configPath,
+          "--project",
+          "brainstack",
+          "--domain",
+          "curation",
+          "--scope",
+          "repo",
+          "--related-repo",
+          "/tmp/brainstack",
+          "--applicability",
+          "Use for curation CLI work.",
+          "--non-applicability",
+          "Do not apply outside Brainstack curation.",
+          "--evidence",
+          "codex-session:abc"
+        ],
+        env
+      );
+      expectSuccess(enrich);
+      const enrichRequest = (await readRequests()).filter((entry) => entry.path === "/api/propose").at(-1);
+      expect(enrichRequest?.body?.source_type).toBe("memory");
+      expect(enrichRequest?.body?.project).toBe("brainstack");
+      expect(enrichRequest?.body?.domain).toBe("curation");
+      expect(enrichRequest?.body?.scope).toBe("repo");
+      expect(enrichRequest?.body?.memory_kind).toBe("project_lesson");
+      expect(enrichRequest?.body?.related_repo).toBe("/tmp/brainstack");
+      expect(enrichRequest?.body?.applicability).toBe("Use for curation CLI work.");
+      expect(enrichRequest?.body?.non_applicability).toBe("Do not apply outside Brainstack curation.");
+      expect(enrichRequest?.body?.evidence_refs).toEqual(["proposal:20260611t000000z-cli-proposal", "source:art-1", "repo:/tmp/brainstack", "codex-session:abc"]);
+
+      const enrichJson = runBrainctl(["proposals", "enrich", "20260611t000000z-cli-proposal", "--config", configPath, "--json"], env);
+      expectSuccess(enrichJson);
+      const enrichJsonBody = JSON.parse(enrichJson.stdout) as Record<string, any>;
+      expect(enrichJsonBody.dryRun).toBe(false);
+      expect(enrichJsonBody.write.status).toBe("accepted");
+      expect(enrichJson.stdout).not.toContain("shared-brain propose accepted");
+
+      const reprocessPlan = runBrainctl(["proposals", "reprocess", "--config", configPath, "--limit", "1", "--json"], env);
+      expectSuccess(reprocessPlan);
+      const reprocessBody = JSON.parse(reprocessPlan.stdout) as Record<string, any>;
+      expect(reprocessBody.apply).toBe(false);
+      expect(reprocessBody.results[0].dryRun).toBe(true);
+      expect(reprocessBody.results[0].payload.evidence_refs).toContain("proposal:20260611t000000z-cli-proposal");
     } finally {
       server.kill();
       await server.exited;
@@ -1158,6 +1208,94 @@ describe("brainctl install safety", () => {
     }
   }, 10_000);
 
+  test("import codex-session finds local session logs and queues bounded evidence", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-import-codex-session-"));
+    try {
+      const home = join(dir, "home");
+      const codexHome = join(home, ".codex");
+      const stateRoot = join(dir, "state");
+      const configPath = join(dir, "client.yaml");
+      const sessionId = "019ebbfc-3a60-7f61-a4fa-a89282b8d83f";
+      const sessionDir = join(codexHome, "sessions", "2026", "06", "12");
+      const archivedSessionDir = join(codexHome, "archived_sessions", "2026", "06", "12");
+      const sessionPath = join(sessionDir, `rollout-2026-06-12T15-18-49-${sessionId}.jsonl`);
+      const archivedSessionPath = join(archivedSessionDir, `rollout-2026-06-11T00-00-00-${sessionId}.jsonl`);
+      await writeFixtureClientConfig(configPath, { home, stateRoot });
+      await mkdir(sessionDir, { recursive: true });
+      await mkdir(archivedSessionDir, { recursive: true });
+      await writeFile(
+        join(codexHome, "session_index.jsonl"),
+        `${JSON.stringify({ id: sessionId, thread_name: "Investigate Slack EA tag miss", updated_at: "2026-06-12T13:19:18.841494Z" })}\n`
+      );
+      await writeFile(
+        archivedSessionPath,
+        `${JSON.stringify({
+          timestamp: "2026-06-11T00:00:00.000Z",
+          type: "event_msg",
+          payload: { type: "task_complete", last_agent_message: "stale archived duplicate should not be imported" }
+        })}\n`
+      );
+      await utimes(archivedSessionPath, new Date("2026-06-11T00:00:00.000Z"), new Date("2026-06-11T00:00:00.000Z"));
+      const transcript = [
+        {
+          timestamp: "2026-06-12T13:18:51.563Z",
+          type: "session_meta",
+          payload: {
+            id: sessionId,
+            timestamp: "2026-06-12T13:18:49.981Z",
+            cwd: "/repo/lindy-debug",
+            originator: "Codex Desktop",
+            cli_version: "0.140.0-alpha.2",
+            source: "vscode",
+            model_provider: "openai"
+          }
+        },
+        {
+          timestamp: "2026-06-12T13:20:00.000Z",
+          type: "event_msg",
+          payload: {
+            type: "task_complete",
+            last_agent_message: "Redis Cluster Lua scripts touching multiple keys need a shared hash tag."
+          }
+        }
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n");
+      await writeFile(sessionPath, `${transcript}\n`);
+
+      const dryRun = runBrainctl(["import", "codex-session", sessionId, "--config", configPath, "--include-transcript", "--dry-run", "--json"], {
+        HOME: home,
+        CODEX_HOME: codexHome
+      });
+      expectSuccess(dryRun);
+      const dryRunBody = JSON.parse(dryRun.stdout) as Record<string, any>;
+      expect(dryRunBody.payload.title).toBe("Codex session: Investigate Slack EA tag miss");
+      expect(dryRunBody.payload.source_type).toBe("codex-session-transcript");
+      expect(dryRunBody.payload.transcript_path).toBe(sessionPath);
+      expect(dryRunBody.payload.transcript_bytes).toBeGreaterThan(0);
+      expect(String(dryRunBody.payload.transcript_sha256)).toHaveLength(64);
+      expect(dryRunBody.payload.started_at).toBe("2026-06-12T13:18:49.981Z");
+      expect(String(dryRunBody.payload.text)).toContain("Redis Cluster Lua scripts");
+      expect(String(dryRunBody.payload.text)).not.toContain("stale archived duplicate");
+      expect(String(dryRunBody.payload.text)).toContain("```jsonl");
+
+      const queued = runBrainctl(["import", "codex-session", sessionId, "--config", configPath], {
+        HOME: home,
+        CODEX_HOME: codexHome
+      });
+      expectSuccess(queued);
+      const payload = await readQueuedPayloadFromOutput(`${queued.stdout}\n${queued.stderr}`);
+      expect(payload.source_type).toBe("codex-session-checkpoint");
+      expect(payload.conversation_id).toBe(sessionId);
+      expect(payload.transcript_path).toBe(sessionPath);
+      expect(payload.transcript_bytes).toBeGreaterThan(0);
+      expect(String(payload.transcript_sha256)).toHaveLength(64);
+      expect(String(payload.text)).toContain("Re-import with `brainctl import codex-session");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("import skills deterministically plans and applies shared skill imports", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-import-skills-"));
     try {
@@ -1391,6 +1529,44 @@ describe("brainctl install safety", () => {
       expect(eventLog).toContain("refresh-skipped");
       expect(eventLog).toContain(sha256Text("hello"));
       expect(eventLog).not.toContain('"prompt":"hello"');
+
+      const transcriptPath = join(dir, "rollout-2026-06-12T15-18-49-019ebbfc-3a60-7f61-a4fa-a89282b8d83f.jsonl");
+      await writeFile(transcriptPath, `${JSON.stringify({ type: "session_meta", payload: { id: "019ebbfc-3a60-7f61-a4fa-a89282b8d83f" } })}\n`);
+      const stopHookCommand = [
+        "printf",
+        "%s",
+        shellQuote(JSON.stringify({ session_id: "019ebbfc-3a60-7f61-a4fa-a89282b8d83f", cwd: "/repo/lindy-debug", transcript_path: transcriptPath })),
+        "|",
+        "bun",
+        "--no-env-file",
+        "run",
+        shellQuote(BRAINCTL),
+        "hook",
+        "run",
+        "--harness",
+        "codex",
+        "--event",
+        "Stop",
+        "--config",
+        shellQuote(configPath)
+      ].join(" ");
+      const stopHookRun = runCommand(["sh", "-c", stopHookCommand], { env: { HOME: home } });
+      expectSuccess(stopHookRun);
+      expect(stopHookRun.stdout.trim()).toBe("{}");
+      const outboxNamespaces = await readdir(join(stateRoot, "outbox"));
+      const queuedFiles = (
+        await Promise.all(outboxNamespaces.map(async (namespace) => (await readdir(join(stateRoot, "outbox", namespace))).map((file) => join(stateRoot, "outbox", namespace, file))))
+      ).flat();
+      expect(queuedFiles.length).toBeGreaterThan(0);
+      const queuedItems = await Promise.all(queuedFiles.map(async (file) => JSON.parse(await readFile(file, "utf8")) as Record<string, any>));
+      const checkpoint = queuedItems
+        .map((item) => item.payload_storage?.data || item.payload)
+        .find((payload) => payload?.source_type === "codex-session-checkpoint") as Record<string, unknown> | undefined;
+      expect(checkpoint?.conversation_id).toBe("019ebbfc-3a60-7f61-a4fa-a89282b8d83f");
+      expect(checkpoint?.transcript_path).toBe(transcriptPath);
+      expect(checkpoint?.transcript_bytes).toBeGreaterThan(0);
+      expect(String(checkpoint?.text)).toContain("Use `brainctl import codex-session");
+      expect(String(checkpoint?.text)).not.toContain("session_meta");
 
       const remove = runBrainctl(["hooks", "remove", "--target", "all"], { HOME: home });
       expectSuccess(remove);

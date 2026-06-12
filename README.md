@@ -33,6 +33,8 @@ bun run packages/brainctl/src/main.ts import skills --config ~/.config/brainstac
 bun run packages/brainctl/src/main.ts import skill ~/.codex/skills/brainstack/SKILL.md --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts status --json --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts proposals clusters --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts proposals reprocess --config ~/.config/brainstack/brainstack.yaml --limit 5
+bun run packages/brainctl/src/main.ts import codex-session SESSION_ID --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts daemon status --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts hooks status --target all
 bun run packages/brainctl/src/main.ts upgrade --profile control --config examples/control.yaml

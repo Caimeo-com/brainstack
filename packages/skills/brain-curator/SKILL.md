@@ -32,3 +32,7 @@ Proposal generation is automatic; wiki mutation is policy-controlled (`curation.
 7. In `auto` mode only low-risk proposals inside `curation.autoApply.allowedPaths` apply automatically; everything else stays `pending` or `needs-human` for `brainctl proposals approve|reject|apply`.
 
 Use `brainctl proposals clusters` to find related old or candidate memories that should be reviewed together. Legacy title/body-only `Remember:` proposals are expected to show as `needs-human`/`needs-context` until enriched.
+
+Use `brainctl proposals enrich <id>` when a context-poor legacy memory has enough known project/scope/applicability/evidence context to become a structured replacement proposal. Use `brainctl proposals reprocess --status needs-human` for a dry-run batch plan, then add `--apply` only after checking the generated envelope. Enrichment creates replacement proposals; it does not apply wiki edits or mutate the original legacy proposal.
+
+If a useful Codex lesson is missing from proposals, first check whether the raw session evidence reached the shared brain. On the machine that owns the Codex log, use `brainctl import codex-session <SESSION_ID|JSONL_PATH>` for a bounded checkpoint or add `--include-transcript` when the full JSONL transcript should become raw evidence.

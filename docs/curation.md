@@ -29,6 +29,10 @@ Memory-shaped proposals (`source_type: remember`, `memory_kind`, or a `remember`
 
 Legacy title/body-only `Remember:` proposals are treated as old-format evidence when read: they surface as `needs-human` with `quality_decision: needs-context`, `legacy_format: true`, and deterministic `cluster_key`/`cluster_label` hints. This is intentionally non-destructive; it does not rewrite proposal files or apply wiki edits. Use clustering to review related old memories together and promote one scoped card instead of approving fragments one by one.
 
+Use `brainctl proposals enrich <id>` when a legacy or context-poor memory has enough known context to become a structured replacement proposal. The command reads the original proposal, preserves it as `proposal:<id>` evidence, fills the memory envelope from flags or conservative defaults, and submits a new proposal through the normal propose/outbox path. It does not mutate or apply the original proposal.
+
+Use `brainctl proposals reprocess` for bounded legacy cleanup. It is dry-run by default, selects `needs-human` / `needs-context` proposals, and prints the structured replacement payloads it would create. Add `--apply` to submit the replacement proposals. This is still a proposal-generation step, not wiki mutation.
+
 Applying a proposal:
 
 1. Validates the target is a `wiki/**.md` path inside the repo.
@@ -72,12 +76,15 @@ The wiki home page shows the curation panel: mode, curator installed, last/next 
 brainctl proposals list [--status open|pending|approved|applied|rejected|superseded|needs-human] [--json]
 brainctl proposals clusters [--status open|pending|approved|applied|rejected|superseded|needs-human] [--min-size N] [--json]
 brainctl proposals show <id> [--json]
+brainctl proposals enrich <id> [--summary TEXT] [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF] [--dry-run|--json]
+brainctl proposals reprocess [--status needs-human|open] [--cluster KEY] [--id ID] [--limit N] [--apply] [--json] [enrichment flags...]
 brainctl proposals approve <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
 brainctl proposals reject <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
 brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
 brainctl curator status [--json]
 brainctl curator run
 brainctl curator install
+brainctl import codex-session <SESSION_ID|JSONL_PATH> [--include-transcript] [--max-bytes N] [--dry-run|--json]
 brainctl remember --repo PATH --summary TEXT [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF]
 brainctl propose --title TITLE --body BODY [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF]
 ```
@@ -105,3 +112,16 @@ Telegram approval applies the proposed wiki change when the proposal carries one
 - `GET /api/curator/status` — policy, curator run state, proposal counts (public read).
 - `POST /api/curator/status` — admin token; telemux reports run outcomes here.
 - `POST /api/propose` — accepts the machine fields (`target_page`, `proposed_content`, `base_sha256`, `risk`, `confidence`, `curator_run_id`, `reason`, `status: pending|needs-human`, `source_ids`) plus the memory envelope fields above. It auto-applies under policy in `auto` mode only after the final proposal status remains applyable.
+
+## Session Evidence
+
+Harness hooks are fail-open and opportunistic. They can queue a small session checkpoint when a hook payload includes a regular `transcript_path`, but they do not import full transcripts by default and some harnesses may send no stdin to hooks. A durable lesson can therefore be absent from proposals even when the local Codex session exists and Brainstack hooks are installed.
+
+When an important session is missing from shared-brain evidence, import it explicitly from the machine where Codex wrote the log:
+
+```bash
+brainctl import codex-session 019ebbfc-3a60-7f61-a4fa-a89282b8d83f \
+  --config ~/.config/brainstack/brainstack.yaml
+```
+
+Use `--include-transcript` only when the full JSONL transcript should become shared-brain raw material. Without it, the import is a bounded checkpoint containing session metadata, last agent message, transcript path, size, and hash.

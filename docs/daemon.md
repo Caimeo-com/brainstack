@@ -55,6 +55,8 @@ Use `--no-sync`, `--no-flush`, or `--no-skills` only for debugging a specific da
 
 Harness hooks should stay cheap. They record checkpoint metadata, read daemon freshness, and skip routine Git/network work when the daemon has updated recently. If the daemon is missing or stale, hooks may attempt a local-only shared skill refresh and still fail open. Hooks also refuse to refresh skills from a missing, dirty, symlinked, or non-Git shared-brain clone.
 
+When a harness stop hook supplies a regular `transcript_path`, the hook queues a small `codex-session-checkpoint` import into the local outbox without doing a network write. The daemon later flushes that outbox entry. The checkpoint is intentionally not the full transcript; use `brainctl import codex-session --include-transcript` when raw JSONL evidence should be imported deliberately.
+
 ## Doctor
 
 `brainctl doctor` reports:

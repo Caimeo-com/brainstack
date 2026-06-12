@@ -74,6 +74,15 @@ brainctl hooks remove --target all
 
 Hooks are fail-open convenience integration. If Brainstack, Git, or the local clone is unavailable, the harness should continue without blocking the user's prompt.
 
+Hooks do not guarantee full raw transcript import. When a harness stop hook supplies a regular `transcript_path`, Brainstack queues a small session checkpoint for daemon/outbox flush; if the harness sends no stdin or no transcript path, there is nothing to import. To recover a concrete Codex Desktop session into shared-brain evidence, run:
+
+```bash
+brainctl import codex-session <SESSION_ID_OR_JSONL_PATH> --config ~/.config/brainstack/brainstack.yaml
+brainctl import codex-session <SESSION_ID_OR_JSONL_PATH> --config ~/.config/brainstack/brainstack.yaml --include-transcript
+```
+
+Use the first command for bounded metadata plus the last agent message. Use `--include-transcript` only when the full JSONL log should become shared-brain raw material.
+
 For client and worker machines that should keep the local clone fresh without per-prompt Git work, use the local daemon mode:
 
 ```bash
@@ -161,6 +170,7 @@ The required grant shape is directional: operator to control/worker, control to 
 - Before substantial work in a repository, run `brainctl context --repo .` and follow the returned Brainstack instructions.
 - Read freshness and source labels should come through `brainctl search --repo . "query"` instead of hand-rolled clone/pull logic.
 - Write continuity should come through `brainctl remember --repo . --summary "..."`, or the lower-level `brainctl import-text` and `brainctl propose` commands when project context is not available.
+- Legacy or context-poor memory proposals should be enriched before review: use `brainctl proposals enrich <id> ...` for one item or `brainctl proposals reprocess --status needs-human` for a dry-run batch plan, then add `--apply` to create structured replacement proposals.
 - Do not manually POST to Brainstack endpoints unless explicitly instructed.
 - If a write reports idempotency `review_required`, inspect the matching record under `derived/idempotency/` and repo state before retrying with a new key; do not force replay an ambiguous side effect.
 - Client bootstrap can receive `BRAIN_IMPORT_TOKEN` or `BRAIN_IMPORT_TOKEN_FILE`; it fills the local token slot only when blank and never prints the value.

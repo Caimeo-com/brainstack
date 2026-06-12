@@ -133,6 +133,21 @@ Targets:
 
 `brainctl hooks install` merges Brainstack-managed entries and preserves unrelated hooks. `remove` deletes only Brainstack-managed entries. Codex and Claude may still require their own hook trust/review flow before non-managed command hooks run.
 
+Hooks do not guarantee full transcript capture. When the harness supplies a regular `transcript_path` on a stop event, Brainstack queues a small `codex-session-checkpoint` import in the local outbox so the daemon can flush it later. The checkpoint records the session id, cwd, and local transcript path, not the prompt/tool transcript body. This avoids per-turn spam and accidental raw prompt leakage, but it also means a missing proposal can still happen when the harness never supplied transcript metadata or the useful lesson was edited directly into a local skill/memory file.
+
+To import a Codex Desktop session explicitly from the machine that owns the log:
+
+```bash
+brainctl import codex-session 019ebbfc-3a60-7f61-a4fa-a89282b8d83f \
+  --config ~/.config/brainstack/brainstack.yaml
+
+brainctl import codex-session 019ebbfc-3a60-7f61-a4fa-a89282b8d83f \
+  --config ~/.config/brainstack/brainstack.yaml \
+  --include-transcript
+```
+
+The first command imports bounded session metadata plus the last agent message. `--include-transcript` imports the JSONL transcript body as explicit operator action and is capped by `--max-bytes`.
+
 ## Local Daemon
 
 On enrolled client and worker machines, use the local daemon when clone freshness, outbox flushes, and shared skill refreshes should happen without every prompt hook doing Git or network work:
