@@ -64,6 +64,17 @@ const PROPOSAL_STATUS_FILTERS = new Set(["open", "pending", "approved", "applied
 const PROPOSAL_QUALITY_FILTERS = new Set(["ready", "needs-context", "needs-evidence", "too-vague"]);
 const DEFAULT_PROPOSAL_LIST_LIMIT = 15;
 const MAX_PROPOSAL_LIST_LIMIT = 30;
+const NEW_CONTEXT_WIZARD_MAX_AGE_MS = 10 * 60 * 1000;
+
+type NewContextWizardStep = "slug-or-machine" | "machine" | "target";
+
+interface PendingNewContextWizard {
+  targetKey: string;
+  slug: string;
+  machine: string | null;
+  step: NewContextWizardStep;
+  createdAt: number;
+}
 
 interface ProposalListRequest {
   status: string;
@@ -301,6 +312,55 @@ function messageTarget(message: TelegramMessage): TelegramTarget {
   };
 }
 
+function slugifyPhrase(value: string, fallback: string): string {
+  const slug = value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-")
+    .slice(0, 63)
+    .replace(/-+$/g, "");
+
+  const candidate = slug.length >= 2 ? slug : fallback;
+
+  try {
+    return normalizeSlug(candidate);
+  } catch {
+    return normalizeSlug(fallback);
+  }
+}
+
+function topicSlugCandidate(message: TelegramMessage): { slug: string; source: string } {
+  const topicName = message.forum_topic_created?.name?.trim() || message.reply_to_message?.forum_topic_created?.name?.trim() || "";
+  if (topicName) {
+    return {
+      slug: slugifyPhrase(topicName, `topic-${message.message_thread_id ?? Math.abs(message.chat.id)}`),
+      source: "Telegram topic title"
+    };
+  }
+
+  if (!message.is_topic_message && message.chat.title?.trim()) {
+    return {
+      slug: slugifyPhrase(message.chat.title, `chat-${Math.abs(message.chat.id)}`),
+      source: "Telegram chat title"
+    };
+  }
+
+  if (message.message_thread_id !== undefined) {
+    return {
+      slug: normalizeSlug(`topic-${message.message_thread_id}`),
+      source: "Telegram thread id; topic title was not included in this update"
+    };
+  }
+
+  return {
+    slug: normalizeSlug(`chat-${Math.abs(message.chat.id)}`),
+    source: "Telegram chat id; no title was included in this update"
+  };
+}
+
 function commandScopeChatId(message: TelegramMessage): number | null {
   return message.chat.type === "group" || message.chat.type === "supergroup" ? message.chat.id : null;
 }
@@ -319,6 +379,47 @@ function contextRoutingNote(): string[] {
     "The old workspace stays on disk unless you archive it or delete it separately.",
     "Old Telegram messages stay in Telegram and are not automatically imported into a newly bound context."
   ];
+}
+
+function formatMachineChoices(hosts: string[]): string[] {
+  if (!hosts.length) {
+    return ["No machines are configured yet. Run /workers, fix worker config, or use the full command with a known machine name."];
+  }
+
+  return hosts.map((host, index) => `${index + 1}) ${host}`);
+}
+
+function parseNewContextTargetReply(input: string): { target: string; baseBranch: string | null } | null {
+  const trimmed = input.trim();
+  const normalized = trimmed.toLowerCase();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (normalized === "1" || normalized === "scratch") {
+    return { target: "scratch", baseBranch: null };
+  }
+  if (normalized === "2" || normalized === "host") {
+    return { target: "host", baseBranch: null };
+  }
+
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  if (!parts.length) {
+    return null;
+  }
+
+  const head = parts[0] || "";
+  const second = parts[1];
+  const third = parts[2];
+  if ((head === "3" || head.toLowerCase() === "repo" || head.toLowerCase() === "path") && second) {
+    return { target: second, baseBranch: third || null };
+  }
+
+  if (parts.length <= 2) {
+    return { target: parts[0] || "", baseBranch: parts[1] || null };
+  }
+
+  return null;
 }
 
 function formatCommandScopeLabel(scope: TelegramBotCommandScope): string {
@@ -544,6 +645,7 @@ function formatUpdateCheckCommandResult(result: {
 
 export class CommandHandler {
   private readonly pendingText = new Map<string, PendingTextPrompt>();
+  private readonly pendingNewContexts = new Map<string, PendingNewContextWizard>();
   private readonly flushingPendingTextKeys = new Set<string>();
   private readonly cronShortcutSnapshots = new Map<string, CronShortcutSnapshot>();
   private readonly artifactShortcutSnapshots = new Map<string, ArtifactShortcutSnapshot>();
@@ -595,6 +697,13 @@ export class CommandHandler {
       await this.flushPendingText(target, message.from?.id ?? null);
     }
     const boundContext = this.contexts.getContextByTopic(target.chatId, target.threadId);
+    if (!parsed && !hasAttachments && text.trim()) {
+      const wizard = this.getPendingNewContextWizard(target, message.from?.id ?? null);
+      if (wizard) {
+        await this.handleNewContextWizardReply(wizard, text, target, boundContext);
+        return;
+      }
+    }
 
     if (parsed?.command === "/whoami") {
       await this.telegram.sendText(
@@ -812,7 +921,7 @@ export class CommandHandler {
               "/mode [fast|normal|max|clear]",
               "/model [model-id|clear]",
               "/effort [low|medium|high|xhigh|clear]",
-              "/newctx <slug> <machine> <target> [base-branch]",
+              "/newctx [slug] [machine] [target] [base-branch]",
               "/bind <machine> <target> [base-branch]",
               "/topicinfo",
               "/run <instruction>",
@@ -840,11 +949,21 @@ export class CommandHandler {
 
         case "/explainctx": {
           if (!boundContext) {
+            const candidate = topicSlugCandidate(message);
             await this.telegram.sendText(
               target,
               [
                 "This topic is not bound yet.",
-                "Use /newctx <slug> <machine> <target> [base-branch] to create a durable context for it."
+                "A Brainstack context is the durable workspace and session binding for one Telegram topic.",
+                "After binding, plain text here starts or resumes work in that workspace; old Telegram messages stay in Telegram and are not automatically imported.",
+                "",
+                `Suggested slug: ${candidate.slug}`,
+                `Slug source: ${candidate.source}`,
+                "Run /newctx to be guided through the missing values.",
+                `Or use the full command: /newctx ${candidate.slug} <machine> scratch`,
+                "",
+                "Known machines:",
+                ...formatMachineChoices(this.workers.knownHosts())
               ].join("\n")
             );
             return;
@@ -1302,8 +1421,24 @@ export class CommandHandler {
 
         case "/newctx": {
           const parts = parsed.rest.split(/\s+/).filter(Boolean);
+          if (!parts.length) {
+            await this.startNewContextWizard(message, target, boundContext);
+            return;
+          }
+
           if (parts.length < 3) {
-            await this.telegram.sendText(target, "Usage: /newctx <slug> <machine> <target> [base-branch]");
+            const key = this.pendingNewContextKey(target, message.from?.id ?? null);
+            const maybeMachine = parts.length === 2 ? this.resolveNewContextMachine(parts[1] || "") : null;
+            const slug = slugifyPhrase(maybeMachine ? (parts[0] || "") : parsed.rest, topicSlugCandidate(message).slug);
+            const wizard: PendingNewContextWizard = {
+              targetKey: key,
+              slug,
+              machine: maybeMachine,
+              step: maybeMachine ? "target" : "machine",
+              createdAt: Date.now()
+            };
+            this.pendingNewContexts.set(key, wizard);
+            await this.telegram.sendText(target, maybeMachine ? this.promptNewContextTarget(wizard) : this.promptNewContextMachine(wizard));
             return;
           }
 
@@ -1867,6 +2002,149 @@ export class CommandHandler {
         timer: setTimeout(() => void this.flushPendingText(target, stored.userId).catch((error) => this.reportPendingTextFlushError(target, error)), Math.max(1, this.config.textCoalesceMs))
       });
     }
+  }
+
+  private pendingNewContextKey(target: TelegramTarget, userId: number | null): string {
+    return `${telegramTargetKey(target)}:${userId ?? "unknown"}`;
+  }
+
+  private getPendingNewContextWizard(target: TelegramTarget, userId: number | null): PendingNewContextWizard | null {
+    const key = this.pendingNewContextKey(target, userId);
+    const wizard = this.pendingNewContexts.get(key);
+    if (!wizard) {
+      return null;
+    }
+
+    if (Date.now() - wizard.createdAt > NEW_CONTEXT_WIZARD_MAX_AGE_MS) {
+      this.pendingNewContexts.delete(key);
+      return null;
+    }
+
+    return wizard;
+  }
+
+  private async startNewContextWizard(message: TelegramMessage, target: TelegramTarget, boundContext: ContextRecord | null): Promise<void> {
+    const candidate = topicSlugCandidate(message);
+    const key = this.pendingNewContextKey(target, message.from?.id ?? null);
+    this.pendingNewContexts.set(key, {
+      targetKey: key,
+      slug: candidate.slug,
+      machine: null,
+      step: "slug-or-machine",
+      createdAt: Date.now()
+    });
+    await this.telegram.sendText(target, this.formatNewContextWizardStart(candidate.slug, candidate.source, boundContext));
+  }
+
+  private promptNewContextMachine(wizard: PendingNewContextWizard): string {
+    return [
+      `Slug: ${wizard.slug}`,
+      "Pick a machine to bind this topic to:",
+      ...formatMachineChoices(this.workers.knownHosts()),
+      "",
+      "Reply with the number or machine name.",
+      "Reply cancel to stop."
+    ].join("\n");
+  }
+
+  private promptNewContextTarget(wizard: PendingNewContextWizard): string {
+    return [
+      `Slug: ${wizard.slug}`,
+      `Machine: ${wizard.machine || "unselected"}`,
+      "Pick a target:",
+      "1) scratch - durable topic workspace; scratch contexts default to low thinking",
+      "2) host - durable machine-host workspace",
+      "3) repo/path - reply with `repo <git-url-or-path> [base-branch]`",
+      "",
+      `Recommended next command: /newctx ${wizard.slug} ${wizard.machine || "<machine>"} scratch`,
+      "Reply cancel to stop."
+    ].join("\n");
+  }
+
+  private formatNewContextWizardStart(slug: string, source: string, boundContext: ContextRecord | null): string {
+    return [
+      boundContext ? this.formatRebindWarning(boundContext) : null,
+      [
+        "Let's bind this Telegram topic to a Brainstack context.",
+        "A context is the durable workspace and session binding for one topic. After it is bound, plain text here starts or resumes work in that workspace.",
+        "Old Telegram messages stay in Telegram and are not automatically imported into the new context.",
+        "",
+        `Suggested slug: ${slug}`,
+        `Slug source: ${source}`,
+        "To change it, reply with a word or phrase now. To keep it, pick a machine:",
+        ...formatMachineChoices(this.workers.knownHosts()),
+        "",
+        `Full command option: /newctx ${slug} <machine> scratch`,
+        "Reply cancel to stop."
+      ].join("\n")
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+  }
+
+  private resolveNewContextMachine(input: string): string | null {
+    const hosts = this.workers.knownHosts();
+    const trimmed = input.trim();
+    const index = Number(trimmed);
+    if (Number.isInteger(index) && index >= 1 && index <= hosts.length) {
+      return hosts[index - 1] || null;
+    }
+
+    const normalized = trimmed.toLowerCase();
+    return hosts.find((host) => host.toLowerCase() === normalized) || null;
+  }
+
+  private async handleNewContextWizardReply(
+    wizard: PendingNewContextWizard,
+    text: string,
+    target: TelegramTarget,
+    boundContext: ContextRecord | null
+  ): Promise<void> {
+    const trimmed = text.trim();
+    if (/^(cancel|stop|never mind|nevermind)$/i.test(trimmed)) {
+      this.pendingNewContexts.delete(wizard.targetKey);
+      await this.telegram.sendText(target, "Context binding cancelled. Run /newctx to start again.");
+      return;
+    }
+
+    if (wizard.step === "slug-or-machine") {
+      const selectedMachine = this.resolveNewContextMachine(trimmed);
+      if (selectedMachine) {
+        wizard.machine = selectedMachine;
+        wizard.step = "target";
+        await this.telegram.sendText(target, this.promptNewContextTarget(wizard));
+        return;
+      }
+
+      wizard.slug = slugifyPhrase(trimmed, wizard.slug);
+      wizard.step = "machine";
+      await this.telegram.sendText(target, this.promptNewContextMachine(wizard));
+      return;
+    }
+
+    if (wizard.step === "machine") {
+      const selectedMachine = this.resolveNewContextMachine(trimmed);
+      if (!selectedMachine) {
+        await this.telegram.sendText(target, [`Unknown machine: ${trimmed}`, "", this.promptNewContextMachine(wizard)].join("\n"));
+        return;
+      }
+
+      wizard.machine = selectedMachine;
+      wizard.step = "target";
+      await this.telegram.sendText(target, this.promptNewContextTarget(wizard));
+      return;
+    }
+
+    const selectedTarget = parseNewContextTargetReply(trimmed);
+    if (!selectedTarget?.target || !wizard.machine) {
+      await this.telegram.sendText(target, ["I could not parse that target choice.", "", this.promptNewContextTarget(wizard)].join("\n"));
+      return;
+    }
+
+    this.pendingNewContexts.delete(wizard.targetKey);
+    const bound = await this.createOrRebindContext(wizard.slug, wizard.machine, selectedTarget.target, selectedTarget.baseBranch, target);
+    const warning = boundContext ? this.formatRebindWarning(boundContext) : null;
+    await this.telegram.sendText(target, [warning, this.formatContextCreated(bound)].filter(Boolean).join("\n\n"));
   }
 
   private async createOrRebindContext(

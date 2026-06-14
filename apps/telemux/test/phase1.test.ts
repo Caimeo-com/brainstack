@@ -132,6 +132,28 @@ function telegramMessage(text: string, threadId: number, userId = TEST_ALLOWED_T
   };
 }
 
+function telegramTopicMessage(
+  text: string,
+  threadId: number,
+  topicName: string,
+  userId = TEST_ALLOWED_TELEGRAM_USER_ID
+): TelegramMessage {
+  return {
+    ...telegramMessage(text, threadId, userId),
+    reply_to_message: {
+      message_thread_id: threadId,
+      chat: {
+        id: 4242,
+        type: "supergroup",
+        title: "Factory"
+      },
+      forum_topic_created: {
+        name: topicName
+      }
+    }
+  };
+}
+
 function telegramPhotoMessage(
   caption: string,
   threadId: number,
@@ -651,6 +673,56 @@ test("telemux state database and runtime roots are private under permissive umas
     if (fixture) {
       await rm(fixture.root, { recursive: true, force: true });
     }
+  }
+});
+
+test("unbound context commands explain and guide deterministic newctx binding", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramTopicMessage("/explainctx", 43, "Proposal curation"));
+    const explainText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(explainText).toContain("This topic is not bound yet.");
+    expect(explainText).toContain("A Brainstack context is the durable workspace");
+    expect(explainText).toContain("Suggested slug: proposal-curation");
+    expect(explainText).toContain("Slug source: Telegram topic title");
+    expect(explainText).toContain("/newctx proposal-curation <machine> scratch");
+    expect(explainText).toContain("1) control");
+    expect(explainText).toContain("2) worker1");
+
+    await fixture.commands.handleMessage(telegramTopicMessage("/newctx", 43, "Proposal curation"));
+    const startText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(startText).toContain("Let's bind this Telegram topic to a Brainstack context.");
+    expect(startText).toContain("Suggested slug: proposal-curation");
+    expect(startText).toContain("To change it, reply with a word or phrase now. To keep it, pick a machine:");
+
+    await fixture.commands.handleMessage(telegramMessage("Proposal curation v2", 43));
+    const slugChangedText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(slugChangedText).toContain("Slug: proposal-curation-v2");
+    expect(slugChangedText).toContain("Pick a machine");
+
+    await fixture.commands.handleMessage(telegramMessage("1", 43));
+    const targetPrompt = fixture.telegram.sent.at(-1)?.text || "";
+    expect(targetPrompt).toContain("Machine: control");
+    expect(targetPrompt).toContain("1) scratch - durable topic workspace");
+    expect(targetPrompt).toContain("/newctx proposal-curation-v2 control scratch");
+
+    await fixture.commands.handleMessage(telegramMessage("1", 43));
+    const created = fixture.db.getContextBySlug("proposal-curation-v2");
+    expect(created?.kind).toBe("scratch");
+    expect(created?.machine).toBe("control");
+    expect(created?.state).toBe("active");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Context proposal-curation-v2 bound to this topic.");
+
+    await fixture.commands.handleMessage(telegramTopicMessage("/newctx", 44, "Fast path"));
+    await fixture.commands.handleMessage(telegramMessage("1", 44));
+    await fixture.commands.handleMessage(telegramMessage("scratch", 44));
+    const fastPath = fixture.db.getContextBySlug("fast-path");
+    expect(fastPath?.kind).toBe("scratch");
+    expect(fastPath?.machine).toBe("control");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
   }
 });
 

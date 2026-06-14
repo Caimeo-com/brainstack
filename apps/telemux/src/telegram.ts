@@ -116,6 +116,12 @@ export interface TelegramVoice {
   file_size?: number;
 }
 
+export interface TelegramForumTopicCreated {
+  name: string;
+  icon_color?: number;
+  icon_custom_emoji_id?: string;
+}
+
 export interface TelegramAnimation {
   file_id: string;
   file_unique_id: string;
@@ -134,6 +140,12 @@ export interface TelegramMessage {
   caption?: string;
   is_topic_message?: boolean;
   message_thread_id?: number;
+  forum_topic_created?: TelegramForumTopicCreated;
+  reply_to_message?: {
+    forum_topic_created?: TelegramForumTopicCreated;
+    chat?: TelegramChat;
+    message_thread_id?: number;
+  };
   photo?: TelegramPhotoSize[];
   document?: TelegramDocument;
   video?: TelegramVideo;
