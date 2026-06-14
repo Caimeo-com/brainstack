@@ -108,7 +108,7 @@ Runs a shared-brain curator pass. It is installed automatically (daily by defaul
 
 The curator reads new imports/logs/proposals since its last cursor (`GET /api/curator/status`), groups them by topic/source type, uses `brainctl proposals clusters` for related memory candidates, and submits machine proposals (`brainctl propose --target-page ... --content-file ... --risk ...`) carrying full proposed page contents. Memory-shaped proposals must include project/scope/applicability/evidence envelope fields or be parked as `needs-human`. Proposal generation is automatic; wiki mutation is policy-controlled by the brain's `curation.mode` (see `docs/curation.md`). After each run telemux reports run status and cursor back to the brain when `FACTORY_BRAIN_ADMIN_TOKEN` is configured.
 
-Inspect and drive it with `/curator_status`, `/curator_run`, and filtered `/proposals` commands in Telegram, or `brainctl curator status|run|install` from the control host. A scheduled curator run is already inside the curator context, so it should perform the pass directly rather than calling `brainctl curator run` again.
+Inspect and drive it with `/curation`, `/curator_status`, `/curator_run`, and filtered `/proposals` commands in Telegram, or `brainctl curator status|run|install` from the control host. Run `/curation` in a dedicated proposal-review topic to bind that topic to the `proposal-curation` scratch context and move the built-in `brain-curator` routine there without creating duplicates. A scheduled curator run is already inside the curator context, so it should perform the pass directly rather than calling `brainctl curator run` again.
 
 This routine should not mix private-journal material into the shared dev brain.
 

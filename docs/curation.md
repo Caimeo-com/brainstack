@@ -96,10 +96,13 @@ Telegram mirrors the basics:
 ```text
 /curator_status
 /curator_run
+/curation
 /proposals [open|pending|needs-human|approved|applied|rejected|superseded] [ready|needs-context|needs-evidence|too-vague] [search terms|project:NAME|scope:NAME] [limit=N]
 /proposal_approve_<token>_<n>
 /proposal_reject_<token>_<n>
 ```
+
+Run `/curation` in the Telegram topic you want to use for proposal review. It binds that topic to a durable `proposal-curation` scratch context, makes the built-in `brain-curator` routine target that topic, and prints the useful proposal review commands. It accepts an optional machine override: `/curation <machine>`.
 
 Telegram approval applies the proposed wiki change when the proposal carries one (drift still parks it as `needs-human`). Approve/reject from Telegram require the optional `FACTORY_BRAIN_ADMIN_TOKEN` in the telemux env; without it, Telegram stays read-only for proposals.
 

@@ -686,6 +686,7 @@ test("unbound context commands explain and guide deterministic newctx binding", 
     expect(explainText).toContain("A Brainstack context is the durable workspace");
     expect(explainText).toContain("Suggested slug: proposal-curation");
     expect(explainText).toContain("Slug source: Telegram topic title");
+    expect(explainText).toContain("Run /curation to bind it automatically.");
     expect(explainText).toContain("/newctx proposal-curation <machine> scratch");
     expect(explainText).toContain("1) control");
     expect(explainText).toContain("2) worker1");
@@ -704,7 +705,9 @@ test("unbound context commands explain and guide deterministic newctx binding", 
     await fixture.commands.handleMessage(telegramMessage("1", 43));
     const targetPrompt = fixture.telegram.sent.at(-1)?.text || "";
     expect(targetPrompt).toContain("Machine: control");
-    expect(targetPrompt).toContain("1) scratch - durable topic workspace");
+    expect(targetPrompt).toContain("1) Topic workspace");
+    expect(targetPrompt).toContain("ongoing conversation, routines, proposal review");
+    expect(targetPrompt).toContain("2) Machine administration");
     expect(targetPrompt).toContain("/newctx proposal-curation-v2 control scratch");
 
     await fixture.commands.handleMessage(telegramMessage("1", 43));
@@ -716,10 +719,45 @@ test("unbound context commands explain and guide deterministic newctx binding", 
 
     await fixture.commands.handleMessage(telegramTopicMessage("/newctx", 44, "Fast path"));
     await fixture.commands.handleMessage(telegramMessage("1", 44));
-    await fixture.commands.handleMessage(telegramMessage("scratch", 44));
+    await fixture.commands.handleMessage(telegramMessage("topic", 44));
     const fastPath = fixture.db.getContextBySlug("fast-path");
     expect(fastPath?.kind).toBe("scratch");
     expect(fastPath?.machine).toBe("control");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("curation command binds the current topic and owns exactly one curator routine", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramTopicMessage("/curation", 45, "Proposal curation"));
+    const context = fixture.db.getContextBySlug("proposal-curation");
+    expect(context?.kind).toBe("scratch");
+    expect(context?.machine).toBe("control");
+    expect(context?.telegramThreadId).toBe(45);
+
+    const jobs = fixture.db.listCronJobs().filter((job) => job.label === "brain-curator");
+    expect(jobs.length).toBe(1);
+    expect(jobs[0]?.executionContextSlug).toBe("proposal-curation");
+    expect(jobs[0]?.targetThreadId).toBe(45);
+    expect(jobs[0]?.instruction).toContain("shared-brain curator pass");
+    const setupText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(setupText).toContain("Proposal curation is ready in this topic.");
+    expect(setupText).toContain("Brain-curator routine installed:");
+    expect(setupText).toContain("/proposals pending");
+    expect(setupText).toContain("/proposals needs-human needs-context");
+
+    await fixture.commands.handleMessage(telegramTopicMessage("/curation", 46, "Proposal curation v2"));
+    const movedContext = fixture.db.getContextBySlug("proposal-curation");
+    expect(movedContext?.telegramThreadId).toBe(46);
+    const movedJobs = fixture.db.listCronJobs().filter((job) => job.label === "brain-curator");
+    expect(movedJobs.length).toBe(1);
+    expect(movedJobs[0]?.executionContextSlug).toBe("proposal-curation");
+    expect(movedJobs[0]?.targetThreadId).toBe(46);
+    expect(fixture.telegram.sent.at(-1)?.text || "").toContain("Brain-curator routine ready:");
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });

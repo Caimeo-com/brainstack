@@ -65,6 +65,7 @@ const PROPOSAL_QUALITY_FILTERS = new Set(["ready", "needs-context", "needs-evide
 const DEFAULT_PROPOSAL_LIST_LIMIT = 15;
 const MAX_PROPOSAL_LIST_LIMIT = 30;
 const NEW_CONTEXT_WIZARD_MAX_AGE_MS = 10 * 60 * 1000;
+const PROPOSAL_CURATION_CONTEXT_SLUG = "proposal-curation";
 
 type NewContextWizardStep = "slug-or-machine" | "machine" | "target";
 
@@ -396,10 +397,28 @@ function parseNewContextTargetReply(input: string): { target: string; baseBranch
     return null;
   }
 
-  if (normalized === "1" || normalized === "scratch") {
+  if (
+    normalized === "1" ||
+    normalized === "scratch" ||
+    normalized === "topic" ||
+    normalized === "topic-workspace" ||
+    normalized === "work" ||
+    normalized === "workspace" ||
+    normalized === "curation" ||
+    normalized === "proposal" ||
+    normalized === "proposals"
+  ) {
     return { target: "scratch", baseBranch: null };
   }
-  if (normalized === "2" || normalized === "host") {
+  if (
+    normalized === "2" ||
+    normalized === "host" ||
+    normalized === "machine" ||
+    normalized === "admin" ||
+    normalized === "ops" ||
+    normalized === "machine-admin" ||
+    normalized === "machine-administration"
+  ) {
     return { target: "host", baseBranch: null };
   }
 
@@ -420,6 +439,10 @@ function parseNewContextTargetReply(input: string): { target: string; baseBranch
   }
 
   return null;
+}
+
+function looksLikeProposalCurationSlug(slug: string): boolean {
+  return /\b(?:proposal|proposals|curation|curator)\b/i.test(slug.replace(/[-_]+/g, " "));
 }
 
 function formatCommandScopeLabel(scope: TelegramBotCommandScope): string {
@@ -918,6 +941,7 @@ export class CommandHandler {
               "/curator_status",
               "/curator_run",
               "/proposals",
+              "/curation",
               "/mode [fast|normal|max|clear]",
               "/model [model-id|clear]",
               "/effort [low|medium|high|xhigh|clear]",
@@ -941,6 +965,7 @@ export class CommandHandler {
               "Use /shred to list tokenized cleanup shortcuts.",
               "Use /mode, /model, and /effort to change Codex runtime behavior for this topic without rebinding it.",
               "Use /context or /usage to inspect the current topic state. Use /compact to compact Codex topics when supported.",
+              "Use /curation in a proposal-review topic to bind it as Brainstack's proposal curation surface.",
               "Use /crons to inspect scheduled jobs linked to this topic/context. Use /cron install update-check, brain-curator, or daily-checkin to add built-in routines.",
               "Use /cron_run <id|label> or the shortcuts from /crons to test a scheduled job immediately."
             ].join("\n")
@@ -959,7 +984,9 @@ export class CommandHandler {
                 "",
                 `Suggested slug: ${candidate.slug}`,
                 `Slug source: ${candidate.source}`,
-                "Run /newctx to be guided through the missing values.",
+                looksLikeProposalCurationSlug(candidate.slug)
+                  ? "This looks like a proposal-curation topic. Run /curation to bind it automatically."
+                  : "Run /newctx to be guided through the missing values.",
                 `Or use the full command: /newctx ${candidate.slug} <machine> scratch`,
                 "",
                 "Known machines:",
@@ -1136,11 +1163,18 @@ export class CommandHandler {
           if (!job) {
             await this.telegram.sendText(
               target,
-              "No brain-curator job is installed. Use /cron_install_brain_curator, or set FACTORY_TELEGRAM_CONTROL_CHAT_ID so it installs automatically."
+              "No brain-curator job is installed. Use /curation in the proposal-review topic, /cron_install_brain_curator, or set FACTORY_TELEGRAM_CONTROL_CHAT_ID so it installs automatically."
             );
             return;
           }
           await this.handleCronJobAction("run", job, target);
+          return;
+        }
+
+        case "/curation":
+        case "/curation_setup":
+        case "/proposal_curation": {
+          await this.setupProposalCurationTopic(parsed.rest, target, boundContext);
           return;
         }
 
@@ -2048,13 +2082,17 @@ export class CommandHandler {
   }
 
   private promptNewContextTarget(wizard: PendingNewContextWizard): string {
+    const curationHint = looksLikeProposalCurationSlug(wizard.slug)
+      ? ["", "This looks like proposal curation. Recommended: reply 1, or run /curation for the dedicated setup."]
+      : [];
     return [
       `Slug: ${wizard.slug}`,
       `Machine: ${wizard.machine || "unselected"}`,
-      "Pick a target:",
-      "1) scratch - durable topic workspace; scratch contexts default to low thinking",
-      "2) host - durable machine-host workspace",
-      "3) repo/path - reply with `repo <git-url-or-path> [base-branch]`",
+      "Pick what this topic is for:",
+      "1) Topic workspace - ongoing conversation, routines, proposal review; stores a durable scratch workspace and defaults to low thinking",
+      "2) Machine administration - inspect or operate the selected machine; stores a durable host workspace",
+      "3) Code repository/path - reply with `repo <git-url-or-path> [base-branch]`",
+      ...curationHint,
       "",
       `Recommended next command: /newctx ${wizard.slug} ${wizard.machine || "<machine>"} scratch`,
       "Reply cancel to stop."
@@ -2179,6 +2217,139 @@ export class CommandHandler {
     });
 
     return this.contexts.bindContext(context.slug, target.chatId, target.threadId) || context;
+  }
+
+  private configuredMachineNames(): string[] {
+    return this.workers.knownHosts().filter((host) => Boolean(this.workers.getWorkerConfig(host)));
+  }
+
+  private preferredProposalCurationMachine(explicitMachine: string | null): { machine: string | null; error: string | null } {
+    const configured = this.configuredMachineNames();
+    if (!configured.length) {
+      return {
+        machine: null,
+        error: "No configured machines are available. Run /workers and fix worker config before setting up proposal curation."
+      };
+    }
+
+    if (explicitMachine) {
+      const match = configured.find((host) => host.toLowerCase() === explicitMachine.toLowerCase());
+      if (!match) {
+        return {
+          machine: null,
+          error: `Unknown machine: ${explicitMachine}\n\nKnown machines:\n${formatMachineChoices(configured).join("\n")}`
+        };
+      }
+      return { machine: match, error: null };
+    }
+
+    const existingCurationContext = this.contexts.getContextBySlug(PROPOSAL_CURATION_CONTEXT_SLUG);
+    if (existingCurationContext && configured.includes(existingCurationContext.machine)) {
+      return { machine: existingCurationContext.machine, error: null };
+    }
+
+    const curatorJob = this.findCuratorJob();
+    const curatorContext = curatorJob?.executionContextSlug ? this.contexts.getContextBySlug(curatorJob.executionContextSlug) : null;
+    if (curatorContext && configured.includes(curatorContext.machine)) {
+      return { machine: curatorContext.machine, error: null };
+    }
+
+    const routinesContext = this.contexts.getContextBySlug("brainstack-routines");
+    if (routinesContext && configured.includes(routinesContext.machine)) {
+      return { machine: routinesContext.machine, error: null };
+    }
+
+    if (this.config.localMachine && configured.includes(this.config.localMachine)) {
+      return { machine: this.config.localMachine, error: null };
+    }
+
+    return { machine: configured[0] || null, error: null };
+  }
+
+  private async ensureBrainCuratorRoutineInContext(context: ContextRecord, target: TelegramTarget): Promise<string> {
+    const routine = getBuiltinRoutine("brain-curator");
+    if (!routine) {
+      return "Brain-curator routine is not available in this build.";
+    }
+
+    const existing = this.findCuratorJob();
+    const draft = builtinRoutineDraft(routine, existing?.schedule || defaultBuiltinSchedule(routine), context.slug);
+    if (existing) {
+      const updated = await this.cronManager.updateJob(existing, {
+        schedule: existing.schedule,
+        executionContextSlug: context.slug,
+        targetChatId: target.chatId,
+        targetThreadId: target.threadId,
+        instruction: draft.instruction || null,
+        reminderText: draft.reminderText || null,
+        runner: draft.runner || null,
+        enabled: true
+      });
+      return `Brain-curator routine ready: ${updated.id} (${updated.enabled ? "enabled" : "paused"}) next=${updated.nextRunAt || "none"}`;
+    }
+
+    const created = await this.cronManager.createJob(
+      {
+        ...draft,
+        targetChatId: target.chatId,
+        targetThreadId: target.threadId
+      },
+      { context, target }
+    );
+    return `Brain-curator routine installed: ${created.id} next=${created.nextRunAt || "none"}`;
+  }
+
+  private async setupProposalCurationTopic(rawRest: string, target: TelegramTarget, boundContext: ContextRecord | null): Promise<void> {
+    const rest = rawRest.trim();
+    if (/^(help|--help|-h)$/i.test(rest)) {
+      await this.telegram.sendText(
+        target,
+        [
+          "Usage: /curation [machine]",
+          "",
+          "Sets this Telegram topic up as Brainstack's proposal curation surface.",
+          "It binds the topic to a durable proposal-curation scratch context and points the brain-curator routine at this topic.",
+          "",
+          "Use /proposals pending, /proposals needs-human needs-context, /curator_status, and /curator_run here."
+        ].join("\n")
+      );
+      return;
+    }
+
+    const explicitMachine = rest ? rest.replace(/^machine[:=]/i, "").trim() : null;
+    const resolved = this.preferredProposalCurationMachine(explicitMachine || null);
+    if (!resolved.machine) {
+      await this.telegram.sendText(target, resolved.error || "No machine could be selected for proposal curation.");
+      return;
+    }
+
+    const bound = await this.createOrRebindContext(PROPOSAL_CURATION_CONTEXT_SLUG, resolved.machine, "scratch", null, target);
+    const routineLine = await this.ensureBrainCuratorRoutineInContext(bound, target);
+    const warning = boundContext && boundContext.slug !== bound.slug ? this.formatRebindWarning(boundContext) : null;
+    await this.telegram.sendText(
+      target,
+      [
+        warning,
+        [
+          "Proposal curation is ready in this topic.",
+          `Context: ${bound.slug}`,
+          `Machine: ${bound.machine}`,
+          "Workspace: topic scratch",
+          routineLine,
+          "",
+          "Use:",
+          "/curator_status",
+          "/curator_run",
+          "/proposals pending",
+          "/proposals needs-human needs-context",
+          "/proposals open limit=10",
+          "",
+          "Approve/reject shortcuts from /proposals are scoped to the list you just loaded."
+        ].join("\n")
+      ]
+        .filter(Boolean)
+        .join("\n\n")
+    );
   }
 
   private formatContextCreated(context: ContextRecord): string {
