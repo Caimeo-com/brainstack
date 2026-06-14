@@ -38,7 +38,7 @@ export const TELEGRAM_BOT_COMMANDS: TelegramBotCommand[] = [
   { command: "cron_run", description: "Run one scheduled job immediately" },
   { command: "curator_status", description: "Show brain curator mode, runs, and proposals" },
   { command: "curator_run", description: "Run the brain curator routine now" },
-  { command: "proposals", description: "List open shared-brain proposals" },
+  { command: "proposals", description: "List or filter shared-brain proposals" },
   { command: "mode", description: "Set or show the Codex mode for this topic" },
   { command: "model", description: "Set or show the Codex model override" },
   { command: "effort", description: "Set or show the Codex reasoning effort" },

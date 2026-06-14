@@ -1787,6 +1787,7 @@ test("deterministic cron commands install built-ins and run jobs immediately", a
     const curator = fixture.db.listCronJobs().find((job) => job.label === "brain-curator");
     expect(curator?.kind).toBe("codex");
     expect(curator?.instruction).toContain("shared-brain curator pass");
+    expect(curator?.instruction).toContain("Do not call `brainctl curator run`");
     expect(curator?.instruction).toContain("Preserve raw imports and proposals");
 
     await fixture.commands.handleMessage(telegramMessage("/crons", 81));
@@ -1883,6 +1884,7 @@ test("basic loops do not retarget user-owned update-check jobs", async () => {
 test("basic loops install the brain-curator routine and curator commands work end to end", async () => {
   const statusPosts: Array<{ auth: string | null; body: Record<string, unknown> }> = [];
   const decisions: Array<{ path: string; auth: string | null; body: Record<string, unknown> }> = [];
+  const proposalStatusQueries: string[] = [];
   const port = 35_000 + Math.floor(Math.random() * 5_000);
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -1908,6 +1910,7 @@ test("basic loops install the brain-curator routine and curator commands work en
         return Response.json({ ok: true });
       }
       if (req.method === "GET" && url.pathname === "/api/proposals") {
+        proposalStatusQueries.push(url.searchParams.get("status") || "");
         return Response.json({
           ok: true,
           mode: "approval",
@@ -1927,6 +1930,19 @@ test("basic loops install the brain-curator routine and curator commands work en
               target_page: null,
               risk: null,
               created_at: "2026-06-10T06:10:00Z"
+            },
+            {
+              id: "20260610t062000z-needs-context-redis",
+              title: "Needs context Redis cluster note",
+              status: "needs-human",
+              target_page: null,
+              risk: null,
+              created_at: "2026-06-10T06:20:00Z",
+              quality_decision: "needs-context",
+              project: "Lindy",
+              scope: "repo",
+              cluster_label: "Lindy / repo / project_lesson",
+              legacy_format: true
             }
           ]
         });
@@ -1979,10 +1995,19 @@ test("basic loops install the brain-curator routine and curator commands work en
 
     await fixture.commands.handleMessage(telegramMessage("/proposals", 90));
     const listText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(proposalStatusQueries.at(-1)).toBe("open");
     expect(listText).toContain("Status update");
     const shortcut = listText.match(/\/proposal_approve_([a-z0-9]{6,10})_1/);
     expect(shortcut).not.toBeNull();
     const token = shortcut![1];
+
+    await fixture.commands.handleMessage(telegramMessage("/proposals needs-human needs-context project:lindy limit=5", 90));
+    const filteredText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(proposalStatusQueries.at(-1)).toBe("needs-human");
+    expect(filteredText).toContain("Needs context Redis cluster note");
+    expect(filteredText).toContain("quality=needs-context");
+    expect(filteredText).toContain("project=Lindy");
+    expect(filteredText).not.toContain("Status update");
 
     // Approving a proposal that carries a wiki change applies it.
     await fixture.commands.handleMessage(telegramMessage(`/proposal_approve_${token}_1`, 90));

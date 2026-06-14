@@ -39,6 +39,7 @@ function brainCuratorInstruction(): string {
     "",
     "Rules:",
     "- Use the `brain-curator` skill if it is installed or visible in this repo.",
+    "- This is already the curator pass. Do not call `brainctl curator run`, `/curator_run`, or any other command that dispatches another curator job from inside this scheduled context; that only reports a busy/409 guard. Run the workflow directly.",
     "- Preserve raw imports and proposals. Do not rewrite raw artifacts.",
     "- Do not mix private-journal material into the shared dev brain.",
     "- Proposal generation is automatic; wiki mutation is policy-controlled by braind. Never edit canonical wiki pages directly: submit proposals and let the curation policy decide.",
@@ -51,7 +52,11 @@ function brainCuratorInstruction(): string {
     "5. Submit machine proposals with `brainctl propose --title ... --body ... --target-page wiki/... --content-file <full proposed page> --base-sha256 <sha256 of current page, or absent> --risk low|medium|high --confidence 0..1 --source-ids id1,id2 --curator-run-id <this run>`. Use --needs-human for anything contradictory or ambiguous.",
     "6. Risk guidance: low = additive, sourced, small (status/source pages); medium = restructures or edits prose; high = deletes content, changes decisions, or touches runbooks.",
     "7. Produce a sourced curation report with: submitted proposals, contradictions, stale facts, skipped private-sensitive items, and exact source paths/ids.",
-    "8. Update `.factory/SUMMARY.md`, `.factory/TODO.md`, and `.factory/ARTIFACTS.md` so the next curator pass can resume."
+    "8. Update `.factory/SUMMARY.md`, `.factory/TODO.md`, and `.factory/ARTIFACTS.md` so the next curator pass can resume.",
+    "",
+    "Telegram summary:",
+    "- Keep the final chat reply short: status, proposal counts, new proposal ids, blockers, and the one most useful next command.",
+    "- Omit scratchpad file paths, \"no attachment\" notes, and routine implementation details unless they explain an actionable failure."
   ].join("\n");
 }
 

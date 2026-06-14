@@ -60,14 +60,25 @@ export interface BrainProposalSummary {
   target_page: string | null;
   risk: string | null;
   created_at: string;
+  quality_decision: string | null;
+  project: string | null;
+  scope: string | null;
+  cluster_label: string | null;
+  legacy_format: boolean;
 }
 
-export async function fetchOpenProposals(config: FactoryConfig): Promise<BrainProposalSummary[] | null> {
+export interface ProposalListOptions {
+  status?: string;
+}
+
+export async function fetchProposals(config: FactoryConfig, options: ProposalListOptions = {}): Promise<BrainProposalSummary[] | null> {
   if (!config.brainBaseUrl) {
     return null;
   }
   try {
-    const response = await fetch(new URL("/api/proposals?status=open", config.brainBaseUrl).toString(), {
+    const url = new URL("/api/proposals", config.brainBaseUrl);
+    url.searchParams.set("status", options.status || "open");
+    const response = await fetch(url.toString(), {
       signal: AbortSignal.timeout(10_000)
     });
     if (!response.ok) {
@@ -80,7 +91,12 @@ export async function fetchOpenProposals(config: FactoryConfig): Promise<BrainPr
       status: String(proposal.status || ""),
       target_page: typeof proposal.target_page === "string" ? proposal.target_page : null,
       risk: typeof proposal.risk === "string" ? proposal.risk : null,
-      created_at: String(proposal.created_at || "")
+      created_at: String(proposal.created_at || ""),
+      quality_decision: typeof proposal.quality_decision === "string" ? proposal.quality_decision : null,
+      project: typeof proposal.project === "string" ? proposal.project : null,
+      scope: typeof proposal.scope === "string" ? proposal.scope : null,
+      cluster_label: typeof proposal.cluster_label === "string" ? proposal.cluster_label : null,
+      legacy_format: proposal.legacy_format === true
     }));
   } catch {
     return null;

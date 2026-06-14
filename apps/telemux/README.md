@@ -98,8 +98,13 @@ If `BRAIN_BASE_URL` and `BRAIN_IMPORT_TOKEN` are set, successful runs import `.f
 - `/artifacts`
 - `/shred`
 - `/usage`
+- `/curator_status`
+- `/curator_run`
+- `/proposals [status] [quality] [search terms] [limit=N]`
 
 `/status` is kept as an alias for `/topicinfo`.
+
+For proposal review, use filters such as `/proposals pending`, `/proposals needs-human needs-context`, or `/proposals open project:lindy limit=10`. The response includes approve/reject shortcuts for the filtered snapshot.
 
 `/cron` subcommands currently include:
 

@@ -96,12 +96,20 @@ Telegram mirrors the basics:
 ```text
 /curator_status
 /curator_run
-/proposals
+/proposals [open|pending|needs-human|approved|applied|rejected|superseded] [ready|needs-context|needs-evidence|too-vague] [search terms|project:NAME|scope:NAME] [limit=N]
 /proposal_approve_<token>_<n>
 /proposal_reject_<token>_<n>
 ```
 
 Telegram approval applies the proposed wiki change when the proposal carries one (drift still parks it as `needs-human`). Approve/reject from Telegram require the optional `FACTORY_BRAIN_ADMIN_TOKEN` in the telemux env; without it, Telegram stays read-only for proposals.
+
+Useful review flows:
+
+```text
+/proposals pending
+/proposals needs-human needs-context
+/proposals open project:lindy limit=10
+```
 
 ## API
 

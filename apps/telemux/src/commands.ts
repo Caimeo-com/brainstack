@@ -11,7 +11,7 @@ import {
 } from "./codex-runtime";
 import { formatControlMetaResponse, resolveControlMetaKind } from "./control-meta";
 import { CronManager } from "./cron-manager";
-import { decideProposal, fetchCuratorStatus, fetchOpenProposals, type BrainProposalSummary } from "./curator-report";
+import { decideProposal, fetchCuratorStatus, fetchProposals, type BrainProposalSummary } from "./curator-report";
 import { ContextRecord, FactoryDb, type PendingTextRecord } from "./db";
 import { ContextService, nextRecommendedAction, normalizeSlug } from "./contexts";
 import { Dispatcher } from "./dispatcher";
@@ -58,6 +58,118 @@ function parseCommand(text: string): { command: string; rest: string; mention: s
     rest,
     mention
   };
+}
+
+const PROPOSAL_STATUS_FILTERS = new Set(["open", "pending", "approved", "applied", "rejected", "superseded", "needs-human"]);
+const PROPOSAL_QUALITY_FILTERS = new Set(["ready", "needs-context", "needs-evidence", "too-vague"]);
+const DEFAULT_PROPOSAL_LIST_LIMIT = 15;
+const MAX_PROPOSAL_LIST_LIMIT = 30;
+
+interface ProposalListRequest {
+  status: string;
+  quality: string | null;
+  query: string;
+  limit: number;
+  help: boolean;
+  error: string | null;
+}
+
+function proposalListUsage(): string {
+  return [
+    "Usage: /proposals [open|pending|needs-human|approved|applied|rejected|superseded] [ready|needs-context|needs-evidence|too-vague] [search terms|project:NAME|scope:NAME] [limit=N]",
+    "Examples:",
+    "/proposals pending",
+    "/proposals needs-human needs-context",
+    "/proposals open project:lindy limit=10"
+  ].join("\n");
+}
+
+function parseProposalListRequest(text: string): ProposalListRequest {
+  const result: ProposalListRequest = {
+    status: "open",
+    quality: null,
+    query: "",
+    limit: DEFAULT_PROPOSAL_LIST_LIMIT,
+    help: false,
+    error: null
+  };
+  const queryParts: string[] = [];
+  for (const rawPart of text.split(/\s+/).map((part) => part.trim()).filter(Boolean)) {
+    const part = rawPart.toLowerCase();
+    if (part === "help" || part === "--help" || part === "-h") {
+      result.help = true;
+      continue;
+    }
+
+    const keyed = part.match(/^(status|quality|q|query|project|scope|cluster|kind|limit|n)[:=](.+)$/);
+    const key = keyed?.[1] || "";
+    const value = keyed?.[2] || "";
+    if ((key === "status" || !key) && PROPOSAL_STATUS_FILTERS.has(key ? value : part)) {
+      result.status = key ? value : part;
+      continue;
+    }
+    if ((key === "quality" || !key) && PROPOSAL_QUALITY_FILTERS.has(key ? value : part)) {
+      result.quality = key ? value : part;
+      continue;
+    }
+    if (key === "limit" || key === "n") {
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        result.error = `Invalid proposal list limit: ${value}`;
+      } else {
+        result.limit = Math.min(parsed, MAX_PROPOSAL_LIST_LIMIT);
+      }
+      continue;
+    }
+    if (key === "status") {
+      result.error = `Unknown proposal status filter: ${value}`;
+      continue;
+    }
+    if (key === "quality") {
+      result.error = `Unknown proposal quality filter: ${value}`;
+      continue;
+    }
+    if (key === "q" || key === "query") {
+      queryParts.push(value);
+      continue;
+    }
+    if (key === "project" || key === "scope" || key === "cluster" || key === "kind") {
+      queryParts.push(value);
+      continue;
+    }
+    queryParts.push(rawPart);
+  }
+  result.query = queryParts.join(" ").trim();
+  return result;
+}
+
+function proposalSearchText(proposal: BrainProposalSummary): string {
+  return [
+    proposal.id,
+    proposal.title,
+    proposal.status,
+    proposal.target_page,
+    proposal.risk,
+    proposal.quality_decision,
+    proposal.project,
+    proposal.scope,
+    proposal.cluster_label,
+    proposal.legacy_format ? "legacy" : null
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+function matchesProposalListRequest(proposal: BrainProposalSummary, request: ProposalListRequest): boolean {
+  if (request.status !== "open" && proposal.status !== request.status) {
+    return false;
+  }
+  if (request.quality && proposal.quality_decision !== request.quality) {
+    return false;
+  }
+  const query = request.query.toLowerCase();
+  return !query || proposalSearchText(proposal).includes(query);
 }
 
 function compact(text: string | null, limit = 280): string {
@@ -914,7 +1026,7 @@ export class CommandHandler {
         }
 
         case "/proposals": {
-          await this.telegram.sendText(target, await this.formatProposalList(target));
+          await this.telegram.sendText(target, await this.formatProposalList(target, parsed.rest));
           return;
         }
 
@@ -2357,33 +2469,69 @@ export class CommandHandler {
     return lines.join("\n");
   }
 
-  private async formatProposalList(target: TelegramTarget): Promise<string> {
-    const proposals = await fetchOpenProposals(this.config);
+  private async formatProposalList(target: TelegramTarget, rawFilter: string): Promise<string> {
+    const request = parseProposalListRequest(rawFilter);
+    if (request.help) {
+      return proposalListUsage();
+    }
+    if (request.error) {
+      return `${request.error}\n\n${proposalListUsage()}`;
+    }
+
+    const proposals = await fetchProposals(this.config, { status: request.status });
     if (proposals === null) {
       return this.config.brainBaseUrl
         ? "Could not list proposals; is braind running?"
         : "BRAIN_BASE_URL is not configured; proposals live in the shared brain service.";
     }
-    if (!proposals.length) {
-      return "No open proposals.";
+    const filtered = proposals.filter((proposal) => matchesProposalListRequest(proposal, request));
+    if (!filtered.length) {
+      const criteria = [
+        `status=${request.status}`,
+        request.quality ? `quality=${request.quality}` : null,
+        request.query ? `query="${request.query}"` : null
+      ]
+        .filter(Boolean)
+        .join(" ");
+      return `No proposals matched ${criteria}.\n\n${proposalListUsage()}`;
     }
-    const limited = proposals.slice(0, 15);
+    const limited = filtered.slice(0, request.limit);
     const token = this.createProposalShortcutSnapshot(limited, target);
-    const lines = [`Open proposals (${proposals.length}):`];
+    const label = [
+      `status=${request.status}`,
+      request.quality ? `quality=${request.quality}` : null,
+      request.query ? `query="${request.query}"` : null
+    ]
+      .filter(Boolean)
+      .join(", ");
+    const lines = [`Proposals (${filtered.length}/${proposals.length}, ${label}):`];
     limited.forEach((proposal, index) => {
+      const tags = [
+        proposal.quality_decision ? `quality=${proposal.quality_decision}` : null,
+        proposal.project ? `project=${proposal.project}` : null,
+        proposal.scope ? `scope=${proposal.scope}` : null,
+        proposal.legacy_format ? "legacy" : null,
+        proposal.risk ? `risk=${proposal.risk}` : null
+      ]
+        .filter(Boolean)
+        .join(", ");
       lines.push(
-        `${index + 1}. [${proposal.status}] ${proposal.title}${proposal.target_page ? ` → ${proposal.target_page}` : ""}${
-          proposal.risk ? ` (risk: ${proposal.risk})` : ""
+        `${index + 1}. [${proposal.status}] ${proposal.title}${proposal.target_page ? ` -> ${proposal.target_page}` : ""}${
+          tags ? ` (${tags})` : ""
         }`
       );
       lines.push(`   /proposal_approve_${token}_${index + 1}  /proposal_reject_${token}_${index + 1}`);
     });
+    if (filtered.length > limited.length) {
+      lines.push(`Showing ${limited.length}; narrow the search or use limit=${Math.min(filtered.length, MAX_PROPOSAL_LIST_LIMIT)}.`);
+    }
     if (!this.config.brainAdminToken) {
       lines.push("");
       lines.push("FACTORY_BRAIN_ADMIN_TOKEN is not set, so the shortcuts above will be refused. Use `brainctl proposals` on the control host.");
     } else {
       lines.push("");
       lines.push("Approve applies the proposed wiki change when the proposal carries one; drift parks it as needs-human.");
+      lines.push("Filter with `/proposals pending`, `/proposals needs-human needs-context`, or `/proposals open project:lindy limit=10`.");
     }
     return lines.join("\n");
   }
