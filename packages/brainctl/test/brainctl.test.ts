@@ -953,7 +953,8 @@ telemux:
       const dryRun = runBrainctl(["fleet", "update", "brain-control", "--dry-run", "--config", configPath], env);
       expectSuccess(dryRun);
       expect(dryRun.stdout).toContain("OK brain-control");
-      expect(dryRun.stdout).toContain("git pull --ff-only");
+      expect(dryRun.stdout).toContain("git fetch --quiet origin main");
+      expect(dryRun.stdout).toContain("git merge --ff-only origin/main");
       expect(dryRun.stdout).toContain("~/.config/brainstack/brainstack.yaml");
       expect(dryRun.stdout).toContain("\\~/*)");
       expect(dryRun.stdout).toContain("${1#\\~/}");
@@ -7126,7 +7127,8 @@ describe("public release hygiene", () => {
       const dryRun = runBrainctl(["fleet", "update", "brain-control", "--dry-run", "--config", configPath]);
       expectSuccess(dryRun);
       expect(dryRun.stdout).toContain("OK brain-control");
-      expect(dryRun.stdout).toContain("git pull --ff-only");
+      expect(dryRun.stdout).toContain("git fetch --quiet origin main");
+      expect(dryRun.stdout).toContain("git merge --ff-only origin/main");
       expect(git(["rev-parse", "HEAD"], productRepo)).not.toBe(git(["rev-parse", "origin/main"], productRepo));
 
       await writeFile(join(productRepo, "README.md"), "local\n");
