@@ -209,7 +209,8 @@ struct DashboardView: View {
       let controlSections = ["brain_api", "control_source", "curator", "proposals", "product"]
       sectionGroup(title: "Local", names: localSections)
       sectionGroup(title: "Control", names: controlSections)
-      let known = Set(localSections + controlSections + ["config"])
+      fleetSection
+      let known = Set(localSections + controlSections + ["fleet", "config"])
       let extra = (model.lastReport?.sectionNames ?? []).filter { !known.contains($0) }
       if !extra.isEmpty {
         sectionGroup(title: "Other", names: extra)
@@ -218,6 +219,41 @@ struct DashboardView: View {
         SectionRowView(name: "config", section: config)
       }
     }
+  }
+
+  @ViewBuilder
+  private var fleetSection: some View {
+    let machines = model.lastReport?.fleetMachines ?? []
+    if !machines.isEmpty {
+      Text("FLEET")
+        .font(.caption2)
+        .foregroundColor(.secondary)
+        .padding(.top, 4)
+      ForEach(machines) { machine in
+        FleetMachineRowView(machine: machine, isBusy: model.busyAction != nil) {
+          updateFleetMachine(machine)
+        }
+      }
+    } else if let section = model.lastReport?.sections["fleet"] {
+      Text("FLEET")
+        .font(.caption2)
+        .foregroundColor(.secondary)
+        .padding(.top, 4)
+      SectionRowView(name: "fleet", section: section)
+    }
+  }
+
+  private func updateFleetMachine(_ machine: FleetMachineSummary) {
+    guard machine.needsUpdate else {
+      return
+    }
+    guard Confirm.ask(
+      title: "Update \(machine.name)",
+      message: "Pull, rebuild, upgrade, and restart Brainstack services on \(machine.name)?"
+    ) else {
+      return
+    }
+    model.updateFleetMachine(machine.name)
   }
 
   private var attentionSummary: some View {
@@ -271,6 +307,15 @@ struct DashboardView: View {
         repair: .checkUpdates
       ))
     }
+    let staleFleet = report.fleetMachines.filter(\.needsUpdate)
+    if !staleFleet.isEmpty {
+      let names = staleFleet.map(\.name).joined(separator: ", ")
+      items.append(AttentionItem(
+        title: "\(staleFleet.count) machine\(staleFleet.count == 1 ? "" : "s") need update",
+        detail: "Open Details and update: \(names).",
+        severity: .warn
+      ))
+    }
     if let curator = report.sections["curator"], curator.state == .ok {
       let installed = curator.data?["curator"]?["installed"]?.boolValue
       if installed == false {
@@ -296,7 +341,7 @@ struct DashboardView: View {
       }
       if section.state == .fail {
         items.append(AttentionItem(title: "\(sectionLabel(name)) failed", detail: sectionMessage(name: name, section: section), severity: .fail, repair: repairKind(forSection: name)))
-      } else if section.state == .warn && !isBenignProductWarning(name: name, section: section) && !isOldControlEndpointWarning(section) {
+      } else if section.state == .warn && !(name == "fleet" && !staleFleet.isEmpty) && !isBenignProductWarning(name: name, section: section) && !isOldControlEndpointWarning(section) {
         items.append(AttentionItem(title: "\(sectionLabel(name)) needs attention", detail: sectionMessage(name: name, section: section), severity: .warn, repair: repairKind(forSection: name)))
       }
     }
@@ -469,6 +514,74 @@ struct SectionRowView: View {
     case .warn, .unknown: return .yellow
     case .fail: return .red
     case .disabled: return .gray
+    }
+  }
+}
+
+struct FleetMachineRowView: View {
+  let machine: FleetMachineSummary
+  var isBusy: Bool
+  var onUpdate: () -> Void
+
+  var body: some View {
+    HStack(alignment: .center, spacing: 6) {
+      Circle()
+        .fill(stateColor)
+        .frame(width: 7, height: 7)
+      VStack(alignment: .leading, spacing: 1) {
+        HStack(spacing: 5) {
+          Text(machine.name)
+            .font(.system(size: 12, weight: .medium))
+            .lineLimit(1)
+          Text(machine.role)
+            .font(.system(size: 10, weight: .medium))
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(Color.secondary.opacity(0.14))
+            .clipShape(Capsule())
+        }
+        Text(detail)
+          .font(.system(size: 11))
+          .foregroundColor(.secondary)
+          .lineLimit(2)
+          .truncationMode(.middle)
+      }
+      Spacer(minLength: 4)
+      if machine.needsUpdate {
+        Button("Update") { onUpdate() }
+          .controlSize(.small)
+          .disabled(isBusy)
+      }
+    }
+    .help(helpText)
+  }
+
+  private var detail: String {
+    var parts: [String] = []
+    parts.append(machine.updateState)
+    if let short = machine.short { parts.append("head=\(short)") }
+    if let behind = machine.behind, behind > 0 { parts.append("behind=\(behind)") }
+    if let ahead = machine.ahead, ahead > 0 { parts.append("ahead=\(ahead)") }
+    if let dirty = machine.dirtyCount, dirty > 0 { parts.append("dirty=\(dirty)") }
+    if !machine.detail.isEmpty { parts.append(machine.detail) }
+    return parts.joined(separator: " · ")
+  }
+
+  private var helpText: String {
+    [
+      "\(machine.name) (\(machine.role), \(machine.transport))",
+      detail,
+      machine.reachable ? "reachable" : "unreachable"
+    ].joined(separator: "\n")
+  }
+
+  private var stateColor: Color {
+    switch machine.status {
+    case "ok": return .green
+    case "fail": return .red
+    case "disabled": return .gray
+    default: return .yellow
     }
   }
 }

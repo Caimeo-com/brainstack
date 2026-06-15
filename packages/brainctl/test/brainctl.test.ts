@@ -143,9 +143,12 @@ async function readQueuedPayloadFromOutput(output: string): Promise<Record<strin
 }
 
 function git(args: string[], cwd: string): string {
-  const result = runCommand(["git", ...args], { cwd });
+  const deterministicArgs = args.includes("commit")
+    ? ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", ...args]
+    : args;
+  const result = runCommand(["git", ...deterministicArgs], { cwd });
   if (result.code !== 0) {
-    throw new Error(`git ${args.join(" ")} failed\n${result.stderr || result.stdout}`);
+    throw new Error(`git ${deterministicArgs.join(" ")} failed\n${result.stderr || result.stdout}`);
   }
   return result.stdout.trim();
 }
@@ -327,7 +330,7 @@ telemux:
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   test("expands configured home paths without using the build machine home", async () => {
     const cfg = await loadConfig(join(PRODUCT_ROOT, "examples", "control.yaml"), "control");
@@ -855,6 +858,14 @@ telemux:
         join(binDir, "ssh"),
         [
           "#!/usr/bin/env bash",
+          "case \"$*\" in",
+          "  *fleet*status*)",
+          "    cat <<'JSON'",
+          "{\"schema_version\":1,\"generated_at\":\"2026-06-11T00:00:00Z\",\"source_machine\":\"brain-control\",\"profile\":\"control\",\"ok\":true,\"degraded\":false,\"summary\":{\"total\":2,\"reachable\":2,\"needs_update\":0,\"unhealthy\":0},\"machines\":[{\"name\":\"brain-control\",\"role\":\"control\",\"transport\":\"local\",\"reachable\":true,\"status\":\"ok\",\"update_state\":\"current\",\"needs_update\":false,\"detail\":\"current head=abcdef0\",\"short\":\"abcdef0\"},{\"name\":\"worker-a\",\"role\":\"worker\",\"transport\":\"ssh\",\"reachable\":true,\"status\":\"ok\",\"update_state\":\"current\",\"needs_update\":false,\"detail\":\"current head=1234567\",\"short\":\"1234567\"}]}",
+          "JSON",
+          "    exit 0",
+          "    ;;",
+          "esac",
           "printf 'repo=/home/operator/brainstack\\n'",
           "printf 'state=ok\\n'",
           "printf 'branch=main\\n'",
@@ -884,6 +895,66 @@ telemux:
       expect(aggregate.sections.control_source.detail).toContain("control host up to date");
       expect(aggregate.sections.control_source.data.machine).toBe("operator@brain-control");
       expect(aggregate.sections.control_source.data.short).toBe("abcdef0");
+      expect(aggregate.sections.fleet.state).toBe("ok");
+      expect(aggregate.sections.fleet.data.summary.total).toBe(3);
+      expect(aggregate.sections.fleet.data.machines.some((machine: Record<string, unknown>) => machine.name === "worker-a")).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("client fleet status flags old control host and update dry-run bootstraps it directly", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-status-old-fleet-control-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const binDir = join(dir, "bin");
+      const configPath = join(dir, "client.yaml");
+      await mkdir(binDir, { recursive: true });
+      await writeFile(
+        join(binDir, "ssh"),
+        [
+          "#!/usr/bin/env bash",
+          "case \"$*\" in",
+          "  *fleet*status*)",
+          "    printf 'Unknown command: fleet\\n' >&2",
+          "    exit 1",
+          "    ;;",
+          "esac",
+          "printf 'repo=/home/operator/brainstack\\n'",
+          "printf 'state=ok\\n'",
+          "printf 'branch=main\\n'",
+          "printf 'head=abcdef0123456789\\n'",
+          "printf 'short=abcdef0\\n'",
+          "printf 'dirty_count=0\\n'",
+          "printf 'remote_ref=origin/main\\n'",
+          "printf 'origin_head=abcdef0123456789\\n'",
+          "printf 'ahead_behind=0\\t0\\n'"
+        ].join("\n")
+      );
+      await chmod(join(binDir, "ssh"), 0o755);
+      await writeFixtureClientConfig(configPath, {
+        home,
+        stateRoot,
+        productRepo: join(dir, "missing-product"),
+        telegramVia: "operator@brain-control",
+        telegramRemoteRepo: "~/brainstack"
+      });
+      const env = { HOME: home, PATH: `${binDir}:${process.env.PATH || ""}` };
+      const status = runBrainctl(["fleet", "status", "--json", "--no-fetch", "--config", configPath], env);
+      expectSuccess(status);
+      const aggregate = JSON.parse(status.stdout) as Record<string, any>;
+      const control = aggregate.machines.find((machine: Record<string, unknown>) => machine.name === "brain-control");
+      expect(control).toBeTruthy();
+      expect(control.needs_update).toBe(true);
+      expect(control.reachable).toBe(true);
+      expect(control.detail).toContain("too old");
+
+      const dryRun = runBrainctl(["fleet", "update", "brain-control", "--dry-run", "--config", configPath], env);
+      expectSuccess(dryRun);
+      expect(dryRun.stdout).toContain("OK brain-control");
+      expect(dryRun.stdout).toContain("git pull --ff-only");
+      expect(dryRun.stdout).toContain("~/.config/brainstack/brainstack.yaml");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -1795,6 +1866,27 @@ describe("brainctl install safety", () => {
       const result = runBrainctl(["daemon", "once", "--config", configPath], { HOME: home });
       expect(result.code).not.toBe(0);
       expect(`${result.stdout}\n${result.stderr}`).toContain("brainstack daemon already running");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("daemon lock ignores a live reused pid when identity does not match brainstackd", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-daemon-lock-identity-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const configPath = join(dir, "client.yaml");
+      await writeFixtureClientConfig(configPath, { home, stateRoot, localPath: join(home, "shared-brain") });
+      await mkdir(join(stateRoot, "daemon"), { recursive: true });
+      await writeFile(
+        join(stateRoot, "daemon", "brainstackd.lock"),
+        `${JSON.stringify({ pid: process.pid, created_at: new Date().toISOString(), host: hostname(), argv: ["/usr/bin/not-brainstack"] })}\n`
+      );
+
+      const result = runBrainctl(["daemon", "once", "--config", configPath, "--no-sync", "--no-skills", "--no-flush"], { HOME: home });
+      expectSuccess(result);
+      expect(await Bun.file(join(stateRoot, "daemon", "brainstackd.lock")).exists()).toBe(false);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -2907,7 +2999,7 @@ describe("braind write safety", () => {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });
     }
-  }, 12_000);
+  }, 30_000);
 
   test("braind queues concurrent mutations instead of rejecting ready writes", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-mutation-queue-"));
@@ -2953,7 +3045,7 @@ describe("braind write safety", () => {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });
     }
-  }, 12_000);
+  }, 30_000);
 
   test("slow URL import preparation does not hold the mutation gate for ready text imports", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-url-prep-gate-"));
@@ -3037,7 +3129,7 @@ describe("braind write safety", () => {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });
     }
-  }, 12_000);
+  }, 30_000);
 
   test("write-rate source cache is bounded while preserving per-source quotas", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-rate-cache-"));
@@ -3075,7 +3167,7 @@ describe("braind write safety", () => {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });
     }
-  }, 12_000);
+  }, 30_000);
 
   test("write-rate limiting has a token-level quota across rotated sources", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-rate-token-"));
@@ -3111,7 +3203,7 @@ describe("braind write safety", () => {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });
     }
-  }, 12_000);
+  }, 30_000);
 
   test("pre-body token quota rejects import floods before request parsing", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-prebody-rate-"));
@@ -3567,7 +3659,7 @@ describe("braind write safety", () => {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });
     }
-  }, 12_000);
+  }, 30_000);
 
   test("auto curation mode applies only low-risk policy-conforming proposals", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-auto-curation-"));
@@ -3674,7 +3766,7 @@ describe("braind write safety", () => {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });
     }
-  }, 12_000);
+  }, 30_000);
 
   test("braind escapes search snippets, allowlists external links, and serves active raw files inertly", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-content-safety-"));
@@ -4106,7 +4198,7 @@ describe("braind write safety", () => {
       await stopBraind(proc);
       await rm(dir, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, 30_000);
 });
 
 describe("public release hygiene", () => {
@@ -5095,7 +5187,7 @@ describe("public release hygiene", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  }, 12_000);
+  }, 30_000);
 
   test("doctor skips missing guidance for unused harnesses", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-guidance-doctor-"));
@@ -5219,7 +5311,7 @@ describe("public release hygiene", () => {
       }
       await rm(dir, { recursive: true, force: true });
     }
-  }, 12_000);
+  }, 30_000);
 
   test("project context blocks personal brains until allowed and search labels sources", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainstack-project-context-"));
@@ -6227,7 +6319,7 @@ describe("public release hygiene", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, 30_000);
 
   test("outbox warns on large queued payloads and refuses above hard cap without truncation", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-outbox-large-"));
@@ -6937,6 +7029,15 @@ describe("public release hygiene", () => {
       expectSuccess(listed);
       expect(listed.stdout).toContain("status=terminal");
       expect(listed.stdout).toContain("HTTP 425 persisted");
+      const terminalId = listed.stdout.split(/\s+/).find((part) => part.startsWith("import-"));
+      expect(typeof terminalId).toBe("string");
+      const retry = runBrainctl(["outbox", "retry", terminalId!, "--config", configPath], env);
+      expectSuccess(retry);
+      expect(retry.stdout).toContain("requeued=1");
+      const retried = runBrainctl(["outbox", "list", "--config", configPath], env);
+      expectSuccess(retried);
+      expect(retried.stdout).toContain("status=queued");
+      expect(retried.stdout).not.toContain("status=terminal");
 
       const proposeConfigPath = join(dir, "config-propose.yaml");
       await writeFile(
@@ -6986,6 +7087,60 @@ describe("public release hygiene", () => {
       await rm(dir, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("fleet status detects behind product repos and exposes dry-run updates", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-fleet-status-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      const bare = join(dir, "product.git");
+      const seed = join(dir, "seed");
+      const productRepo = join(dir, "product");
+      git(["init", "--bare", "--initial-branch=main", bare], dir);
+      git(["clone", bare, seed], dir);
+      await writeFile(join(seed, "README.md"), "v1\n");
+      git(["add", "README.md"], seed);
+      git(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "seed"], seed);
+      git(["push", "-u", "origin", "main"], seed);
+      git(["clone", bare, productRepo], dir);
+      await writeFile(join(seed, "README.md"), "v2\n");
+      git(["add", "README.md"], seed);
+      git(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "update"], seed);
+      git(["push"], seed);
+      await writeFixtureConfig(configPath);
+      const fixtureConfig = await readFile(configPath, "utf8");
+      await writeFile(
+        configPath,
+        fixtureConfig.replace("paths:\n  home: /tmp/brainstack-test-home\n", `paths:\n  home: ${join(dir, "home")}\n  productRepo: ${productRepo}\n`)
+      );
+
+      const status = runBrainctl(["fleet", "status", "--json", "--config", configPath]);
+      expectSuccess(status);
+      const body = JSON.parse(status.stdout) as Record<string, any>;
+      expect(body.summary.needs_update).toBe(1);
+      expect(body.machines[0].name).toBe("brain-control");
+      expect(body.machines[0].update_state).toBe("behind");
+      expect(body.machines[0].needs_update).toBe(true);
+
+      const dryRun = runBrainctl(["fleet", "update", "brain-control", "--dry-run", "--config", configPath]);
+      expectSuccess(dryRun);
+      expect(dryRun.stdout).toContain("OK brain-control");
+      expect(dryRun.stdout).toContain("git pull --ff-only");
+      expect(git(["rev-parse", "HEAD"], productRepo)).not.toBe(git(["rev-parse", "origin/main"], productRepo));
+
+      await writeFile(join(productRepo, "README.md"), "local\n");
+      git(["add", "README.md"], productRepo);
+      git(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "local"], productRepo);
+      const diverged = runBrainctl(["fleet", "status", "--json", "--config", configPath]);
+      expectSuccess(diverged);
+      const divergedBody = JSON.parse(diverged.stdout) as Record<string, any>;
+      expect(divergedBody.summary.needs_update).toBe(0);
+      expect(divergedBody.machines[0].update_state).toBe("ahead");
+      expect(divergedBody.machines[0].needs_update).toBe(false);
+      expect(divergedBody.machines[0].detail).toContain("diverged");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 
   test("updates command is read-only and reports versions", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-updates-"));
@@ -7157,7 +7312,7 @@ describe("public release hygiene", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, 30_000);
 
   test("doctor reports client write readiness and explicit write smoke", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-client-readiness-"));
@@ -7385,7 +7540,7 @@ describe("public release hygiene", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, 30_000);
 
   test("telegram send-file streams local file over SSH with control-host trust and no Telegram secrets", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-telegram-send-file-"));

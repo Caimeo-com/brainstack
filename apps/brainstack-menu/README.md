@@ -7,16 +7,16 @@ Native macOS menu bar companion for enrolled Brainstack machines. It makes Brain
 The menu bar icon is the status surface:
 
 - **Green** — healthy, no degraded sections.
-- **Yellow** — degraded but usable (missing optional hooks, offline curator endpoint, …).
+- **Yellow** — degraded but usable (missing optional hooks, offline curator endpoint, a fleet machine behind `origin/main`, …).
 - **Red** — broken local setup (failed config, corrupt outbox, failing section).
 - **Gray** — `brainctl` missing, config missing, status timed out, or unparseable.
 - Dimmed icon — showing the last good status because the latest refresh failed (stale).
 
-The dropdown shows local sections (daemon, shared brain, outbox, hooks, skills) and control sections (brain API, curator, proposals, product updates), each with state and a one-line detail. Unknown future sections render generically by `state`/`detail`.
+The dropdown shows local sections (daemon, shared brain, outbox, hooks, skills), control sections (brain API, curator, proposals, product updates), and a Fleet section with each known machine, reachability, source head, dirty/behind state, and service status. Unknown future sections render generically by `state`/`detail`.
 
 ## Safe actions
 
-Refresh, Open Wiki, Open Shared Brain/Config folders, Copy Redacted Diagnostics, Run Doctor, and confirmation-gated Flush Outbox, Refresh Skills, Install/Restart Daemon, Install/Repair Hooks. Every command runs off the main thread with a hard timeout.
+Refresh, Open Wiki, Open Shared Brain/Config folders, Copy Redacted Diagnostics, Run Doctor, and confirmation-gated Flush Outbox, Refresh Skills, Install/Restart Daemon, Install/Repair Hooks. Fleet machine rows show an Update button only when that machine is behind; the button runs `brainctl fleet update <machine>` and confirms before pulling, rebuilding, upgrading, and restarting services. Every command runs off the main thread with a hard timeout.
 
 ## Operator Mode
 

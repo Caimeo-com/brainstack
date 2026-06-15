@@ -36,6 +36,43 @@ public struct StatusSection: Sendable {
   }
 }
 
+public struct FleetMachineSummary: Identifiable, Equatable, Sendable {
+  public let name: String
+  public let role: String
+  public let transport: String
+  public let reachable: Bool
+  public let status: String
+  public let updateState: String
+  public let needsUpdate: Bool
+  public let detail: String
+  public let short: String?
+  public let branch: String?
+  public let behind: Int?
+  public let ahead: Int?
+  public let dirtyCount: Int?
+
+  public var id: String { name }
+
+  public init?(json: JSONValue) {
+    guard let name = json["name"]?.stringValue, !name.isEmpty else {
+      return nil
+    }
+    self.name = name
+    self.role = json["role"]?.stringValue ?? "machine"
+    self.transport = json["transport"]?.stringValue ?? "unknown"
+    self.reachable = json["reachable"]?.boolValue ?? false
+    self.status = json["status"]?.stringValue ?? "unknown"
+    self.updateState = json["update_state"]?.stringValue ?? "unknown"
+    self.needsUpdate = json["needs_update"]?.boolValue ?? false
+    self.detail = json["detail"]?.stringValue ?? ""
+    self.short = json["short"]?.stringValue
+    self.branch = json["branch"]?.stringValue
+    self.behind = json["behind"]?.numberValue.map(Int.init)
+    self.ahead = json["ahead"]?.numberValue.map(Int.init)
+    self.dirtyCount = json["dirty_count"]?.numberValue.map(Int.init)
+  }
+}
+
 /// Parsed aggregate status report. Section order is preserved for rendering, and
 /// sections the app does not know about are kept and rendered generically.
 public struct StatusReport: Sendable {
@@ -63,7 +100,7 @@ public struct StatusReport: Sendable {
     var parsed: [String: StatusSection] = [:]
     if let sectionsObject = object["sections"]?.objectValue {
       // Render in a stable, contract-first order; unknown sections follow alphabetically.
-      let preferredOrder = ["config", "daemon", "shared_brain", "outbox", "hooks", "skills", "brain_api", "curator", "proposals", "telemux", "product"]
+      let preferredOrder = ["config", "daemon", "shared_brain", "outbox", "hooks", "skills", "brain_api", "curator", "proposals", "telemux", "fleet", "control_source", "product"]
       let known = preferredOrder.filter { sectionsObject.keys.contains($0) }
       let unknown = sectionsObject.keys.filter { !preferredOrder.contains($0) }.sorted()
       names = known + unknown
@@ -86,6 +123,12 @@ public struct StatusReport: Sendable {
       throw StatusParseError.invalidJson(String(describing: error))
     }
     return try StatusReport(json: decoded)
+  }
+}
+
+public extension StatusReport {
+  var fleetMachines: [FleetMachineSummary] {
+    sections["fleet"]?.data?["machines"]?.arrayValue?.compactMap(FleetMachineSummary.init(json:)) ?? []
   }
 }
 

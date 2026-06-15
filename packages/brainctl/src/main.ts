@@ -318,6 +318,7 @@ function usage(): string {
   brainctl status --config brainstack.yaml [--json] [--timeout-ms N]
   brainctl daemon run|once|status|install|uninstall|logs --config brainstack.yaml [--json]
   brainctl updates --config brainstack.yaml [--profile ...]
+  brainctl fleet status|update --config brainstack.yaml [machine|--all] [--json] [--dry-run]
   brainctl expose tailscale --config brainstack.yaml --dry-run|--apply
   brainctl backup --config brainstack.yaml [--out DIR] [--pause-telemux]
   brainctl restore --backup DIR_OR_TGZ --target DIR [--apply]
@@ -349,7 +350,7 @@ function usage(): string {
   brainctl search --repo PATH "query" [--config brainstack.yaml] [--json] [--wait-fresh]
   brainctl remember --repo PATH --summary TEXT [--target BRAIN_ID] [--confirm-cross-brain] [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF]
   brainctl allow repo --repo PATH --brain BRAIN_ID [--sections a,b] --always|--once|--deny
-  brainctl outbox status|list|flush|purge|purge-corrupt --config brainstack.yaml [--yes]
+  brainctl outbox status|list|flush|retry|purge|purge-corrupt --config brainstack.yaml [ID|--all] [--yes]
   brainctl destroy --config brainstack.yaml [--profile ...] --dry-run|--yes [--scope control|worker|client|all] [--remove-shared-brain] [--remove-private-brain] [--remove-tailscale-serve]
   brainctl migrate-current-install [--out FILE]
   brainctl smoke --profile single-node|control|worker|client-macos --config brainstack.yaml`;
@@ -2985,6 +2986,10 @@ async function ensureGitRepoLayout(cfg: BrainstackConfig, mode: "fresh" | "runti
         run([
           "git",
           "-c",
+          "core.hooksPath=/dev/null",
+          "-c",
+          "commit.gpgsign=false",
+          "-c",
           "user.name=brainstack",
           "-c",
           "user.email=brainstack@local",
@@ -3391,6 +3396,7 @@ async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Pro
         ? check("WARN", "locks", "pending-reindex", pendingReindexPathFor(cfg), "braind should retry this automatically; inspect braind logs if it persists.")
         : check("PASS", "locks", "pending-reindex", "absent")
     );
+    checks.push(braindPortOwnerCheck(cfg));
     try {
       const response = await fetch(`http://${cfg.security.bindHost}:${cfg.brain.port}/healthz`, { signal: AbortSignal.timeout(2000) });
       checks.push(response.ok ? check("PASS", "health", "braind-healthz", `HTTP ${response.status}`) : check("WARN", "health", "braind-healthz", `HTTP ${response.status}`));
@@ -4019,6 +4025,75 @@ function quoteForBash(value: string): string {
   return shellSingleQuote(value);
 }
 
+function listeningTcpPids(port: number): number[] {
+  const pids = new Set<number>();
+  const lsof = Bun.which("lsof");
+  if (lsof) {
+    const result = run([lsof, "-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], { check: false, timeoutMs: 2000 });
+    for (const line of result.stdout.split(/\r?\n/)) {
+      const pid = Number(line.trim());
+      if (Number.isSafeInteger(pid) && pid > 0) {
+        pids.add(pid);
+      }
+    }
+  }
+  const ss = Bun.which("ss");
+  if (!pids.size && ss) {
+    const result = run([ss, "-ltnp", `sport = :${port}`], { check: false, timeoutMs: 2000 });
+    for (const match of result.stdout.matchAll(/pid=(\d+)/g)) {
+      const pid = Number(match[1]);
+      if (Number.isSafeInteger(pid) && pid > 0) {
+        pids.add(pid);
+      }
+    }
+  }
+  return [...pids].sort((left, right) => left - right);
+}
+
+function systemdUserMainPid(serviceName: string): number | null {
+  if (!commandPath("systemctl")) {
+    return null;
+  }
+  const result = run(["systemctl", "--user", "show", serviceName, "--property=MainPID", "--value"], { check: false, timeoutMs: 2000 });
+  const pid = Number(result.stdout.trim());
+  return result.code === 0 && Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+}
+
+function systemdUserServiceActive(serviceName: string): boolean | null {
+  if (!commandPath("systemctl")) {
+    return null;
+  }
+  const result = run(["systemctl", "--user", "is-active", "--quiet", serviceName], { check: false, timeoutMs: 2000 });
+  return result.code === 0;
+}
+
+function braindPortOwnerCheck(cfg: BrainstackConfig): DoctorCheck {
+  if (process.platform !== "linux" || !commandPath("systemctl")) {
+    return check("PASS", "health", "braind-port-owner", "systemd unavailable; skipped managed port-owner comparison");
+  }
+  const pids = listeningTcpPids(cfg.brain.port);
+  const active = systemdUserServiceActive("braind.service");
+  const mainPid = systemdUserMainPid("braind.service");
+  const ownerDetails = pids.map((pid) => `${pid}:${processCommandLine(pid) || "command unavailable"}`).join("; ");
+  if (!pids.length) {
+    return check("PASS", "health", "braind-port-owner", `no listener on ${cfg.brain.port} outside health checks`);
+  }
+  if (active === true && mainPid && pids.includes(mainPid)) {
+    return check("PASS", "health", "braind-port-owner", `systemd owns port ${cfg.brain.port} pid=${mainPid}`);
+  }
+  const unmanaged = active === true && mainPid ? `systemd MainPID=${mainPid}, listener(s)=${ownerDetails}` : `listener(s)=${ownerDetails}`;
+  if (active === null) {
+    return check("WARN", "health", "braind-port-owner", `cannot compare listener to systemd; ${unmanaged}`);
+  }
+  return check(
+    "FAIL",
+    "health",
+    "braind-port-owner",
+    `unmanaged process owns brain port ${cfg.brain.port}: ${unmanaged}`,
+    "Stop the orphan listener, then restart the managed service with `systemctl --user restart braind.service`."
+  );
+}
+
 async function commandDoctor(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
   const checks = await collectDoctorChecks(cfg, args);
@@ -4357,11 +4432,13 @@ async function collectDaemonStatusSection(cfg: BrainstackConfig, args: ParsedArg
           detail: pidAlive === true ? "pid alive from daemon status" : "fresh daemon status; service-manager probe skipped"
         }
       : await daemonServiceStatus(cfg, args, timeoutMs);
-  const state: BrainctlStatusState = status?.ok && fresh ? "ok" : service.running === true && fresh ? "ok" : "warn";
+  const active = service.running === true || pidAlive === true;
+  const state: BrainctlStatusState = status?.ok && fresh && active ? "ok" : "warn";
   return statusSection(state, `service=${service.running === true ? "running" : service.running === false ? "stopped" : "unknown"} fresh=${fresh}`, {
     service,
     status,
-    fresh
+    fresh,
+    pid_alive: pidAlive
   }, { available: Boolean(status) || service.running === true });
 }
 
@@ -4534,6 +4611,528 @@ async function collectControlSourceStatusSection(cfg: BrainstackConfig, timeoutM
   });
 }
 
+interface FleetMachineStatus {
+  name: string;
+  role: "client" | "control" | "worker";
+  transport: string;
+  reachable: boolean;
+  status: BrainctlStatusState;
+  update_state: "current" | "behind" | "ahead" | "dirty" | "standalone" | "unknown" | "unreachable" | "failed";
+  needs_update: boolean;
+  detail: string;
+  product_repo?: string | null;
+  branch?: string | null;
+  head?: string | null;
+  short?: string | null;
+  remote_ref?: string | null;
+  origin_head?: string | null;
+  ahead?: number | null;
+  behind?: number | null;
+  dirty_count?: number | null;
+  services?: Record<string, string>;
+  error?: string;
+}
+
+interface FleetStatusReport {
+  schema_version: 1;
+  generated_at: string;
+  source_machine: string;
+  profile: Profile;
+  ok: boolean;
+  degraded: boolean;
+  machines: FleetMachineStatus[];
+  summary: {
+    total: number;
+    reachable: number;
+    needs_update: number;
+    unhealthy: number;
+  };
+}
+
+function fleetServiceNames(cfg: BrainstackConfig, role: FleetMachineStatus["role"]): string[] {
+  if (role === "client") {
+    return [];
+  }
+  if (role === "control") {
+    return ["braind.service", ...(cfg.telemux.enabled ? ["telemux.service"] : [])];
+  }
+  return ["brainstackd.service"];
+}
+
+function serviceStates(names: string[]): Record<string, string> {
+  const states: Record<string, string> = {};
+  if (!names.length) {
+    return states;
+  }
+  if (!commandPath("systemctl")) {
+    for (const name of names) {
+      states[name] = "unknown";
+    }
+    return states;
+  }
+  for (const name of names) {
+    const result = run(["systemctl", "--user", "is-active", name], { check: false, timeoutMs: 2000 });
+    states[name] = result.stdout.trim() || (result.code === 0 ? "active" : "inactive");
+  }
+  return states;
+}
+
+function serviceStatesUnhealthy(states: Record<string, string>): boolean {
+  return Object.values(states).some((state) => state !== "active" && state !== "unknown");
+}
+
+function gitSnapshotForFleet(productRoot: string, timeoutMs: number, options: { fetch?: boolean } = {}): Record<string, string> {
+  const values: Record<string, string> = { product_repo: productRoot };
+  if (!existsSync(productRoot)) {
+    values.state = "missing";
+    return values;
+  }
+  if (!gitExists(productRoot)) {
+    values.state = "not-git";
+    return values;
+  }
+  if (options.fetch) {
+    const fetchResult = gitStatusProbe(["fetch", "--quiet", "origin", "main"], productRoot, Math.min(Math.max(timeoutMs, 500), 20_000));
+    if (!fetchResult.ok) {
+      values.fetch_error = fetchResult.output || `exit ${fetchResult.code}`;
+    }
+  }
+  values.state = "ok";
+  values.branch = gitStatusProbe(["rev-parse", "--abbrev-ref", "HEAD"], productRoot, timeoutMs).output;
+  values.head = gitStatusProbe(["rev-parse", "HEAD"], productRoot, timeoutMs).output;
+  values.short = gitStatusProbe(["rev-parse", "--short", "HEAD"], productRoot, timeoutMs).output;
+  const dirty = gitStatusProbe(["status", "--porcelain"], productRoot, timeoutMs);
+  values.dirty_count = dirty.ok && dirty.output ? String(dirty.output.split(/\r?\n/).filter(Boolean).length) : "0";
+  values.remote_ref = ["origin/main", "refs/remotes/https-main"].find((candidate) => gitStatusProbe(["rev-parse", "--verify", candidate], productRoot, timeoutMs).ok) || "";
+  if (values.remote_ref) {
+    values.origin_head = gitStatusProbe(["rev-parse", "--verify", values.remote_ref], productRoot, timeoutMs).output;
+    values.ahead_behind = gitStatusProbe(["rev-list", "--left-right", "--count", `HEAD...${values.remote_ref}`], productRoot, timeoutMs).output;
+  }
+  if (!options.fetch) {
+    const liveRemote = gitStatusProbe(["ls-remote", "origin", "refs/heads/main"], productRoot, Math.min(Math.max(timeoutMs, 500), 5000));
+    const liveHead = liveRemote.ok ? liveRemote.output.split(/\s+/)[0] || "" : "";
+    if (liveHead) {
+      const existingAheadBehind = parseAheadBehind(values.ahead_behind);
+      values.remote_ref = values.remote_ref || "origin/main";
+      values.origin_head = liveHead;
+      if (values.head && values.head !== liveHead && !(existingAheadBehind && existingAheadBehind.ahead > 0)) {
+        values.ahead_behind = "0 1";
+        values.live_remote = "true";
+      }
+    }
+  }
+  return values;
+}
+
+function fleetStatusFromValues(input: {
+  name: string;
+  role: FleetMachineStatus["role"];
+  transport: string;
+  values: Record<string, string>;
+  services?: Record<string, string>;
+  standaloneOk?: boolean;
+  error?: string;
+}): FleetMachineStatus {
+  const values = input.values;
+  const services = input.services || {};
+  const reachable = !input.error && values.state !== "unreachable";
+  const dirtyCount = Number(values.dirty_count || "0");
+  const aheadBehind = parseAheadBehind(values.ahead_behind);
+  const short = values.short || (values.head ? values.head.slice(0, 12) : null);
+  const serviceUnhealthy = serviceStatesUnhealthy(services);
+  if (!reachable) {
+    return {
+      name: input.name,
+      role: input.role,
+      transport: input.transport,
+      reachable: false,
+      status: "warn",
+      update_state: "unreachable",
+      needs_update: false,
+      detail: input.error || "unreachable",
+      product_repo: values.product_repo || null,
+      services,
+      error: input.error
+    };
+  }
+  if (values.state === "missing" || values.state === "not-git") {
+    const standalone = input.standaloneOk && input.role === "client";
+    return {
+      name: input.name,
+      role: input.role,
+      transport: input.transport,
+      reachable: true,
+      status: standalone ? "ok" : "warn",
+      update_state: standalone ? "standalone" : "unknown",
+      needs_update: false,
+      detail: standalone ? "client binary install; no product source checkout" : `product repo ${values.state}`,
+      product_repo: values.product_repo || null,
+      services
+    };
+  }
+  let status: BrainctlStatusState = "ok";
+  let updateState: FleetMachineStatus["update_state"] = "current";
+  let needsUpdate = false;
+  let detail = `current head=${short || "unknown"}`;
+  if (Number.isFinite(dirtyCount) && dirtyCount > 0) {
+    status = "warn";
+    updateState = "dirty";
+    detail = `dirty files=${dirtyCount} head=${short || "unknown"}`;
+  } else if (aheadBehind && aheadBehind.ahead > 0) {
+    status = "warn";
+    updateState = "ahead";
+    detail =
+      aheadBehind.behind > 0
+        ? `diverged from origin ahead=${aheadBehind.ahead} behind=${aheadBehind.behind} head=${short || "unknown"}`
+        : `ahead of origin by ${aheadBehind.ahead} commit(s) head=${short || "unknown"}`;
+  } else if (aheadBehind && aheadBehind.behind > 0) {
+    status = "warn";
+    updateState = "behind";
+    needsUpdate = true;
+    detail = `behind origin by ${aheadBehind.behind} commit(s) head=${short || "unknown"}`;
+  } else if (!values.remote_ref) {
+    status = "warn";
+    updateState = "unknown";
+    detail = `remote ref unavailable head=${short || "unknown"}`;
+  }
+  if (serviceUnhealthy) {
+    status = "warn";
+    detail = `${detail}; service not active`;
+  }
+  if (values.fetch_error) {
+    status = "warn";
+    detail = `${detail}; fetch failed`;
+  }
+  return {
+    name: input.name,
+    role: input.role,
+    transport: input.transport,
+    reachable: true,
+    status,
+    update_state: updateState,
+    needs_update: needsUpdate,
+    detail,
+    product_repo: values.product_repo || null,
+    branch: values.branch || null,
+    head: values.head || null,
+    short,
+    remote_ref: values.remote_ref || null,
+    origin_head: values.origin_head || null,
+    ahead: aheadBehind?.ahead ?? null,
+    behind: aheadBehind?.behind ?? null,
+    dirty_count: Number.isFinite(dirtyCount) ? dirtyCount : null,
+    services,
+    ...(values.fetch_error ? { error: values.fetch_error } : {})
+  };
+}
+
+async function localFleetMachineStatus(
+  cfg: BrainstackConfig,
+  role: FleetMachineStatus["role"],
+  timeoutMs: number,
+  options: { fetch?: boolean; standaloneOk?: boolean } = {}
+): Promise<FleetMachineStatus> {
+  const values = gitSnapshotForFleet(cfg.paths.productRepo || PRODUCT_ROOT, timeoutMs, { fetch: options.fetch });
+  return fleetStatusFromValues({
+    name: cfg.machine.name,
+    role,
+    transport: "local",
+    values,
+    services: serviceStates(fleetServiceNames(cfg, role)),
+    standaloneOk: options.standaloneOk
+  });
+}
+
+function fleetProbeScript(productRepo: string, services: string[], fetch: boolean): string {
+  const serviceLines = services.map((service) => `printf 'service:${service}=%s\\n' "$(systemctl --user is-active ${quoteForBash(service)} 2>/dev/null || printf inactive)"`);
+  return `
+set -u
+brainstack_expand_home() {
+  case "$1" in
+    "~") printf '%s\\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
+    *) printf '%s\\n' "$1" ;;
+  esac
+}
+repo="$(brainstack_expand_home ${quoteForBash(productRepo)})"
+printf 'state=ok\\n'
+printf 'product_repo=%s\\n' "$repo"
+if [ ! -d "$repo" ]; then
+  printf 'state=missing\\n'
+  exit 0
+fi
+if [ ! -d "$repo/.git" ]; then
+  printf 'state=not-git\\n'
+  exit 0
+fi
+if [ ${fetch ? "1" : "0"} -eq 1 ]; then
+  fetch_error="$(git -C "$repo" fetch --quiet origin main 2>&1 || true)"
+  if [ -n "$fetch_error" ]; then printf 'fetch_error=%s\\n' "$(printf '%s' "$fetch_error" | tr '\\n' ' ' | cut -c1-300)"; fi
+fi
+printf 'branch=%s\\n' "$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+printf 'head=%s\\n' "$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
+printf 'short=%s\\n' "$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || true)"
+printf 'dirty_count=%s\\n' "$(git -C "$repo" status --porcelain 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
+remote_ref=""
+for candidate in origin/main refs/remotes/https-main; do
+  if git -C "$repo" rev-parse --verify "$candidate" >/dev/null 2>&1; then
+    remote_ref="$candidate"
+    break
+  fi
+done
+printf 'remote_ref=%s\\n' "$remote_ref"
+if [ -n "$remote_ref" ]; then
+  printf 'origin_head=%s\\n' "$(git -C "$repo" rev-parse --verify "$remote_ref" 2>/dev/null || true)"
+  printf 'ahead_behind=%s\\n' "$(git -C "$repo" rev-list --left-right --count "HEAD...$remote_ref" 2>/dev/null || true)"
+fi
+if [ ${fetch ? "1" : "0"} -eq 0 ]; then
+  live_remote="$(git -C "$repo" ls-remote origin refs/heads/main 2>/dev/null | awk 'NR == 1 { print $1 }' || true)"
+  if [ -n "$live_remote" ]; then
+    [ -n "$remote_ref" ] || printf 'remote_ref=%s\\n' "origin/main"
+    printf 'origin_head=%s\\n' "$live_remote"
+    head_now="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
+    ahead_now="$(git -C "$repo" rev-list --left-right --count "HEAD...$remote_ref" 2>/dev/null | awk '{ print $1 }' || true)"
+    if [ -n "$head_now" ] && [ "$head_now" != "$live_remote" ] && [ "\${ahead_now:-0}" = "0" ]; then
+      printf 'ahead_behind=%s\\n' "0 1"
+      printf 'live_remote=%s\\n' "true"
+    fi
+  fi
+fi
+if command -v systemctl >/dev/null 2>&1; then
+${serviceLines.join("\n")}
+fi
+`.trim();
+}
+
+async function workerFleetMachineStatus(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, timeoutMs: number, fetch: boolean): Promise<FleetMachineStatus> {
+  const script = fleetProbeScript(cfg.paths.productRepo || "~/brainstack", fleetServiceNames(cfg, "worker"), fetch);
+  const result = runWorkerShell(cfg, worker, script, Math.max(3, Math.ceil(timeoutMs / 1000)), true);
+  const combined = `${result.stdout}\n${result.stderr}`.trim();
+  if (result.timedOut || result.code === 124) {
+    return fleetStatusFromValues({ name: worker.name, role: "worker", transport: worker.transport, values: { state: "unreachable" }, error: "timed out" });
+  }
+  if (result.code !== 0) {
+    return fleetStatusFromValues({
+      name: worker.name,
+      role: "worker",
+      transport: worker.transport,
+      values: { state: "unreachable" },
+      error: sanitizeStatusError(combined || `exit ${result.code}`)
+    });
+  }
+  const values = parseKeyValueLines(result.stdout);
+  const services: Record<string, string> = {};
+  for (const [key, value] of Object.entries(values)) {
+    if (key.startsWith("service:")) {
+      services[key.slice("service:".length)] = value || "unknown";
+    }
+  }
+  return fleetStatusFromValues({ name: worker.name, role: "worker", transport: worker.transport, values, services });
+}
+
+function finalizeFleetStatus(report: FleetStatusReport): FleetStatusReport {
+  report.summary = {
+    total: report.machines.length,
+    reachable: report.machines.filter((machine) => machine.reachable).length,
+    needs_update: report.machines.filter((machine) => machine.needs_update).length,
+    unhealthy: report.machines.filter((machine) => machine.status === "warn" || machine.status === "fail").length
+  };
+  report.ok = report.summary.unhealthy === 0;
+  report.degraded = !report.ok;
+  return report;
+}
+
+async function collectLocalFleetStatus(cfg: BrainstackConfig, timeoutMs: number, options: { fetch?: boolean } = {}): Promise<FleetStatusReport> {
+  const role: FleetMachineStatus["role"] = cfg.profile === "client-macos" ? "client" : cfg.profile === "worker" ? "worker" : "control";
+  const report: FleetStatusReport = {
+    schema_version: 1,
+    generated_at: new Date().toISOString(),
+    source_machine: cfg.machine.name,
+    profile: cfg.profile,
+    ok: false,
+    degraded: true,
+    machines: [],
+    summary: { total: 0, reachable: 0, needs_update: 0, unhealthy: 0 }
+  };
+  report.machines.push(await localFleetMachineStatus(cfg, role, timeoutMs, { fetch: options.fetch, standaloneOk: cfg.profile === "client-macos" }));
+  if (cfg.profile === "control" || cfg.profile === "single-node") {
+    for (const worker of defaultWorkers(cfg)) {
+      if (worker.name === cfg.machine.name || worker.transport === "local") {
+        continue;
+      }
+      report.machines.push(await workerFleetMachineStatus(cfg, worker, timeoutMs, Boolean(options.fetch)));
+    }
+  }
+  return finalizeFleetStatus(report);
+}
+
+function remoteFleetControlScript(remoteRepo: string, argv: string[]): string {
+  return `
+set -euo pipefail
+brainstack_expand_home() {
+  case "$1" in
+    "~") printf '%s\\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
+    *) printf '%s\\n' "$1" ;;
+  esac
+}
+repo="$(brainstack_expand_home ${quoteForBash(remoteRepo)})"
+cd "$repo"
+if [ -x "$HOME/.local/bin/brainctl" ]; then
+  exec "$HOME/.local/bin/brainctl" ${argv.map(quoteForBash).join(" ")} --config "$HOME/.config/brainstack/brainstack.yaml"
+fi
+if [ -x "$HOME/.bun/bin/bun" ]; then
+  bun_bin="$HOME/.bun/bin/bun"
+else
+  bun_bin="$(command -v bun)"
+fi
+exec "$bun_bin" --no-env-file run packages/brainctl/src/main.ts ${argv.map(quoteForBash).join(" ")} --config "$HOME/.config/brainstack/brainstack.yaml"
+`.trim();
+}
+
+function fleetControlSshTarget(cfg: BrainstackConfig, args: ParsedArgs): string | null {
+  const via = requireFlagValue(args, "via") || process.env.BRAINSTACK_TELEGRAM_VIA?.trim() || cfg.client.telegramVia || sshTargetFromRemoteSsh(cfg.client.remoteSsh);
+  return via ? validateInviteSshTarget(via, "fleet control SSH target") : null;
+}
+
+function fleetControlFallbackName(cfg: BrainstackConfig, args: ParsedArgs): string {
+  try {
+    const via = fleetControlSshTarget(cfg, args);
+    return via ? workerSshHost(telegramControlWorker(via)) : "control";
+  } catch {
+    return cfg.client.telegramVia || "control";
+  }
+}
+
+function looksLikeUnsupportedFleetCommand(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return normalized.includes("unknown command: fleet") || (normalized.includes("unknown command") && normalized.includes("brainctl init"));
+}
+
+function runFleetControlRemoteScript(cfg: BrainstackConfig, args: ParsedArgs, remoteScript: string, timeoutMs: number): ReturnType<typeof run> | null {
+  const via = fleetControlSshTarget(cfg, args);
+  if (!via) {
+    return null;
+  }
+  const worker = telegramControlWorker(via);
+  const knownHostsPath = telegramKnownHostsPath(cfg, args);
+  const sshTrustMode = telegramSshTrustMode(args);
+  const sshBin = Bun.which("ssh") || "ssh";
+  return run(
+    [
+      sshBin,
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=8",
+      ...telegramSshTrustArgs(sshTrustMode, knownHostsPath),
+      ...workerSshPortArgs(worker),
+      workerRemoteTarget(worker),
+      `bash -lc ${quoteForBash(remoteScript)}`
+    ],
+    { check: false, timeoutMs }
+  );
+}
+
+function runFleetControlSsh(cfg: BrainstackConfig, args: ParsedArgs, argv: string[], timeoutMs: number): ReturnType<typeof run> | null {
+  const remoteRepo = requireFlagValue(args, "remote-repo") || process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() || cfg.client.telegramRemoteRepo || "~/brainstack";
+  return runFleetControlRemoteScript(cfg, args, remoteFleetControlScript(remoteRepo, argv), timeoutMs);
+}
+
+function clientFleetTargetIsControl(cfg: BrainstackConfig, args: ParsedArgs, target: string | undefined): boolean {
+  if (!target || target === "control") {
+    return true;
+  }
+  const via = fleetControlSshTarget(cfg, args);
+  if (!via) {
+    return false;
+  }
+  const worker = telegramControlWorker(via);
+  return target === via || target === workerRemoteTarget(worker) || target === workerSshHost(worker);
+}
+
+function runFleetControlBootstrapUpdate(cfg: BrainstackConfig, args: ParsedArgs, dryRun: boolean): FleetUpdateResult {
+  const remoteRepo = requireFlagValue(args, "remote-repo") || process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() || cfg.client.telegramRemoteRepo || "~/brainstack";
+  const script = fleetUpdateScript("~/.config/brainstack/brainstack.yaml", "control", remoteRepo, dryRun);
+  if (dryRun) {
+    return { machine: fleetControlFallbackName(cfg, args), role: "control", ok: true, dry_run: true, code: 0, output: script };
+  }
+  const result = runFleetControlRemoteScript(cfg, args, script, 300_000);
+  if (!result) {
+    throw new Error("fleet update needs a control SSH target for client-macos installs");
+  }
+  return {
+    machine: fleetControlFallbackName(cfg, args),
+    role: "control",
+    ok: result.code === 0,
+    dry_run: false,
+    code: result.code,
+    output: summarizeLines(`${result.stdout}\n${result.stderr}`.trim(), 100)
+  };
+}
+
+async function collectFleetStatus(cfg: BrainstackConfig, args: ParsedArgs, timeoutMs: number, options: { fetch?: boolean } = {}): Promise<FleetStatusReport> {
+  if (cfg.profile === "client-macos") {
+    const local = await collectLocalFleetStatus(cfg, timeoutMs, { fetch: false });
+    const remote = runFleetControlSsh(cfg, args, ["fleet", "status", "--json", ...(options.fetch ? ["--fetch"] : [])], timeoutMs);
+    if (!remote) {
+      return finalizeFleetStatus(local);
+    }
+    if (remote.code !== 0 || remote.timedOut) {
+      const combined = `${remote.stdout}\n${remote.stderr}`.trim();
+      if (!remote.timedOut && looksLikeUnsupportedFleetCommand(combined)) {
+        local.machines.push({
+          name: fleetControlFallbackName(cfg, args),
+          role: "control",
+          transport: "ssh",
+          reachable: true,
+          status: "warn",
+          update_state: "unknown",
+          needs_update: true,
+          detail: "control host brainctl is too old for fleet status; update control host",
+          services: {},
+          error: sanitizeStatusError(combined)
+        });
+        return finalizeFleetStatus(local);
+      }
+      local.machines.push(
+        fleetStatusFromValues({
+          name: fleetControlFallbackName(cfg, args),
+          role: "control",
+          transport: "ssh",
+          values: { state: "unreachable" },
+          error: remote.timedOut ? "timed out" : sanitizeStatusError(combined || `exit ${remote.code}`)
+        })
+      );
+      return finalizeFleetStatus(local);
+    }
+    try {
+      const parsed = JSON.parse(remote.stdout) as FleetStatusReport;
+      const names = new Set(local.machines.map((machine) => machine.name));
+      local.machines.push(...(parsed.machines || []).filter((machine) => !names.has(machine.name)));
+      return finalizeFleetStatus(local);
+    } catch (error) {
+      local.machines.push(
+        fleetStatusFromValues({
+          name: fleetControlFallbackName(cfg, args),
+          role: "control",
+          transport: "ssh",
+          values: { state: "unreachable" },
+          error: `could not parse fleet status: ${sanitizeStatusError(error)}`
+        })
+      );
+      return finalizeFleetStatus(local);
+    }
+  }
+  return await collectLocalFleetStatus(cfg, timeoutMs, options);
+}
+
+async function collectFleetStatusSection(cfg: BrainstackConfig, args: ParsedArgs, timeoutMs: number): Promise<BrainctlStatusSection> {
+  const report = await collectFleetStatus(cfg, args, timeoutMs, { fetch: false });
+  const state: BrainctlStatusState = report.summary.unhealthy > 0 ? "warn" : "ok";
+  return statusSection(state, `machines=${report.summary.total} reachable=${report.summary.reachable} needs_update=${report.summary.needs_update} unhealthy=${report.summary.unhealthy}`, report);
+}
+
 function formatBrainctlStatusReport(report: BrainctlStatusReport): string {
   const lines = [
     `brainstack status: ok=${report.ok} degraded=${report.degraded} profile=${report.profile || "unknown"} machine=${report.machine || "unknown"}`,
@@ -4607,6 +5206,8 @@ async function commandStatus(args: ParsedArgs): Promise<void> {
   report.sections.curator = await collectStatusSection(() => collectCuratorStatusSection(cfg!, timeoutMs), timeoutMs + 250);
   report.sections.proposals = await collectStatusSection(() => collectProposalsStatusSection(cfg!, timeoutMs), timeoutMs + 250);
   report.sections.telemux = await collectStatusSection(() => collectTelemuxStatusSection(cfg!, timeoutMs), timeoutMs + 250);
+  const fleetTimeoutMs = Math.min(Math.max(timeoutMs * 4, 3000), 15_000);
+  report.sections.fleet = await collectStatusSection(() => collectFleetStatusSection(cfg!, args, fleetTimeoutMs), fleetTimeoutMs + 500);
   const controlSourceTimeoutMs = cfg.client.telegramVia ? Math.max(Math.min(timeoutMs, 3000), 2500) : timeoutMs;
   report.sections.control_source = await collectStatusSection(() => collectControlSourceStatusSection(cfg!, controlSourceTimeoutMs), controlSourceTimeoutMs + 250);
   report.sections.product = await collectStatusSection(() => collectProductStatusSection(cfg!, Math.min(timeoutMs, 2000)), timeoutMs);
@@ -6872,6 +7473,43 @@ async function flushOutbox(cfg: BrainstackConfig): Promise<{ flushed: number; ke
     }
   }
   return { flushed, kept, terminalFailures, corrupt };
+}
+
+async function retryOutboxItems(cfg: BrainstackConfig, args: ParsedArgs, scans: Array<Awaited<ReturnType<typeof scanOutbox>>>): Promise<number> {
+  const target = args.positional[1];
+  const retryAll = hasFlag(args, "all");
+  if (!retryAll && !target) {
+    throw new Error("outbox retry requires an item id or --all");
+  }
+  const corrupt = scans.flatMap((scan) => scan.corrupt);
+  if (corrupt.length) {
+    throw new Error("outbox retry found corrupt/unsafe entries; run `brainctl outbox list` and repair or purge-corrupt first");
+  }
+  let requeued = 0;
+  const now = new Date().toISOString();
+  for (const entry of scans.flatMap((scan) => scan.items)) {
+    const normalized = normalizeOutboxItem(entry.item);
+    const matches = retryAll || normalized.id === target || basename(entry.path) === target || basename(entry.path) === `${target}.json`;
+    if (!matches) {
+      continue;
+    }
+    if (retryAll && !normalized.terminal_error) {
+      continue;
+    }
+    const next = {
+      ...normalized,
+      retry_count: 0,
+      last_error: null,
+      terminal_error: null,
+      requeued_at: now
+    } as OutboxItem & { requeued_at: string };
+    await writeOutboxItem(entry.path, next);
+    requeued += 1;
+  }
+  if (!requeued && target) {
+    throw new Error(`outbox item not found or not retryable: ${target}`);
+  }
+  return requeued;
 }
 
 function parseIntegerFlag(args: ParsedArgs, key: string): number | null {
@@ -9679,6 +10317,82 @@ function processAlive(pid: number): boolean {
   }
 }
 
+interface DaemonLockRecord {
+  pid?: number;
+  created_at?: string;
+  host?: string;
+  exec_path?: string;
+  argv?: string[];
+  cwd?: string;
+}
+
+function currentDaemonLockRecord(): DaemonLockRecord {
+  return {
+    pid: process.pid,
+    created_at: new Date().toISOString(),
+    host: hostname(),
+    exec_path: process.execPath,
+    argv: process.argv,
+    cwd: process.cwd()
+  };
+}
+
+function processCommandLine(pid: number): string | null {
+  if (process.platform !== "linux") {
+    return null;
+  }
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, "utf8")
+      .replace(/\0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  } catch {
+    return null;
+  }
+}
+
+function looksLikeBrainstackDaemonCommand(value: string): boolean {
+  const text = value.toLowerCase();
+  return (text.includes("brainctl") || text.includes("packages/brainctl/src/main.ts") || text.includes("main.ts")) && text.includes("daemon");
+}
+
+function daemonLockHasIdentity(record: DaemonLockRecord): boolean {
+  return Boolean(record.host || record.exec_path || Array.isArray(record.argv));
+}
+
+function daemonLockOwnerState(record: DaemonLockRecord): { live: boolean; detail: string } {
+  if (typeof record.pid !== "number" || !Number.isSafeInteger(record.pid) || record.pid <= 0) {
+    return { live: false, detail: "lock has no valid pid" };
+  }
+  if (!processAlive(record.pid)) {
+    return { live: false, detail: `pid ${record.pid} is not alive` };
+  }
+  if (record.host && record.host !== hostname()) {
+    return { live: false, detail: `pid ${record.pid} belongs to stale lock for host ${record.host}` };
+  }
+  if (!daemonLockHasIdentity(record)) {
+    // Legacy pid-only locks cannot prove identity. Keep the old conservative
+    // behavior for already-live PIDs so an upgrade cannot steal a real old daemon.
+    return { live: true, detail: `pid-only lock for live pid ${record.pid}` };
+  }
+  const lockCommand = Array.isArray(record.argv) ? record.argv.join(" ") : "";
+  const lockLooksLikeDaemon = looksLikeBrainstackDaemonCommand(lockCommand);
+  const currentCommand = processCommandLine(record.pid);
+  const currentLooksLikeDaemon = currentCommand === null ? null : looksLikeBrainstackDaemonCommand(currentCommand);
+  if (lockLooksLikeDaemon && currentLooksLikeDaemon !== false) {
+    return { live: true, detail: currentCommand ? `pid ${record.pid} matches daemon command` : `pid ${record.pid} alive; command identity unavailable` };
+  }
+  if (currentLooksLikeDaemon === true) {
+    return { live: true, detail: `pid ${record.pid} command is a daemon` };
+  }
+  return {
+    live: false,
+    detail: currentCommand
+      ? `pid ${record.pid} command does not match daemon identity: ${currentCommand.slice(0, 200)}`
+      : `pid ${record.pid} alive but lock identity does not describe a daemon`
+  };
+}
+
 async function acquireDaemonLock(cfg: BrainstackConfig): Promise<() => Promise<void>> {
   await ensureDir(daemonStateDir(cfg));
   await chmod(daemonStateDir(cfg), 0o700).catch(() => undefined);
@@ -9689,7 +10403,7 @@ async function acquireDaemonLock(cfg: BrainstackConfig): Promise<() => Promise<v
     try {
       const handle = await open(path, "wx", 0o600);
       try {
-        await handle.writeFile(`${JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() }, null, 2)}\n`, "utf8");
+        await handle.writeFile(`${JSON.stringify(currentDaemonLockRecord(), null, 2)}\n`, "utf8");
       } finally {
         await handle.close();
       }
@@ -9706,16 +10420,17 @@ async function acquireDaemonLock(cfg: BrainstackConfig): Promise<() => Promise<v
       // Lock disappeared between create and read; retry the atomic create.
       continue;
     }
-    let prior: { pid?: number; created_at?: string };
+    let prior: DaemonLockRecord;
     try {
-      prior = JSON.parse(existing) as { pid?: number; created_at?: string };
+      prior = JSON.parse(existing) as DaemonLockRecord;
     } catch {
       // A malformed lock is treated as held: removing it blindly could break a live
       // daemon whose lock was corrupted, so require explicit operator recovery.
       throw new Error(`brainstack daemon lock is unreadable: ${path}; inspect and remove it manually if no daemon is running`);
     }
-    if (typeof prior.pid === "number" && processAlive(prior.pid)) {
-      throw new Error(`brainstack daemon already running with pid ${prior.pid}`);
+    const owner = daemonLockOwnerState(prior);
+    if (owner.live) {
+      throw new Error(`brainstack daemon already running with pid ${prior.pid}: ${owner.detail}`);
     }
     // Stale lock: removal happens under a short-lived takeover mutex (atomic mkdir)
     // with a content re-check, so two contenders can never remove each other's
@@ -10052,7 +10767,11 @@ async function commandDaemonStatus(args: ParsedArgs): Promise<void> {
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile") || "client-macos", flag(args, "root"));
   const service = await daemonServiceStatus(cfg, args);
   const status = await readDaemonStatus(cfg);
-  const body = { ok: Boolean(status?.ok), service, status };
+  const fresh = daemonStatusFresh(status, 10 * 60_000);
+  const pidAlive = typeof status?.pid === "number" ? processAlive(status.pid) : null;
+  const active = service.running === true || pidAlive === true;
+  const ok = Boolean(status?.ok && fresh && active && service.installed && service.running !== false);
+  const body = { ok, fresh, pid_alive: pidAlive, service, status };
   if (hasFlag(args, "json")) {
     console.log(JSON.stringify(body, null, 2));
     return;
@@ -10062,7 +10781,7 @@ async function commandDaemonStatus(args: ParsedArgs): Promise<void> {
     console.log(`daemon status: missing (${daemonStatusPath(cfg)})`);
     return;
   }
-  console.log(`daemon status: ok=${status.ok} pid=${status.pid} updated=${status.updated_at} iteration=${status.iteration}`);
+  console.log(`daemon status: ok=${status.ok} fresh=${fresh} pid=${status.pid} pid_alive=${pidAlive ?? "unknown"} updated=${status.updated_at} iteration=${status.iteration}`);
   console.log(`shared-brain: path=${status.repo.path} head=${status.repo.head || "unknown"} clean=${status.repo.clean ?? "unknown"} last_pull=${status.repo.last_pull_at || "never"}`);
   console.log(`outbox: ${status.outbox.detail}`);
   console.log(`skills: ${status.skills.detail}`);
@@ -10090,6 +10809,7 @@ async function commandDaemonInstall(args: ParsedArgs): Promise<void> {
     if (platform === "systemd") {
       run(["systemctl", "--user", "daemon-reload"], { check: false });
       run(["systemctl", "--user", "enable", "--now", BRAINSTACK_DAEMON_SERVICE], { check: false });
+      run(["systemctl", "--user", "restart", BRAINSTACK_DAEMON_SERVICE], { check: false });
     } else {
       const uid = typeof process.getuid === "function" ? process.getuid() : null;
       const domain = uid === null ? `gui/${process.env.UID || ""}` : `gui/${uid}`;
@@ -10101,7 +10821,7 @@ async function commandDaemonInstall(args: ParsedArgs): Promise<void> {
   console.log(`daemon installed: platform=${platform} path=${path}`);
   console.log(
     platform === "systemd"
-      ? `activation: systemctl --user daemon-reload && systemctl --user enable --now ${BRAINSTACK_DAEMON_SERVICE}`
+      ? `activation: systemctl --user daemon-reload && systemctl --user enable --now ${BRAINSTACK_DAEMON_SERVICE} && systemctl --user restart ${BRAINSTACK_DAEMON_SERVICE}`
       : `activation: launchctl bootstrap gui/$(id -u) ${shellSingleQuote(path)}`
   );
 }
@@ -10882,6 +11602,12 @@ async function commandOutbox(args: ParsedArgs): Promise<void> {
       }
       return;
     }
+    case "retry": {
+      const requeued = await retryOutboxItems(cfg, args, scans);
+      console.log(`requeued=${requeued}`);
+      console.log("Run `brainctl outbox flush` to replay the requeued item(s).");
+      return;
+    }
     case "purge":
       if (!hasFlag(args, "yes")) {
         throw new Error("outbox purge is destructive; rerun with --yes");
@@ -10914,7 +11640,7 @@ async function commandOutbox(args: ParsedArgs): Promise<void> {
       }
       return;
     default:
-      throw new Error("outbox subcommand must be status|list|flush|purge|purge-corrupt");
+      throw new Error("outbox subcommand must be status|list|flush|retry|purge|purge-corrupt");
   }
 }
 
@@ -11084,6 +11810,230 @@ async function commandUpdates(args: ParsedArgs): Promise<void> {
   }
   console.log("  os packages: use your package manager manually after reviewing the read-only check above");
   console.log(`  selected harness: ${installHint(cfg.harness.name)}`);
+}
+
+function formatFleetStatus(report: FleetStatusReport): string {
+  const lines = [
+    `fleet: ok=${report.ok} degraded=${report.degraded} machines=${report.summary.total} reachable=${report.summary.reachable} needs_update=${report.summary.needs_update} unhealthy=${report.summary.unhealthy}`
+  ];
+  for (const machine of report.machines) {
+    lines.push(
+      [
+        `${machine.status.toUpperCase()} ${machine.name}`,
+        `role=${machine.role}`,
+        `transport=${machine.transport}`,
+        `state=${machine.update_state}`,
+        machine.short ? `head=${machine.short}` : null,
+        machine.behind ? `behind=${machine.behind}` : null,
+        machine.ahead ? `ahead=${machine.ahead}` : null,
+        machine.dirty_count ? `dirty=${machine.dirty_count}` : null,
+        `detail=${machine.detail}`
+      ]
+        .filter(Boolean)
+        .join(" ")
+    );
+  }
+  return lines.join("\n");
+}
+
+function fleetUpdateScript(configPath: string, role: FleetMachineStatus["role"], productRepo: string, dryRun: boolean): string {
+  const services = role === "worker" ? ["brainstackd.service"] : ["braind.service", "telemux.service", "brainstackd.service"];
+  const commands = [
+    "set -euo pipefail",
+    "brainstack_expand_home() {",
+    "  case \"$1\" in",
+    "    \"~\") printf '%s\\n' \"$HOME\" ;;",
+    "    \"~/\"*) printf '%s/%s\\n' \"$HOME\" \"${1#~/}\" ;;",
+    "    *) printf '%s\\n' \"$1\" ;;",
+    "  esac",
+    "}",
+    `repo="$(brainstack_expand_home ${quoteForBash(productRepo)})"`,
+    `config="$(brainstack_expand_home ${quoteForBash(configPath)})"`,
+    "brainctl_bin=\"$HOME/.local/bin/brainctl\"",
+    "if [ -x \"$HOME/.bun/bin/bun\" ]; then bun_bin=\"$HOME/.bun/bin/bun\"; else bun_bin=\"$(command -v bun)\"; fi",
+    "cd \"$repo\"",
+    "git pull --ff-only",
+    "\"$bun_bin\" install --frozen-lockfile",
+    "\"$bun_bin\" build packages/brainctl/src/main.ts --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --outfile \"$brainctl_bin\"",
+    "chmod 755 \"$brainctl_bin\"",
+    "\"$brainctl_bin\" upgrade --config \"$config\"",
+    "if command -v systemctl >/dev/null 2>&1; then",
+    "  systemctl --user daemon-reload || true",
+    ...services.map((service) => `  if systemctl --user cat ${quoteForBash(service)} >/dev/null 2>&1; then systemctl --user restart ${quoteForBash(service)}; fi`),
+    "fi",
+    "printf 'updated=true\\n'",
+    "printf 'head=%s\\n' \"$(git rev-parse --short HEAD 2>/dev/null || true)\""
+  ];
+  if (!dryRun) {
+    return commands.join("\n");
+  }
+  return commands.map((line) => `# ${line}`).join("\n");
+}
+
+interface FleetUpdateResult {
+  machine: string;
+  role: FleetMachineStatus["role"];
+  ok: boolean;
+  dry_run: boolean;
+  code: number;
+  output: string;
+}
+
+async function runFleetUpdateLocal(
+  cfg: BrainstackConfig,
+  machine: string,
+  role: FleetMachineStatus["role"],
+  configPath: string,
+  dryRun: boolean
+): Promise<FleetUpdateResult> {
+  const script = fleetUpdateScript(configPath, role, cfg.paths.productRepo || PRODUCT_ROOT, dryRun);
+  if (dryRun) {
+    return { machine, role, ok: true, dry_run: true, code: 0, output: script };
+  }
+  const result = run(["bash", "-lc", script], { check: false, timeoutMs: 300_000 });
+  return {
+    machine,
+    role,
+    ok: result.code === 0,
+    dry_run: false,
+    code: result.code,
+    output: summarizeLines(`${result.stdout}\n${result.stderr}`.trim(), 80)
+  };
+}
+
+async function runFleetUpdateWorker(
+  cfg: BrainstackConfig,
+  worker: BrainstackWorkerConfig,
+  configPath: string,
+  dryRun: boolean
+): Promise<FleetUpdateResult> {
+  const script = fleetUpdateScript(configPath, "worker", cfg.paths.productRepo || "~/brainstack", dryRun);
+  if (dryRun) {
+    return { machine: worker.name, role: "worker", ok: true, dry_run: true, code: 0, output: script };
+  }
+  const result = runWorkerShell(cfg, worker, script, 300, true);
+  return {
+    machine: worker.name,
+    role: "worker",
+    ok: result.code === 0,
+    dry_run: false,
+    code: result.code,
+    output: summarizeLines(`${result.stdout}\n${result.stderr}`.trim(), 80)
+  };
+}
+
+async function runFleetUpdates(cfg: BrainstackConfig, args: ParsedArgs, configPath: string): Promise<FleetUpdateResult[]> {
+  const dryRun = hasFlag(args, "dry-run");
+  const target = args.positional[1];
+  const updateAll = hasFlag(args, "all") || target === "all";
+  if (!updateAll && !target) {
+    throw new Error("fleet update requires a machine name or --all");
+  }
+  const results: FleetUpdateResult[] = [];
+  const workers = defaultWorkers(cfg).filter((worker) => worker.name !== cfg.machine.name && worker.transport !== "local");
+  if (updateAll) {
+    for (const worker of workers) {
+      results.push(await runFleetUpdateWorker(cfg, worker, configPath, dryRun));
+    }
+    if (cfg.profile === "control" || cfg.profile === "single-node") {
+      results.push(await runFleetUpdateLocal(cfg, cfg.machine.name, "control", configPath, dryRun));
+    } else if (cfg.profile === "worker") {
+      results.push(await runFleetUpdateLocal(cfg, cfg.machine.name, "worker", configPath, dryRun));
+    }
+    return results;
+  }
+  if (target === cfg.machine.name) {
+    const role: FleetMachineStatus["role"] = cfg.profile === "worker" ? "worker" : cfg.profile === "client-macos" ? "client" : "control";
+    if (role === "client") {
+      throw new Error("fleet update cannot self-update a standalone macOS client install; install a signed release or rebuild the local binary/app bundle");
+    }
+    results.push(await runFleetUpdateLocal(cfg, cfg.machine.name, role, configPath, dryRun));
+    return results;
+  }
+  const worker = workers.find((candidate) => candidate.name === target);
+  if (!worker) {
+    throw new Error(`unknown fleet machine: ${target}`);
+  }
+  results.push(await runFleetUpdateWorker(cfg, worker, configPath, dryRun));
+  return results;
+}
+
+async function commandFleet(args: ParsedArgs): Promise<void> {
+  const sub = args.positional[0] || "status";
+  if (sub === "help" || sub === "--help" || sub === "-h") {
+    console.log("Usage: brainctl fleet status [--json] [--fetch|--no-fetch]\n       brainctl fleet update <machine|all> [--all] [--json] [--dry-run] [--via SSH_TARGET] [--remote-repo PATH]");
+    return;
+  }
+  const configPath = abs(requireFlagValue(args, "config") || brainstackDefaultConfigPath());
+  const cfg = await loadConfig(configPath, flag(args, "profile"), flag(args, "root"));
+  if (sub === "status") {
+    const report = await collectFleetStatus(cfg, args, parsePositiveIntegerFlag(args, "timeout-ms", 20_000), { fetch: !hasFlag(args, "no-fetch") });
+    if (hasFlag(args, "json")) {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      console.log(formatFleetStatus(report));
+    }
+    return;
+  }
+  if (sub === "update") {
+    if (cfg.profile === "client-macos") {
+      const target = args.positional[1];
+      const updateAll = hasFlag(args, "all") || target === "all";
+      if (!updateAll && !target) {
+        throw new Error("fleet update requires a machine name or --all");
+      }
+      const results: FleetUpdateResult[] = [];
+      if (updateAll || clientFleetTargetIsControl(cfg, args, target)) {
+        const bootstrap = runFleetControlBootstrapUpdate(cfg, args, hasFlag(args, "dry-run"));
+        results.push(bootstrap);
+        if (!bootstrap.ok) {
+          if (hasFlag(args, "json")) {
+            console.log(JSON.stringify({ ok: false, results }, null, 2));
+          } else {
+            console.log(`${bootstrap.ok ? "OK" : "FAIL"} ${bootstrap.machine} role=${bootstrap.role} dry_run=${bootstrap.dry_run} exit=${bootstrap.code}`);
+            if (bootstrap.output) console.log(bootstrap.output);
+          }
+          throw new Error("control host bootstrap update failed");
+        }
+        if (!updateAll || hasFlag(args, "dry-run")) {
+          if (hasFlag(args, "json")) {
+            console.log(JSON.stringify({ ok: true, results }, null, 2));
+          } else {
+            console.log(`${bootstrap.ok ? "OK" : "FAIL"} ${bootstrap.machine} role=${bootstrap.role} dry_run=${bootstrap.dry_run} exit=${bootstrap.code}`);
+            if (bootstrap.output) console.log(bootstrap.output);
+          }
+          return;
+        }
+      }
+      const argv = ["fleet", "update", ...(hasFlag(args, "all") ? ["--all"] : args.positional[1] ? [args.positional[1]] : []), ...(hasFlag(args, "json") ? ["--json"] : []), ...(hasFlag(args, "dry-run") ? ["--dry-run"] : [])];
+      const result = runFleetControlSsh(cfg, args, argv, 300_000);
+      if (!result) {
+        throw new Error("fleet update needs a control SSH target for client-macos installs");
+      }
+      if (result.stdout) process.stdout.write(result.stdout);
+      if (result.stderr) process.stderr.write(result.stderr);
+      if (result.code !== 0) {
+        throw new Error(`fleet update failed over ssh with exit ${result.code}`);
+      }
+      return;
+    }
+    const results = await runFleetUpdates(cfg, args, configPath);
+    if (hasFlag(args, "json")) {
+      console.log(JSON.stringify({ ok: results.every((result) => result.ok), results }, null, 2));
+    } else {
+      for (const result of results) {
+        console.log(`${result.ok ? "OK" : "FAIL"} ${result.machine} role=${result.role} dry_run=${result.dry_run} exit=${result.code}`);
+        if (result.output) {
+          console.log(result.output);
+        }
+      }
+    }
+    if (results.some((result) => !result.ok)) {
+      throw new Error("one or more fleet updates failed");
+    }
+    return;
+  }
+  throw new Error(`Unknown fleet subcommand: ${sub}`);
 }
 
 async function copyIfExists(source: string, target: string): Promise<void> {
@@ -12114,6 +13064,8 @@ async function main(): Promise<void> {
       return await commandDaemon(args);
     case "updates":
       return await commandUpdates(args);
+    case "fleet":
+      return await commandFleet(args);
     case "expose":
       return await commandExpose(args);
     case "import":

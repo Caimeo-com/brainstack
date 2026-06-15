@@ -43,7 +43,7 @@ Use `--brainctl PATH_OR_COMMAND` with `install` when the generated service shoul
 
 Use `--platform launchd|systemd` only for testing or unusual cross-platform rendering. The default is `launchd` on macOS and `systemd` elsewhere.
 
-Use `--start` with `install` to ask launchd/systemd to load the service immediately after writing the service file. Without `--start`, `install` writes the file and prints the activation command.
+Use `--start` with `install` to ask launchd/systemd to load the service immediately after writing the service file. On systemd this also restarts an already-running `brainstackd.service`, which matters after replacing the `brainctl` binary. Without `--start`, `install` writes the file and prints the activation command.
 
 Use `--lines N` with `logs` to change how many lines are printed from local daemon logs. The default is 80.
 
@@ -66,5 +66,9 @@ When a harness stop hook supplies a regular `transcript_path`, the hook queues a
 - last daemon run time
 - local shared-brain freshness
 - last outbox and skill-refresh state
+
+`brainctl daemon status --json` reports `ok=false` when the service is missing, inactive, stale, or when the status pid is not alive, even if an old status file still says the last daemon iteration succeeded.
+
+For control hosts, `doctor` also checks whether the configured `braind` port is owned by the managed `braind.service` MainPID. If an orphan process owns the port, doctor fails with the listener pid so the operator can stop it and restart the managed service.
 
 Missing daemon state is a warning, not a correctness failure. Brainstack still works through `brainctl`, hooks, outbox, and the control-host `braind` ingest path.

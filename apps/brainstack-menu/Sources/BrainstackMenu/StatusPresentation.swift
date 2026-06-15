@@ -77,6 +77,10 @@ func statusSummaryLine(for report: StatusReport) -> String {
   if controlHostLooksOld(report) {
     return "control host needs update"
   }
+  let staleFleet = report.fleetMachines.filter(\.needsUpdate)
+  if !staleFleet.isEmpty {
+    return "\(staleFleet.count) machine\(staleFleet.count == 1 ? "" : "s") need update"
+  }
   if curatorRoutineMissing(report) {
     return "curator routine not installed"
   }
@@ -153,6 +157,7 @@ func sectionLabel(_ name: String) -> String {
   case "skills": return "Skills"
   case "curator": return "Curator"
   case "proposals": return "Proposals"
+  case "fleet": return "Fleet"
   case "control_source": return "Control Host"
   case "product": return "Local Source"
   case "telemux": return "Telegram"
@@ -169,6 +174,13 @@ func sectionMessage(name: String, section: StatusSection) -> String {
   }
   if isBenignProductWarning(name: name, section: section) {
     return "This Mac is using the installed client binary without a local product source checkout."
+  }
+  if name == "fleet" {
+    let machines = section.data?["machines"]?.arrayValue?.compactMap(FleetMachineSummary.init(json:)) ?? []
+    let stale = machines.filter(\.needsUpdate).map(\.name)
+    if !stale.isEmpty {
+      return "Update needed: \(stale.joined(separator: ", "))"
+    }
   }
   if !section.detail.isEmpty {
     return section.detail

@@ -23,10 +23,13 @@ bun run packages/brainctl/src/main.ts render --profile single-node --config exam
 bun run packages/brainctl/src/main.ts smoke --profile single-node --config examples/single-node.yaml
 bun run packages/brainctl/src/main.ts doctor --config examples/control.yaml --workers
 bun run packages/brainctl/src/main.ts updates --config examples/control.yaml
+bun run packages/brainctl/src/main.ts fleet status --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts fleet update yoda --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts expose tailscale --config examples/control.yaml --dry-run
 bun run packages/brainctl/src/main.ts context --repo .
 bun run packages/brainctl/src/main.ts search --repo . "runbook"
 bun run packages/brainctl/src/main.ts outbox status --config examples/client-macos.yaml
+bun run packages/brainctl/src/main.ts outbox retry import-... --config examples/client-macos.yaml
 bun run packages/brainctl/src/main.ts skills install --target codex --profile client --dry-run
 bun run packages/brainctl/src/main.ts skills doctor --dir ~/.codex/skills
 bun run packages/brainctl/src/main.ts import skills --config ~/.config/brainstack/brainstack.yaml
@@ -46,7 +49,7 @@ bun run packages/brainctl/src/main.ts destroy --config ~/.config/brainstack/brai
 
 The normal installed config path is `~/.config/brainstack/brainstack.yaml`. If a command points at a missing config, `brainctl` prints the provision command to create it and lists nearby existing `*.brainstack.yaml` candidates instead of surfacing a raw filesystem `ENOENT`.
 
-Use `brainctl status --json` as the stable machine-facing status surface for local UI, menu bar, and automation consumers. It is read-only, uses short bounded checks, reports daemon, shared-brain, outbox, hooks, skills, brain API, curator, proposals, telemux, and product-git state, and exits successfully with degraded section details when optional services are offline.
+Use `brainctl status --json` as the stable machine-facing status surface for local UI, menu bar, and automation consumers. It is read-only, uses short bounded checks, reports daemon, shared-brain, outbox, hooks, skills, brain API, curator, proposals, telemux, fleet, and product-git state, and exits successfully with degraded section details when optional services are offline.
 
 Build a current-platform standalone CLI:
 
@@ -102,7 +105,9 @@ See [`docs/security-postures.md`](./docs/security-postures.md), [`docs/tailscale
 
 `destroy` is intentionally manifest-driven and destructive only with `--yes`. Use `--scope control|worker|client|all` to limit removal to brainstack-owned artifacts for that role. It never removes package installs, Tailscale enrollment, Codex/Claude auth, or sudo policy.
 
-Client import/propose writes can queue into `~/.local/state/brainstack/outbox/<brain-id>/` when the brain is unreachable. Use `brainctl outbox status|list|flush|purge|purge-corrupt`; flush replays only import/propose payloads and never mutates canonical wiki pages offline.
+Client import/propose writes can queue into `~/.local/state/brainstack/outbox/<brain-id>/` when the brain is unreachable. Use `brainctl outbox status|list|flush|retry|purge|purge-corrupt`; flush replays only import/propose payloads and never mutates canonical wiki pages offline. `retry <id>` clears a terminal item after operator review so a later flush can replay it.
+
+Use `brainctl fleet status --json` on the control host, or from an enrolled Mac client with a configured control SSH route, to see every known machine, reachability, service status, and whether its Brainstack product checkout is behind `origin/main`. Use `brainctl fleet update <machine>` or `brainctl fleet update --all` to pull, rebuild `brainctl`, run `upgrade`, and restart managed Brainstack services on the target machine(s). A Mac client can bootstrap an old control host even when that host's installed `brainctl` predates the `fleet` command.
 
 Mac clients can send local files to mobile through the control host's telemux bot with `brainctl telegram send-file`. The file streams over SSH to the control host, telemux uses its local Telegram env, and the bot token never needs to exist on the client.
 

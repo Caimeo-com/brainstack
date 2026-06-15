@@ -97,4 +97,4 @@ Clear it only after confirming no matching request is active and copying the rep
 bun run packages/brainctl/src/main.ts locks clear --config ~/.config/brainstack/brainstack.yaml --path /path/to/derived/idempotency/<endpoint>/<key>.json.lock --yes --token <clear_token>
 ```
 
-When an outbox item becomes terminal, inspect the related `derived/idempotency/...json` record and the committed artifacts/proposals before retrying with a new key or purging the queued item.
+When an outbox item becomes terminal, inspect the related `derived/idempotency/...json` record and the committed artifacts/proposals before replaying or purging the queued item. If replay is correct, use `brainctl outbox retry <id>` to clear the terminal marker and then `brainctl outbox flush`; this preserves the same idempotency key instead of creating a duplicate write path.

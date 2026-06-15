@@ -58,6 +58,27 @@ final class StatusReportTests: XCTestCase {
     XCTAssertEqual(OverallStateMapper.map(report: report), .yellow)
   }
 
+  func testFleetMachinesParseFromStatusSection() throws {
+    let json = """
+    {"ok": false, "degraded": true, "sections": {
+      "config": {"state": "ok", "ok": true, "available": true, "detail": "config loaded"},
+      "fleet": {"state": "warn", "ok": false, "available": true, "detail": "machines=2 reachable=2 needs_update=1 unhealthy=1", "data": {
+        "machines": [
+          {"name": "valkyrie", "role": "control", "transport": "local", "reachable": true, "status": "ok", "update_state": "current", "needs_update": false, "detail": "current head=abc", "short": "abc"},
+          {"name": "yoda", "role": "worker", "transport": "ssh", "reachable": true, "status": "warn", "update_state": "behind", "needs_update": true, "detail": "behind origin by 1 commit", "short": "def", "behind": 1, "dirty_count": 0}
+        ]
+      }}
+    }}
+    """
+    let report = try StatusReport.parse(data: Data(json.utf8))
+    XCTAssertEqual(report.sectionNames, ["config", "fleet"])
+    XCTAssertEqual(report.fleetMachines.count, 2)
+    XCTAssertEqual(report.fleetMachines[1].name, "yoda")
+    XCTAssertEqual(report.fleetMachines[1].needsUpdate, true)
+    XCTAssertEqual(report.fleetMachines[1].behind, 1)
+    XCTAssertEqual(OverallStateMapper.map(report: report), .yellow)
+  }
+
   func testNilAndEmptyReportsMapGray() throws {
     XCTAssertEqual(OverallStateMapper.map(report: nil), .gray)
     let empty = try StatusReport.parse(data: Data(#"{"ok": false, "degraded": true, "sections": {}}"#.utf8))

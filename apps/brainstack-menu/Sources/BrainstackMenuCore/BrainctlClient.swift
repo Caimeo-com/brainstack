@@ -182,7 +182,7 @@ public struct BrainctlClient: Sendable {
   }
 
   public func daemonInstall() async -> ActionOutcome {
-    await runAction(title: "Install/Restart Daemon", arguments: ["daemon", "install", "--config", configPath])
+    await runAction(title: "Install/Restart Daemon", arguments: ["daemon", "install", "--start", "--config", configPath])
   }
 
   public func daemonStatus() async -> ActionOutcome {
@@ -199,6 +199,10 @@ public struct BrainctlClient: Sendable {
 
   public func updates() async -> ActionOutcome {
     await runAction(title: "Check Stack Updates", arguments: ["updates", "--config", configPath], timeout: 60)
+  }
+
+  public func fleetUpdate(machine: String) async -> ActionOutcome {
+    await runAction(title: "Update \(machine)", arguments: ["fleet", "update", machine, "--config", configPath], timeout: 300)
   }
 
   public func curatorStatus() async -> ActionOutcome {

@@ -225,6 +225,12 @@ final class AppModel: ObservableObject {
     actionLog.last
   }
 
+  func updateFleetMachine(_ machine: String) {
+    runAction("Update \(machine)") { client in
+      await client.fleetUpdate(machine: machine)
+    }
+  }
+
   // MARK: - Operator mode
 
   func loadProposals() {
