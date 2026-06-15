@@ -1874,6 +1874,24 @@ describe("brainctl install safety", () => {
     }
   });
 
+  test("daemon once clears a stale pid-only lock", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-daemon-stale-lock-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const configPath = join(dir, "client.yaml");
+      await writeFixtureClientConfig(configPath, { home, stateRoot, localPath: join(home, "shared-brain") });
+      await mkdir(join(stateRoot, "daemon"), { recursive: true });
+      await writeFile(join(stateRoot, "daemon", "brainstackd.lock"), `${JSON.stringify({ pid: 999_999_999, created_at: new Date().toISOString() })}\n`);
+
+      const result = runBrainctl(["daemon", "once", "--config", configPath, "--no-sync", "--no-skills", "--no-flush"], { HOME: home });
+      expectSuccess(result);
+      expect(await Bun.file(join(stateRoot, "daemon", "brainstackd.lock")).exists()).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("daemon lock ignores a live reused pid when identity does not match brainstackd", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-daemon-lock-identity-"));
     try {

@@ -12717,7 +12717,7 @@ interface RepoLockInfo {
   reason: string;
 }
 
-function processAlive(pid: unknown): "yes" | "no" | "unknown" {
+function processAliveLabel(pid: unknown): "yes" | "no" | "unknown" {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
     return "unknown";
   }
@@ -12789,7 +12789,7 @@ async function repoLockInfo(lockPath: string): Promise<RepoLockInfo> {
         ? releaseTokens[0]
         : null;
   const localHost = hostname();
-  const pidAlive = ownerHost && ownerHost !== localHost ? "unknown" : processAlive(owner?.pid);
+  const pidAlive = ownerHost && ownerHost !== localHost ? "unknown" : processAliveLabel(owner?.pid);
   const safeToClear = Boolean(owner && pidAlive === "no");
   const reason = entries.length === 0
     ? "lock directory is empty; likely interrupted acquisition or release"
