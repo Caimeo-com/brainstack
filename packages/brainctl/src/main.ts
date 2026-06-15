@@ -1526,9 +1526,17 @@ function compareVersions(a: string, b: string): number {
   return 0;
 }
 
-function installedBunVersion(): string | null {
-  const proc = run(["bun", "--version"], { check: false });
-  return proc.code === 0 ? proc.stdout.trim() : null;
+function installedBunVersion(pathOrName = "bun"): string | null {
+  const candidate = pathOrName.trim() || "bun";
+  const proc = run([candidate, "--version"], { check: false, env: userShellPathEnv(), timeoutMs: updateProbeTimeoutMs() });
+  if (proc.code === 0 && proc.stdout.trim()) {
+    return proc.stdout.trim();
+  }
+  if (candidate !== "bun") {
+    const fallback = run(["bun", "--version"], { check: false, env: userShellPathEnv(), timeoutMs: updateProbeTimeoutMs() });
+    return fallback.code === 0 && fallback.stdout.trim() ? fallback.stdout.trim() : null;
+  }
+  return null;
 }
 
 function runtimeCommandAvailable(pathOrName: string): boolean {
@@ -3320,7 +3328,7 @@ async function harnessGuidanceChecks(cfg: BrainstackConfig): Promise<DoctorCheck
 async function collectDoctorChecks(cfg: BrainstackConfig, args: ParsedArgs): Promise<DoctorCheck[]> {
   const checks: DoctorCheck[] = [];
   const bunRequired = profileRequiresBunRuntime(cfg.profile);
-  const bunVersion = installedBunVersion();
+  const bunVersion = installedBunVersion(cfg.runtime.bunBin);
   if (bunRequired) {
     checks.push(
       bunVersion && compareVersions(bunVersion, MIN_BUN_VERSION) >= 0

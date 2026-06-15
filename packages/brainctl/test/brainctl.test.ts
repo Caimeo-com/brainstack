@@ -1326,6 +1326,67 @@ describe("brainctl install safety", () => {
     }
   }, 30_000);
 
+  test("doctor accepts configured Bun binary when Bun is absent from PATH", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-doctor-bun-bin-"));
+    try {
+      const binDir = join(dir, "bin");
+      const home = join(dir, "home");
+      const configRoot = join(home, ".config", "brainstack");
+      const stateRoot = join(home, ".local", "state", "brainstack");
+      await mkdir(binDir, { recursive: true });
+      await mkdir(configRoot, { recursive: true });
+      await mkdir(stateRoot, { recursive: true });
+
+      const fakeBun = join(dir, "configured-bun");
+      await writeExecutable(fakeBun, "#!/usr/bin/env sh\nprintf '1.3.14\\n'\n");
+      await writeExecutable(join(binDir, "git"), "#!/usr/bin/env sh\nprintf 'git version 2.54.0\\n'\n");
+      await writeExecutable(join(binDir, "ssh"), "#!/usr/bin/env sh\nprintf 'OpenSSH fake\\n'\n");
+      await writeFakeTailscale(binDir);
+      await writeFakeDoctorCodex(binDir);
+
+      const configPath = join(configRoot, "brainstack.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: worker",
+          "runtime:",
+          `  bunBin: ${fakeBun}`,
+          "machine:",
+          "  name: worker-a",
+          "  user: operator",
+          "paths:",
+          `  home: ${home}`,
+          `  configRoot: ${configRoot}`,
+          `  stateRoot: ${stateRoot}`,
+          "brain:",
+          "  publicBaseUrl: https://brain-control.example.ts.net",
+          "client:",
+          "  remoteSsh: operator@brain-control:/home/operator/shared-brain/bare/shared-brain.git",
+          "harness:",
+          "  name: codex",
+          "  bin: codex",
+          ""
+        ].join("\n")
+      );
+
+      const result = runCommand([process.execPath, "run", BRAINCTL, "doctor", "--config", configPath], {
+        env: {
+          HOME: home,
+          USER: "operator",
+          PATH: `${binDir}:/usr/bin:/bin`,
+          BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1"
+        }
+      });
+      expectSuccess(result);
+      expect(result.stdout).toContain("PASS [versions] bun: Bun 1.3.14");
+      expect(result.stdout).toContain(`PASS [versions] bun-bin: ${fakeBun}`);
+      expect(result.stdout).not.toContain("FAIL [versions] bun:");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("import skill packages local files, folders, and URLs through the outbox", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-skill-import-"));
     const port = 47_000 + Math.floor(Math.random() * 1_000);
