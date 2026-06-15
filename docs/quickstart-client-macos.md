@@ -6,6 +6,18 @@ The smooth client path is a current-platform compiled `brainctl` binary. It does
 
 Use this path even on a Mac that also has a Brainstack development checkout. The checkout is for product work; the installed client lives under normal user locations such as `~/.local/bin/brainctl`, `~/.config/brainstack/brainstack.yaml`, `~/.config/shared-brain.env`, `~/.codex/skills`, and `~/shared-brain`.
 
+## Menu App Install
+
+For a normal Mac user, the signed `BrainstackMenu-<version>.dmg` is the friendliest path. It includes a standalone `brainctl` in the app bundle. On first run, click **Set Up…**, paste a fresh `bs1_...` invite, and the app will:
+
+1. copy the bundled helper to `~/.local/bin/brainctl`;
+2. write the invite to a private temporary file;
+3. run `brainctl enroll --invite-file ... --config ~/.config/brainstack/brainstack.yaml`;
+4. delete the temporary invite file;
+5. run `brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml`.
+
+Copying `brainctl` to `~/.local/bin` first keeps hooks and the LaunchAgent pointed at a stable path instead of the mounted DMG, Downloads, or the app bundle. The pasted invite is never stored in app preferences or diagnostics.
+
 ## Binary-First Install
 
 If the control host has a current `brainctl`, prefer an invite:
@@ -143,11 +155,13 @@ The bootstrap installer installs real guidance, not prose pointers:
 For background refresh/checkpoint integration, install fail-open hooks after enrollment:
 
 ```bash
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml --dry-run
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml
 brainctl hooks install --target all --config ~/.config/brainstack/brainstack.yaml
 brainctl hooks status --target all
 ```
 
-`--target codex` writes `~/.codex/hooks.json`, `--target claude` writes `~/.claude/settings.json`, and `--target cursor` writes `~/.cursor/hooks.json`. `--target all` applies all three. The installer preserves unrelated hook entries and `brainctl hooks remove --target all` removes only Brainstack-managed entries. Hooks refresh shared skill packages on session or prompt start and write local checkpoint metadata; if Brainstack is offline, they return success without blocking the harness.
+Prefer `lifecycle repair` for routine client repair: it refreshes generated runtime files, repairs missing local harness guidance stubs, installs/starts the local daemon, installs hooks, and refreshes shared skill packages from the local shared-brain clone. The lower-level `hooks install` command is useful when you only want to touch hook config. `--target codex` writes `~/.codex/hooks.json`, `--target claude` writes `~/.claude/settings.json`, and `--target cursor` writes `~/.cursor/hooks.json`. `--target all` applies all three. The installer preserves unrelated hook entries and `brainctl hooks remove --target all` removes only Brainstack-managed entries. Hooks refresh shared skill packages on session or prompt start and write local checkpoint metadata; if Brainstack is offline, they return success without blocking the harness.
 
 To globalize existing local skills, start with the no-side-effect planner:
 
@@ -163,12 +177,13 @@ The planner scans the current directory plus default Codex, Claude, and Cursor s
 Install the local daemon when this Mac should keep `~/shared-brain`, outbox, and shared skills fresh without every harness hook doing Git work:
 
 ```bash
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml
 brainctl daemon install --config ~/.config/brainstack/brainstack.yaml
 brainctl daemon install --config ~/.config/brainstack/brainstack.yaml --start
 brainctl daemon status --config ~/.config/brainstack/brainstack.yaml
 ```
 
-On macOS this writes `~/Library/LaunchAgents/com.brainstack.daemon.plist`. It runs the same `brainctl` binary in daemon mode; there is no second binary to install. See [`daemon.md`](./daemon.md).
+`lifecycle repair` is the normal one-command path. Use the lower-level daemon commands when you only want to inspect or change the daemon service. On macOS daemon install writes `~/Library/LaunchAgents/com.brainstack.daemon.plist`. It runs the same `brainctl` binary in daemon mode; there is no second binary to install. See [`daemon.md`](./daemon.md).
 
 ## Read/Write Model
 

@@ -76,9 +76,11 @@ jobs:
             echo "release version $version must match package.json version $package_version because brainctl embeds the default invite install tag" >&2
             exit 1
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "publish=$publish" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
 
   cli-release:
     name: Build CLI release assets
@@ -118,20 +120,6 @@ jobs:
             dist/brainstack-${{ needs.resolve.outputs.version }}.tar.gz.sha256
           if-no-files-found: error
 
-      - name: Publish GitHub Release
-        if: needs.resolve.outputs.publish == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.resolve.outputs.tag }}
-        run: |
-          set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/brainctl-* dist/install.sh dist/manifest.json dist/brainstack-*.tar.gz dist/brainstack-*.tar.gz.sha256 --clobber
-          else
-            gh release create "$TAG" dist/brainctl-* dist/install.sh dist/manifest.json dist/brainstack-*.tar.gz dist/brainstack-*.tar.gz.sha256 --title "$TAG" --generate-notes
-          fi
-
   menu-app-release:
     name: Build signed macOS menu app assets
     runs-on: macos-15
@@ -139,7 +127,9 @@ jobs:
     needs:
       - resolve
       - cli-release
-    if: github.event_name == 'workflow_dispatch' && inputs.include_menu_app == true
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.include_menu_app == true)
+    outputs:
+      built: ${{ steps.signing.outputs.available }}
 
     steps:
       - name: Check out repository
@@ -147,14 +137,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.3.10"
-
-      - name: Validate release secrets
+      - name: Check Apple signing secrets
+        id: signing
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          INCLUDE_MENU_APP: ${{ github.event_name == 'workflow_dispatch' && inputs.include_menu_app == true }}
           MACOS_DEVELOPER_ID_CERT_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_CERT_P12_BASE64 }}
           MACOS_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_CERT_PASSWORD }}
           MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
@@ -164,7 +152,7 @@ jobs:
           APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
         run: |
           set -euo pipefail
-          missing=0
+          missing=()
           for name in \
             MACOS_DEVELOPER_ID_CERT_P12_BASE64 \
             MACOS_DEVELOPER_ID_CERT_PASSWORD \
@@ -176,12 +164,37 @@ jobs:
           do
             if [ -z "${!name:-}" ]; then
               echo "missing secret: $name" >&2
-              missing=1
+              missing+=("$name")
             fi
           done
-          exit "$missing"
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INCLUDE_MENU_APP" = "true" ]; then
+              echo "menu app release was explicitly requested; signing secrets are required" >&2
+              exit 1
+            fi
+            echo "Apple signing secrets absent; skipping menu app artifacts for this tag release."
+            exit 0
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Download CLI release assets
+        if: steps.signing.outputs.available == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: brainstack-${{ needs.resolve.outputs.version }}-cli-release-assets
+          path: dist
+
+      - name: Build unsigned universal menu app inputs
+        if: steps.signing.outputs.available == 'true'
+        shell: bash
+        working-directory: apps/brainstack-menu
+        run: |
+          set -euo pipefail
+          swift build -c release --arch arm64 --arch x86_64
 
       - name: Import Developer ID certificate
+        if: steps.signing.outputs.available == 'true'
         shell: bash
         env:
           MACOS_DEVELOPER_ID_CERT_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_CERT_P12_BASE64 }}
@@ -195,12 +208,13 @@ jobs:
           security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$keychain_path"
           security set-keychain-settings -lut 21600 "$keychain_path"
           security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$keychain_path"
-          security import "$cert_path" -P "$MACOS_DEVELOPER_ID_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path"
+          security import "$cert_path" -P "$MACOS_DEVELOPER_ID_CERT_PASSWORD" -t cert -f pkcs12 -k "$keychain_path"
           security list-keychains -d user -s "$keychain_path"
           security default-keychain -s "$keychain_path"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$MACOS_KEYCHAIN_PASSWORD" "$keychain_path"
 
       - name: Write App Store Connect API key
+        if: steps.signing.outputs.available == 'true'
         id: notary-key
         shell: bash
         env:
@@ -213,36 +227,82 @@ jobs:
           echo "path=$key_path" >> "$GITHUB_OUTPUT"
 
       - name: Build, sign, notarize, and staple menu app assets
+        if: steps.signing.outputs.available == 'true'
         shell: bash
         env:
-          BRAINSTACK_RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
-          BRAINSTACK_RELEASE_MENU_APP: "1"
+          BRAINSTACK_MENU_VERSION: ${{ needs.resolve.outputs.version }}
+          BRAINSTACK_MENU_ARCHES: "arm64 x64"
           CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
           APP_STORE_CONNECT_API_KEY_PATH: ${{ steps.notary-key.outputs.path }}
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
           APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
         run: |
           set -euo pipefail
-          scripts/release.sh
+          apps/brainstack-menu/scripts/make-app.sh --skip-build --notarize
+
+      - name: Write menu app checksums
+        if: steps.signing.outputs.available == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd apps/brainstack-menu/dist
+          shasum -a 256 "BrainstackMenu-$VERSION.zip" > "BrainstackMenu-$VERSION.zip.sha256"
+          shasum -a 256 "BrainstackMenu-$VERSION.dmg" > "BrainstackMenu-$VERSION.dmg.sha256"
 
       - name: Upload menu app workflow artifacts
+        if: steps.signing.outputs.available == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: brainstack-${{ needs.resolve.outputs.version }}-menu-app-assets
           path: |
-            dist/BrainstackMenu-*
+            apps/brainstack-menu/dist/BrainstackMenu-*
           if-no-files-found: error
 
-      - name: Publish menu app assets to GitHub Release
-        if: needs.resolve.outputs.publish == 'true'
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - resolve
+      - cli-release
+      - menu-app-release
+    if: always() && needs.resolve.outputs.publish == 'true' && needs.cli-release.result == 'success' && (needs.menu-app-release.result == 'success' || needs.menu-app-release.result == 'skipped')
+
+    steps:
+      - name: Download CLI release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: brainstack-${{ needs.resolve.outputs.version }}-cli-release-assets
+          path: release-assets/cli
+
+      - name: Download menu app release assets
+        if: needs.menu-app-release.outputs.built == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: brainstack-${{ needs.resolve.outputs.version }}-menu-app-assets
+          path: release-assets/menu
+
+      - name: Publish assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.resolve.outputs.tag }}
+          MENU_BUILT: ${{ needs.menu-app-release.outputs.built }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
+          assets=(release-assets/cli/*)
+          if [ "$MENU_BUILT" = "true" ]; then
+            assets+=(release-assets/menu/*)
+          fi
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "no release assets downloaded" >&2
+            exit 1
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/BrainstackMenu-* --clobber
+            gh release upload "$TAG" "${assets[@]}" --clobber
           else
-            gh release create "$TAG" dist/BrainstackMenu-* --title "$TAG" --generate-notes
+            gh release create "$TAG" "${assets[@]}" --title "$TAG" --generate-notes
           fi

@@ -43,21 +43,28 @@ Do not rerun `init` on an existing install. For product updates or service/hook/
 
 ```bash
 cd ~/brainstack
-bun run packages/brainctl/src/main.ts upgrade --profile single-node --config examples/single-node.yaml
+bun run packages/brainctl/src/main.ts lifecycle upgrade --profile single-node --config examples/single-node.yaml
 systemctl --user daemon-reload
 systemctl --user restart braind.service
+```
+
+For a narrower repair pass without the pre-upgrade backup, use:
+
+```bash
+bun run packages/brainctl/src/main.ts lifecycle repair --profile single-node --config examples/single-node.yaml --dry-run
+bun run packages/brainctl/src/main.ts lifecycle repair --profile single-node --config examples/single-node.yaml
 ```
 
 To rehearse teardown without deleting data:
 
 ```bash
-bun run packages/brainctl/src/main.ts destroy --config ~/.config/brainstack/brainstack.yaml --scope all --dry-run
+bun run packages/brainctl/src/main.ts lifecycle uninstall --config ~/.config/brainstack/brainstack.yaml --dry-run
 ```
 
-Without `--dry-run`, `destroy` requires `--yes`. It consumes `~/.config/brainstack/managed-artifacts.json`, disables/stops rendered user services, removes brainstack-owned config/state artifacts, and keeps `~/shared-brain`/`~/private-brain` unless explicit removal flags are passed.
+Without `--dry-run`, lifecycle uninstall requires `--yes`. It delegates to `destroy`, consumes `~/.config/brainstack/managed-artifacts.json`, disables/stops rendered user services, removes brainstack-owned config/state artifacts, and keeps `~/shared-brain`/`~/private-brain` unless explicit removal flags are passed.
 
 ```bash
-bun run packages/brainctl/src/main.ts destroy --config ~/.config/brainstack/brainstack.yaml --scope all --yes
+bun run packages/brainctl/src/main.ts lifecycle uninstall --config ~/.config/brainstack/brainstack.yaml --yes
 ```
 
 To enable Telegram control explicitly, use `examples/control-telegram.yaml` and read `operator-preflight.md` first.

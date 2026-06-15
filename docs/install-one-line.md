@@ -4,6 +4,8 @@ Brainstack's low-friction client install is a small shell downloader plus the co
 
 The ordinary user path does not require a Brainstack source checkout. Enrollment writes the client config, installs SSH host pins from the invite, clones or updates the shared-brain checkout, installs harness guidance, installs the default Codex skill bundle for Codex clients, and runs doctor unless explicitly skipped.
 
+On macOS, the signed menu app is an equivalent low-friction installer path: the DMG bundles a standalone `brainctl`, copies it to `~/.local/bin/brainctl`, prompts for the invite, runs `brainctl enroll --invite-file ...`, and finishes with `brainctl lifecycle repair`. Use the terminal installer when you want a scriptable path or when the Mac app is not available for the selected release.
+
 On a control host, create a private invite:
 
 ```bash
@@ -50,6 +52,20 @@ brainctl invite create \
 ```
 
 Use `brainctl skills install --target codex --profile client|operator` after enrollment only to repair or deliberately change the installed skill bundle.
+
+## After Install
+
+Use the lifecycle wrapper for day-two maintenance:
+
+```bash
+brainctl lifecycle status --config ~/.config/brainstack/brainstack.yaml
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml --dry-run
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml
+```
+
+`lifecycle status` is a bounded read-only health report. `lifecycle repair` refreshes generated runtime files, repairs missing local Codex/Claude/Cursor guidance stubs, reinstalls the local `brainstackd` service when the profile uses it, reinstalls fail-open hooks, and refreshes shared skill packages from the already-local shared-brain clone. It does not delete data, clone/pull during guidance repair, or reseed canonical shared-brain pages. Pass `--sync-skills` if you explicitly want repair to pull the shared-brain clone before refreshing skill packages.
+
+Use `brainctl lifecycle uninstall --dry-run` to inspect removal. Without `--dry-run`, uninstall requires `--yes` and delegates to the manifest-driven `destroy` command. It defaults to client-owned artifacts on client installs, worker-owned artifacts on worker installs, and full managed artifact removal on control/single-node installs.
 
 ## Public Installer
 
@@ -106,9 +122,11 @@ The installer requires HTTPS by default for all download tools. Set `BRAINSTACK_
 - `dist/install.sh`
 - `dist/manifest.json`
 - `dist/brainstack-<version>.tar.gz`
+- `dist/BrainstackMenu-<version>.zip`
+- `dist/BrainstackMenu-<version>.dmg`
 
-Each binary and source archive gets a `.sha256` sidecar. Set `BRAINSTACK_RELEASE_TARGETS` to a space-separated target subset for local test releases.
+Each binary, source archive, and menu-app artifact gets a `.sha256` sidecar. Set `BRAINSTACK_RELEASE_TARGETS` to a space-separated target subset for local test releases.
 
 The compiled binary embeds both client bootstrap templates and `packages/skills`, so the one-line installer does not need Bun or a source checkout for client enrollment or skill installation.
 
-The release script stamps `dist/install.sh` with the release tag so `curl -fsSL .../releases/download/vX.Y.Z/install.sh | sh` downloads `brainctl` from the same tag by default. The GitHub release workflow builds and can publish CLI assets without Apple signing or notarization secrets. The macOS menu app is an optional workflow lane (`include_menu_app`) so a missing Developer ID or App Store Connect secret cannot block the single-command CLI installer release.
+The release script stamps `dist/install.sh` with the release tag so `curl -fsSL .../releases/download/vX.Y.Z/install.sh | sh` downloads `brainctl` from the same tag by default. The GitHub release workflow builds and can publish CLI assets without Apple signing or notarization secrets. Tag releases also build the signed/notarized universal macOS menu app when signing secrets are configured; manual workflow runs can opt in with `include_menu_app`.

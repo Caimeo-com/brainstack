@@ -1769,6 +1769,23 @@ describe("brainctl install safety", () => {
       expect(JSON.stringify(cursorHooks)).toContain("beforeSubmitPrompt");
       expect(JSON.stringify(cursorHooks)).toContain("hook run --harness cursor");
 
+      const spacedBrainctl = join(home, "bin with spaces", "brainctl");
+      await mkdir(dirname(spacedBrainctl), { recursive: true });
+      await writeExecutable(spacedBrainctl, "#!/usr/bin/env sh\nexit 0\n");
+      const spacedInstall = runBrainctl(["hooks", "install", "--target", "codex", "--config", configPath, "--brainctl", spacedBrainctl], { HOME: home });
+      expectSuccess(spacedInstall);
+      const spacedCodexHooks = JSON.parse(await readFile(join(home, ".codex", "hooks.json"), "utf8")) as Record<string, unknown>;
+      expect(JSON.stringify(spacedCodexHooks)).toContain(shellQuote(spacedBrainctl));
+
+      const rawInstall = runBrainctl(["hooks", "install", "--target", "codex", "--config", configPath, "--brainctl-command", "env BRAINSTACK_TEST=1 brainctl"], { HOME: home });
+      expectSuccess(rawInstall);
+      const rawCodexHooks = JSON.parse(await readFile(join(home, ".codex", "hooks.json"), "utf8")) as Record<string, unknown>;
+      expect(JSON.stringify(rawCodexHooks)).toContain("env BRAINSTACK_TEST=1 brainctl hook run");
+
+      const transientInstall = runBrainctl(["hooks", "install", "--target", "codex", "--config", configPath, "--brainctl", "/Volumes/Brainstack Menu.app/Contents/Resources/brainctl"], { HOME: home });
+      expect(transientInstall.code).not.toBe(0);
+      expect(`${transientInstall.stdout}\n${transientInstall.stderr}`).toContain("transient path");
+
       const hookCommand = [
         "printf",
         "%s",
@@ -1799,7 +1816,8 @@ describe("brainctl install safety", () => {
       expect(eventLog).not.toContain('"prompt":"hello"');
 
       const transcriptPath = join(dir, "rollout-2026-06-12T15-18-49-019ebbfc-3a60-7f61-a4fa-a89282b8d83f.jsonl");
-      await writeFile(transcriptPath, `${JSON.stringify({ type: "session_meta", payload: { id: "019ebbfc-3a60-7f61-a4fa-a89282b8d83f" } })}\n`);
+      const transcriptText = `${JSON.stringify({ type: "session_meta", payload: { id: "019ebbfc-3a60-7f61-a4fa-a89282b8d83f" } })}\n`;
+      await writeFile(transcriptPath, transcriptText);
       const stopHookCommand = [
         "printf",
         "%s",
@@ -1832,8 +1850,11 @@ describe("brainctl install safety", () => {
         .find((payload) => payload?.source_type === "codex-session-checkpoint") as Record<string, unknown> | undefined;
       expect(checkpoint?.conversation_id).toBe("019ebbfc-3a60-7f61-a4fa-a89282b8d83f");
       expect(checkpoint?.transcript_path).toBe(transcriptPath);
+      expect(checkpoint?.transcript_path_durable).toBe(false);
       expect(checkpoint?.transcript_bytes).toBeGreaterThan(0);
+      expect(checkpoint?.transcript_sha256).toBe(sha256Text(transcriptText));
       expect(String(checkpoint?.text)).toContain("Use `brainctl import codex-session");
+      expect(String(checkpoint?.text)).toContain("Transcript sha256");
       expect(String(checkpoint?.text)).not.toContain("session_meta");
 
       const remove = runBrainctl(["hooks", "remove", "--target", "all"], { HOME: home });
@@ -2010,6 +2031,18 @@ describe("brainctl install safety", () => {
       const service = await readFile(servicePath, "utf8");
       expect(service).toContain("daemon run");
       expect(service).toContain(configPath);
+
+      const spacedBrainctl = join(home, "stable bin", "brainctl");
+      await mkdir(dirname(spacedBrainctl), { recursive: true });
+      await writeExecutable(spacedBrainctl, "#!/usr/bin/env sh\nexit 0\n");
+      const spacedDryRun = runBrainctl(["daemon", "install", "--config", configPath, "--platform", "systemd", "--dry-run", "--brainctl", spacedBrainctl], { HOME: home });
+      expectSuccess(spacedDryRun);
+      expect(spacedDryRun.stdout).toContain(shellQuote(spacedBrainctl));
+
+      const transientDryRun = runBrainctl(["daemon", "install", "--config", configPath, "--platform", "systemd", "--dry-run", "--brainctl", "/Volumes/Brainstack Menu.app/Contents/Resources/brainctl"], { HOME: home });
+      expect(transientDryRun.code).not.toBe(0);
+      expect(`${transientDryRun.stdout}\n${transientDryRun.stderr}`).toContain("transient path");
+
       const manifest = JSON.parse(await readFile(join(home, ".config", "brainstack", "managed-artifacts.json"), "utf8")) as Record<string, unknown>;
       const artifactPaths = (manifest.artifacts as Array<Record<string, unknown>>).map((artifact) => artifact.path);
       expect(artifactPaths).toContain(servicePath);
@@ -2127,6 +2160,146 @@ describe("brainctl install safety", () => {
       );
       expect(strict.code).not.toBe(0);
       expect(`${strict.stdout}\n${strict.stderr}`).toContain("sudo should be explicit for worker provision");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("lifecycle status and help paths are safe without an install", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-lifecycle-help-"));
+    try {
+      const missingConfig = join(dir, "missing.yaml");
+      const status = runBrainctl(["lifecycle", "status", "--json", "--config", missingConfig, "--timeout-ms", "50"], { HOME: dir });
+      expectSuccess(status);
+      const parsed = JSON.parse(status.stdout) as { ok: boolean; sections: Record<string, { state: string; error?: string }> };
+      expect(parsed.ok).toBe(false);
+      expect(parsed.sections.config.state).toBe("fail");
+      expect(parsed.sections.config.error || "").toContain("Brainstack config not found");
+
+      const lifecycleHelp = runBrainctl(["lifecycle", "help"], { HOME: dir });
+      expectSuccess(lifecycleHelp);
+      expect(lifecycleHelp.stdout).toContain("brainctl lifecycle status");
+      expect(lifecycleHelp.stdout).toContain("brainctl lifecycle repair");
+
+      const uninstallHelp = runBrainctl(["lifecycle", "uninstall", "--help"], { HOME: dir });
+      expectSuccess(uninstallHelp);
+      expect(uninstallHelp.stdout).toContain("brainctl lifecycle uninstall");
+      expect(uninstallHelp.stderr).toBe("");
+
+      const destroyHelp = runBrainctl(["destroy", "--help"], { HOME: dir });
+      expectSuccess(destroyHelp);
+      expect(destroyHelp.stdout).toContain("Usage: brainctl destroy");
+      expect(destroyHelp.stderr).toBe("");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("lifecycle repair dry-run explains the composed client repair without writes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-lifecycle-repair-plan-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(home, ".local", "state", "brainstack");
+      const configPath = join(dir, "client.yaml");
+      await writeFixtureClientConfig(configPath, { home, stateRoot, localPath: join(home, "shared-brain") });
+
+      const result = runBrainctl(["lifecycle", "repair", "--config", configPath, "--dry-run"], { HOME: home });
+      expectSuccess(result);
+      expect(result.stdout).toContain("lifecycle repair plan");
+      expect(result.stdout).toContain("brainctl apply-runtime --config");
+      expect(result.stdout).toContain("guidance");
+      expect(result.stdout).toContain("brainctl daemon install --config");
+      expect(result.stdout).toContain("brainctl hooks install --target all");
+      expect(result.stdout).toContain("brainctl skills refresh --target codex");
+      expect(result.stdout).toContain("brainctl skills refresh --target claude");
+      expect(result.stdout).toContain("brainctl skills refresh --target cursor");
+      expect(result.stdout).toContain("--no-sync");
+      expect(existsSync(join(home, ".config", "brainstack"))).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("lifecycle repair reinstalls local client runtime, daemon, hooks, and skills surfaces", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-lifecycle-repair-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(home, ".local", "state", "brainstack");
+      const configPath = join(dir, "client.yaml");
+      await writeFixtureClientConfig(configPath, { home, stateRoot, localPath: join(home, "shared-brain") });
+
+      const result = runBrainctl(
+        ["lifecycle", "repair", "--config", configPath, "--target", "codex", "--platform", "systemd", "--no-start", "--no-status"],
+        { HOME: home }
+      );
+      expectSuccess(result);
+      expect(result.stdout).toContain("apply-runtime complete for client-macos");
+      expect(result.stdout).toContain("local guidance repaired:");
+      expect(result.stdout).toContain("daemon installed: platform=systemd");
+      expect(result.stdout).toContain("codex: hooks installed");
+      expect(result.stdout).toContain("skills_refresh target=codex");
+      expect(existsSync(join(home, ".config", "brainstack", "client-bootstrap", "codex-shared-brain.include.md"))).toBe(true);
+      expect(existsSync(join(home, ".config", "brainstack", "managed-artifacts.json"))).toBe(true);
+      expect(await readFile(join(home, ".codex", "AGENTS.md"), "utf8")).toContain("Shared Brain");
+      expect(await readFile(join(home, ".claude", "CLAUDE.md"), "utf8")).toContain("@");
+      expect(existsSync(join(home, ".cursor", "rules", "shared-brain.md"))).toBe(true);
+      expect(existsSync(join(home, ".config", "systemd", "user", "brainstackd.service"))).toBe(true);
+      const hooks = await readFile(join(home, ".codex", "hooks.json"), "utf8");
+      expect(hooks).toContain("hook run --harness codex");
+      expect(hooks).toContain(configPath);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("lifecycle uninstall defaults to the selected profile scope", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-lifecycle-uninstall-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(home, ".local", "state", "brainstack");
+      const configPath = join(dir, "client.yaml");
+      await writeFixtureClientConfig(configPath, { home, stateRoot, localPath: join(home, "shared-brain") });
+
+      const result = runBrainctl(["lifecycle", "uninstall", "--config", configPath, "--dry-run"], { HOME: home });
+      expectSuccess(result);
+      expect(result.stdout).toContain("dry-run destroy plan");
+      expect(result.stdout).toContain("scope=client");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("lifecycle uninstall defaults control installs to full managed artifact removal", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-lifecycle-uninstall-control-"));
+    try {
+      const home = join(dir, "home");
+      const configRoot = join(home, ".config", "brainstack");
+      const stateRoot = join(home, ".local", "state", "brainstack");
+      const sharedBrainRoot = join(home, "shared-brain");
+      const configPath = join(dir, "control.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: brain-control",
+          "  user: operator",
+          "paths:",
+          `  home: ${home}`,
+          `  configRoot: ${configRoot}`,
+          `  stateRoot: ${stateRoot}`,
+          `  sharedBrainRoot: ${sharedBrainRoot}`,
+          "telemux:",
+          "  enabled: false",
+          ""
+        ].join("\n")
+      );
+
+      const result = runBrainctl(["lifecycle", "uninstall", "--config", configPath, "--dry-run"], { HOME: home });
+      expectSuccess(result);
+      expect(result.stdout).toContain("dry-run destroy plan");
+      expect(result.stdout).toContain("scope=all");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -8754,6 +8927,7 @@ describe("public release hygiene", () => {
     const releaseScript = await readFile(join(PRODUCT_ROOT, "scripts", "release.sh"), "utf8");
     const releaseWorkflow = await readFile(join(PRODUCT_ROOT, ".github", "workflows", "release.yml"), "utf8");
     const installDoc = await readFile(join(PRODUCT_ROOT, "docs", "install-one-line.md"), "utf8");
+    const makeApp = await readFile(join(PRODUCT_ROOT, "apps", "brainstack-menu", "scripts", "make-app.sh"), "utf8");
     const appModel = await readFile(join(PRODUCT_ROOT, "apps", "brainstack-menu", "Sources", "BrainstackMenu", "AppModel.swift"), "utf8");
     for (const text of [packageJson, releaseScript]) {
       expect(text).toContain("--no-compile-autoload-dotenv");
@@ -8782,9 +8956,23 @@ describe("public release hygiene", () => {
     expect(releaseWorkflow).toContain("include_menu_app");
     expect(releaseWorkflow).toContain("must match package.json version");
     expect(releaseWorkflow).toContain("actions/checkout@v6");
+    expect(releaseWorkflow).toContain("actions/download-artifact@v4");
     expect(releaseWorkflow).not.toContain("actions/checkout@v4");
     expect(releaseWorkflow).not.toContain("node -e");
     expect(releaseWorkflow).toContain("sed -n");
+    expect(releaseWorkflow).toContain("github.event_name == 'push'");
+    expect(releaseWorkflow).toContain("publish-release:");
+    expect(releaseWorkflow).toContain("needs.menu-app-release.outputs.built");
+    expect(releaseWorkflow).toContain("menu app release was explicitly requested");
+    expect(releaseWorkflow).toContain("swift build -c release --arch arm64 --arch x86_64");
+    expect(releaseWorkflow).not.toContain("security import \"$cert_path\" -P \"$MACOS_DEVELOPER_ID_CERT_PASSWORD\" -A");
+    expect(releaseScript).toContain('BRAINSTACK_MENU_ARCHES="${BRAINSTACK_MENU_ARCHES:-arm64 x64}"');
+    expect(makeApp).toContain("Contents/Resources/brainctl");
+    expect(makeApp).toContain("--skip-build");
+    expect(makeApp).toContain('lipo "$path" -verify_arch');
+    expect(makeApp).toContain("BRAINSTACK_MENU_BRAINCTL_SOURCE");
+    expect(makeApp).toContain('codesign --force --options runtime --timestamp --sign "$IDENTITY" "$BUNDLED_BRAINCTL"');
+    expect(makeApp).toContain("lipo -create");
     expect(installDoc).not.toContain("--invite-file FILE|-");
     expect(installDoc).toContain("Debian/Ubuntu");
     expect(installDoc).toContain("Arch/Omarchy");

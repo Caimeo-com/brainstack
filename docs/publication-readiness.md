@@ -8,7 +8,7 @@ Before sharing brainstack with another machine or person:
 - `bun test` passes.
 - `brainctl smoke --profile single-node` passes.
 - `brainctl smoke --profile control` passes.
-- `brainctl init` has been tested only on fresh install roots; use `brainctl upgrade` or `brainctl apply-runtime` for existing installs.
+- `brainctl init` has been tested only on fresh install roots; use `brainctl lifecycle repair|upgrade` or the lower-level `brainctl upgrade`/`brainctl apply-runtime` for existing installs.
 - `brainctl bootstrap-client` renders Codex, Claude, Cursor, SSH, env, and install artifacts from a source run and from the compiled binary.
 - Product examples do not contain real tokens, chat ids, private keys, or personal repo data.
 - Tailscale docs clearly separate Serve from Funnel.

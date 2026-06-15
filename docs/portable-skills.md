@@ -117,6 +117,8 @@ brainctl skills doctor --dir ~/.codex/skills --check-remote
 Hooks are opt-in background integration. They refresh shared skill packages on session or prompt start and write local checkpoint metadata, but they are fail-open: if Brainstack, Git, or the local clone is unavailable, the harness should keep running.
 
 ```bash
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml --dry-run
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml
 brainctl hooks install --target all \
   --config ~/.config/brainstack/brainstack.yaml
 
@@ -132,6 +134,8 @@ Targets:
 - `all`: applies all three.
 
 `brainctl hooks install` merges Brainstack-managed entries and preserves unrelated hooks. `remove` deletes only Brainstack-managed entries. Codex and Claude may still require their own hook trust/review flow before non-managed command hooks run.
+
+Prefer `brainctl lifecycle repair` for routine installed-machine repair. It composes runtime refresh, local harness guidance repair, daemon install, hook install, and shared skill refresh. Use `hooks install` directly only when you intentionally want to touch hook config alone.
 
 Hooks do not guarantee full transcript capture. When the harness supplies a regular `transcript_path` on a stop event, Brainstack queues a small `codex-session-checkpoint` import in the local outbox so the daemon can flush it later. The checkpoint records the session id, cwd, and local transcript path, not the prompt/tool transcript body. This avoids per-turn spam and accidental raw prompt leakage, but it also means a missing proposal can still happen when the harness never supplied transcript metadata or the useful lesson was edited directly into a local skill/memory file.
 
@@ -153,13 +157,14 @@ The first command imports bounded session metadata plus the last agent message. 
 On enrolled client and worker machines, use the local daemon when clone freshness, outbox flushes, and shared skill refreshes should happen without every prompt hook doing Git or network work:
 
 ```bash
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml
 brainctl daemon install --config ~/.config/brainstack/brainstack.yaml
 brainctl daemon install --config ~/.config/brainstack/brainstack.yaml --start
 brainctl daemon status --config ~/.config/brainstack/brainstack.yaml
 brainctl daemon once --config ~/.config/brainstack/brainstack.yaml
 ```
 
-`brainstackd` is the service name, not a second installed binary. The service runs `brainctl daemon run`, writes bounded local status under Brainstack state, and leaves harness hooks fail-open. If the clone is missing, dirty, or not a real Git checkout, the daemon records degradation and refuses to install shared skills from that unsafe source.
+`lifecycle repair` is the normal command after enrollment. `brainstackd` is the service name, not a second installed binary. The service runs `brainctl daemon run`, writes bounded local status under Brainstack state, and leaves harness hooks fail-open. If the clone is missing, dirty, or not a real Git checkout, the daemon records degradation and refuses to install shared skills from that unsafe source.
 
 ## Client File Relay
 

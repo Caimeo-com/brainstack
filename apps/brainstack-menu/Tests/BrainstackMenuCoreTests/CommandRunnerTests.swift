@@ -99,6 +99,16 @@ final class CommandRunnerTests: XCTestCase {
     XCTAssertTrue(outcome.summary.contains("timed out"))
   }
 
+  func testTimeoutKillsSurvivingChildThatKeepsStdoutOpen() async throws {
+    let binary = try fakeBrainctl("(sleep 30) & exit 0")
+    let started = Date()
+    let outcome = await client(binary).runAction(title: "Install", arguments: ["install"], timeout: 1.0)
+    let elapsed = Date().timeIntervalSince(started)
+    XCTAssertLessThan(elapsed, 6, "surviving child must not keep the runner blocked")
+    XCTAssertFalse(outcome.succeeded)
+    XCTAssertTrue(outcome.summary.contains("timed out"))
+  }
+
   func testUnsupportedCommandDetection() async throws {
     let binary = try fakeBrainctl("echo 'Unknown command: curator' >&2; exit 1")
     let outcome = await client(binary).runAction(title: "Curator Run", arguments: ["curator", "run"])

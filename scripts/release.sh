@@ -118,7 +118,7 @@ if [ "${BRAINSTACK_RELEASE_MENU_APP:-0}" = "1" ]; then
     exit 1
   fi
   rm -f dist/BrainstackMenu-*.zip dist/BrainstackMenu-*.zip.sha256 dist/BrainstackMenu-*.dmg dist/BrainstackMenu-*.dmg.sha256
-  BRAINSTACK_MENU_VERSION="$version" apps/brainstack-menu/scripts/make-app.sh --notarize
+  BRAINSTACK_MENU_VERSION="$version" BRAINSTACK_MENU_ARCHES="${BRAINSTACK_MENU_ARCHES:-arm64 x64}" apps/brainstack-menu/scripts/make-app.sh --notarize
   menu_app_zip="dist/BrainstackMenu-${version}.zip"
   menu_app_dmg="dist/BrainstackMenu-${version}.dmg"
   cp "apps/brainstack-menu/dist/BrainstackMenu-${version}.zip" "$menu_app_zip"

@@ -17,7 +17,7 @@ bun run packages/brainctl/src/main.ts provision --profile control --out ~/.confi
 bun run packages/brainctl/src/main.ts smoke --profile control --config examples/control.yaml
 ```
 
-For a fresh control host install, run `brainctl init`. For later product updates, use `brainctl upgrade`; it backs up first and applies runtime files without rewriting canonical shared-brain content.
+For a fresh control host install, run `brainctl init`. For later product updates, use `brainctl lifecycle upgrade`; it backs up first and applies runtime files without rewriting canonical shared-brain content. Use `brainctl lifecycle repair` for a narrower runtime/service repair pass without the pre-upgrade backup.
 
 `provision` only checks prerequisites and writes config. It does not install Bun, Git, OpenSSH, Tailscale, Codex, or Claude. If both Codex and Claude are installed in a non-interactive run, pass `--harness codex` or `--harness claude`.
 
@@ -28,7 +28,7 @@ cd ~/brainstack
 bun run packages/brainctl/src/main.ts init --profile control --config ~/.config/brainstack/brainstack.yaml
 loginctl enable-linger "$USER"
 systemctl --user daemon-reload
-bun run packages/brainctl/src/main.ts upgrade --profile control --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts lifecycle upgrade --profile control --config ~/.config/brainstack/brainstack.yaml
 systemctl --user daemon-reload
 systemctl --user restart braind.service
 ```

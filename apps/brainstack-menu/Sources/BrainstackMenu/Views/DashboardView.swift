@@ -12,6 +12,7 @@ private struct ScrollContentHeightKey: PreferenceKey {
 struct DashboardView: View {
   @ObservedObject var model: AppModel
   var openPreferences: () -> Void
+  var openInstaller: () -> Void
   var openOperatorConsole: () -> Void
   // Start with a plausible height so the popover doesn't open tiny and balloon a
   // moment later (which can make AppKit re-place it).
@@ -118,6 +119,7 @@ struct DashboardView: View {
         }
       }
       Section("Maintain") {
+        Button("Set Up / Repair Brainstack…") { openInstaller() }
         Button("Run Doctor") { performRepair(.doctor) }
         Button("Check Stack Updates") { performRepair(.checkUpdates) }
         Button("Flush Outbox…") { performRepair(.flushOutbox) }
@@ -181,7 +183,8 @@ struct DashboardView: View {
           .font(.caption)
           .foregroundColor(.secondary)
         HStack {
-          Button("Copy Install Command") { model.copySetupCommand() }
+          Button("Set Up…") { openInstaller() }
+          Button("Copy Terminal Command") { model.copySetupCommand() }
           Button("Choose Binary…") { openPreferences() }
         }
       } else if case .unsupportedBinary(let path) = model.lastFailure {
@@ -190,13 +193,17 @@ struct DashboardView: View {
           .font(.caption)
           .foregroundColor(.secondary)
         HStack {
-          Button("Copy Update Command") { model.copySetupCommand() }
+          Button("Repair…") { openInstaller() }
+          Button("Copy Terminal Command") { model.copySetupCommand() }
           Button("Choose Binary…") { openPreferences() }
         }
       } else if let failure = model.lastFailure {
         Text("Status unavailable").font(.callout).bold()
         Text(Diagnostics.describe(failure)).font(.caption).foregroundColor(.secondary)
-        Button("Copy Install Command") { model.copySetupCommand() }
+        HStack {
+          Button("Set Up / Repair…") { openInstaller() }
+          Button("Copy Terminal Command") { model.copySetupCommand() }
+        }
       } else {
         Text("No status yet.").font(.callout)
       }

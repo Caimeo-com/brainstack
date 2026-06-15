@@ -21,6 +21,7 @@ final class AppModel: ObservableObject {
   @Published private(set) var proposalDetails: [String: ProposalDetail] = [:]
   @Published private(set) var loadingDetailId: String?
   @Published private(set) var detailErrors: [String: String] = [:]
+  @Published private(set) var installerRunning = false
 
   @Published var binaryPathPreference: String? {
     didSet { preferences.binaryPathPreference = binaryPathPreference }
@@ -127,6 +128,9 @@ final class AppModel: ObservableObject {
     guard !isRefreshing else {
       return
     }
+    guard !installerRunning else {
+      return
+    }
     isRefreshing = true
     Task {
       await self.performRefresh()
@@ -229,6 +233,39 @@ final class AppModel: ObservableObject {
     runAction("Update \(machine)") { client in
       await client.fleetUpdate(machine: machine)
     }
+  }
+
+  func installOrRepair(invite: String?) {
+    guard busyAction == nil, !installerRunning else {
+      return
+    }
+    let trimmed = invite?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let title = trimmed?.isEmpty == false ? "Set Up Brainstack" : "Repair Brainstack"
+    busyAction = title
+    installerRunning = true
+    Task {
+      let outcome = await BrainstackMenuInstaller.installAndRepair(
+        configPath: self.configPath,
+        invite: trimmed
+      )
+      await MainActor.run {
+        self.record(outcome)
+        self.installerRunning = false
+        self.busyAction = nil
+        if outcome.succeeded {
+          self.binaryPathPreference = BrainstackMenuInstaller.defaultInstallPath()
+        }
+        self.refresh()
+      }
+    }
+  }
+
+  var bundledBrainctlPath: String? {
+    BrainstackMenuInstaller.bundledBrainctlPath()
+  }
+
+  var defaultInstallPath: String {
+    BrainstackMenuInstaller.defaultInstallPath()
   }
 
   // MARK: - Operator mode

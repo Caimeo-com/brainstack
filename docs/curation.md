@@ -58,7 +58,7 @@ curation:
 - `approval` (default): the curator creates proposals; a human accepts or rejects them. Accept calls the apply path directly.
 - `auto`: low-risk proposals that match `allowedPaths`, stay within `maxChangedLines`, respect `allowDeletes`, and pass the drift check apply automatically at propose time. Everything else stays `pending` or `needs-human`.
 
-`brainctl upgrade` renders the policy into `braind.runtime.env` as `BRAIN_CURATION_MODE`, `BRAIN_CURATION_ALLOWED_PATHS`, `BRAIN_CURATION_MAX_CHANGED_LINES`, and `BRAIN_CURATION_ALLOW_DELETES`.
+`brainctl lifecycle upgrade` or the lower-level `brainctl upgrade` renders the policy into `braind.runtime.env` as `BRAIN_CURATION_MODE`, `BRAIN_CURATION_ALLOWED_PATHS`, `BRAIN_CURATION_MAX_CHANGED_LINES`, and `BRAIN_CURATION_ALLOW_DELETES`.
 
 ## Curator automation
 

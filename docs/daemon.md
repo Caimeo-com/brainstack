@@ -21,6 +21,15 @@ The daemon does not make canonical wiki edits, run LLMs, repair dirty clones sil
 
 ## Commands
 
+For routine installed-machine repair, prefer the lifecycle wrapper:
+
+```bash
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml
+brainctl lifecycle status --config ~/.config/brainstack/brainstack.yaml
+```
+
+Use the lower-level daemon commands when you only want to inspect or change daemon behavior:
+
 ```bash
 brainctl daemon install --config ~/.config/brainstack/brainstack.yaml
 brainctl daemon install --config ~/.config/brainstack/brainstack.yaml --start

@@ -205,6 +205,22 @@ public struct BrainctlClient: Sendable {
     await runAction(title: "Update \(machine)", arguments: ["fleet", "update", machine, "--config", configPath], timeout: 300)
   }
 
+  public func enroll(inviteFile: String, timeout: TimeInterval? = nil) async -> ActionOutcome {
+    await runAction(
+      title: "Enroll",
+      arguments: ["enroll", "--invite-file", inviteFile, "--config", configPath],
+      timeout: timeout ?? actionTimeout
+    )
+  }
+
+  public func lifecycleRepair(timeout: TimeInterval? = nil) async -> ActionOutcome {
+    await runAction(
+      title: "Lifecycle Repair",
+      arguments: ["lifecycle", "repair", "--config", configPath],
+      timeout: timeout ?? actionTimeout
+    )
+  }
+
   public func curatorStatus() async -> ActionOutcome {
     await runAction(title: "Curator Status", arguments: ["curator", "status", "--config", configPath], timeout: 20)
   }

@@ -1,6 +1,18 @@
 # Brainstack Menu
 
-Native macOS menu bar companion for enrolled Brainstack machines. It makes Brainstack present and observable without becoming another harness, daemon, or source of truth: all data and actions go through stable `brainctl` CLI surfaces, primarily `brainctl status --json`.
+Native macOS menu bar installer and companion for Brainstack machines. A signed DMG includes the app plus a bundled standalone `brainctl`; first launch can install that binary to `~/.local/bin/brainctl`, enroll the Mac from an invite, and run lifecycle repair. After setup, the app stays a lightweight status/control surface: all data and actions go through stable `brainctl` CLI surfaces, primarily `brainctl status --json`.
+
+## First-run setup
+
+On a fresh Mac:
+
+1. Drag `Brainstack Menu.app` to `/Applications` and open it.
+2. Click **Set Up…** when the app reports that `brainctl` is missing.
+3. Paste a fresh `bs1_…` invite from the control host.
+
+The app writes the invite to a private temporary file, runs `brainctl enroll --invite-file …`, deletes the temporary file, then runs `brainctl lifecycle repair --config …`. The invite is never stored in Preferences, diagnostics, command arguments, or action logs. The bundled helper is copied to `~/.local/bin/brainctl` first so hooks and launchd services point at a stable path, not `/Volumes`, Downloads, or the app bundle.
+
+For an already enrolled Mac, **Set Up / Repair Brainstack…** runs the same stable-binary install followed by lifecycle repair.
 
 ## What it shows
 
@@ -29,14 +41,20 @@ Proposal review renders the shared `brainctl proposals show --json` contract, in
 ```bash
 cd apps/brainstack-menu
 swift run BrainstackMenu        # development (no notifications/login item)
-scripts/make-app.sh             # dist/Brainstack Menu.app + zip + dmg (Developer ID if present, else ad-hoc)
+scripts/make-app.sh             # dist/Brainstack Menu.app + zip + dmg with bundled brainctl (Developer ID if present, else ad-hoc)
 cp -R "dist/Brainstack Menu.app" /Applications/
 ```
 
 Signing is automatic: the script uses `CODESIGN_IDENTITY` if set, otherwise the first
 "Developer ID Application" identity in the keychain (with hardened runtime and a secure
-timestamp), otherwise an ad-hoc signature for local-only use. The app icon is built into
+timestamp), otherwise an ad-hoc signature for local-only use. The bundled `brainctl` is
+signed as nested code before the parent app is signed. The app icon is built into
 `AppIcon.icns` from `icon/icon-1024.png` at package time.
+
+Local builds target the current Mac architecture by default. The release wrapper sets
+`BRAINSTACK_MENU_ARCHES="arm64 x64"` so the published app and bundled helper are universal.
+Use `BRAINSTACK_MENU_BRAINCTL_SOURCE=/path/to/brainctl` only for local smoke tests with a
+known helper binary.
 
 For a distributable artifact people can download and run (signed, notarized, stapled,
 Gatekeeper-accepted):
@@ -56,9 +74,10 @@ BRAINSTACK_RELEASE_MENU_APP=1 NOTARY_PROFILE=BrainstackNotary scripts/release.sh
 # → dist/BrainstackMenu-<version>.zip/.dmg + .sha256 files alongside the brainctl assets
 ```
 
-The GitHub release workflow always builds the CLI installer assets first and only runs
-the signed/notarized menu-app lane when `include_menu_app` is enabled. Missing Apple
-signing or notarization secrets should not block a CLI release.
+The GitHub release workflow always builds the CLI installer assets first. Tag releases
+also build and publish the signed/notarized menu-app lane; manual workflow runs can opt
+in with `include_menu_app`. Missing Apple signing or notarization secrets block the menu
+app lane, not the standalone CLI asset build.
 
 CI can use App Store Connect API-key notarization instead of a local notary profile by
 setting `APP_STORE_CONNECT_API_KEY_PATH`, `APP_STORE_CONNECT_API_KEY_ID`, and

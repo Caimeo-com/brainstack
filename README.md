@@ -39,6 +39,8 @@ bun run packages/brainctl/src/main.ts proposals groups --config ~/.config/brains
 bun run packages/brainctl/src/main.ts proposals merge-group GROUP_KEY --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts proposals reprocess --config ~/.config/brainstack/brainstack.yaml --limit 5
 bun run packages/brainctl/src/main.ts import codex-session SESSION_ID --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts lifecycle status --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts lifecycle repair --config ~/.config/brainstack/brainstack.yaml --dry-run
 bun run packages/brainctl/src/main.ts daemon status --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts hooks status --target all
 bun run packages/brainctl/src/main.ts upgrade --profile control --config examples/control.yaml
@@ -46,6 +48,8 @@ bun run packages/brainctl/src/main.ts destroy --config ~/.config/brainstack/brai
 ```
 
 `init` is fresh-install only. Use `upgrade` or `apply-runtime` for existing installs; those commands do not silently seed or rewrite canonical shared-brain content.
+
+For normal installed-machine maintenance, prefer `brainctl lifecycle status|repair|upgrade|uninstall`. These are safer orchestration wrappers around the lower-level commands: `status` is bounded and read-only, `repair` re-renders runtime and local harness guidance files plus daemon/hooks/skills surfaces, `upgrade` performs the existing backup plus runtime refresh, and `uninstall` delegates to manifest-driven `destroy`. Uninstall defaults to full managed artifact removal for control/single-node installs and client/worker artifact removal for edge installs.
 
 The normal installed config path is `~/.config/brainstack/brainstack.yaml`. If a command points at a missing config, `brainctl` prints the provision command to create it and lists nearby existing `*.brainstack.yaml` candidates instead of surfacing a raw filesystem `ENOENT`.
 

@@ -34,7 +34,7 @@ Search uses local SQLite under `derived/` in the serve clone and is never shared
 
 `brainctl init` is a fresh-install command. It seeds canonical shared-brain content only when the canonical repo is empty, unless the operator explicitly passes `--seed-missing` or `--force-seed`.
 
-Use `brainctl upgrade` or `brainctl apply-runtime` for existing installs. Those commands render and apply runtime artifacts such as service files, hooks, env examples, Tailscale Serve config, and bootstrap files, but they do not silently rewrite canonical wiki pages, manifests, raw artifacts, proposals, or logs.
+Use `brainctl lifecycle repair` for routine installed-machine repair and `brainctl lifecycle upgrade` for backup plus runtime refresh. The underlying `upgrade` and `apply-runtime` primitives render runtime artifacts such as service files, hooks, env examples, Tailscale Serve config, and bootstrap files, but they do not silently rewrite canonical wiki pages, manifests, raw artifacts, proposals, or logs.
 
 Runtime env and secrets env are split:
 

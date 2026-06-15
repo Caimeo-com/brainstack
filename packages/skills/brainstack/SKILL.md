@@ -58,11 +58,13 @@ Use `brainctl import skills` before a broad migration. It scans the current dire
 Connected machines install shared skill packages from their local clone:
 
 ```bash
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml --dry-run
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml
 brainctl skills refresh --config ~/.config/brainstack/brainstack.yaml --target codex
 brainctl skills doctor --dir ~/.codex/skills --check-remote
 ```
 
-`skills refresh` refuses to clobber an existing unmarked local skill unless `--force` is passed. `skills doctor --check-remote` may use the network and should be run intentionally, not as a routine hook.
+Prefer `lifecycle repair` for routine post-install repair: it re-renders runtime files, repairs missing local harness guidance stubs, repairs daemon service files and hooks, and refreshes shared skill packages without deleting data or reseeding canonical brain pages. `skills refresh` remains the narrow advanced command and refuses to clobber an existing unmarked local skill unless `--force` is passed. `skills doctor --check-remote` may use the network and should be run intentionally, not as a routine hook.
 
 Harness hooks can run the refresh/checkpoint-metadata path in the background:
 
@@ -86,6 +88,7 @@ Use the first command for bounded metadata plus the last agent message. Use `--i
 For client and worker machines that should keep the local clone fresh without per-prompt Git work, use the local daemon mode:
 
 ```bash
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml
 brainctl daemon install --config ~/.config/brainstack/brainstack.yaml
 brainctl daemon install --config ~/.config/brainstack/brainstack.yaml --start
 brainctl daemon status --config ~/.config/brainstack/brainstack.yaml

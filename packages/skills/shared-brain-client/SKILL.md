@@ -15,6 +15,7 @@ Use this skill from client machines and harnesses.
 - Do not directly edit canonical wiki pages unless the operator explicitly asks for trusted power-user mode.
 - Never request or store the admin ingest token on client or worker profiles.
 - Prefer invite-based enrollment when joining a stack: the operator creates a private invite, the client installer runs `brainctl enroll`, local config lands at `~/.config/brainstack/brainstack.yaml`, and Codex client skills are installed automatically for Codex invites.
+- Use `brainctl lifecycle status --config ~/.config/brainstack/brainstack.yaml` for bounded local health and `brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml` for routine post-install repair of runtime files, local harness guidance, daemon service files, hooks, and shared skill packages.
 - Use `brainctl skills install --target codex --profile client` only to repair or intentionally refresh the public client skill bundle after enrollment.
 - Use `brainctl import skills --config ~/.config/brainstack/brainstack.yaml` to plan local skill sharing across the current directory and default Codex/Claude/Cursor skill roots. Add `--apply` only after confirming the listed skills should become global shared-brain imports.
 - Use `brainctl skills refresh --config ~/.config/brainstack/brainstack.yaml --target codex` to install validated skill packages that were imported into the shared brain. Hook-based refresh is convenience-only and must fail open when the brain or clone is unavailable.

@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
   private var statusItem: NSStatusItem!
   private var popover: NSPopover!
   private var preferencesWindow: NSWindow?
+  private var installerWindow: NSWindow?
   private let model = AppModel()
 
   func applicationDidFinishLaunching(_ notification: Notification) {
@@ -33,6 +34,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         model: model,
         openPreferences: { [weak self] in
           self?.openPreferences()
+        },
+        openInstaller: { [weak self] in
+          self?.openInstaller()
         },
         openOperatorConsole: { [weak self] in
           self?.openOperatorConsole()
@@ -258,6 +262,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
     preferencesWindow?.center()
     preferencesWindow?.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
+
+  func openInstaller() {
+    if popover.isShown {
+      popover.performClose(nil)
+    }
+    if installerWindow == nil {
+      let hosting = NSHostingController(rootView: InstallerView(model: model))
+      let window = NSWindow(contentViewController: hosting)
+      window.title = "Set Up Brainstack"
+      window.styleMask = [.titled, .closable]
+      window.isReleasedWhenClosed = false
+      window.center()
+      installerWindow = window
+    }
+    installerWindow?.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
   }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, createReadStream, existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { appendFile, chmod, cp, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
@@ -326,6 +326,7 @@ function usage(): string {
   brainctl apply-runtime --config brainstack.yaml [--profile ...] [--dry-run] [--root /tmp/install-root]
   brainctl doctor --config brainstack.yaml [--profile ...] [--json] [--workers] [--deep] [--write-smoke]
   brainctl status --config brainstack.yaml [--json] [--timeout-ms N]
+  brainctl lifecycle status|repair|upgrade|uninstall --config brainstack.yaml [--target codex|claude|cursor|all] [--dry-run]
   brainctl daemon run|once|status|install|uninstall|logs --config brainstack.yaml [--json]
   brainctl updates --config brainstack.yaml [--profile ...]
   brainctl fleet status|update --config brainstack.yaml [machine|--all] [--json] [--dry-run]
@@ -341,7 +342,7 @@ function usage(): string {
   brainctl import skill <SKILL.md|DIR|URL> --config brainstack.yaml [--title TITLE] [--source-harness HARNESS] [--source-machine MACHINE] [--max-bytes N] [--max-files N] [--allow-private-url] [--allow-ssh-git]
   brainctl import skills [--config brainstack.yaml] [--target codex|claude|cursor|all] [--scan-dir DIR] [--skill NAME] [--apply] [--json]
   brainctl import codex-session <SESSION_ID|JSONL_PATH> [--config brainstack.yaml] [--include-transcript] [--max-bytes N] [--dry-run] [--json]
-  brainctl hooks install|status|remove [--target codex|claude|cursor|all] [--config brainstack.yaml] [--brainctl PATH_OR_COMMAND] [--dry-run]
+  brainctl hooks install|status|remove [--target codex|claude|cursor|all] [--config brainstack.yaml] [--brainctl PATH] [--brainctl-command COMMAND] [--dry-run]
   brainctl hook run --harness codex|claude|cursor --event EVENT [--config brainstack.yaml]
   brainctl invite create --config brainstack.yaml [--import-token-file FILE|--import-token-env ENV] [--ssh-known-hosts-file FILE] [--control-ssh SSH_TARGET] [--control-repo PATH] [--skills-profile client|operator|control|worker|none] [--expires-hours N] [--install-version TAG|latest|--install-url URL] [--allow-insecure-install-url] [--json]
   brainctl enroll --invite bs1_...|--invite-file FILE|- [--config brainstack.yaml] [--skills-profile client|operator|control|worker|none] [--skip-skills] [--skip-init] [--skip-doctor] [--force]
@@ -446,6 +447,11 @@ function requireFlagValue(args: ParsedArgs, key: string): string | undefined {
     throw new Error(`--${key} requires a value`);
   }
   return flag(args, key);
+}
+
+function commandHasHelp(args: ParsedArgs): boolean {
+  const first = args.positional[0];
+  return hasFlag(args, "help") || first === "help" || first === "--help" || first === "-h";
 }
 
 function expandHome(input: string): string {
@@ -1892,6 +1898,10 @@ function usesBrainstackDaemon(cfg: BrainstackConfig): boolean {
   return cfg.profile === "client-macos" || cfg.profile === "worker";
 }
 
+function usesLocalHarnessGuidance(cfg: BrainstackConfig): boolean {
+  return cfg.profile === "client-macos" || cfg.profile === "worker";
+}
+
 function braindService(cfg: BrainstackConfig): string {
   return [
     "[Unit]",
@@ -2397,11 +2407,7 @@ function canonicalJson(value: unknown): string {
     .join(",")}}`;
 }
 
-async function installLocalClientBootstrap(cfg: BrainstackConfig, options: { importTokenFile?: string; importToken?: string } = {}): Promise<string[]> {
-  if (options.importTokenFile && options.importToken !== undefined) {
-    throw new Error("client bootstrap accepts either an import token file or an in-memory import token, not both");
-  }
-  const touched: string[] = [];
+async function renderLocalClientBootstrapTemplates(cfg: BrainstackConfig): Promise<{ bootstrapRoot: string; bootstrapFiles: Record<string, string> }> {
   const bootstrapRoot = join(cfg.paths.configRoot, "client-bootstrap");
   const bootstrapFiles = clientBootstrapFiles(cfg);
   await writeFileMap(bootstrapRoot, bootstrapFiles);
@@ -2414,6 +2420,64 @@ async function installLocalClientBootstrap(cfg: BrainstackConfig, options: { imp
       SHARED_BRAIN_LOCAL_PATH: clientLocalPathAbs(cfg)
     })
   );
+  return { bootstrapRoot, bootstrapFiles };
+}
+
+async function installLocalHarnessGuidance(cfg: BrainstackConfig, bootstrapRoot: string, bootstrapFiles: Record<string, string>): Promise<string[]> {
+  const touched: string[] = [];
+  const codexHome = join(cfg.paths.home, ".codex");
+  await ensureDir(codexHome);
+  const codexAgents = join(codexHome, "AGENTS.md");
+  const codexTarget = join(bootstrapRoot, "codex-shared-brain.include.md");
+  const codexInfo = await lstat(codexAgents).catch(() => null);
+  if (!codexInfo) {
+    await symlink(codexTarget, codexAgents);
+    touched.push(codexAgents);
+  } else {
+    console.log(`Codex already has ${codexAgents}; append the real shared-brain guidance with:`);
+    console.log(`cat ${codexTarget} >> ${codexAgents}`);
+  }
+
+  const claudeHome = join(cfg.paths.home, ".claude");
+  await ensureDir(claudeHome);
+  const claudeFile = join(claudeHome, "CLAUDE.md");
+  if (await writeIfMissing(claudeFile, `@${join(bootstrapRoot, "claude-user-CLAUDE.md")}\n`)) {
+    touched.push(claudeFile);
+  } else {
+    console.log(`Claude already has ${claudeFile}; append this exact import line manually:`);
+    console.log(`@${join(bootstrapRoot, "claude-user-CLAUDE.md")}`);
+  }
+
+  const cursorRules = join(cfg.paths.home, ".cursor", "rules");
+  await ensureDir(cursorRules);
+  const cursorRule = join(cursorRules, "shared-brain.md");
+  if (await writeIfMissing(cursorRule, bootstrapFiles["cursor-user-rule.md"])) {
+    touched.push(cursorRule);
+  } else {
+    console.log(`Cursor shared-brain rule already exists at ${cursorRule}; append or merge the actual rule content with:`);
+    console.log(`cat ${join(bootstrapRoot, "cursor-user-rule.md")} >> ${cursorRule}`);
+  }
+  return touched;
+}
+
+async function repairLocalClientGuidance(cfg: BrainstackConfig): Promise<string[]> {
+  const touched: string[] = [];
+  const { bootstrapRoot, bootstrapFiles } = await renderLocalClientBootstrapTemplates(cfg);
+  touched.push(bootstrapRoot);
+  const envPath = clientEnvPathAbs(cfg);
+  if (await writeIfMissing(envPath, bootstrapFiles["client.env.example"], 0o600)) {
+    touched.push(envPath);
+  }
+  touched.push(...(await installLocalHarnessGuidance(cfg, bootstrapRoot, bootstrapFiles)));
+  return touched;
+}
+
+async function installLocalClientBootstrap(cfg: BrainstackConfig, options: { importTokenFile?: string; importToken?: string } = {}): Promise<string[]> {
+  if (options.importTokenFile && options.importToken !== undefined) {
+    throw new Error("client bootstrap accepts either an import token file or an in-memory import token, not both");
+  }
+  const touched: string[] = [];
+  const { bootstrapRoot, bootstrapFiles } = await renderLocalClientBootstrapTemplates(cfg);
   touched.push(bootstrapRoot);
 
   const target = clientLocalPathAbs(cfg);
@@ -2444,37 +2508,7 @@ async function installLocalClientBootstrap(cfg: BrainstackConfig, options: { imp
     console.log(`BRAIN_IMPORT_TOKEN installed in ${envPath}; value not printed.`);
   }
 
-  const codexHome = join(cfg.paths.home, ".codex");
-  await ensureDir(codexHome);
-  const codexAgents = join(codexHome, "AGENTS.md");
-  if (!existsSync(codexAgents)) {
-    await symlink(join(bootstrapRoot, "codex-shared-brain.include.md"), codexAgents);
-    touched.push(codexAgents);
-  } else {
-    console.log(`Codex already has ${codexAgents}; append the real shared-brain guidance with:`);
-    console.log(`cat ${join(bootstrapRoot, "codex-shared-brain.include.md")} >> ${codexAgents}`);
-  }
-
-  const claudeHome = join(cfg.paths.home, ".claude");
-  await ensureDir(claudeHome);
-  const claudeFile = join(claudeHome, "CLAUDE.md");
-  if (await writeIfMissing(claudeFile, `@${join(bootstrapRoot, "claude-user-CLAUDE.md")}\n`)) {
-    touched.push(claudeFile);
-  } else {
-    console.log(`Claude already has ${claudeFile}; append this exact import line manually:`);
-    console.log(`@${join(bootstrapRoot, "claude-user-CLAUDE.md")}`);
-  }
-
-  const cursorRules = join(cfg.paths.home, ".cursor", "rules");
-  await ensureDir(cursorRules);
-  const cursorRule = join(cursorRules, "shared-brain.md");
-  if (await writeIfMissing(cursorRule, bootstrapFiles["cursor-user-rule.md"])) {
-    touched.push(cursorRule);
-  } else {
-    console.log(`Cursor shared-brain rule already exists at ${cursorRule}; append or merge the actual rule content with:`);
-    console.log(`cat ${join(bootstrapRoot, "cursor-user-rule.md")} >> ${cursorRule}`);
-  }
-
+  touched.push(...(await installLocalHarnessGuidance(cfg, bootstrapRoot, bootstrapFiles)));
   return touched;
 }
 
@@ -9893,18 +9927,55 @@ function hookConfigPath(target: HookTarget): string {
   return join(home, ".cursor", "hooks.json");
 }
 
-function currentBrainctlHookCommand(args: ParsedArgs): string {
-  const explicit = requireFlagValue(args, "brainctl");
-  if (explicit) {
-    if (explicit.includes(" ")) {
-      return explicit;
+function isTransientBrainctlPath(path: string): boolean {
+  const normalized = abs(path);
+  const tmp = abs(tmpdir());
+  const home = process.env.HOME ? abs(process.env.HOME) : "";
+  const underHome = Boolean(home && (normalized === home || normalized.startsWith(`${home}/`)));
+  return normalized.startsWith("/Volumes/")
+    || (normalized.startsWith(`${tmp}/`) && !underHome)
+    || normalized.includes("/.build/")
+    || normalized.includes(".app/Contents/Resources/");
+}
+
+function shellCommandForBrainctlPath(pathOrName: string, label: string): string {
+  const value = pathOrName.trim();
+  if (!value) {
+    throw new Error(`${label} must not be empty`);
+  }
+  const pathLike = value.includes("/") || value.startsWith(".") || value.startsWith("~");
+  if (!pathLike) {
+    if (/\s/.test(value)) {
+      throw new Error(`${label} now accepts an executable path or command name only; use --brainctl-command for raw shell snippets`);
     }
-    return explicit.includes("/") || explicit.startsWith(".") || explicit.startsWith("~") ? quoteForBash(abs(explicit)) : quoteForBash(explicit);
+    return quoteForBash(value);
+  }
+  const resolved = abs(value);
+  if (isTransientBrainctlPath(resolved)) {
+    throw new Error(`${label} points at a transient path (${resolved}); install brainctl to a stable path such as ~/.local/bin/brainctl and pass that path`);
+  }
+  return quoteForBash(resolved);
+}
+
+function currentBrainctlHookCommand(args: ParsedArgs): string {
+  const rawCommand = requireFlagValue(args, "brainctl-command");
+  const explicit = requireFlagValue(args, "brainctl");
+  if (rawCommand && explicit) {
+    throw new Error("use either --brainctl or --brainctl-command, not both");
+  }
+  if (rawCommand) {
+    return rawCommand;
+  }
+  if (explicit) {
+    return shellCommandForBrainctlPath(explicit, "--brainctl");
   }
   const executable = process.execPath;
   const script = process.argv[1];
   if (script && script.endsWith(".ts")) {
     return `${quoteForBash(executable)} --no-env-file run ${quoteForBash(abs(script))}`;
+  }
+  if (isTransientBrainctlPath(executable)) {
+    throw new Error(`brainctl is running from a transient path (${executable}); rerun with --brainctl ~/.local/bin/brainctl or reinstall brainctl to a stable path before installing hooks or daemons`);
   }
   return quoteForBash(executable);
 }
@@ -10173,6 +10244,23 @@ function sessionIdFromTranscriptPath(path: string): string | undefined {
   return match?.[1];
 }
 
+async function sha256File(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) {
+    hash.update(chunk);
+  }
+  return hash.digest("hex");
+}
+
+function isDurableTranscriptPath(path: string, cfg: BrainstackConfig): boolean {
+  const normalized = abs(path);
+  const tempRoot = abs(tmpdir());
+  const home = abs(cfg.paths.home);
+  return !normalized.startsWith("/Volumes/")
+    && !normalized.includes(".app/Contents/")
+    && !(normalized.startsWith(`${tempRoot}/`) && !normalized.startsWith(`${home}/`));
+}
+
 async function hookSessionCheckpointPayload(
   cfg: BrainstackConfig,
   target: HookTarget,
@@ -10190,6 +10278,8 @@ async function hookSessionCheckpointPayload(
   }
   const sessionId = hookInputString(input, "session_id") || sessionIdFromTranscriptPath(transcriptPath) || sha256Hex(transcriptPath).slice(0, 16);
   const cwd = hookInputString(input, "cwd") || process.cwd();
+  const transcriptSha256 = await sha256File(transcriptPath);
+  const transcriptPathDurable = isDurableTranscriptPath(transcriptPath, cfg);
   const title = `Codex session checkpoint: ${sessionId}`;
   const text = [
     `# ${title}`,
@@ -10199,6 +10289,8 @@ async function hookSessionCheckpointPayload(
     `- Hook event: \`${event}\``,
     `- Cwd: \`${cwd}\``,
     `- Local transcript path: \`${transcriptPath}\``,
+    `- Transcript sha256: \`${transcriptSha256}\``,
+    `- Transcript path durable: \`${transcriptPathDurable ? "true" : "false"}\``,
     "",
     "## Capture Note",
     "",
@@ -10214,7 +10306,9 @@ async function hookSessionCheckpointPayload(
     conversation_id: sessionId,
     related_repo: cwd,
     transcript_path: transcriptPath,
+    transcript_path_durable: transcriptPathDurable,
     transcript_bytes: info.size,
+    transcript_sha256: transcriptSha256,
     tags: uniqueNonEmptyStrings(["codex-session", "codex-session-checkpoint", `session:${sessionId}`, `repo:${deriveProjectLabel(cwd)}`])
   };
 }
@@ -12108,6 +12202,219 @@ async function commandFleet(args: ParsedArgs): Promise<void> {
   throw new Error(`Unknown fleet subcommand: ${sub}`);
 }
 
+function lifecycleUsage(): string {
+  return [
+    "Usage: brainctl lifecycle status --config brainstack.yaml [--json] [--timeout-ms N]",
+    "       brainctl lifecycle repair --config brainstack.yaml [--target codex|claude|cursor|all] [--dry-run] [--no-runtime] [--no-guidance] [--no-daemon] [--no-hooks] [--no-skills] [--no-status] [--no-start] [--sync-skills]",
+    "       brainctl lifecycle upgrade --config brainstack.yaml [--dry-run] [--no-daemon] [--no-status] [--no-start]",
+    "       brainctl lifecycle uninstall --config brainstack.yaml --dry-run|--yes [--scope control|worker|client|all]",
+    "",
+    "Lifecycle commands are safe wrappers around existing primitives:",
+    "  status    bounded read-only aggregate status",
+    "  repair    re-render runtime/guidance files, reinstall daemon/hooks, refresh shared skills from the local clone",
+    "  upgrade   backup plus runtime refresh for the currently installed version",
+    "  uninstall guarded manifest-driven destroy; defaults to full removal for control installs and client/worker removal for edge installs"
+  ].join("\n");
+}
+
+function lifecycleConfigPath(args: ParsedArgs): string {
+  return abs(requireFlagValue(args, "config") || brainstackDefaultConfigPath());
+}
+
+function lifecycleTargetsFromArgs(args: ParsedArgs): HookTarget[] {
+  const target = (requireFlagValue(args, "target") || "all").trim().toLowerCase();
+  if (target === "all") {
+    return ["codex", "claude", "cursor"];
+  }
+  return [normalizeHookTarget(target)];
+}
+
+function lifecycleDisplayCommand(command: string, parts: string[]): string {
+  return ["brainctl", command, ...parts].join(" ");
+}
+
+function lifecycleRepairPlan(cfg: BrainstackConfig, args: ParsedArgs, configPath: string): Array<{ name: string; command: string; detail: string }> {
+  const target = requireFlagValue(args, "target") || "all";
+  const selectedTargets = target === "all" ? ["codex", "claude", "cursor"] as HookTarget[] : [normalizeHookTarget(target)];
+  const noStart = hasFlag(args, "no-start");
+  const steps: Array<{ name: string; command: string; detail: string }> = [];
+  if (!hasFlag(args, "no-runtime")) {
+    steps.push({
+      name: "runtime",
+      command: lifecycleDisplayCommand("apply-runtime", ["--config", configPath, "--profile", cfg.profile]),
+      detail: "refresh generated runtime, bootstrap templates, service files, and ownership manifest; canonical brain content is not seeded"
+    });
+  }
+  if (!hasFlag(args, "no-guidance") && usesLocalHarnessGuidance(cfg)) {
+    steps.push({
+      name: "guidance",
+      command: "managed by lifecycle repair",
+      detail: "repair missing local Codex/Claude/Cursor shared-brain guidance stubs without cloning or pulling the shared-brain repo"
+    });
+  }
+  if (!hasFlag(args, "no-daemon") && usesBrainstackDaemon(cfg)) {
+    steps.push({
+      name: "daemon",
+      command: lifecycleDisplayCommand("daemon install", ["--config", configPath, ...(!noStart ? ["--start"] : [])]),
+      detail: "install or replace the local background daemon service"
+    });
+  }
+  if (!hasFlag(args, "no-hooks")) {
+    steps.push({
+      name: "hooks",
+      command: lifecycleDisplayCommand("hooks install", ["--target", target, "--config", configPath]),
+      detail: "install fail-open Brainstack hooks for selected harness targets"
+    });
+  }
+  if (!hasFlag(args, "no-skills")) {
+    for (const skillTarget of selectedTargets) {
+      steps.push({
+        name: `skills:${skillTarget}`,
+        command: lifecycleDisplayCommand("skills refresh", ["--target", skillTarget, "--config", configPath, ...(!hasFlag(args, "sync-skills") ? ["--no-sync"] : [])]),
+        detail: "refresh shared skill packages from the local shared-brain clone; pass --sync-skills to pull first"
+      });
+    }
+  }
+  if (!hasFlag(args, "no-status")) {
+    steps.push({
+      name: "status",
+      command: lifecycleDisplayCommand("status", ["--config", configPath, "--timeout-ms", requireFlagValue(args, "timeout-ms") || "3000"]),
+      detail: "finish with bounded aggregate diagnostics"
+    });
+  }
+  return steps;
+}
+
+function printLifecycleRepairPlan(cfg: BrainstackConfig, args: ParsedArgs, configPath: string): void {
+  const steps = lifecycleRepairPlan(cfg, args, configPath);
+  if (hasFlag(args, "json")) {
+    console.log(JSON.stringify({ ok: true, dry_run: true, profile: cfg.profile, machine: cfg.machine.name, config_path: configPath, steps }, null, 2));
+    return;
+  }
+  console.log(`lifecycle repair plan profile=${cfg.profile} machine=${cfg.machine.name} config=${configPath}`);
+  for (const step of steps) {
+    console.log(`- ${step.name}: ${step.detail}`);
+    console.log(`  ${step.command}`);
+  }
+  if (!steps.length) {
+    console.log("(no steps selected)");
+  }
+}
+
+async function commandLifecycleRepair(args: ParsedArgs): Promise<void> {
+  const configPath = lifecycleConfigPath(args);
+  const cfg = await loadConfig(configPath, flag(args, "profile"), flag(args, "root"));
+  if (hasFlag(args, "dry-run")) {
+    printLifecycleRepairPlan(cfg, args, configPath);
+    return;
+  }
+  if (hasFlag(args, "json")) {
+    throw new Error("lifecycle repair --json is only supported with --dry-run; use lifecycle status --json after repair for machine-readable diagnostics");
+  }
+  if (!hasFlag(args, "no-runtime")) {
+    await commandApplyRuntime({ ...args, flags: { ...args.flags, config: configPath, profile: cfg.profile } }, false);
+  }
+  if (!hasFlag(args, "no-guidance") && usesLocalHarnessGuidance(cfg)) {
+    const touched = await repairLocalClientGuidance(cfg);
+    console.log(`local guidance repaired: ${touched.length ? touched.join(", ") : "(none)"}`);
+  }
+  if (!hasFlag(args, "no-daemon") && usesBrainstackDaemon(cfg)) {
+    const daemonFlags: ParsedArgs["flags"] = { ...args.flags, config: configPath, profile: cfg.profile };
+    delete daemonFlags["dry-run"];
+    if (!hasFlag(args, "no-start")) {
+      daemonFlags.start = true;
+    }
+    await commandDaemonInstall({ command: "daemon", positional: ["install"], flags: daemonFlags });
+  }
+  if (!hasFlag(args, "no-hooks")) {
+    const hooksFlags: ParsedArgs["flags"] = { ...args.flags, config: configPath, target: requireFlagValue(args, "target") || "all" };
+    delete hooksFlags["dry-run"];
+    await commandHooks({ command: "hooks", positional: ["install"], flags: hooksFlags });
+  }
+  if (!hasFlag(args, "no-skills")) {
+    for (const target of lifecycleTargetsFromArgs(args)) {
+      const skillFlags: ParsedArgs["flags"] = { ...args.flags, config: configPath, target };
+      delete skillFlags["dry-run"];
+      if (!hasFlag(args, "sync-skills")) {
+        skillFlags["no-sync"] = true;
+      }
+      await commandSkills({ command: "skills", positional: ["refresh"], flags: skillFlags });
+    }
+  }
+  if (!hasFlag(args, "no-status")) {
+    await commandStatus({
+      command: "status",
+      positional: [],
+      flags: { config: configPath, "timeout-ms": requireFlagValue(args, "timeout-ms") || "3000" }
+    });
+  }
+}
+
+async function commandLifecycleUpgrade(args: ParsedArgs): Promise<void> {
+  const configPath = lifecycleConfigPath(args);
+  const cfg = await loadConfig(configPath, flag(args, "profile"), flag(args, "root"));
+  if (hasFlag(args, "dry-run")) {
+    console.log(`lifecycle upgrade dry-run profile=${cfg.profile} machine=${cfg.machine.name} config=${configPath}`);
+    console.log("- backup current runtime state");
+    console.log("- refresh generated runtime artifacts without seeding canonical shared-brain content");
+    if (!hasFlag(args, "no-daemon") && usesBrainstackDaemon(cfg)) {
+      console.log(`- reinstall local daemon service${hasFlag(args, "no-start") ? "" : " and start it"}`);
+    }
+    if (!hasFlag(args, "no-status")) {
+      console.log("- run bounded aggregate status");
+    }
+    return;
+  }
+  await commandApplyRuntime({ ...args, flags: { ...args.flags, config: configPath, profile: cfg.profile } }, true);
+  if (!hasFlag(args, "no-daemon") && usesBrainstackDaemon(cfg)) {
+    const daemonFlags: ParsedArgs["flags"] = { ...args.flags, config: configPath, profile: cfg.profile };
+    if (!hasFlag(args, "no-start")) {
+      daemonFlags.start = true;
+    }
+    await commandDaemonInstall({ command: "daemon", positional: ["install"], flags: daemonFlags });
+  }
+  if (!hasFlag(args, "no-status")) {
+    await commandStatus({
+      command: "status",
+      positional: [],
+      flags: { config: configPath, "timeout-ms": requireFlagValue(args, "timeout-ms") || "3000" }
+    });
+  }
+}
+
+async function commandLifecycleUninstall(args: ParsedArgs): Promise<void> {
+  if (commandHasHelp(args)) {
+    console.log(lifecycleUsage());
+    return;
+  }
+  const configPath = lifecycleConfigPath(args);
+  const cfg = await loadConfig(configPath, flag(args, "profile"), flag(args, "root"));
+  const scope = requireFlagValue(args, "scope") || (runsBraind(cfg) ? "all" : destroyScopeFromProfile(cfg.profile));
+  await commandDestroy({ ...args, command: "destroy", positional: [], flags: { ...args.flags, config: configPath, profile: cfg.profile, scope } });
+}
+
+async function commandLifecycle(args: ParsedArgs): Promise<void> {
+  const sub = args.positional[0] || "status";
+  if (sub === "help" || sub === "--help" || sub === "-h") {
+    console.log(lifecycleUsage());
+    return;
+  }
+  switch (sub) {
+    case "status":
+      return await commandStatus({ ...args, positional: args.positional.slice(1), flags: { ...args.flags, config: lifecycleConfigPath(args) } });
+    case "repair":
+      return await commandLifecycleRepair({ ...args, positional: args.positional.slice(1) });
+    case "upgrade":
+      return await commandLifecycleUpgrade({ ...args, positional: args.positional.slice(1) });
+    case "uninstall":
+    case "remove":
+    case "destroy":
+      return await commandLifecycleUninstall({ ...args, positional: args.positional.slice(1) });
+    default:
+      throw new Error(`Unknown lifecycle subcommand: ${sub}\n${lifecycleUsage()}`);
+  }
+}
+
 async function copyIfExists(source: string, target: string): Promise<void> {
   if (!existsSync(source)) {
     return;
@@ -12356,6 +12663,10 @@ async function removeFileIfExact(path: string, expectedContent: string, dryRun: 
 }
 
 async function commandDestroy(args: ParsedArgs): Promise<void> {
+  if (commandHasHelp(args)) {
+    console.log("Usage: brainctl destroy --config brainstack.yaml [--profile ...] --dry-run|--yes [--scope control|worker|client|all] [--remove-shared-brain] [--remove-private-brain] [--remove-tailscale-serve]");
+    return;
+  }
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
   const dryRun = hasFlag(args, "dry-run");
   const scope = (flag(args, "scope") || "all") as DestroyScope;
@@ -13132,6 +13443,8 @@ async function main(): Promise<void> {
       return await commandDoctor(args);
     case "status":
       return await commandStatus(args);
+    case "lifecycle":
+      return await commandLifecycle(args);
     case "daemon":
       return await commandDaemon(args);
     case "updates":

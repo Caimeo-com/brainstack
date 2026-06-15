@@ -36,33 +36,37 @@ brainctl import skill ~/.codex/skills/brainstack/SKILL.md --config ~/.config/bra
 brainctl import skill https://github.com/example/skill-repo --config ~/.config/brainstack/brainstack.yaml
 brainctl import skills --config ~/.config/brainstack/brainstack.yaml
 brainctl import skills --config ~/.config/brainstack/brainstack.yaml --apply
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml
 brainctl skills refresh --config ~/.config/brainstack/brainstack.yaml --target codex
 brainctl skills doctor --dir ~/.codex/skills --check-remote
 ```
 
-Local `SKILL.md` inputs package the whole parent folder. Directory inputs must contain `SKILL.md`. URL inputs fetch a raw skill file or clone a repository/tree URL. Raw-file URL imports block private network targets by default; use `--allow-private-url` only for trusted private sources. Refresh installs validated shared skill packages from the local shared-brain clone and refuses to overwrite unmarked local skill directories unless `--force` is passed.
+Local `SKILL.md` inputs package the whole parent folder. Directory inputs must contain `SKILL.md`. URL inputs fetch a raw skill file or clone a repository/tree URL. Raw-file URL imports block private network targets by default; use `--allow-private-url` only for trusted private sources. `lifecycle repair` is the routine installed-machine repair path; narrow `skills refresh` installs validated shared skill packages from the local shared-brain clone and refuses to overwrite unmarked local skill directories unless `--force` is passed.
 
 `import skills` is the no-side-effect bulk planner. It scans the current directory plus default Codex, Claude, and Cursor skill roots, reports which skills would become global shared-brain imports, notes duplicate and already-current skills, and writes only when `--apply` is passed.
 
 Harness hooks can run refresh in the background:
 
 ```bash
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml --dry-run
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml
 brainctl hooks install --target all --config ~/.config/brainstack/brainstack.yaml
 brainctl hooks status --target all
 brainctl hooks remove --target all
 ```
 
-Hooks are fail-open convenience integration; they must not be required for shared-brain correctness.
+Hooks are fail-open convenience integration; they must not be required for shared-brain correctness. Use `hooks install` directly only when you want to touch hook config without the rest of lifecycle repair.
 
 Client and worker machines can also run the local daemon:
 
 ```bash
+brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml
 brainctl daemon install --config ~/.config/brainstack/brainstack.yaml
 brainctl daemon install --config ~/.config/brainstack/brainstack.yaml --start
 brainctl daemon status --config ~/.config/brainstack/brainstack.yaml
 brainctl daemon once --config ~/.config/brainstack/brainstack.yaml
 ```
 
-`brainstackd` is `brainctl daemon run`, not a separate binary. It keeps the local shared-brain clone, outbox, and shared skills fresh in the background; hooks read its status and stay fail-open if it is unavailable.
+`lifecycle repair` is the normal path after enrollment. `brainstackd` is `brainctl daemon run`, not a separate binary. It keeps the local shared-brain clone, outbox, and shared skills fresh in the background; hooks read its status and stay fail-open if it is unavailable.
 
 Keep this package generic. Do not add private hostnames, personal paths, live tokens, Telegram chat ids, tailnet names, or customer-specific topology. Operators who need exact machine names or service paths should maintain a private local overlay skill outside this package.
