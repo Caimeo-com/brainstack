@@ -31,10 +31,24 @@ checksum() {
 commit="$(git rev-parse --short HEAD)"
 version="${BRAINSTACK_RELEASE_VERSION:-$commit}"
 targets="${BRAINSTACK_RELEASE_TARGETS:-darwin-arm64 darwin-x64 linux-arm64 linux-x64}"
+default_install_version="${BRAINSTACK_RELEASE_INSTALL_VERSION:-}"
 
 case "$version" in
   ""|*[!A-Za-z0-9._-]*)
     echo "release refused: invalid BRAINSTACK_RELEASE_VERSION: $version" >&2
+    exit 1
+    ;;
+esac
+if [ -z "$default_install_version" ]; then
+  case "$version" in
+    latest|v*) default_install_version="$version" ;;
+    *) default_install_version="v$version" ;;
+  esac
+fi
+case "$default_install_version" in
+  latest|v[A-Za-z0-9._-]*) ;;
+  *)
+    echo "release refused: invalid BRAINSTACK_RELEASE_INSTALL_VERSION: $default_install_version" >&2
     exit 1
     ;;
 esac
@@ -87,7 +101,8 @@ done
 } >> "$manifest_tmp"
 
 mv "$manifest_tmp" dist/manifest.json
-install -m 0755 scripts/install.sh dist/install.sh
+sed "s|^version=\"\${BRAINSTACK_VERSION:-latest}\"$|version=\"\${BRAINSTACK_VERSION:-$default_install_version}\"|" scripts/install.sh > dist/install.sh
+chmod 0755 dist/install.sh
 
 archive="dist/brainstack-${version}.tar.gz"
 git archive --format=tar.gz --prefix="brainstack-${version}/" HEAD > "$archive"

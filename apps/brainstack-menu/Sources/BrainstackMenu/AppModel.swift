@@ -383,7 +383,7 @@ final class AppModel: ObservableObject {
   func copySetupCommand() {
     let pasteboard = NSPasteboard.general
     pasteboard.clearContents()
-    pasteboard.setString("curl -fsSL https://github.com/Caimeo-com/brainstack/releases/latest/download/install.sh | sh", forType: .string)
+    pasteboard.setString("curl -fsSL https://github.com/Caimeo-com/brainstack/releases/download/v\(AppVersion.current)/install.sh | sh", forType: .string)
   }
 
 }

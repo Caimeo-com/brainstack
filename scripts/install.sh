@@ -3,7 +3,7 @@ set -eu
 
 usage() {
   cat <<'USAGE'
-Usage: install.sh [--invite-file FILE|-] [--version vX.Y.Z|latest] [--base-url URL] [--bin-dir DIR] [--config FILE] [--skills-profile client|operator|control|worker|none] [--skip-enroll] [--skip-init] [--skip-skills] [--skip-doctor] [--force]
+Usage: install.sh [--invite-file FILE] [--version vX.Y.Z|latest] [--base-url URL] [--bin-dir DIR] [--config FILE] [--skills-profile client|operator|control|worker|none] [--skip-enroll] [--skip-init] [--skip-skills] [--skip-doctor] [--force]
 
 Downloads the platform-specific brainctl binary, verifies its SHA256 sidecar,
 installs it to the target bin directory, and optionally runs brainctl enroll.
@@ -15,7 +15,7 @@ for one after brainctl is installed. That keeps token-bearing invites out of
 shell history, environment snapshots, and brainctl argv.
 
 Flags:
-  --invite-file FILE|-    Read a private invite from FILE or stdin.
+  --invite-file FILE      Read a private invite from FILE.
   --version TAG|latest    Download a GitHub release tag or latest release.
   --base-url URL          Download assets from URL instead of GitHub releases.
   --bin-dir DIR           Install brainctl into DIR. Default: $HOME/.local/bin.
@@ -151,6 +151,12 @@ done
 
 if [ -n "$invite" ] && [ -n "$invite_file" ]; then
   echo "install.sh: use either --invite or --invite-file, not both" >&2
+  exit 2
+fi
+
+if [ "$invite_file" = "-" ]; then
+  echo "install.sh: --invite-file - is not supported because curl-piped installers already use stdin for the script" >&2
+  echo "install.sh: paste the invite at the prompt or save it to a chmod 600 file and pass --invite-file /path/to/invite.txt" >&2
   exit 2
 fi
 

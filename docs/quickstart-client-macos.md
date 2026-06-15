@@ -18,7 +18,7 @@ brainctl invite create \
   --ssh-known-hosts-file ~/.config/brainstack/control_ssh_known_hosts
 ```
 
-Run the printed command on the Mac after the selected release exists, then paste the printed invite at the prompt. The installer keeps the invite out of `brainctl` argv by writing it to a private temporary file and calling `brainctl enroll --invite-file ...`; enrollment writes `~/.config/brainstack/brainstack.yaml`, installs pinned SSH host keys when embedded, clones the shared brain, installs harness guidance, installs the default Codex client skill bundle when the invite uses Codex, and runs doctor unless `--skip-doctor` is passed to the installer.
+Run the printed command on the Mac after the selected release exists, then paste the printed invite at the prompt. The printed command is pinned to the Brainstack package release by default, and release-built `install.sh` is stamped so it downloads `brainctl` from the same tag. Pass `--install-version latest` only when you intentionally want a moving installer. The installer keeps the invite out of `brainctl` argv by writing it to a private temporary file and calling `brainctl enroll --invite-file ...`; enrollment writes `~/.config/brainstack/brainstack.yaml`, installs pinned SSH host keys when embedded, clones the shared brain, installs harness guidance, installs the default Codex client skill bundle when the invite uses Codex, and runs doctor unless `--skip-doctor` is passed to the installer.
 
 If this Mac is the operator's daily-driver machine, create the invite with the operator skill bundle:
 
@@ -33,7 +33,7 @@ brainctl invite create \
 
 `--ssh-known-hosts-file` should contain the control SSH host pin for the `--control-ssh` target. Extra entries are ignored; a file with no matching control-host pin is rejected.
 
-For scripted setup, save the invite to a `chmod 600` file and pass `--invite-file /path/to/invite.txt`. Avoid `--invite bs1_...` on shared machines because token-bearing invites can otherwise land in shell history or process listings.
+For scripted setup, save the invite to a `chmod 600` file and pass `--invite-file /path/to/invite.txt`. Do not pass `--invite-file -` to the installer when using `curl ... | sh`; stdin is already the installer script. Avoid `--invite bs1_...` on shared machines because token-bearing invites can otherwise land in shell history or process listings.
 
 Skill profile values:
 

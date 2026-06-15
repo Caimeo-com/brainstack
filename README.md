@@ -73,11 +73,10 @@ brainctl invite create \
 Then run the release installer on the client machine after publishing release assets:
 
 ```bash
-RELEASE_TAG=vX.Y.Z
-curl -fsSL "https://github.com/Caimeo-com/brainstack/releases/download/$RELEASE_TAG/install.sh" | sh
+curl -fsSL 'https://github.com/Caimeo-com/brainstack/releases/download/vX.Y.Z/install.sh' | sh
 ```
 
-Paste the printed invite when prompted. The installer only downloads and verifies `brainctl`; enrollment, config rendering, token installation, client bootstrap, and post-install doctor checks live in the versioned CLI. See [`docs/install-one-line.md`](./docs/install-one-line.md).
+Paste the printed invite when prompted. `brainctl invite create` pins the generated installer command to the package release by default, and release-built `install.sh` is stamped so it downloads `brainctl` from the same tag. Pass `--install-version latest` only when you deliberately want a moving release. The installer only downloads and verifies `brainctl`; enrollment, config rendering, token installation, client bootstrap, and post-install doctor checks live in the versioned CLI. See [`docs/install-one-line.md`](./docs/install-one-line.md).
 
 Use `brainctl invite create --skills-profile operator` for an admin or daily-driver machine that should receive every public Brainstack skill during enrollment. The default `client` profile is for ordinary enrolled machines. Installer flags can override the invite: `--skills-profile client|operator|control|worker|none`, `--skip-skills`, `--skip-doctor`, `--skip-init`, and `--skip-enroll` are documented in [`docs/install-one-line.md`](./docs/install-one-line.md#flag-reference).
 

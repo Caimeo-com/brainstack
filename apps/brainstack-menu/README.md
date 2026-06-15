@@ -49,12 +49,16 @@ NOTARY_PROFILE=BrainstackNotary scripts/make-app.sh --notarize
 # → dist/BrainstackMenu-<version>.zip + .dmg (stapled and Gatekeeper-checked)
 ```
 
-The repo release script can attach it as a release asset:
+The repo release script can attach it as an optional release asset:
 
 ```bash
 BRAINSTACK_RELEASE_MENU_APP=1 NOTARY_PROFILE=BrainstackNotary scripts/release.sh
 # → dist/BrainstackMenu-<version>.zip/.dmg + .sha256 files alongside the brainctl assets
 ```
+
+The GitHub release workflow always builds the CLI installer assets first and only runs
+the signed/notarized menu-app lane when `include_menu_app` is enabled. Missing Apple
+signing or notarization secrets should not block a CLI release.
 
 CI can use App Store Connect API-key notarization instead of a local notary profile by
 setting `APP_STORE_CONNECT_API_KEY_PATH`, `APP_STORE_CONNECT_API_KEY_ID`, and

@@ -8280,9 +8280,72 @@ describe("public release hygiene", () => {
       expectSuccess(result);
       const payload = JSON.parse(result.stdout);
       expect(payload.includesImportToken).toBe(false);
+      expect(payload.installCommand).toContain("https://github.com/Caimeo-com/brainstack/releases/download/v0.1.0/install.sh");
+      expect(payload.installCommand).not.toContain("/releases/latest/");
       const decoded = JSON.parse(Buffer.from(String(payload.invite).slice("bs1_".length), "base64url").toString("utf8"));
       expect(decoded.importToken).toBeUndefined();
       expect(result.stdout).not.toContain("must-not-be-embedded");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("invite create keeps latest explicit and rejects unsafe install URL selectors", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-invite-install-version-"));
+    try {
+      const configPath = join(dir, "control.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: control",
+          "  user: operator",
+          "  sshUser: operator",
+          "  hostname: control.example",
+          "paths:",
+          `  home: ${dir}`,
+          "brain:",
+          "  publicBaseUrl: https://control.example.ts.net",
+          "client:",
+          "  remoteSsh: operator@control.example:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+      const latest = runBrainctl(["invite", "create", "--config", configPath, "--install-version", "latest"], {
+        HOME: dir,
+        USER: "operator"
+      });
+      expectSuccess(latest);
+      expect(latest.stdout).toContain("https://github.com/Caimeo-com/brainstack/releases/latest/download/install.sh");
+      expect(latest.stdout).toContain("WARN install URL uses the moving 'latest' release");
+
+      const conflict = runBrainctl(
+        [
+          "invite",
+          "create",
+          "--config",
+          configPath,
+          "--install-version",
+          "0.1.0",
+          "--install-url",
+          "https://example.invalid/install.sh"
+        ],
+        {
+          HOME: dir,
+          USER: "operator"
+        }
+      );
+      expect(conflict.code).not.toBe(0);
+      expect(`${conflict.stdout}\n${conflict.stderr}`).toContain("either --install-url or --install-version");
+
+      const unsafeUrl = runBrainctl(["invite", "create", "--config", configPath, "--install-url", "http://example.invalid/install.sh"], {
+        HOME: dir,
+        USER: "operator"
+      });
+      expect(unsafeUrl.code).not.toBe(0);
+      expect(`${unsafeUrl.stdout}\n${unsafeUrl.stderr}`).toContain("--install-url must use https");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -8628,6 +8691,9 @@ describe("public release hygiene", () => {
   test("release build uses deterministic Bun compile flags", async () => {
     const packageJson = await readFile(join(PRODUCT_ROOT, "package.json"), "utf8");
     const releaseScript = await readFile(join(PRODUCT_ROOT, "scripts", "release.sh"), "utf8");
+    const releaseWorkflow = await readFile(join(PRODUCT_ROOT, ".github", "workflows", "release.yml"), "utf8");
+    const installDoc = await readFile(join(PRODUCT_ROOT, "docs", "install-one-line.md"), "utf8");
+    const appModel = await readFile(join(PRODUCT_ROOT, "apps", "brainstack-menu", "Sources", "BrainstackMenu", "AppModel.swift"), "utf8");
     for (const text of [packageJson, releaseScript]) {
       expect(text).toContain("--no-compile-autoload-dotenv");
       expect(text).toContain("--no-compile-autoload-bunfig");
@@ -8646,6 +8712,20 @@ describe("public release hygiene", () => {
     expect(installScript).toContain("refusing non-HTTPS download URL");
     expect(installScript).toContain("--allow-unsafe-invite");
     expect(installScript).toContain("raw invites in argv/env can leak");
+    expect(installScript).toContain("--invite-file - is not supported");
+    expect(releaseScript).toContain("BRAINSTACK_RELEASE_INSTALL_VERSION");
+    expect(releaseScript).toContain("BRAINSTACK_VERSION:-$default_install_version");
+    expect(releaseWorkflow).toContain("cli-release:");
+    expect(releaseWorkflow).toContain('BRAINSTACK_RELEASE_MENU_APP: "0"');
+    expect(releaseWorkflow).toContain("menu-app-release:");
+    expect(releaseWorkflow).toContain("include_menu_app");
+    expect(releaseWorkflow).toContain("must match package.json version");
+    expect(installDoc).not.toContain("--invite-file FILE|-");
+    expect(installDoc).toContain("Debian/Ubuntu");
+    expect(installDoc).toContain("Arch/Omarchy");
+    expect(installDoc).toContain("does not require Bun or a Brainstack source checkout");
+    expect(appModel).not.toContain("releases/latest/download/install.sh");
+    expect(appModel).toContain("AppVersion.current");
   });
 
   test("install script verifies local release checksum before installing", async () => {
@@ -8690,6 +8770,78 @@ describe("public release hygiene", () => {
       );
       expect(mismatch.code).not.toBe(0);
       expect(`${mismatch.stdout}\n${mismatch.stderr}`).toContain("checksum mismatch");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("install script uses explicit GitHub release version for binary downloads", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainstack-install-script-version-url-"));
+    try {
+      const binDir = join(dir, "bin");
+      const curlLog = join(dir, "curl.log");
+      const fakeBin = join(dir, "fake-bin");
+      await mkdir(fakeBin, { recursive: true });
+      const os = process.platform === "darwin" ? "darwin" : process.platform === "linux" ? "linux" : "unsupported";
+      const arch = process.arch === "arm64" ? "arm64" : "x64";
+      if (os === "unsupported") {
+        return;
+      }
+      const asset = `brainctl-${os}-${arch}`;
+      const assetBody = "#!/usr/bin/env sh\necho fake brainctl\n";
+      const assetHash = sha256Text(assetBody);
+      await writeFile(
+        join(fakeBin, "curl"),
+        [
+          "#!/usr/bin/env bash",
+          "set -euo pipefail",
+          "out=''",
+          "url=''",
+          "while [ $# -gt 0 ]; do",
+          "  case \"$1\" in",
+          "    -o) out=\"$2\"; shift 2 ;;",
+          "    http*) url=\"$1\"; shift ;;",
+          "    *) shift ;;",
+          "  esac",
+          "done",
+          `printf '%s\\n' "$url" >> ${shellQuote(curlLog)}`,
+          "case \"$url\" in",
+          `  *.sha256) printf '%s  %s\\n' ${shellQuote(assetHash)} ${shellQuote(asset)} > "$out" ;;`,
+          `  *) printf '%s' ${shellQuote(assetBody)} > "$out" ;;`,
+          "esac",
+          ""
+        ].join("\n")
+      );
+      await chmod(join(fakeBin, "curl"), 0o755);
+      const installed = runCommand(["sh", "scripts/install.sh", "--version", "v1.2.3", "--bin-dir", binDir, "--skip-enroll"], {
+        cwd: PRODUCT_ROOT,
+        env: {
+          HOME: join(dir, "home"),
+          PATH: `${fakeBin}:${process.env.PATH || ""}`
+        }
+      });
+      expectSuccess(installed);
+      const urls = await readFile(curlLog, "utf8");
+      expect(urls).toContain(`https://github.com/Caimeo-com/brainstack/releases/download/v1.2.3/${asset}`);
+      expect(urls).toContain(`https://github.com/Caimeo-com/brainstack/releases/download/v1.2.3/${asset}.sha256`);
+      expect(urls).not.toContain("/releases/latest/");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("install script rejects stdin invite before download", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainstack-install-script-stdin-invite-"));
+    try {
+      const refused = runCommand(["sh", "scripts/install.sh", "--invite-file", "-", "--bin-dir", join(dir, "bin")], {
+        cwd: PRODUCT_ROOT,
+        env: {
+          HOME: join(dir, "home")
+        }
+      });
+      expect(refused.code).toBe(2);
+      expect(`${refused.stdout}\n${refused.stderr}`).toContain("--invite-file - is not supported");
+      expect(`${refused.stdout}\n${refused.stderr}`).toContain("stdin");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

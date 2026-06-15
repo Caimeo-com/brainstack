@@ -39,6 +39,7 @@ import portableBrainCuratorSkill from "../../skills/brain-curator/SKILL.md" with
 import portableBrainstackSkill from "../../skills/brainstack/SKILL.md" with { type: "text" };
 import portableRemoteMachineOpsSkill from "../../skills/remote-machine-ops/SKILL.md" with { type: "text" };
 import portableSharedBrainClientSkill from "../../skills/shared-brain-client/SKILL.md" with { type: "text" };
+import packageJsonText from "../../../package.json" with { type: "text" };
 
 type Profile = "single-node" | "control" | "worker" | "client-macos" | "private-journal";
 const SUPPORTED_PROFILES: Profile[] = ["single-node", "control", "worker", "client-macos"];
@@ -255,7 +256,16 @@ const CLIENT_INVITE_TYPE = "brainstack-client-invite";
 const CLIENT_INVITE_MAX_CHARS = 128 * 1024;
 const CLIENT_INVITE_KNOWN_HOSTS_MAX_ENTRIES = 128;
 const CLIENT_INVITE_KNOWN_HOSTS_MAX_LINE_BYTES = 4096;
-const DEFAULT_INSTALL_URL = "https://github.com/Caimeo-com/brainstack/releases/latest/download/install.sh";
+const GITHUB_RELEASE_DOWNLOAD_BASE = "https://github.com/Caimeo-com/brainstack/releases/download";
+const LATEST_INSTALL_URL = "https://github.com/Caimeo-com/brainstack/releases/latest/download/install.sh";
+const BRAINSTACK_PACKAGE_VERSION = (() => {
+  try {
+    const parsed = JSON.parse(packageJsonText) as { version?: unknown };
+    return typeof parsed.version === "string" && parsed.version.trim() ? parsed.version.trim() : "latest";
+  } catch {
+    return "latest";
+  }
+})();
 const CLIENT_BOOTSTRAP_TEMPLATE_NAMES = [
   "client.env.example",
   "codex-shared-brain.include.md",
@@ -333,7 +343,7 @@ function usage(): string {
   brainctl import codex-session <SESSION_ID|JSONL_PATH> [--config brainstack.yaml] [--include-transcript] [--max-bytes N] [--dry-run] [--json]
   brainctl hooks install|status|remove [--target codex|claude|cursor|all] [--config brainstack.yaml] [--brainctl PATH_OR_COMMAND] [--dry-run]
   brainctl hook run --harness codex|claude|cursor --event EVENT [--config brainstack.yaml]
-  brainctl invite create --config brainstack.yaml [--import-token-file FILE|--import-token-env ENV] [--ssh-known-hosts-file FILE] [--control-ssh SSH_TARGET] [--control-repo PATH] [--skills-profile client|operator|control|worker|none] [--expires-hours N] [--install-url URL] [--json]
+  brainctl invite create --config brainstack.yaml [--import-token-file FILE|--import-token-env ENV] [--ssh-known-hosts-file FILE] [--control-ssh SSH_TARGET] [--control-repo PATH] [--skills-profile client|operator|control|worker|none] [--expires-hours N] [--install-version TAG|latest|--install-url URL] [--allow-insecure-install-url] [--json]
   brainctl enroll --invite bs1_...|--invite-file FILE|- [--config brainstack.yaml] [--skills-profile client|operator|control|worker|none] [--skip-skills] [--skip-init] [--skip-doctor] [--force]
   brainctl join-worker --config brainstack.yaml --worker WORKER_HOST [--ssh-user USER] [--out DIR]
   brainctl trust-worker --config brainstack.yaml --worker WORKER_NAME [--host HOST] [--dry-run]
@@ -2566,7 +2576,7 @@ function installHint(name: string): string {
   const osRelease = existsSync("/etc/os-release") ? readFileSync("/etc/os-release", "utf8").toLowerCase() : "";
   if (process.platform === "darwin") {
     if (name === "bun") return "Install Bun: curl -fsSL https://bun.sh/install | bash";
-    if (name === "tailscale") return "Install Tailscale: brew install --cask tailscale";
+    if (name === "tailscale") return "Install Tailscale from https://tailscale.com/download/mac, or use brew install --cask tailscale if you already use Homebrew.";
     if (name === "git") return "Install Git: xcode-select --install or brew install git";
     if (name === "ssh") return "OpenSSH client is normally built in; install Xcode Command Line Tools if missing.";
     if (name === "sshd") return "Enable Remote Login in macOS Sharing settings if this machine must accept SSH.";
@@ -7608,6 +7618,58 @@ async function inviteImportToken(args: ParsedArgs): Promise<string | undefined> 
   return undefined;
 }
 
+function normalizeInstallReleaseTag(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error("--install-version must not be empty");
+  }
+  if (trimmed === "latest") {
+    return "latest";
+  }
+  const tag = trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
+  if (!/^v[A-Za-z0-9._-]+$/.test(tag)) {
+    throw new Error(`invalid Brainstack release tag: ${trimmed}`);
+  }
+  return tag;
+}
+
+function releaseInstallUrlForTag(tag: string): string {
+  const normalized = normalizeInstallReleaseTag(tag);
+  return normalized === "latest" ? LATEST_INSTALL_URL : `${GITHUB_RELEASE_DOWNLOAD_BASE}/${normalized}/install.sh`;
+}
+
+function defaultInviteInstallUrl(): string {
+  return releaseInstallUrlForTag(BRAINSTACK_PACKAGE_VERSION);
+}
+
+function validateInviteInstallUrl(url: string, args: ParsedArgs): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`invalid --install-url: ${url}`);
+  }
+  if (parsed.protocol !== "https:" && !hasFlag(args, "allow-insecure-install-url")) {
+    throw new Error("--install-url must use https; pass --allow-insecure-install-url only for local release smoke tests");
+  }
+  return url;
+}
+
+function inviteInstallUrl(args: ParsedArgs): string {
+  const explicitUrl = requireFlagValue(args, "install-url");
+  const explicitVersion = requireFlagValue(args, "install-version");
+  if (explicitUrl && explicitVersion) {
+    throw new Error("invite create accepts either --install-url or --install-version, not both");
+  }
+  if (explicitUrl) {
+    return validateInviteInstallUrl(explicitUrl, args);
+  }
+  if (explicitVersion) {
+    return releaseInstallUrlForTag(explicitVersion);
+  }
+  return defaultInviteInstallUrl();
+}
+
 function inviteInstallCommand(installUrl: string): string {
   return `curl -fsSL ${shellSingleQuote(installUrl)} | sh`;
 }
@@ -7670,7 +7732,7 @@ async function commandInviteCreate(args: ParsedArgs): Promise<void> {
     throw new Error("invite create requires client.remoteSsh in config or --brain-remote");
   }
   const invite = encodeClientInvite(invitePayload);
-  const installUrl = requireFlagValue(args, "install-url") || DEFAULT_INSTALL_URL;
+  const installUrl = inviteInstallUrl(args);
   const installCommand = inviteInstallCommand(installUrl);
 
   // Token-bearing invites are bearer secrets: never print them to stdout by default,
@@ -7710,7 +7772,8 @@ async function commandInviteCreate(args: ParsedArgs): Promise<void> {
     console.log(invite);
   } else {
     console.log(`Invite written to: ${invitePath}`);
-    console.log("Transfer it over a private channel and pass it to the installer with --invite-file, or pipe it on stdin.");
+    console.log("Transfer it over a private channel and pass it to the installer with --invite-file.");
+    console.log("Do not use installer --invite-file - with `curl | sh`; stdin is already the installer script.");
     console.log("Use --print-secret to print the invite to stdout instead (it will land in terminal scrollback).");
   }
   console.log("");
@@ -7720,9 +7783,9 @@ async function commandInviteCreate(args: ParsedArgs): Promise<void> {
   console.log(`codex skills profile: ${skillsProfile}`);
   if (importToken) {
     console.log("treat the invite as a bearer secret; avoid putting it in shell history or shared logs.");
-    if (/\/releases\/latest\//.test(installUrl)) {
-      console.log("WARN install URL uses the moving 'latest' release; pass --install-url with a pinned release tag so enrollment installs a known binary.");
-    }
+  }
+  if (/\/releases\/latest\//.test(installUrl)) {
+    console.log("WARN install URL uses the moving 'latest' release; pass --install-version vX.Y.Z or --install-url with a pinned release tag so enrollment installs a known binary.");
   }
 }
 
@@ -7734,7 +7797,7 @@ async function commandInvite(args: ParsedArgs): Promise<void> {
     case "help":
     case "--help":
     case "-h":
-      console.log("Usage: brainctl invite create --config brainstack.yaml [--import-token-file FILE|--import-token-env ENV] [--ssh-known-hosts-file FILE] [--control-ssh SSH_TARGET] [--control-repo PATH] [--skills-profile client|operator|control|worker|none] [--expires-hours N] [--install-url URL] [--out FILE] [--print-secret] [--json]");
+      console.log("Usage: brainctl invite create --config brainstack.yaml [--import-token-file FILE|--import-token-env ENV] [--ssh-known-hosts-file FILE] [--control-ssh SSH_TARGET] [--control-repo PATH] [--skills-profile client|operator|control|worker|none] [--expires-hours N] [--install-version TAG|latest|--install-url URL] [--allow-insecure-install-url] [--out FILE] [--print-secret] [--json]");
       return;
     default:
       throw new Error(`Unknown invite command: ${subcommand}`);

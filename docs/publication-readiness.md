@@ -23,20 +23,20 @@ Before sharing brainstack with another machine or person:
 
 ## Release Artifacts
 
-Current-platform binary:
+CLI release assets:
 
 ```bash
 cd ~/brainstack
 scripts/release.sh
 ```
 
-The release script refuses dirty trees, runs `bun install --frozen-lockfile`, runs `bun test`, builds `dist/brainctl`, and emits a source archive from `git archive`.
+The release script refuses dirty trees, runs `bun install --frozen-lockfile`, runs `bun test`, builds `dist/brainctl-darwin-arm64`, `dist/brainctl-darwin-x64`, `dist/brainctl-linux-arm64`, `dist/brainctl-linux-x64`, copies `dist/install.sh`, emits `dist/manifest.json`, and writes a source archive from `git archive`. Every binary and archive gets a `.sha256` sidecar. Release-built `dist/install.sh` is stamped with the release tag so a pinned installer URL downloads the matching `brainctl` binary by default.
 
 The `brainctl` binary is compiled with `--no-compile-autoload-dotenv` and `--no-compile-autoload-bunfig`. Those flags keep release artifacts from inheriting local release-machine `.env` or `bunfig.toml` behavior. The binary embeds the client bootstrap templates so a Mac client can provision, doctor, init, and render `bootstrap-client` without a source checkout or Bun. `braind` and `telemux` are intentionally not compiled by default; they run from source under Bun so service behavior stays inspectable.
 
 Generated source-run services use `bun --no-env-file run ...` for the same reason: service env must come from explicit runtime/secrets env files, not ambient repo `.env` loading.
 
-Cross-compilation can be added later with Bun compile targets after target support is verified on the release host.
+The GitHub release workflow publishes the CLI installer assets without Apple signing secrets. The signed/notarized macOS menu app is an optional lane so Developer ID or notary failures do not block the one-command install release.
 
 ## Review Handoff Bundles
 

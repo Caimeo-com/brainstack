@@ -18,6 +18,33 @@ Then open a new shell or export Bun's bin path:
 export PATH="$HOME/.bun/bin:$PATH"
 ```
 
+On Debian/Ubuntu-style Linux:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git openssh-client openssh-server
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo systemctl enable --now ssh.service tailscaled.service
+curl -fsSL https://bun.sh/install | bash
+```
+
+On Fedora-style Linux:
+
+```bash
+sudo dnf install -y git openssh-clients openssh-server
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo systemctl enable --now sshd.service tailscaled.service
+curl -fsSL https://bun.sh/install | bash
+```
+
+On a macOS client-only machine:
+
+```bash
+xcode-select --install
+```
+
+Then install and sign in to Tailscale from `https://tailscale.com/download/mac`. OpenSSH is normally built into macOS, and Git comes from Xcode Command Line Tools. Install and authenticate the selected harness (`Codex.app`, Codex CLI, or Claude Code) before enrollment. A compiled `brainctl` client install does not require Bun, Homebrew, or a Brainstack source checkout.
+
 Install and authenticate the selected harness, usually Codex or Claude, before running Brainstack provisioning. Brainstack only verifies the harness; it does not create harness accounts or permission-bypass settings.
 
 On a macOS client using a compiled `brainctl` binary, Bun and a Brainstack source checkout are not prerequisites. Install Git, SSH, Tailscale for the current tailnet workflow, and the selected harness, then use `docs/quickstart-client-macos.md`. For the lowest-friction path, create a control-host invite with `brainctl invite create` and run the printed one-line installer on the Mac. The compiled binary embeds client bootstrap templates and public Codex skills. Bun remains required for control, worker, and single-node machines because those profiles run Brainstack services from source.
