@@ -29,10 +29,12 @@ Proposal generation is automatic; wiki mutation is policy-controlled (`curation.
    Prefer `scope=repo` or `scope=project` unless the lesson is truly global. Add `--needs-human` when a future harness would not know where the lesson applies and where it does not.
 5. Run the intelligibility test before submitting memory: "Would a future harness, with no original thread context, know where this applies and where it does not?" If no, enrich it or park it as `needs-human`.
 6. Risk guidance: `low` = additive, sourced, small (Status/Sources pages); `medium` = restructuring or prose edits; `high` = deletions, decision changes, runbooks.
-7. In `auto` mode only low-risk proposals inside `curation.autoApply.allowedPaths` apply automatically; everything else stays `pending` or `needs-human` for `brainctl proposals approve|reject|apply`.
+7. In `auto` mode only low-risk proposals inside `curation.autoApply.allowedPaths` apply automatically; everything else stays `pending` or `needs-human` for explicit Accept/reject review. Accept is the user-facing apply path; the low-level `approve` command exists only for compatibility.
 
-Use `brainctl proposals clusters` to find related old or candidate memories that should be reviewed together. Legacy title/body-only `Remember:` proposals are expected to show as `needs-human`/`needs-context` until enriched.
+Use `brainctl proposals groups` to find related old or candidate memories that should be reviewed together. Review groups are deterministic hints from project/repo/scope/kind/topic metadata; Brainstack does not use embeddings or cosine thresholds for this path. Legacy title/body-only `Remember:` proposals are expected to show as `needs-human`/`needs-context` until enriched.
 
 Use `brainctl proposals enrich <id>` when a context-poor legacy memory has enough known project/scope/applicability/evidence context to become a structured replacement proposal. Use `brainctl proposals reprocess --status needs-human` for a dry-run batch plan, then add `--apply` only after checking the generated envelope. Enrichment creates replacement proposals; it does not apply wiki edits or mutate the original legacy proposal.
+
+Use `brainctl proposals merge-group <group-key|label>` when a group contains overlapping scoped lessons. It is dry-run by default and processes at most 20 proposals unless `--limit N` or `--all` is passed deliberately. Add `--submit` to create one consolidated proposal, and add `--close-sources` only when running on the control host with admin token available. Source proposals without a target page should be merged or enriched before they are accepted.
 
 If a useful Codex lesson is missing from proposals, first check whether the raw session evidence reached the shared brain. On the machine that owns the Codex log, use `brainctl import codex-session <SESSION_ID|JSONL_PATH>` for a bounded checkpoint or add `--include-transcript` when the full JSONL transcript should become raw evidence.

@@ -63,6 +63,8 @@ export interface BrainProposalSummary {
   quality_decision: string | null;
   project: string | null;
   scope: string | null;
+  memory_kind: string | null;
+  cluster_key: string | null;
   cluster_label: string | null;
   legacy_format: boolean;
 }
@@ -95,6 +97,8 @@ export async function fetchProposals(config: FactoryConfig, options: ProposalLis
       quality_decision: typeof proposal.quality_decision === "string" ? proposal.quality_decision : null,
       project: typeof proposal.project === "string" ? proposal.project : null,
       scope: typeof proposal.scope === "string" ? proposal.scope : null,
+      memory_kind: typeof proposal.memory_kind === "string" ? proposal.memory_kind : null,
+      cluster_key: typeof proposal.cluster_key === "string" ? proposal.cluster_key : null,
       cluster_label: typeof proposal.cluster_label === "string" ? proposal.cluster_label : null,
       legacy_format: proposal.legacy_format === true
     }));
@@ -110,11 +114,12 @@ export async function decideProposal(
   decidedBy: string,
   reason?: string
 ): Promise<{ ok: boolean; message: string }> {
+  const displayAction = action === "apply" ? "accept" : action;
   if (!config.brainBaseUrl) {
     return { ok: false, message: "BRAIN_BASE_URL is not configured." };
   }
   if (!config.brainAdminToken) {
-    return { ok: false, message: "FACTORY_BRAIN_ADMIN_TOKEN is not configured; approve/reject from Telegram is disabled. Use `brainctl proposals` on the control host." };
+    return { ok: false, message: "FACTORY_BRAIN_ADMIN_TOKEN is not configured; accept/reject from Telegram is disabled. Use `brainctl proposals` on the control host." };
   }
   try {
     const response = await fetch(new URL(`/api/proposals/${encodeURIComponent(id)}/${action}`, config.brainBaseUrl).toString(), {
@@ -134,16 +139,16 @@ export async function decideProposal(
       // Non-JSON error bodies fall through to the generic message below.
     }
     if (!response.ok) {
-      return { ok: false, message: `Proposal ${action} failed (HTTP ${response.status}): ${String(parsed.error || "unknown error").slice(0, 300)}` };
+      return { ok: false, message: `Proposal ${displayAction} failed (HTTP ${response.status}): ${String(parsed.error || "unknown error").slice(0, 300)}` };
     }
     const blocked = typeof parsed.blocked_reason === "string" ? parsed.blocked_reason : null;
     return {
       ok: true,
       message: blocked
         ? `Proposal ${id} was not applied: ${blocked}`
-        : `Proposal ${id} ${action} → status=${String(parsed.status)}${parsed.commit ? ` commit=${String(parsed.commit).slice(0, 10)}` : ""}`
+        : `Proposal ${id} ${action === "apply" ? "accepted" : action} -> status=${String(parsed.status)}${parsed.commit ? ` commit=${String(parsed.commit).slice(0, 10)}` : ""}`
     };
   } catch (error) {
-    return { ok: false, message: `Proposal ${action} failed: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, message: `Proposal ${displayAction} failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }

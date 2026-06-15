@@ -170,7 +170,7 @@ The required grant shape is directional: operator to control/worker, control to 
 - Before substantial work in a repository, run `brainctl context --repo .` and follow the returned Brainstack instructions.
 - Read freshness and source labels should come through `brainctl search --repo . "query"` instead of hand-rolled clone/pull logic.
 - Write continuity should come through `brainctl remember --repo . --summary "..."`, or the lower-level `brainctl import-text` and `brainctl propose` commands when project context is not available.
-- Legacy or context-poor memory proposals should be enriched before review: use `brainctl proposals enrich <id> ...` for one item or `brainctl proposals reprocess --status needs-human` for a dry-run batch plan, then add `--apply` to create structured replacement proposals.
+- Legacy or context-poor memory proposals should be enriched before review: use `brainctl proposals enrich <id> ...` for one item or `brainctl proposals reprocess --status needs-human` for a dry-run batch plan, then add `--apply` to create structured replacement proposals. Use `brainctl proposals groups` and `brainctl proposals merge-group <group>` for overlapping lessons; normal operator UX is Accept/reject, where Accept applies a wiki-backed proposal directly.
 - Do not manually POST to Brainstack endpoints unless explicitly instructed.
 - If a write reports idempotency `review_required`, inspect the matching record under `derived/idempotency/` and repo state before retrying with a new key; do not force replay an ambiguous side effect.
 - Client bootstrap can receive `BRAIN_IMPORT_TOKEN` or `BRAIN_IMPORT_TOKEN_FILE`; it fills the local token slot only when blank and never prints the value.

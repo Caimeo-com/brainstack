@@ -276,7 +276,7 @@ struct DashboardView: View {
       if installed == false {
         items.append(AttentionItem(
           title: "Curator routine is not installed",
-          detail: "Use Install to schedule proposal generation on the control host; wiki edits still require approval.",
+          detail: "Use Install to schedule proposal generation on the control host; wiki edits still require Accept.",
           severity: .warn,
           repair: .installCurator
         ))

@@ -57,7 +57,7 @@ struct PreferencesView: View {
 
       Section {
         Toggle("Enable Operator Mode", isOn: $model.operatorModeEnabled)
-        Text("Operator Mode exposes curator runs and proposal approve/reject/apply. Actions work when brainctl can reach admin auth locally or through the enrolled control host; the app never stores tokens.")
+        Text("Operator Mode exposes curator runs and proposal Accept/reject review. Accept applies wiki-backed proposals. Actions work when brainctl can reach admin auth locally or through the enrolled control host; the app never stores tokens.")
           .font(.caption)
           .foregroundColor(.secondary)
       } header: {

@@ -81,6 +81,10 @@ interface ProposalListRequest {
   status: string;
   quality: string | null;
   query: string;
+  project: string | null;
+  scope: string | null;
+  group: string | null;
+  kind: string | null;
   limit: number;
   help: boolean;
   error: string | null;
@@ -88,7 +92,7 @@ interface ProposalListRequest {
 
 function proposalListUsage(): string {
   return [
-    "Usage: /proposals [open|pending|needs-human|approved|applied|rejected|superseded] [ready|needs-context|needs-evidence|too-vague] [search terms|project:NAME|scope:NAME] [limit=N]",
+    "Usage: /proposals [open|pending|needs-human|approved|applied|rejected|superseded] [ready|needs-context|needs-evidence|too-vague] [search terms|project:NAME|scope:NAME|group:NAME] [limit=N]",
     "Examples:",
     "/proposals pending",
     "/proposals needs-human needs-context",
@@ -101,6 +105,10 @@ function parseProposalListRequest(text: string): ProposalListRequest {
     status: "open",
     quality: null,
     query: "",
+    project: null,
+    scope: null,
+    group: null,
+    kind: null,
     limit: DEFAULT_PROPOSAL_LIST_LIMIT,
     help: false,
     error: null
@@ -113,7 +121,7 @@ function parseProposalListRequest(text: string): ProposalListRequest {
       continue;
     }
 
-    const keyed = part.match(/^(status|quality|q|query|project|scope|cluster|kind|limit|n)[:=](.+)$/);
+    const keyed = part.match(/^(status|quality|q|query|project|scope|group|cluster|kind|limit|n)[:=](.+)$/);
     const key = keyed?.[1] || "";
     const value = keyed?.[2] || "";
     if ((key === "status" || !key) && PROPOSAL_STATUS_FILTERS.has(key ? value : part)) {
@@ -145,8 +153,20 @@ function parseProposalListRequest(text: string): ProposalListRequest {
       queryParts.push(value);
       continue;
     }
-    if (key === "project" || key === "scope" || key === "cluster" || key === "kind") {
-      queryParts.push(value);
+    if (key === "project") {
+      result.project = value;
+      continue;
+    }
+    if (key === "scope") {
+      result.scope = value;
+      continue;
+    }
+    if (key === "group" || key === "cluster") {
+      result.group = value;
+      continue;
+    }
+    if (key === "kind") {
+      result.kind = value;
       continue;
     }
     queryParts.push(rawPart);
@@ -165,6 +185,8 @@ function proposalSearchText(proposal: BrainProposalSummary): string {
     proposal.quality_decision,
     proposal.project,
     proposal.scope,
+    proposal.memory_kind,
+    proposal.cluster_key,
     proposal.cluster_label,
     proposal.legacy_format ? "legacy" : null
   ]
@@ -178,6 +200,22 @@ function matchesProposalListRequest(proposal: BrainProposalSummary, request: Pro
     return false;
   }
   if (request.quality && proposal.quality_decision !== request.quality) {
+    return false;
+  }
+  if (request.project && proposal.project?.toLowerCase() !== request.project) {
+    return false;
+  }
+  if (request.scope && proposal.scope?.toLowerCase() !== request.scope) {
+    return false;
+  }
+  if (request.kind && proposal.memory_kind?.toLowerCase() !== request.kind) {
+    return false;
+  }
+  if (
+    request.group &&
+    proposal.cluster_key?.toLowerCase() !== request.group &&
+    !proposal.cluster_label?.toLowerCase().includes(request.group)
+  ) {
     return false;
   }
   const query = request.query.toLowerCase();
@@ -901,14 +939,14 @@ export class CommandHandler {
         return;
       }
 
-      const proposalShortcut = parsed.command.match(/^\/proposal_(approve|reject)_([a-z0-9]{6,10})_(\d+)$/);
+      const proposalShortcut = parsed.command.match(/^\/proposal_(accept|approve|reject)_([a-z0-9]{6,10})_(\d+)$/);
       if (proposalShortcut) {
         const proposal = this.resolveProposalSnapshotShortcut(proposalShortcut[2] || "", proposalShortcut[3] || "", target);
         if (!proposal) {
           await this.telegram.sendText(target, "That proposal shortcut expired or the list changed. Use /proposals to refresh.");
           return;
         }
-        await this.handleProposalDecision(proposalShortcut[1] === "approve" ? "approve" : "reject", proposal, target, message.from?.id ?? null);
+        await this.handleProposalDecision(proposalShortcut[1] === "reject" ? "reject" : "accept", proposal, target, message.from?.id ?? null);
         return;
       }
 
@@ -2344,7 +2382,7 @@ export class CommandHandler {
           "/proposals needs-human needs-context",
           "/proposals open limit=10",
           "",
-          "Approve/reject shortcuts from /proposals are scoped to the list you just loaded."
+          "Accept/reject shortcuts from /proposals are scoped to the list you just loaded."
         ].join("\n")
       ]
         .filter(Boolean)
@@ -2913,7 +2951,7 @@ export class CommandHandler {
       lines.push("BRAIN_BASE_URL is not configured; only local job state is shown.");
     }
     if (!this.config.brainAdminToken) {
-      lines.push("Note: FACTORY_BRAIN_ADMIN_TOKEN is not set, so approve/reject from Telegram is disabled.");
+      lines.push("Note: FACTORY_BRAIN_ADMIN_TOKEN is not set, so accept/reject from Telegram is disabled.");
     }
     return lines.join("\n");
   }
@@ -2949,6 +2987,10 @@ export class CommandHandler {
     const label = [
       `status=${request.status}`,
       request.quality ? `quality=${request.quality}` : null,
+      request.project ? `project=${request.project}` : null,
+      request.scope ? `scope=${request.scope}` : null,
+      request.group ? `group=${request.group}` : null,
+      request.kind ? `kind=${request.kind}` : null,
       request.query ? `query="${request.query}"` : null
     ]
       .filter(Boolean)
@@ -2959,6 +3001,7 @@ export class CommandHandler {
         proposal.quality_decision ? `quality=${proposal.quality_decision}` : null,
         proposal.project ? `project=${proposal.project}` : null,
         proposal.scope ? `scope=${proposal.scope}` : null,
+        proposal.memory_kind ? `kind=${proposal.memory_kind}` : null,
         proposal.legacy_format ? "legacy" : null,
         proposal.risk ? `risk=${proposal.risk}` : null
       ]
@@ -2969,7 +3012,8 @@ export class CommandHandler {
           tags ? ` (${tags})` : ""
         }`
       );
-      lines.push(`   /proposal_approve_${token}_${index + 1}  /proposal_reject_${token}_${index + 1}`);
+      const acceptPart = proposal.target_page ? `/proposal_accept_${token}_${index + 1}` : "merge/enrich first";
+      lines.push(`   ${acceptPart}  /proposal_reject_${token}_${index + 1}`);
     });
     if (filtered.length > limited.length) {
       lines.push(`Showing ${limited.length}; narrow the search or use limit=${Math.min(filtered.length, MAX_PROPOSAL_LIST_LIMIT)}.`);
@@ -2979,7 +3023,7 @@ export class CommandHandler {
       lines.push("FACTORY_BRAIN_ADMIN_TOKEN is not set, so the shortcuts above will be refused. Use `brainctl proposals` on the control host.");
     } else {
       lines.push("");
-      lines.push("Approve applies the proposed wiki change when the proposal carries one; drift parks it as needs-human.");
+      lines.push("Accept applies the proposed wiki change. Context-only candidates need merge/enrichment first.");
       lines.push("Filter with `/proposals pending`, `/proposals needs-human needs-context`, or `/proposals open project:lindy limit=10`.");
     }
     return lines.join("\n");
@@ -3029,15 +3073,17 @@ export class CommandHandler {
   }
 
   private async handleProposalDecision(
-    action: "approve" | "reject",
+    action: "accept" | "reject",
     proposal: BrainProposalSummary,
     target: TelegramTarget,
     userId: number | null
   ): Promise<void> {
     const decidedBy = `telegram:${userId ?? "unknown"}`;
-    // Telegram approval means "make it canon": apply when the proposal carries a
-    // wiki change, otherwise record approval only.
-    const effectiveAction = action === "approve" && proposal.target_page ? "apply" : action;
+    if (action === "accept" && !proposal.target_page) {
+      await this.telegram.sendText(target, "This proposal has no wiki change attached yet. Merge its review group or enrich it before accepting.");
+      return;
+    }
+    const effectiveAction = action === "accept" ? "apply" : action;
     const result = await decideProposal(this.config, proposal.id, effectiveAction, decidedBy);
     await this.telegram.sendText(target, result.message);
   }

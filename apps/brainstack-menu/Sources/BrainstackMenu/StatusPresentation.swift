@@ -45,7 +45,7 @@ enum RepairKind: Equatable, Sendable {
     case .repairHooks:
       return ("Install/Repair Hooks", "Install or repair Brainstack hooks for Codex, Claude, and Cursor?")
     case .installCurator:
-      return ("Install Curator", "Install the brain-curator routine on the control host? It schedules proposal generation; it does not approve or apply wiki edits.")
+      return ("Install Curator", "Install the brain-curator routine on the control host? It schedules proposal generation; it does not accept or apply wiki edits.")
     }
   }
 }

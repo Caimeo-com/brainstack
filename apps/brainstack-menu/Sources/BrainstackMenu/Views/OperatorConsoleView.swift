@@ -132,7 +132,7 @@ struct OperatorConsoleView: View {
         }
       }
       Button("Install Curator Routine…") {
-        if Confirm.ask(title: "Install Curator", message: "Install the brain-curator routine on the control host? It schedules proposal generation; it does not approve or apply wiki edits.") {
+        if Confirm.ask(title: "Install Curator", message: "Install the brain-curator routine on the control host? It schedules proposal generation; it does not accept or apply wiki edits.") {
           model.runAction("Install Curator") { await $0.curatorInstall() }
         }
       }
@@ -164,11 +164,11 @@ struct OperatorConsoleView: View {
     let (label, tint, help): (String, Color, String) = {
       switch model.adminAvailability {
       case .available:
-        return ("decision path: ready", .green, "The last approve/apply/reject command reached admin auth successfully.")
+        return ("admin path: ready", .green, "The last accept/reject command reached admin auth successfully.")
       case .unavailable:
-        return ("decision path: blocked", .orange, "The last approve/apply/reject command could not reach admin auth.")
+        return ("admin path: blocked", .orange, "The last accept/reject command could not reach admin auth.")
       case .unknown:
-        return ("decision path: not tested", .secondary, "Listing and showing proposals are read-only. Approve, apply, or reject will test the admin decision path.")
+        return ("admin path: not tested", .secondary, "Listing and showing proposals are read-only. Accept or reject will test the admin path.")
       }
     }()
     return Label(label, systemImage: "key.fill")
@@ -187,7 +187,7 @@ struct OperatorConsoleView: View {
       VStack(spacing: 10) {
         Image(systemName: "doc.text.magnifyingglass").font(.largeTitle).foregroundColor(.secondary)
         Text("Select a proposal to review it.").font(.callout).foregroundColor(.secondary)
-        Text("Approve/apply changes the shared brain wiki. Nothing is ever auto-approved by this app.")
+        Text("Accept applies a wiki-backed proposal. Context-only candidates need merge or enrichment first.")
           .font(.caption)
           .foregroundColor(.secondary)
       }
@@ -399,7 +399,7 @@ private struct ProposalDetailPane: View {
       metadataRow("Domain", detail?.domain)
       metadataRow("Scope", detail?.scope ?? proposal.scope)
       metadataRow("Kind", detail?.memoryKind ?? proposal.memoryKind)
-      metadataRow("Cluster", detail?.clusterLabel ?? proposal.clusterLabel)
+      metadataRow("Review group", detail?.clusterLabel ?? proposal.clusterLabel)
       metadataRow("Related repo", detail?.relatedRepo)
       metadataRow("Review after", detail?.reviewAfter)
       metadataRow("Expires", detail?.expiresAt)
@@ -446,11 +446,14 @@ private struct ProposalDetailPane: View {
         .foregroundColor(.secondary)
       Spacer()
       Button("Reject…") { decide("reject") }
-      Button("Approve…") { decide("approve") }
       if proposal.targetPage != nil {
-        Button("Apply…") { decide("apply") }
+        Button("Accept…") { decide("apply") }
           .keyboardShortcut(.defaultAction)
           .buttonStyle(.borderedProminent)
+      } else {
+        Text("Merge or enrich before accepting.")
+          .font(.caption2)
+          .foregroundColor(.secondary)
       }
     }
     .controlSize(.regular)
@@ -464,10 +467,6 @@ private struct ProposalDetailPane: View {
     switch action {
     case "apply":
       consequence = "This APPLIES the proposed content to \(proposal.targetPage ?? "its target page") in the shared brain wiki."
-    case "approve":
-      consequence = proposal.targetPage != nil
-        ? "This marks the proposal approved. Applying it to \(proposal.targetPage!) is a separate action."
-        : "This marks the proposal approved."
     default:
       consequence = "This rejects the proposal."
     }
@@ -479,7 +478,8 @@ private struct ProposalDetailPane: View {
       "",
       consequence
     ].compactMap { $0 }.joined(separator: "\n")
-    if Confirm.ask(title: "\(action.capitalized) Proposal", message: message) {
+    let title = action == "apply" ? "Accept Proposal" : "\(action.capitalized) Proposal"
+    if Confirm.ask(title: title, message: message) {
       model.decideProposal(proposal, action: action)
     }
   }

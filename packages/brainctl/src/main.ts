@@ -343,7 +343,7 @@ function usage(): string {
   brainctl telegram send-file --file PATH [--config brainstack.yaml] [--via SSH_TARGET] [--remote-repo PATH] [--caption TEXT] [--context SLUG|--chat-id ID] [--thread-id ID] [--kind document|photo] [--max-bytes N] [--allow-sensitive] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default] [--json]
   brainctl import-text --config brainstack.yaml --title TITLE --text TEXT --source-harness HARNESS --source-machine MACHINE [--source-type note]
   brainctl propose --config brainstack.yaml --title TITLE --body BODY [--target-page wiki/PATH.md] [--content-file FILE] [--base-sha256 HASH|absent] [--risk low|medium|high] [--confidence 0..1] [--curator-run-id ID] [--reason TEXT] [--needs-human] [--source-ids id1,id2] [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF]
-  brainctl proposals list|clusters|show|enrich|reprocess|approve|reject|apply [...]
+  brainctl proposals list|groups|clusters|show|enrich|reprocess|merge-group|approve|reject|apply [...]
   brainctl curator status|run|install [--config brainstack.yaml]
   brainctl context --repo PATH [--config brainstack.yaml] [--json] [--sync|--no-sync]
   brainctl search --repo PATH "query" [--config brainstack.yaml] [--json] [--wait-fresh]
@@ -1639,8 +1639,8 @@ function sharedBrainSeedFiles(cfg: BrainstackConfig): Record<string, string> {
       "- `GET /search?q=...&scope=wiki|raw|all`",
       "- `POST /api/import` requires import or admin bearer token.",
       "- `POST /api/propose` requires import or admin bearer token; accepts machine proposal fields (`target_page`, `proposed_content`, `base_sha256`, `risk`, `confidence`, `curator_run_id`, `source_ids`) plus memory envelope fields (`project`, `domain`, `scope`, `memory_kind`, `applicability`, `non_applicability`, `evidence_refs`).",
-      "- `GET /api/proposals[?status=...]` lists proposals and memory cluster hints.",
-      "- `GET /api/proposals/clusters[?status=open&min_size=2]` lists deterministic memory-review clusters.",
+      "- `GET /api/proposals[?status=...]` lists proposals and memory review-group hints.",
+      "- `GET /api/proposals/groups[?status=open&min_size=2]` lists deterministic memory review groups.",
       "- `GET /api/proposals/ID` shows one proposal with a diff.",
       "- `POST /api/proposals/ID/approve|reject|apply` requires admin bearer token.",
       "- `GET /api/curator/status` shows curation mode, curator runs, and proposal counts.",
@@ -1805,7 +1805,7 @@ function telemuxSecretsEnv(): string {
     "FACTORY_ALLOWED_TELEGRAM_USER_ID=0",
     "FACTORY_PRE_DISPATCH_CLASSIFIER_API_KEY=",
     "BRAIN_IMPORT_TOKEN=",
-    "# Optional: enables /proposals approve/reject and curator status reporting from Telegram.",
+    "# Optional: enables /proposals Accept/reject and curator status reporting from Telegram.",
     "# FACTORY_BRAIN_ADMIN_TOKEN=",
     ""
   ].join("\n");
@@ -4304,16 +4304,16 @@ async function collectProposalsStatusSection(cfg: BrainstackConfig, timeoutMs: n
   }
   const body = response.body && typeof response.body === "object" && !Array.isArray(response.body) ? (response.body as Record<string, unknown>) : {};
   const proposals = Array.isArray(body.proposals) ? (body.proposals as Array<Record<string, unknown>>) : [];
-  const clusters = Array.isArray(body.clusters) ? (body.clusters as Array<Record<string, unknown>>) : [];
+  const reviewGroups = proposalReviewGroupsFromResult(body);
   const byStatus: Record<string, number> = {};
   for (const proposal of proposals) {
     const proposalStatus = String(proposal.status || "unknown");
     byStatus[proposalStatus] = (byStatus[proposalStatus] || 0) + 1;
   }
-  return statusSection("ok", `open_proposals=${proposals.length}${clusters.length ? ` clusters=${clusters.length}` : ""}`, {
+  return statusSection("ok", `open_proposals=${proposals.length}${reviewGroups.length ? ` review_groups=${reviewGroups.length}` : ""}`, {
     count: proposals.length,
     by_status: byStatus,
-    clusters: clusters.slice(0, 10),
+    review_groups: reviewGroups.slice(0, 10),
     proposals: proposals.slice(0, 25)
   });
 }
@@ -5762,6 +5762,10 @@ function uniqueNonEmptyStrings(values: Array<string | undefined | null>): string
   return Array.from(new Set(values.map((value) => value?.trim() || "").filter(Boolean)));
 }
 
+function uniqueRecordStrings(records: Array<Record<string, unknown>>, key: string): string[] {
+  return uniqueNonEmptyStrings(records.map((record) => stringFromRecord(record, key)));
+}
+
 function collapseWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
@@ -5888,6 +5892,235 @@ function proposalEnrichmentPayload(
     review_after: boundedCliString(requireFlagValue(args, "review-after"), 80),
     expires_at: boundedCliString(requireFlagValue(args, "expires-at"), 80)
   };
+}
+
+function slugPart(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/'/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+}
+
+function firstUniqueOrFallback(values: string[], fallback: string): string {
+  return values.length === 1 ? values[0]! : fallback;
+}
+
+function proposalReviewGroupsFromResult(result: Record<string, unknown>): Array<Record<string, unknown>> {
+  return Array.isArray(result.review_groups)
+    ? (result.review_groups as Array<Record<string, unknown>>)
+    : Array.isArray(result.clusters)
+      ? (result.clusters as Array<Record<string, unknown>>)
+      : [];
+}
+
+function stripRememberPrefix(value: string): string {
+  return collapseWhitespace(value.replace(/^remember(?:\s*\([^)]+\))?:/i, ""));
+}
+
+function mergedIntoReason(record: Record<string, unknown>): string | null {
+  const reason = stringFromRecord(record, "reason") || "";
+  const match = reason.match(/^merged into\s+(.+)$/i);
+  return match?.[1]?.trim() || null;
+}
+
+function proposalLessonLine(detail: { id: string; proposal: Record<string, unknown>; body: string }): string {
+  const title = stripRememberPrefix(stringFromRecord(detail.proposal, "title") || detail.id);
+  if (title.length >= 12) {
+    return title;
+  }
+  const bodyLine = firstUsefulProposalLine(detail.body);
+  return bodyLine || `Review proposal ${detail.id}`;
+}
+
+function buildReviewGroupContent(input: {
+  title: string;
+  groupKey: string;
+  groupLabel: string;
+  project: string;
+  domain: string;
+  scope: string;
+  memoryKind: string;
+  details: Array<{ id: string; proposal: Record<string, unknown>; body: string }>;
+  conflicts: string[];
+}): string {
+  const seen = new Set<string>();
+  const lessonLines = input.details
+    .map((detail) => ({ id: detail.id, text: proposalLessonLine(detail) }))
+    .filter((item) => {
+      const normalized = slugPart(item.text);
+      if (seen.has(normalized)) return false;
+      seen.add(normalized);
+      return true;
+    });
+  const sourceIds = uniqueNonEmptyStrings(input.details.flatMap((detail) => stringArrayFromRecord(detail.proposal, "source_ids")));
+  const evidenceRefs = uniqueNonEmptyStrings([
+    ...input.details.map((detail) => `proposal:${detail.id}`),
+    ...input.details.flatMap((detail) => stringArrayFromRecord(detail.proposal, "evidence_refs"))
+  ]);
+  return [
+    `# ${input.title}`,
+    "",
+    `Consolidates ${input.details.length} related Brainstack proposal candidates from review group \`${input.groupKey}\` (${input.groupLabel}).`,
+    "",
+    "## Lessons",
+    "",
+    ...lessonLines.map((item) => `- ${item.text} (source: \`proposal:${item.id}\`)`),
+    "",
+    "## Applicability",
+    "",
+    `Use for ${input.project}/${input.domain} work when the scope is \`${input.scope}\` and the lesson kind is \`${input.memoryKind}\`.`,
+    "",
+    "## Non-applicability",
+    "",
+    `Do not apply outside ${input.project}/${input.domain} without checking the source proposals and current system behavior.`,
+    "",
+    "## Review Notes",
+    "",
+    ...(input.conflicts.length ? input.conflicts.map((conflict) => `- Needs human review: ${conflict}`) : ["- Deterministic consolidation only; no embedding or cosine-similarity merge was used."]),
+    "",
+    "## Evidence",
+    "",
+    ...evidenceRefs.map((ref) => `- \`${ref}\``),
+    ...(sourceIds.length ? ["", "## Source Artifacts", "", ...sourceIds.map((id) => `- \`${id}\``)] : [])
+  ].join("\n");
+}
+
+async function createReviewGroupMergeProposal(
+  cfg: BrainstackConfig,
+  args: ParsedArgs,
+  groupKey: string
+): Promise<{ payload: Record<string, unknown>; selected: number; conflicts: string[]; dryRun: boolean; write?: BrainWriteOutcome; closed?: string[] }> {
+  const closeSources = hasFlag(args, "close-sources");
+  const status = requireFlagValue(args, "status") || (closeSources ? "open,rejected" : "open");
+  const result = await brainApiRequest(cfg, "GET", `/api/proposals?status=${encodeURIComponent(status)}`);
+  const proposals = Array.isArray(result.proposals) ? (result.proposals as Array<Record<string, unknown>>) : [];
+  const matching = proposals.filter((proposal) => stringFromRecord(proposal, "cluster_key") === groupKey || stringFromRecord(proposal, "cluster_label") === groupKey);
+  if (matching.length < 2) {
+    throw new Error(`review group ${groupKey} has ${matching.length} matching proposal(s); merge-group requires at least 2`);
+  }
+  const limit = parsePositiveIntegerFlag(args, "limit", 20);
+  if (!hasFlag(args, "all") && matching.length > limit) {
+    throw new Error(`review group ${groupKey} has ${matching.length} proposal(s); merge-group defaults to ${limit}. Rerun with --limit N or --all.`);
+  }
+  const details: Array<{ id: string; proposal: Record<string, unknown>; body: string }> = [];
+  for (const item of hasFlag(args, "all") ? matching : matching.slice(0, limit)) {
+    const id = stringFromRecord(item, "id");
+    if (!id) continue;
+    const detail = await fetchProposalDetail(cfg, id);
+    details.push({ id, proposal: { ...item, ...detail.proposal }, body: detail.body });
+  }
+  if (details.length < 2) {
+    throw new Error(`review group ${groupKey} has ${details.length} readable proposal(s); merge-group requires at least 2`);
+  }
+  const records = details.map((detail) => detail.proposal);
+  const groupLabel = stringFromRecord(records[0] || {}, "cluster_label") || groupKey;
+  const labelSubject = groupLabel.split("/")[0]?.trim() || groupKey;
+  const projectValues = uniqueRecordStrings(records, "project");
+  const domainValues = uniqueRecordStrings(records, "domain");
+  const scopeValues = uniqueRecordStrings(records, "scope").filter((value) => value !== "needs-context");
+  const kindValues = uniqueRecordStrings(records, "memory_kind");
+  const relatedRepoValues = uniqueRecordStrings(records, "related_repo");
+  const conflicts = [
+    projectValues.length > 1 ? `multiple projects: ${projectValues.join(", ")}` : null,
+    domainValues.length > 1 ? `multiple domains: ${domainValues.join(", ")}` : null,
+    scopeValues.length > 1 ? `multiple scopes: ${scopeValues.join(", ")}` : null,
+    kindValues.length > 1 ? `multiple memory kinds: ${kindValues.join(", ")}` : null,
+    relatedRepoValues.length > 1 ? `multiple related repos: ${relatedRepoValues.join(", ")}` : null,
+    records.some(proposalNeedsContext) ? "one or more source proposals need context" : null,
+    records.some((proposal) => !stringFromRecord(proposal, "target_page") && !stringFromRecord(proposal, "memory_kind")) ? "one or more source proposals are context-only candidates" : null
+  ].filter(Boolean) as string[];
+  const project = boundedCliString(requireFlagValue(args, "project"), 120) || firstUniqueOrFallback(projectValues, labelSubject || "shared-brain");
+  const domain = boundedCliString(requireFlagValue(args, "domain"), 120) || firstUniqueOrFallback(domainValues, project);
+  const scope = validateMemoryScope(requireFlagValue(args, "scope") || firstUniqueOrFallback(scopeValues, "project"));
+  const memoryKind = boundedCliString(requireFlagValue(args, "memory-kind") || requireFlagValue(args, "kind"), 80) || firstUniqueOrFallback(kindValues, "project_lesson");
+  const title = requireFlagValue(args, "title") || `Consolidate: ${groupLabel}`;
+  const targetPage = requireFlagValue(args, "target-page") || `wiki/Syntheses/${slugPart(labelSubject || groupKey) || "review-group"}-lessons.md`;
+  const confidenceRaw = requireFlagValue(args, "confidence") || (conflicts.length ? "0.55" : "0.75");
+  const confidence = Number(confidenceRaw);
+  if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+    throw new Error("--confidence must be a number between 0 and 1");
+  }
+  const content = buildReviewGroupContent({ title, groupKey, groupLabel, project, domain, scope, memoryKind, details, conflicts });
+  const sourceIds = uniqueNonEmptyStrings([
+    ...details.map((detail) => `proposal:${detail.id}`),
+    ...details.flatMap((detail) => stringArrayFromRecord(detail.proposal, "source_ids"))
+  ]).slice(0, 100);
+  const evidenceRefs = uniqueNonEmptyStrings([
+    ...details.map((detail) => `proposal:${detail.id}`),
+    ...details.flatMap((detail) => stringArrayFromRecord(detail.proposal, "evidence_refs"))
+  ]).slice(0, 100);
+  const payload: Record<string, unknown> = {
+    title,
+    body: `Consolidates ${details.length} related proposal candidates from review group ${groupKey}.`,
+    source_harness: requireFlagValue(args, "source-harness") || cfg.harness.name,
+    source_machine: requireFlagValue(args, "source-machine") || cfg.machine.name,
+    source_type: "memory",
+    target_page: targetPage,
+    proposed_content: content,
+    base_sha256: requireFlagValue(args, "base-sha256") || "absent",
+    risk: requireFlagValue(args, "risk") || "low",
+    confidence,
+    source_ids: sourceIds,
+    project,
+    domain,
+    scope,
+    memory_kind: memoryKind,
+    context: `Consolidated from Brainstack review group ${groupKey} (${groupLabel}).`,
+    applicability: `Use for ${project}/${domain} work when the source proposals and scope match.`,
+    non_applicability: `Do not apply outside ${project}/${domain} without checking the source proposals.`,
+    evidence_refs: evidenceRefs
+  };
+  if (conflicts.length || hasFlag(args, "needs-human")) {
+    payload.status = "needs-human";
+    payload.reason = conflicts.length ? `Review group merge needs human review: ${conflicts.join("; ")}` : "Review group merge was explicitly marked needs-human.";
+  }
+  const dryRun = !hasFlag(args, "submit") && !hasFlag(args, "apply") && !hasFlag(args, "yes");
+  if (dryRun) {
+    return { payload, selected: details.length, conflicts, dryRun };
+  }
+  const existingMergeIds = uniqueNonEmptyStrings(details.map((detail) => mergedIntoReason(detail.proposal)));
+  if (closeSources && existingMergeIds.length > 1) {
+    throw new Error(`review group ${groupKey} has sources already merged into different proposals: ${existingMergeIds.join(", ")}`);
+  }
+  if (closeSources) {
+    const openProposalStatuses = new Set(["pending", "approved", "needs-human"]);
+    const unclosable = details
+      .filter((detail) => {
+        const proposalStatus = stringFromRecord(detail.proposal, "status") || "";
+        return !openProposalStatuses.has(proposalStatus) && !mergedIntoReason(detail.proposal);
+      })
+      .map((detail) => `${detail.id}:${stringFromRecord(detail.proposal, "status") || "unknown"}`);
+    if (unclosable.length) {
+      throw new Error(`review group ${groupKey} has source proposals that cannot be closed: ${unclosable.join(", ")}`);
+    }
+  }
+  const write: BrainWriteOutcome =
+    closeSources && existingMergeIds[0]
+      ? { status: "accepted", response: { proposal_id: existingMergeIds[0], status: "already-created" } }
+      : closeSources
+        ? { status: "accepted", response: await brainApiRequest(cfg, "POST", "/api/propose", { admin: true, body: payload }) }
+        : await postBrainWriteOrQueue(cfg, "propose", payload, {}, { quiet: hasFlag(args, "json") });
+  const closed: string[] = [];
+  if (closeSources) {
+    const mergedId = stringFromRecord(write.response || {}, "proposal_id") || stringFromRecord(write.response || {}, "id") || "merged review-group proposal";
+    for (const detail of details) {
+      if (mergedIntoReason(detail.proposal)) {
+        closed.push(detail.id);
+        continue;
+      }
+      await brainApiRequest(cfg, "POST", `/api/proposals/${encodeURIComponent(detail.id)}/reject`, {
+        admin: true,
+        body: {
+          decided_by: `${process.env.USER || "operator"}@${cfg.machine.name}`,
+          reason: `merged into ${mergedId}`
+        }
+      });
+      closed.push(detail.id);
+    }
+  }
+  return { payload, selected: details.length, conflicts, dryRun, write, closed };
 }
 
 function crossBrainAllowKey(sourceId: string, targetId: string): string {
@@ -6337,7 +6570,7 @@ function idempotencyPendingTerminalError(item: OutboxItem, status: number, respo
 }
 
 type BrainWriteOutcome =
-  | { status: "accepted" }
+  | { status: "accepted"; response?: Record<string, unknown> }
   | { status: "queued"; path: string; reason: string };
 
 async function postBrainWriteOrQueue(
@@ -6392,10 +6625,19 @@ async function postBrainWriteOrQueue(
       }
       throw new Error(`brain rejected ${endpoint} with HTTP ${response.status}: ${sanitizedHttpError(response.status, text)}`);
     }
+    const text = await response.text();
+    let parsed: Record<string, unknown> | undefined;
+    if (text.trim()) {
+      try {
+        parsed = JSON.parse(text) as Record<string, unknown>;
+      } catch {
+        parsed = undefined;
+      }
+    }
     if (!options.quiet) {
       console.log(`shared-brain ${endpoint} accepted`);
     }
-    return { status: "accepted" };
+    return { status: "accepted", response: parsed };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (message.startsWith("brain rejected ")) {
@@ -10148,7 +10390,7 @@ function formatProposalLine(proposal: Record<string, unknown>): string {
     String(proposal.id),
     `status=${String(proposal.status)}`,
     proposal.legacy_format ? "legacy=yes" : null,
-    proposal.cluster_label ? `cluster=${String(proposal.cluster_label)}` : null,
+    proposal.cluster_label ? `group=${String(proposal.cluster_label)}` : null,
     proposal.target_page ? `target=${String(proposal.target_page)}` : null,
     proposal.risk ? `risk=${String(proposal.risk)}` : null,
     proposal.quality_decision ? `quality=${String(proposal.quality_decision)}` : null,
@@ -10244,9 +10486,9 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
   const sub = args.positional[0] || "list";
   if (sub === "help" || sub === "--help" || sub === "-h") {
     console.log(
-      "Usage: brainctl proposals list [--status open|pending|approved|applied|rejected|superseded|needs-human] [--json]\n       brainctl proposals clusters [--status open|pending|approved|applied|rejected|superseded|needs-human] [--min-size N] [--json]\n       brainctl proposals show <id> [--json]\n       brainctl proposals approve <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals reject <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]"
-        + "\n       brainctl proposals enrich <id> [--summary TEXT] [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF] [--dry-run|--json]"
-        + "\n       brainctl proposals reprocess [--status needs-human|open] [--cluster KEY] [--id ID] [--limit N] [--apply] [--json] [enrichment flags...]"
+      "Usage: brainctl proposals list [--status open|pending|approved|applied|rejected|superseded|needs-human] [--json]\n       brainctl proposals groups [--status open|pending|approved|applied|rejected|superseded|needs-human] [--min-size N] [--json]\n       brainctl proposals show <id> [--json]\n       brainctl proposals merge-group <group-key|group-label> [--submit] [--limit N|--all] [--target-page wiki/PATH.md] [--needs-human] [--close-sources] [--json]\n       brainctl proposals approve <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals reject <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]"
+      + "\n       brainctl proposals enrich <id> [--summary TEXT] [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF] [--dry-run|--json]"
+        + "\n       brainctl proposals reprocess [--status needs-human|open] [--group KEY] [--cluster KEY] [--id ID] [--limit N] [--apply] [--json] [enrichment flags...]"
     );
     return;
   }
@@ -10265,29 +10507,30 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
       for (const proposal of proposals) {
         console.log(formatProposalLine(proposal));
       }
-      const clusters = Array.isArray(result.clusters) ? (result.clusters as Array<Record<string, unknown>>) : [];
+      const clusters = proposalReviewGroupsFromResult(result);
       if (clusters.length) {
-        console.log(`memory_clusters=${clusters.length}`);
+        console.log(`review_groups=${clusters.length}`);
         for (const cluster of clusters) {
           console.log(formatProposalClusterLine(cluster));
         }
       }
       return;
     }
+    case "groups":
     case "clusters": {
       const status = requireFlagValue(args, "status") || "open";
       const minSize = requireFlagValue(args, "min-size") || requireFlagValue(args, "min") || "2";
       const result = await brainApiRequest(
         cfg,
         "GET",
-        `/api/proposals/clusters?status=${encodeURIComponent(status)}&min_size=${encodeURIComponent(minSize)}`
+        `/api/proposals/groups?status=${encodeURIComponent(status)}&min_size=${encodeURIComponent(minSize)}`
       );
       if (hasFlag(args, "json")) {
         console.log(JSON.stringify(result, null, 2));
         return;
       }
-      const clusters = Array.isArray(result.clusters) ? (result.clusters as Array<Record<string, unknown>>) : [];
-      console.log(`proposal memory clusters=${clusters.length} (status filter: ${status}, min size: ${String(result.min_size || minSize)})`);
+      const clusters = proposalReviewGroupsFromResult(result);
+      console.log(`proposal review groups=${clusters.length} (status filter: ${status}, min size: ${String(result.min_size || minSize)})`);
       for (const cluster of clusters) {
         console.log(formatProposalClusterLine(cluster));
       }
@@ -10349,7 +10592,7 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
       const result = await brainApiRequest(cfg, "GET", `/api/proposals?status=${encodeURIComponent(status)}`);
       const proposals = Array.isArray(result.proposals) ? (result.proposals as Array<Record<string, unknown>>) : [];
       const ids = new Set(flagValues(args, "id"));
-      const cluster = requireFlagValue(args, "cluster");
+      const cluster = requireFlagValue(args, "group") || requireFlagValue(args, "cluster");
       const selected = proposals
         .filter((proposal) => !ids.size || ids.has(stringFromRecord(proposal, "id") || ""))
         .filter((proposal) => !cluster || stringFromRecord(proposal, "cluster_key") === cluster || stringFromRecord(proposal, "cluster_label") === cluster)
@@ -10373,6 +10616,34 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
       }
       if (!apply) {
         console.log("No writes performed. Rerun with --apply to create enriched replacement proposals.");
+      }
+      return;
+    }
+    case "merge-group":
+    case "merge-cluster": {
+      const groupKey = args.positional[1] || requireFlagValue(args, "group") || requireFlagValue(args, "cluster");
+      if (!groupKey) {
+        throw new Error("proposals merge-group requires a review group key or label");
+      }
+      const result = await createReviewGroupMergeProposal(cfg, args, groupKey);
+      if (hasFlag(args, "json")) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      console.log(
+        [
+          `review_group=${groupKey}`,
+          `selected=${result.selected}`,
+          result.dryRun ? "dry_run=true" : `merged=${result.write?.status || "submitted"}`,
+          `target=${String(result.payload.target_page)}`,
+          result.conflicts.length ? `needs_human=${result.conflicts.join("; ")}` : "needs_human=false",
+          result.closed?.length ? `closed_sources=${result.closed.join(",")}` : null
+        ]
+          .filter(Boolean)
+          .join(" ")
+      );
+      if (result.dryRun) {
+        console.log("No writes performed. Rerun with --submit to create the consolidated proposal.");
       }
       return;
     }

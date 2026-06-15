@@ -2051,6 +2051,8 @@ test("basic loops install the brain-curator routine and curator commands work en
               quality_decision: "needs-context",
               project: "Lindy",
               scope: "repo",
+              memory_kind: "project_lesson",
+              cluster_key: "lindy:repo:project_lesson",
               cluster_label: "Lindy / repo / project_lesson",
               legacy_format: true
             }
@@ -2107,30 +2109,42 @@ test("basic loops install the brain-curator routine and curator commands work en
     const listText = fixture.telegram.sent.at(-1)?.text || "";
     expect(proposalStatusQueries.at(-1)).toBe("open");
     expect(listText).toContain("Status update");
-    const shortcut = listText.match(/\/proposal_approve_([a-z0-9]{6,10})_1/);
+    const shortcut = listText.match(/\/proposal_accept_([a-z0-9]{6,10})_1/);
     expect(shortcut).not.toBeNull();
     const token = shortcut![1];
+    expect(listText).not.toContain(`/proposal_accept_${token}_2`);
+    expect(listText).toContain("merge/enrich first");
 
-    await fixture.commands.handleMessage(telegramMessage("/proposals needs-human needs-context project:lindy limit=5", 90));
+    await fixture.commands.handleMessage(telegramMessage("/proposals needs-human needs-context project:lindy scope:repo group:lindy kind:project_lesson limit=5", 90));
     const filteredText = fixture.telegram.sent.at(-1)?.text || "";
     expect(proposalStatusQueries.at(-1)).toBe("needs-human");
     expect(filteredText).toContain("Needs context Redis cluster note");
     expect(filteredText).toContain("quality=needs-context");
     expect(filteredText).toContain("project=Lindy");
+    expect(filteredText).toContain("kind=project_lesson");
     expect(filteredText).not.toContain("Status update");
 
-    // Approving a proposal that carries a wiki change applies it.
-    await fixture.commands.handleMessage(telegramMessage(`/proposal_approve_${token}_1`, 90));
+    // Accepting a proposal that carries a wiki change applies it.
+    await fixture.commands.handleMessage(telegramMessage(`/proposal_accept_${token}_1`, 90));
     await waitFor(() => decisions.length === 1);
     expect(decisions[0].path).toBe("/api/proposals/20260610t060000z-status-update/apply");
     expect(decisions[0].auth).toBe("Bearer brain-admin-token");
     expect(String(decisions[0].body.decided_by)).toContain("telegram:");
     expect(fixture.telegram.sent.at(-1)?.text).toContain("status=applied");
 
-    // Approving a note-only proposal records approval without an apply.
+    // Context-only proposals need enrichment or group merge before Accept can apply them.
+    await fixture.commands.handleMessage(telegramMessage(`/proposal_accept_${token}_2`, 90));
+    expect(decisions.length).toBe(1);
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("no wiki change attached");
+
+    // Legacy approve shortcuts remain an alias for the guarded Accept path.
     await fixture.commands.handleMessage(telegramMessage(`/proposal_approve_${token}_2`, 90));
+    expect(decisions.length).toBe(1);
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("no wiki change attached");
+
+    await fixture.commands.handleMessage(telegramMessage(`/proposal_approve_${token}_1`, 90));
     await waitFor(() => decisions.length === 2);
-    expect(decisions[1].path).toBe("/api/proposals/20260610t061000z-note-only/approve");
+    expect(decisions[1].path).toBe("/api/proposals/20260610t060000z-status-update/apply");
 
     await fixture.commands.handleMessage(telegramMessage(`/proposal_reject_${token}_1`, 90));
     await waitFor(() => decisions.length === 3);
@@ -2152,7 +2166,7 @@ test("basic loops install the brain-curator routine and curator commands work en
   }
 }, 30_000);
 
-test("telegram proposal approvals are refused without the brain admin token", async () => {
+test("telegram proposal decisions are refused without the brain admin token", async () => {
   const port = 35_000 + Math.floor(Math.random() * 5_000);
   let decisionAttempts = 0;
   const server = Bun.serve({
@@ -2192,10 +2206,10 @@ test("telegram proposal approvals are refused without the brain admin token", as
     await fixture.commands.handleMessage(telegramMessage("/proposals", 91));
     const listText = fixture.telegram.sent.at(-1)?.text || "";
     expect(listText).toContain("FACTORY_BRAIN_ADMIN_TOKEN is not set");
-    const token = listText.match(/\/proposal_approve_([a-z0-9]{6,10})_1/)![1];
+    const token = listText.match(/\/proposal_accept_([a-z0-9]{6,10})_1/)![1];
 
-    await fixture.commands.handleMessage(telegramMessage(`/proposal_approve_${token}_1`, 91));
-    expect(fixture.telegram.sent.at(-1)?.text).toContain("approve/reject from Telegram is disabled");
+    await fixture.commands.handleMessage(telegramMessage(`/proposal_accept_${token}_1`, 91));
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("accept/reject from Telegram is disabled");
     expect(decisionAttempts).toBe(0);
   } finally {
     server.stop(true);

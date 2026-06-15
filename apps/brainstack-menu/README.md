@@ -20,9 +20,9 @@ Refresh, Open Wiki, Open Shared Brain/Config folders, Copy Redacted Diagnostics,
 
 ## Operator Mode
 
-Opt-in via Preferences. Adds curator status/run and proposal list/approve/reject/apply. Every wiki-mutating action shows a confirmation dialog with the proposal id, title, and target. The app never auto-approves or auto-applies anything, and it never stores or prints tokens. Admin actions work when `brainctl` can reach `BRAIN_ADMIN_TOKEN` locally, or when an enrolled client config has an explicit control-host SSH route so `brainctl` can forward the proposal decision to the control host. When neither path works, the app shows the decision path as blocked with command output for diagnosis.
+Opt-in via Preferences. Adds curator status/run and proposal list review with Accept/reject decisions. Accept calls the concrete `brainctl proposals apply` path, so every wiki-mutating action shows a confirmation dialog with the proposal id, title, and target. The app never auto-accepts or auto-applies anything, and it never stores or prints tokens. Admin actions work when `brainctl` can reach `BRAIN_ADMIN_TOKEN` locally, or when an enrolled client config has an explicit control-host SSH route so `brainctl` can forward the proposal decision to the control host. When neither path works, the app shows the decision path as blocked with command output for diagnosis.
 
-Proposal review renders the shared `brainctl proposals show --json` contract, including project/scope, memory kind, applicability, evidence refs, legacy-format markers, cluster hints, and the deterministic quality gate. Vague or old title/body-only memory candidates should show as `needs-human`/`needs-context` instead of looking like ordinary canon candidates.
+Proposal review renders the shared `brainctl proposals show --json` contract, including project/scope, memory kind, applicability, evidence refs, legacy-format markers, review group hints, and the deterministic quality gate. Vague or old title/body-only memory candidates should show as `needs-human`/`needs-context` instead of looking like ordinary canon candidates.
 
 ## Build, sign, and distribute
 

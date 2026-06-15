@@ -251,6 +251,7 @@ public struct BrainctlClient: Sendable {
   }
 
   public func proposalDecision(id: String, action: String) async -> ActionOutcome {
-    await runAction(title: "\(action.capitalized) Proposal", arguments: ["proposals", action, id, "--config", configPath], timeout: 60)
+    let title = action == "apply" ? "Accept Proposal" : "\(action.capitalized) Proposal"
+    return await runAction(title: title, arguments: ["proposals", action, id, "--config", configPath], timeout: 60)
   }
 }

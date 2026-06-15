@@ -100,9 +100,18 @@ final class CommandRunnerTests: XCTestCase {
 
   func testAdminUnavailableDetection() async throws {
     let binary = try fakeBrainctl("echo 'BRAIN_ADMIN_TOKEN is required for this action; run it on the control host or export BRAIN_ADMIN_TOKEN' >&2; exit 1")
-    let outcome = await client(binary).runAction(title: "Approve Proposal", arguments: ["proposals", "approve", "x"])
+    let outcome = await client(binary).runAction(title: "Accept Proposal", arguments: ["proposals", "apply", "x"])
     XCTAssertTrue(outcome.adminUnavailable)
     XCTAssertFalse(outcome.succeeded)
+  }
+
+  func testProposalDecisionApplyUsesBrainctlApply() async throws {
+    let argsPath = scratch.appendingPathComponent("proposal-args.txt")
+    let binary = try fakeBrainctl("printf '%s\\n' \"$@\" > '\(argsPath.path)'; echo 'accepted'")
+    let outcome = await client(binary).proposalDecision(id: "p1", action: "apply")
+    XCTAssertTrue(outcome.succeeded)
+    XCTAssertEqual(try String(contentsOf: argsPath), "proposals\napply\np1\n--config\n/tmp/test.yaml\n")
+    XCTAssertEqual(outcome.title, "Accept Proposal")
   }
 
   func testCuratorInstallUsesNamedArguments() async throws {

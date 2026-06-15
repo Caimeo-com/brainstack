@@ -2184,11 +2184,13 @@ async function listProposalsResponse(url: URL): Promise<Response> {
   }
   const records = await listProposals(writeRepoRoot, statuses);
   const policy = curationPolicyFromEnv();
+  const reviewGroups = clusterMemoryProposals(records);
   return json({
     ok: true,
     mode: policy.mode,
     proposals: records.map(proposalToJson),
-    clusters: clusterMemoryProposals(records)
+    clusters: reviewGroups,
+    review_groups: reviewGroups
   });
 }
 
@@ -2208,11 +2210,13 @@ async function listProposalClustersResponse(url: URL): Promise<Response> {
   const minSizeRaw = Number(url.searchParams.get("min_size") || "2");
   const minSize = Number.isFinite(minSizeRaw) && minSizeRaw > 0 ? Math.trunc(minSizeRaw) : 2;
   const records = await listProposals(writeRepoRoot, statuses);
+  const reviewGroups = clusterMemoryProposals(records, minSize);
   return json({
     ok: true,
     status: statusParam,
     min_size: minSize,
-    clusters: clusterMemoryProposals(records, minSize)
+    clusters: reviewGroups,
+    review_groups: reviewGroups
   });
 }
 
@@ -2640,7 +2644,7 @@ const server = Bun.serve({
       if (request.method === "GET" && url.pathname === "/api/proposals") {
         return await listProposalsResponse(url);
       }
-      if (request.method === "GET" && url.pathname === "/api/proposals/clusters") {
+      if (request.method === "GET" && (url.pathname === "/api/proposals/groups" || url.pathname === "/api/proposals/clusters")) {
         return await listProposalClustersResponse(url);
       }
       {

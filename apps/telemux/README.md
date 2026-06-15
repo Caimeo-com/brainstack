@@ -104,7 +104,7 @@ If `BRAIN_BASE_URL` and `BRAIN_IMPORT_TOKEN` are set, successful runs import `.f
 
 `/status` is kept as an alias for `/topicinfo`.
 
-For proposal review, use filters such as `/proposals pending`, `/proposals needs-human needs-context`, or `/proposals open project:lindy limit=10`. The response includes approve/reject shortcuts for the filtered snapshot.
+For proposal review, use filters such as `/proposals pending`, `/proposals needs-human needs-context`, or `/proposals open project:lindy limit=10`. The response includes accept/reject shortcuts for the filtered snapshot. Accept applies a wiki-backed proposal; context-only candidates need enrichment or review-group merge first.
 
 `/cron` subcommands currently include:
 

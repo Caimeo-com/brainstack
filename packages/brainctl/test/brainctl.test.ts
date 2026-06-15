@@ -417,6 +417,12 @@ telemux:
       serverScript,
       [
         `const receivedPath = ${JSON.stringify(receivedPath)};`,
+        `const proposals = [`,
+        `  { id: "20260611t000000z-cli-proposal", title: "Remember: CLI proposal needs context", status: "needs-human", legacy_format: true, quality_decision: "needs-context", cluster_key: "cli:needs-context:legacy_memory", cluster_label: "CLI / needs-context / legacy_memory", target_page: "wiki/Status/CLI.md", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:00:00Z", source_ids: ["art-1"] },`,
+        `  { id: "p1", title: "Remember (cli): CLI proposal output should be bounded", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", quality_decision: "ready", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:01:00Z", source_ids: ["art-1"] },`,
+        `  { id: "p2", title: "Remember (cli): CLI proposal merge should preserve evidence", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", quality_decision: "ready", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:02:00Z", source_ids: ["art-2"] }`,
+        `];`,
+        `const reviewGroups = [{ id: "cli:repo:project_lesson", label: "CLI / repo / project_lesson", count: 2, legacyCount: 0, needsContextCount: 0, proposalIds: ["p1", "p2"] }];`,
         `Bun.serve({`,
         `  hostname: "127.0.0.1",`,
         `  port: ${port},`,
@@ -432,16 +438,24 @@ telemux:
         `      return Response.json({ ok: true, service: "braind", search_ready: true, pending_reindex: { present: false } });`,
         `    }`,
         `    if (req.method === "GET" && url.pathname === "/api/proposals") {`,
-        `      return Response.json({ ok: true, mode: "approval", proposals: [{ id: "20260611t000000z-cli-proposal", title: "Remember: CLI proposal needs context", status: "needs-human", legacy_format: true, quality_decision: "needs-context", cluster_key: "cli:needs-context:legacy_memory", cluster_label: "CLI / needs-context / legacy_memory", target_page: "wiki/Status/CLI.md", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:00:00Z" }], clusters: [{ id: "cli:repo:project_lesson", label: "CLI / repo / project_lesson", count: 2, legacyCount: 1, needsContextCount: 1, proposalIds: ["p1", "p2"] }] });`,
+        `      return Response.json({ ok: true, mode: "approval", proposals, review_groups: reviewGroups });`,
         `    }`,
-        `    if (req.method === "GET" && url.pathname === "/api/proposals/clusters") {`,
-        `      return Response.json({ ok: true, status: url.searchParams.get("status") || "open", min_size: Number(url.searchParams.get("min_size") || "2"), clusters: [{ id: "cli:repo:project_lesson", label: "CLI / repo / project_lesson", count: 2, legacyCount: 1, needsContextCount: 1, proposalIds: ["p1", "p2"] }] });`,
+        `    if (req.method === "GET" && (url.pathname === "/api/proposals/groups" || url.pathname === "/api/proposals/clusters")) {`,
+        `      return Response.json({ ok: true, status: url.searchParams.get("status") || "open", min_size: Number(url.searchParams.get("min_size") || "2"), review_groups: reviewGroups });`,
         `    }`,
         `    if (req.method === "GET" && url.pathname.startsWith("/api/proposals/")) {`,
-        `      return Response.json({ ok: true, proposal: { id: "20260611t000000z-cli-proposal", title: "Remember: CLI proposal needs context", status: "needs-human", legacy_format: true, quality_decision: "needs-context", cluster_key: "cli:needs-context:legacy_memory", cluster_label: "CLI / needs-context / legacy_memory", created_at: "2026-06-11T00:00:00Z", source_ids: ["art-1"] }, body: "## Request\\n\\nCLI legacy lesson body", diff: "+ new line" });`,
+        `      const id = decodeURIComponent(url.pathname.split("/").pop() || "");`,
+        `      const proposal = proposals.find((item) => item.id === id) || proposals[0];`,
+        `      return Response.json({ ok: true, proposal, body: "## Request\\n\\n" + proposal.title, diff: "+ new line" });`,
         `    }`,
         `    if (req.method === "POST" && url.pathname.endsWith("/approve")) {`,
         `      return Response.json({ ok: true, status: "approved" });`,
+        `    }`,
+        `    if (req.method === "POST" && url.pathname.endsWith("/reject")) {`,
+        `      return Response.json({ ok: true, status: "rejected" });`,
+        `    }`,
+        `    if (req.method === "POST" && url.pathname.endsWith("/apply")) {`,
+        `      return Response.json({ ok: true, status: "applied" });`,
         `    }`,
         `    if (req.method === "GET" && url.pathname === "/api/curator/status") {`,
         `      return Response.json({ ok: true, mode: "approval", curator: { installed: true, last_run_finished_at: "2026-06-11T00:00:00Z", last_run_ok: true, last_run_failures: [], cursor: null, next_run_at: null }, proposal_counts: { pending: 1, approved: 0, applied: 0, rejected: 0, superseded: 0, "needs-human": 0 } });`,
@@ -480,13 +494,42 @@ telemux:
       expectSuccess(list);
       expect(list.stdout).toContain("20260611t000000z-cli-proposal");
       expect(list.stdout).toContain("status=needs-human");
-      expect(list.stdout).toContain("memory_clusters=1");
+      expect(list.stdout).toContain("review_groups=1");
       expect((await readRequests()).at(-1)?.auth).toBeNull();
 
-      const clusterList = runBrainctl(["proposals", "clusters", "--config", configPath], env);
+      const clusterList = runBrainctl(["proposals", "groups", "--config", configPath], env);
       expectSuccess(clusterList);
-      expect(clusterList.stdout).toContain("proposal memory clusters=1");
+      expect(clusterList.stdout).toContain("proposal review groups=1");
       expect(clusterList.stdout).toContain("cli:repo:project_lesson");
+
+      const mergePlan = runBrainctl(["proposals", "merge-group", "cli:repo:project_lesson", "--config", configPath], env);
+      expectSuccess(mergePlan);
+      expect(mergePlan.stdout).toContain("dry_run=true");
+      expect(mergePlan.stdout).toContain("target=wiki/Syntheses/cli-lessons.md");
+
+      const mergeLimited = runBrainctl(["proposals", "merge-group", "cli:repo:project_lesson", "--limit", "1", "--config", configPath], env);
+      expect(mergeLimited.code).not.toBe(0);
+      expect(mergeLimited.stderr).toContain("merge-group defaults to 1");
+
+      const mergeSubmit = runBrainctl(["proposals", "merge-group", "cli:repo:project_lesson", "--submit", "--config", configPath], env);
+      expectSuccess(mergeSubmit);
+      const mergeRequest = (await readRequests()).find((entry) => entry.path === "/api/propose" && String(entry.body?.title || "").startsWith("Consolidate: CLI"));
+      expect(mergeRequest?.body?.target_page).toBe("wiki/Syntheses/cli-lessons.md");
+      expect(String(mergeRequest?.body?.proposed_content || "")).toContain("proposal:p1");
+      expect(String(mergeRequest?.body?.proposed_content || "")).toContain("proposal:p2");
+
+      const mergeClose = runBrainctl(["proposals", "merge-group", "cli:repo:project_lesson", "--submit", "--close-sources", "--config", configPath], {
+        ...env,
+        BRAIN_ADMIN_TOKEN: "cli-admin-token"
+      });
+      expectSuccess(mergeClose);
+      const closeRequests = await readRequests();
+      const closeProposeRequest = closeRequests
+        .filter((entry) => entry.path === "/api/propose" && String(entry.body?.title || "").startsWith("Consolidate: CLI"))
+        .at(-1);
+      expect(closeProposeRequest?.auth).toBe("Bearer cli-admin-token");
+      const closeRejects = closeRequests.filter((entry) => entry.path.endsWith("/reject") && String(entry.body?.reason || "").includes("merged into x"));
+      expect(closeRejects.map((entry) => entry.path).sort()).toEqual(["/api/proposals/p1/reject", "/api/proposals/p2/reject"]);
 
       const show = runBrainctl(["proposals", "show", "20260611t000000z-cli-proposal", "--config", configPath], env);
       expectSuccess(show);
@@ -519,7 +562,7 @@ telemux:
       expect(aggregate.sections.curator.state).toBe("ok");
       expect(aggregate.sections.curator.data.open_proposals).toBe(1);
       expect(aggregate.sections.proposals.state).toBe("ok");
-      expect(aggregate.sections.proposals.data.count).toBe(1);
+      expect(aggregate.sections.proposals.data.count).toBe(3);
 
       // propose with machine fields posts them to /api/propose.
       const contentFile = join(dir, "proposed.md");
@@ -567,7 +610,7 @@ telemux:
         env
       );
       expectSuccess(propose);
-      const proposeRequest = (await readRequests()).find((entry) => entry.path === "/api/propose");
+      const proposeRequest = (await readRequests()).find((entry) => entry.path === "/api/propose" && entry.body?.target_page === "wiki/Status/CLI.md");
       expect(proposeRequest?.body?.target_page).toBe("wiki/Status/CLI.md");
       expect(proposeRequest?.body?.proposed_content).toBe("# Proposed\n");
       expect(proposeRequest?.body?.base_sha256).toBe("absent");
@@ -632,6 +675,96 @@ telemux:
       expect(reprocessBody.apply).toBe(false);
       expect(reprocessBody.results[0].dryRun).toBe(true);
       expect(reprocessBody.results[0].payload.evidence_refs).toContain("proposal:20260611t000000z-cli-proposal");
+    } finally {
+      server.kill();
+      await server.exited;
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("merge-group close-sources resumes after a partially closed source", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-merge-retry-"));
+    const receivedPath = join(dir, "requests.jsonl");
+    const port = 46_000 + Math.floor(Math.random() * 1_000);
+    const configPath = join(dir, "brainstack.yaml");
+    await writeFile(
+      configPath,
+      [
+        "schema_version: 1",
+        "profile: client-macos",
+        "machine:",
+        "  name: cli",
+        "brain:",
+        `  publicBaseUrl: http://127.0.0.1:${port}`,
+        "security:",
+        "  posture: trusted-tailnet",
+        "  bindHost: 127.0.0.1",
+        "  trustedExposure: none",
+        "paths:",
+        `  configRoot: ${dir}`,
+        `  stateRoot: ${join(dir, "state")}`,
+        `  sharedBrainBareRepo: ${join(dir, "bare.git")}`,
+        `  sharedBrainStagingRepo: ${join(dir, "staging")}`,
+        `  sharedBrainServeRepo: ${join(dir, "serve")}`,
+        "client:",
+        `  localPath: ${join(dir, "shared-brain")}`,
+        ""
+      ].join("\n")
+    );
+    const serverScript = join(dir, "brain.ts");
+    await writeFile(
+      serverScript,
+      [
+        `const receivedPath = ${JSON.stringify(receivedPath)};`,
+        `const proposals = [`,
+        `  { id: "p1", title: "Remember (cli): old closed", status: "rejected", reason: "merged into old-merge", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", created_at: "2026-06-11T00:01:00Z" },`,
+        `  { id: "p2", title: "Remember (cli): still open", status: "pending", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", created_at: "2026-06-11T00:02:00Z" }`,
+        `];`,
+        `Bun.serve({`,
+        `  hostname: "127.0.0.1",`,
+        `  port: ${port},`,
+        `  async fetch(req) {`,
+        `    const url = new URL(req.url);`,
+        `    const body = req.method === "POST" ? await req.json().catch(() => null) : null;`,
+        `    const existing = (await Bun.file(receivedPath).exists()) ? await Bun.file(receivedPath).text() : "";`,
+        `    await Bun.write(receivedPath, existing + JSON.stringify({ method: req.method, path: url.pathname + url.search, auth: req.headers.get("authorization"), body }) + "\\n");`,
+        `    if (req.method === "GET" && url.pathname === "/api/proposals") return Response.json({ ok: true, proposals });`,
+        `    if (req.method === "GET" && url.pathname.startsWith("/api/proposals/")) {`,
+        `      const id = decodeURIComponent(url.pathname.split("/").pop() || "");`,
+        `      const proposal = proposals.find((item) => item.id === id);`,
+        `      return proposal ? Response.json({ ok: true, proposal, body: "## Request\\n\\n" + proposal.title, diff: "" }) : Response.json({ error: "missing" }, { status: 404 });`,
+        `    }`,
+        `    if (req.method === "POST" && url.pathname === "/api/propose") return Response.json({ error: "must not create duplicate merge" }, { status: 500 });`,
+        `    if (req.method === "POST" && url.pathname === "/api/proposals/p1/reject") return Response.json({ error: "already rejected" }, { status: 409 });`,
+        `    if (req.method === "POST" && url.pathname === "/api/proposals/p2/reject") return Response.json({ ok: true, status: "rejected" });`,
+        `    return Response.json({ error: "unexpected" }, { status: 500 });`,
+        `  }`,
+        `});`
+      ].join("\n")
+    );
+    const server = Bun.spawn(["bun", "run", serverScript], { stdout: "ignore", stderr: "ignore" });
+    const readRequests = async (): Promise<Array<{ method: string; path: string; auth: string | null; body: Record<string, unknown> | null }>> =>
+      (await Bun.file(receivedPath).exists())
+        ? (await readFile(receivedPath, "utf8"))
+            .trim()
+            .split(/\r?\n/)
+            .filter(Boolean)
+            .map((line) => JSON.parse(line) as { method: string; path: string; auth: string | null; body: Record<string, unknown> | null })
+        : [];
+    try {
+      await waitForCondition(async () => {
+        const response = await fetch(`http://127.0.0.1:${port}/api/proposals`).catch(() => null);
+        return Boolean(response?.ok);
+      });
+      const env = { ...process.env, BRAIN_BASE_URL: `http://127.0.0.1:${port}`, BRAIN_ADMIN_TOKEN: "cli-admin-token" };
+      const result = runBrainctl(["proposals", "merge-group", "cli:repo:project_lesson", "--submit", "--close-sources", "--config", configPath], env);
+      expectSuccess(result);
+      const requests = await readRequests();
+      expect(requests.some((entry) => entry.path === "/api/propose")).toBe(false);
+      expect(requests.some((entry) => entry.path === "/api/proposals/p1/reject")).toBe(false);
+      const p2Reject = requests.find((entry) => entry.path === "/api/proposals/p2/reject");
+      expect(p2Reject?.auth).toBe("Bearer cli-admin-token");
+      expect(p2Reject?.body?.reason).toBe("merged into old-merge");
     } finally {
       server.kill();
       await server.exited;
@@ -3368,7 +3501,7 @@ describe("braind write safety", () => {
 
       // Legacy title/body-only remember proposals are not silently treated as
       // ordinary pending canon candidates. They are synthesized as needs-human
-      // and grouped into deterministic cluster hints for batch review. This check
+      // and grouped into deterministic review-group hints for batch review. This check
       // runs after mutating lifecycle assertions because these direct fixtures are
       // intentionally uncommitted legacy artifacts.
       const legacyDir = join(staging, "proposals", "pending");
@@ -3423,10 +3556,10 @@ describe("braind write safety", () => {
       expect(legacyProposal?.legacy_format).toBe(true);
       expect(legacyProposal?.quality_decision).toBe("needs-context");
       expect(legacyProposal?.cluster_label).toBe("Slack EA Buttons / needs-context / legacy_memory");
-      const clusters = (await (await fetch(`http://127.0.0.1:${port}/api/proposals/clusters?status=open&min_size=2`)).json()) as {
-        clusters: Array<Record<string, unknown>>;
+      const groups = (await (await fetch(`http://127.0.0.1:${port}/api/proposals/groups?status=open&min_size=2`)).json()) as {
+        review_groups: Array<Record<string, unknown>>;
       };
-      const legacyCluster = clusters.clusters.find((cluster) => String(cluster.id).startsWith("slack-ea-buttons:"));
+      const legacyCluster = groups.review_groups.find((cluster) => String(cluster.id).startsWith("slack-ea-buttons:"));
       expect(legacyCluster?.count).toBe(2);
       expect(legacyCluster?.legacyCount).toBe(2);
       expect(legacyCluster?.needsContextCount).toBe(2);

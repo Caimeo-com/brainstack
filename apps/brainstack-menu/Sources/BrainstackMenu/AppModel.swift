@@ -260,7 +260,8 @@ final class AppModel: ObservableObject {
     guard busyAction == nil, let client = client() else {
       return
     }
-    busyAction = "\(action.capitalized) \(proposal.id)"
+    let actionLabel = action == "apply" ? "Accept" : action.capitalized
+    busyAction = "\(actionLabel) \(proposal.id)"
     Task {
       let outcome = await client.proposalDecision(id: proposal.id, action: action)
       await MainActor.run {
