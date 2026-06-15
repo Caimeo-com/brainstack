@@ -1,6 +1,5 @@
 import type { ContextRecord } from "../db";
 import { summarizeManualUsage } from "./manual";
-import { summarizeOpenAiCodexUsage } from "./openai_codex";
 
 export interface UsageSummary {
   adapter: string;
@@ -8,10 +7,15 @@ export interface UsageSummary {
 }
 
 export async function summarizeUsage(context: ContextRecord): Promise<UsageSummary> {
-  if (context.usageAdapter === "openai_codex") {
+  const adapter = context.usageAdapter.trim() || "manual";
+  if (adapter !== "manual") {
     return {
-      adapter: "openai_codex",
-      text: await summarizeOpenAiCodexUsage(context)
+      adapter,
+      text: [
+        `Unsupported usage adapter: ${adapter}`,
+        "Brainstack only supports the manual local run-log parser now.",
+        "Set FACTORY_USAGE_ADAPTER=manual and recreate or rebind this context to use current usage reporting."
+      ].join("\n")
     };
   }
 

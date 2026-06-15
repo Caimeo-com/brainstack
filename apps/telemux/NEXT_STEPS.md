@@ -1,4 +1,6 @@
-# Final Manual Steps
+# Legacy Direct Telemux Steps
+
+These notes describe the old direct telemux setup. New Brainstack installs should use `brainctl provision`, `brainctl init`, `brainctl lifecycle repair`, and `brainctl doctor` from the product root instead of running the scripts in this folder directly.
 
 ## For a fresh control host
 

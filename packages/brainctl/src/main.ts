@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { accessSync, constants, createReadStream, existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { appendFile, chmod, cp, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
@@ -41,8 +41,12 @@ import portableRemoteMachineOpsSkill from "../../skills/remote-machine-ops/SKILL
 import portableSharedBrainClientSkill from "../../skills/shared-brain-client/SKILL.md" with { type: "text" };
 import packageJsonText from "../../../package.json" with { type: "text" };
 
-type Profile = "single-node" | "control" | "worker" | "client-macos" | "private-journal";
-const SUPPORTED_PROFILES: Profile[] = ["single-node", "control", "worker", "client-macos"];
+const SUPPORTED_PROFILES = ["single-node", "control", "worker", "client-macos"] as const;
+type Profile = (typeof SUPPORTED_PROFILES)[number];
+const RESERVED_PROFILE_ERRORS: Record<string, string> = {
+  "private-journal":
+    "Unsupported profile private-journal: first-class private journaling is not implemented yet. Use a separate explicit Brainstack install/config with separate repo paths and tokens."
+};
 type SeedMode = "empty-only" | "missing" | "force";
 type HarnessName = "codex" | "claude";
 type HookTarget = "codex" | "claude" | "cursor";
@@ -60,6 +64,10 @@ const BRAINSTACK_HOOK_STATUS_MESSAGE = "Brainstack refresh/checkpoint";
 
 function truthyEnv(value: string | undefined): boolean {
   return ["1", "true", "yes", "on"].includes((value || "").trim().toLowerCase());
+}
+
+function isSupportedProfile(value: string): value is Profile {
+  return (SUPPORTED_PROFILES as readonly string[]).includes(value);
 }
 
 interface ParsedArgs {
@@ -351,7 +359,7 @@ function usage(): string {
   brainctl worker-cache status|clear --config brainstack.yaml [worker|--all]
   brainctl repo-lock status|clear --config brainstack.yaml [--repo write|serve] [--path LOCK_DIR] [--yes] [--token LOCK_TOKEN] [--force] [--min-age-ms MS]
   brainctl locks status|clear --config brainstack.yaml [--repo write|serve] [--path LOCK_DIR] [--yes] [--token LOCK_TOKEN] [--force] [--min-age-ms MS]
-  brainctl rotate-token --kind import|admin|telegram-placeholder --config brainstack.yaml [--env FILE]
+  brainctl rotate-token --kind import|admin --config brainstack.yaml [--env FILE]
   brainctl telegram send-file --file PATH [--config brainstack.yaml] [--via SSH_TARGET] [--remote-repo PATH] [--caption TEXT] [--context SLUG|--chat-id ID] [--thread-id ID] [--kind document|photo] [--max-bytes N] [--allow-sensitive] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default] [--json]
   brainctl import-text --config brainstack.yaml --title TITLE --text TEXT --source-harness HARNESS --source-machine MACHINE [--source-type note]
   brainctl propose --config brainstack.yaml --title TITLE --body BODY [--target-page wiki/PATH.md] [--content-file FILE] [--base-sha256 HASH|absent] [--risk low|medium|high] [--confidence 0..1] [--curator-run-id ID] [--reason TEXT] [--needs-human] [--source-ids id1,id2] [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF]
@@ -729,7 +737,7 @@ async function discoverConfigCandidates(configDir: string): Promise<string[]> {
 
 async function missingConfigMessage(configPath: string, profileHint?: string): Promise<string> {
   const candidates = await discoverConfigCandidates(dirname(configPath));
-  const profile = SUPPORTED_PROFILES.includes(profileHint as Profile) ? (profileHint as Profile) : "control";
+  const profile = profileHint && isSupportedProfile(profileHint) ? profileHint : "control";
   const createLines =
     profile === "client-macos"
       ? [
@@ -835,13 +843,14 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
   const raw = await loadRawConfig(configPath, profileOverride);
   validateRawConfig(raw);
   const schemaVersion = numberAt(raw, "schema_version", numberAt(raw, "config_version", CONFIG_SCHEMA_VERSION));
-  const profile = (profileOverride || stringAt(raw, "profile", "single-node")) as Profile;
-  if (profile === "private-journal") {
-    throw new Error("Unsupported profile private-journal: first-class private journaling is not implemented yet. Use a separate explicit Brainstack install/config with separate repo paths and tokens.");
+  const profileName = profileOverride || stringAt(raw, "profile", "single-node");
+  if (RESERVED_PROFILE_ERRORS[profileName]) {
+    throw new Error(RESERVED_PROFILE_ERRORS[profileName]);
   }
-  if (!SUPPORTED_PROFILES.includes(profile)) {
-    throw new Error(`Unsupported profile ${profile}; supported profiles are ${SUPPORTED_PROFILES.join("|")}`);
+  if (!isSupportedProfile(profileName)) {
+    throw new Error(`Unsupported profile ${profileName}; supported profiles are ${SUPPORTED_PROFILES.join("|")}`);
   }
+  const profile = profileName;
   const runtime = objectAt(raw, "runtime");
   const harness = objectAt(raw, "harness");
   const machine = objectAt(raw, "machine");
@@ -1136,21 +1145,6 @@ async function readExistingPrivateText(path: string): Promise<string> {
 
 async function writePrivateText(path: string, text: string): Promise<void> {
   await writeText(path, text, 0o600);
-}
-
-async function writePrivateIfMissing(path: string, text: string): Promise<boolean> {
-  if (existsSync(path)) {
-    const info = await lstat(path);
-    if (info.isSymbolicLink() || !info.isFile()) {
-      throw new Error(`refusing to use non-regular private file: ${path}`);
-    }
-    if ((info.mode & 0o077) !== 0) {
-      await chmod(path, 0o600);
-    }
-    return false;
-  }
-  await writePrivateText(path, text);
-  return true;
 }
 
 async function writeIfMissing(path: string, text: string, mode?: number): Promise<boolean> {
@@ -3293,10 +3287,6 @@ function brainInstanceId(cfg: BrainstackConfig): string {
   return sha256Hex(base).slice(0, 32);
 }
 
-async function countOutboxItems(cfg: BrainstackConfig): Promise<number> {
-  return (await scanOutbox(outboxRoot(cfg))).items.length;
-}
-
 async function harnessGuidanceChecks(cfg: BrainstackConfig): Promise<DoctorCheck[]> {
   const checks: DoctorCheck[] = [];
   const bootstrapRoot = join(cfg.paths.configRoot, "client-bootstrap");
@@ -5018,33 +5008,53 @@ async function collectLocalFleetStatus(cfg: BrainstackConfig, timeoutMs: number,
   return finalizeFleetStatus(report);
 }
 
-function remoteFleetControlScript(remoteRepo: string, argv: string[]): string {
-  return `
-set -euo pipefail
-brainstack_expand_home() {
-  case "$1" in
-    \\~) printf '%s\\n' "$HOME" ;;
-    \\~/*) printf '%s/%s\\n' "$HOME" "\${1#\\~/}" ;;
-    *) printf '%s\\n' "$1" ;;
-  esac
+function remoteBrainctlScript(remoteRepo: string, argv: string[], options: { preferInstalledBinary?: boolean } = {}): string {
+  const argvText = argv.map(quoteForBash).join(" ");
+  return [
+    "set -euo pipefail",
+    "brainstack_expand_home() {",
+    '  case "$1" in',
+    '    \\~) printf \'%s\\n\' "$HOME" ;;',
+    '    \\~/*) printf \'%s/%s\\n\' "$HOME" "${1#\\~/}" ;;',
+    '    *) printf \'%s\\n\' "$1" ;;',
+    "  esac",
+    "}",
+    `repo="$(brainstack_expand_home ${quoteForBash(remoteRepo)})"`,
+    'cd "$repo"',
+    options.preferInstalledBinary
+      ? [
+          'if [ -x "$HOME/.local/bin/brainctl" ]; then',
+          `  exec "$HOME/.local/bin/brainctl" ${argvText} --config "$HOME/.config/brainstack/brainstack.yaml"`,
+          "fi"
+        ].join("\n")
+      : null,
+    'if [ -x "$HOME/.bun/bin/bun" ]; then',
+    '  bun_bin="$HOME/.bun/bin/bun"',
+    "else",
+    '  bun_bin="$(command -v bun)"',
+    "fi",
+    `exec "$bun_bin" --no-env-file run packages/brainctl/src/main.ts ${argvText} --config "$HOME/.config/brainstack/brainstack.yaml"`
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
 }
-repo="$(brainstack_expand_home ${quoteForBash(remoteRepo)})"
-cd "$repo"
-if [ -x "$HOME/.local/bin/brainctl" ]; then
-  exec "$HOME/.local/bin/brainctl" ${argv.map(quoteForBash).join(" ")} --config "$HOME/.config/brainstack/brainstack.yaml"
-fi
-if [ -x "$HOME/.bun/bin/bun" ]; then
-  bun_bin="$HOME/.bun/bin/bun"
-else
-  bun_bin="$(command -v bun)"
-fi
-exec "$bun_bin" --no-env-file run packages/brainctl/src/main.ts ${argv.map(quoteForBash).join(" ")} --config "$HOME/.config/brainstack/brainstack.yaml"
-`.trim();
+
+function controlSshTarget(
+  cfg: BrainstackConfig,
+  args: ParsedArgs,
+  label: string,
+  options: { allowRemoteSshFallback?: boolean } = {}
+): string | null {
+  const via =
+    requireFlagValue(args, "via") ||
+    process.env.BRAINSTACK_TELEGRAM_VIA?.trim() ||
+    cfg.client.telegramVia ||
+    (options.allowRemoteSshFallback ? sshTargetFromRemoteSsh(cfg.client.remoteSsh) : null);
+  return via ? validateInviteSshTarget(via, label) : null;
 }
 
 function fleetControlSshTarget(cfg: BrainstackConfig, args: ParsedArgs): string | null {
-  const via = requireFlagValue(args, "via") || process.env.BRAINSTACK_TELEGRAM_VIA?.trim() || cfg.client.telegramVia || sshTargetFromRemoteSsh(cfg.client.remoteSsh);
-  return via ? validateInviteSshTarget(via, "fleet control SSH target") : null;
+  return controlSshTarget(cfg, args, "fleet control SSH target", { allowRemoteSshFallback: true });
 }
 
 function fleetControlFallbackName(cfg: BrainstackConfig, args: ParsedArgs): string {
@@ -5061,14 +5071,24 @@ function looksLikeUnsupportedFleetCommand(text: string): boolean {
   return normalized.includes("unknown command: fleet") || (normalized.includes("unknown command") && normalized.includes("brainctl init"));
 }
 
-function runFleetControlRemoteScript(cfg: BrainstackConfig, args: ParsedArgs, remoteScript: string, timeoutMs: number): ReturnType<typeof run> | null {
-  const via = fleetControlSshTarget(cfg, args);
+function runControlRemoteScript(
+  cfg: BrainstackConfig,
+  args: ParsedArgs,
+  label: string,
+  remoteScript: string,
+  timeoutMs: number,
+  options: { allowRemoteSshFallback?: boolean } = {}
+): ReturnType<typeof run> | null {
+  const via = controlSshTarget(cfg, args, label, options);
   if (!via) {
     return null;
   }
   const worker = telegramControlWorker(via);
   const knownHostsPath = telegramKnownHostsPath(cfg, args);
   const sshTrustMode = telegramSshTrustMode(args);
+  if (sshTrustMode === "accept-new") {
+    mkdirSync(dirname(knownHostsPath), { recursive: true });
+  }
   const sshBin = Bun.which("ssh") || "ssh";
   return run(
     [
@@ -5088,7 +5108,14 @@ function runFleetControlRemoteScript(cfg: BrainstackConfig, args: ParsedArgs, re
 
 function runFleetControlSsh(cfg: BrainstackConfig, args: ParsedArgs, argv: string[], timeoutMs: number): ReturnType<typeof run> | null {
   const remoteRepo = requireFlagValue(args, "remote-repo") || process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() || cfg.client.telegramRemoteRepo || "~/brainstack";
-  return runFleetControlRemoteScript(cfg, args, remoteFleetControlScript(remoteRepo, argv), timeoutMs);
+  return runControlRemoteScript(
+    cfg,
+    args,
+    "fleet control SSH target",
+    remoteBrainctlScript(remoteRepo, argv, { preferInstalledBinary: true }),
+    timeoutMs,
+    { allowRemoteSshFallback: true }
+  );
 }
 
 function clientFleetTargetIsControl(cfg: BrainstackConfig, args: ParsedArgs, target: string | undefined): boolean {
@@ -5109,7 +5136,7 @@ function runFleetControlBootstrapUpdate(cfg: BrainstackConfig, args: ParsedArgs,
   if (dryRun) {
     return { machine: fleetControlFallbackName(cfg, args), role: "control", ok: true, dry_run: true, code: 0, output: script };
   }
-  const result = runFleetControlRemoteScript(cfg, args, script, 300_000);
+  const result = runControlRemoteScript(cfg, args, "fleet control SSH target", script, 300_000, { allowRemoteSshFallback: true });
   if (!result) {
     throw new Error("fleet update needs a control SSH target for client-macos installs");
   }
@@ -11302,63 +11329,20 @@ function formatProposalClusterLine(cluster: Record<string, unknown>): string {
 
 type ProposalDecisionAction = "approve" | "reject" | "apply";
 
-function proposalDecisionControlSshTarget(cfg: BrainstackConfig, args: ParsedArgs): string | null {
-  const via = requireFlagValue(args, "via") || process.env.BRAINSTACK_TELEGRAM_VIA?.trim() || cfg.client.telegramVia;
-  return via ? validateInviteSshTarget(via, "proposal decision SSH target") : null;
-}
-
-function proposalDecisionRemoteScript(remoteRepo: string, action: ProposalDecisionAction, id: string, reason?: string): string {
-  const reasonArgs = reason ? ` --reason ${quoteForBash(reason)}` : "";
-  return `
-set -euo pipefail
-brainstack_expand_home() {
-  case "$1" in
-    \\~) printf '%s\\n' "$HOME" ;;
-    \\~/*) printf '%s/%s\\n' "$HOME" "\${1#\\~/}" ;;
-    *) printf '%s\\n' "$1" ;;
-  esac
-}
-repo="$(brainstack_expand_home ${quoteForBash(remoteRepo)})"
-cd "$repo"
-if [ -x "$HOME/.bun/bin/bun" ]; then
-  bun_bin="$HOME/.bun/bin/bun"
-else
-  bun_bin="$(command -v bun)"
-fi
-"$bun_bin" --no-env-file run packages/brainctl/src/main.ts proposals ${action} ${quoteForBash(id)} --config "$HOME/.config/brainstack/brainstack.yaml"${reasonArgs}
-`.trim();
-}
-
 async function maybeRunRemoteProposalDecision(cfg: BrainstackConfig, args: ParsedArgs, action: ProposalDecisionAction, id: string, reason?: string): Promise<boolean> {
   if (cfg.telemux.enabled || process.env.BRAIN_ADMIN_TOKEN || readEnvFile(join(cfg.paths.configRoot, "braind.secrets.env")).BRAIN_ADMIN_TOKEN) {
     return false;
   }
-  const via = proposalDecisionControlSshTarget(cfg, args);
+  const via = controlSshTarget(cfg, args, "proposal decision SSH target");
   if (!via) {
     return false;
   }
-  const worker = telegramControlWorker(via);
   const remoteRepo = requireFlagValue(args, "remote-repo") || process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() || cfg.client.telegramRemoteRepo || "~/brainstack";
-  const knownHostsPath = telegramKnownHostsPath(cfg, args);
-  const sshTrustMode = telegramSshTrustMode(args);
-  if (sshTrustMode === "accept-new") {
-    await ensureDir(dirname(knownHostsPath));
+  const argv = ["proposals", action, id, ...(reason ? ["--reason", reason] : [])];
+  const result = runControlRemoteScript(cfg, args, "proposal decision SSH target", remoteBrainctlScript(remoteRepo, argv), 120_000);
+  if (!result) {
+    return false;
   }
-  const remoteScript = proposalDecisionRemoteScript(remoteRepo, action, id, reason);
-  const result = run(
-    [
-      "ssh",
-      "-o",
-      "BatchMode=yes",
-      "-o",
-      "ConnectTimeout=8",
-      ...telegramSshTrustArgs(sshTrustMode, knownHostsPath),
-      ...workerSshPortArgs(worker),
-      workerRemoteTarget(worker),
-      `bash -lc ${quoteForBash(remoteScript)}`
-    ],
-    { check: false, timeoutMs: 120_000 }
-  );
   if (result.code !== 0) {
     throw new Error(`proposal ${action} failed over ssh with exit ${result.code}\n${result.stderr || result.stdout}`);
   }
@@ -11594,62 +11578,26 @@ async function telemuxControlRequest(cfg: BrainstackConfig, path: string): Promi
   return parsed;
 }
 
-function curatorControlSshTarget(cfg: BrainstackConfig, args: ParsedArgs): string | null {
-  const via = requireFlagValue(args, "via") || process.env.BRAINSTACK_TELEGRAM_VIA?.trim() || cfg.client.telegramVia || sshTargetFromRemoteSsh(cfg.client.remoteSsh);
-  return via ? validateInviteSshTarget(via, "curator control SSH target") : null;
-}
-
-function curatorRemoteControlScript(remoteRepo: string, subcommand: "run" | "install"): string {
-  return `
-set -euo pipefail
-brainstack_expand_home() {
-  case "$1" in
-    \\~) printf '%s\\n' "$HOME" ;;
-    \\~/*) printf '%s/%s\\n' "$HOME" "\${1#\\~/}" ;;
-    *) printf '%s\\n' "$1" ;;
-  esac
-}
-repo="$(brainstack_expand_home ${quoteForBash(remoteRepo)})"
-cd "$repo"
-if [ -x "$HOME/.bun/bin/bun" ]; then
-  bun_bin="$HOME/.bun/bin/bun"
-else
-  bun_bin="$(command -v bun)"
-fi
-"$bun_bin" --no-env-file run packages/brainctl/src/main.ts curator ${subcommand} --config "$HOME/.config/brainstack/brainstack.yaml"
-`.trim();
-}
-
 async function maybeRunRemoteCuratorControl(cfg: BrainstackConfig, args: ParsedArgs, subcommand: "run" | "install"): Promise<boolean> {
   if (cfg.telemux.enabled) {
     return false;
   }
-  const via = curatorControlSshTarget(cfg, args);
+  const via = controlSshTarget(cfg, args, "curator control SSH target", { allowRemoteSshFallback: true });
   if (!via) {
     return false;
   }
-  const worker = telegramControlWorker(via);
   const remoteRepo = requireFlagValue(args, "remote-repo") || process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() || cfg.client.telegramRemoteRepo || "~/brainstack";
-  const knownHostsPath = telegramKnownHostsPath(cfg, args);
-  const sshTrustMode = telegramSshTrustMode(args);
-  if (sshTrustMode === "accept-new") {
-    await ensureDir(dirname(knownHostsPath));
-  }
-  const remoteScript = curatorRemoteControlScript(remoteRepo, subcommand);
-  const result = run(
-    [
-      "ssh",
-      "-o",
-      "BatchMode=yes",
-      "-o",
-      "ConnectTimeout=8",
-      ...telegramSshTrustArgs(sshTrustMode, knownHostsPath),
-      ...workerSshPortArgs(worker),
-      workerRemoteTarget(worker),
-      `bash -lc ${quoteForBash(remoteScript)}`
-    ],
-    { check: false, timeoutMs: 120_000 }
+  const result = runControlRemoteScript(
+    cfg,
+    args,
+    "curator control SSH target",
+    remoteBrainctlScript(remoteRepo, ["curator", subcommand]),
+    120_000,
+    { allowRemoteSshFallback: true }
   );
+  if (!result) {
+    return false;
+  }
   if (result.code !== 0) {
     throw new Error(`curator ${subcommand} failed over ssh with exit ${result.code}\n${result.stderr || result.stdout}`);
   }
@@ -13332,12 +13280,8 @@ async function upsertEnv(path: string, key: string, value: string): Promise<void
 
 async function commandRotateToken(args: ParsedArgs): Promise<void> {
   const kind = flag(args, "kind");
-  if (kind === "telegram-placeholder") {
-    console.log("Telegram bot tokens must be rotated in BotFather. After rotation, update FACTORY_TELEGRAM_BOT_TOKEN in telemux.secrets.env and restart telemux.");
-    return;
-  }
   if (kind !== "import" && kind !== "admin") {
-    throw new Error("rotate-token requires --kind import|admin|telegram-placeholder");
+    throw new Error("rotate-token requires --kind import|admin");
   }
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
   const envPath = abs(flag(args, "env") || join(cfg.paths.configRoot, "braind.secrets.env"));

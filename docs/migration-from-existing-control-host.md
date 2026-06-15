@@ -34,10 +34,10 @@ cd ~/brainstack
 bun run packages/brainctl/src/main.ts migrate-current-install
 ```
 
-This writes a compatibility config at:
+This deprecated compatibility command writes a config at:
 
 ```text
-~/.config/brainstack/current-control.brainstack.yaml
+~/.config/brainstack/current-install.brainstack.yaml
 ```
 
 It does not stop services, move repos, rewrite hooks, or delete `/srv`.

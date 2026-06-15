@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 export type WorkerTransport = "local" | "ssh" | "tailscale-ssh";
 export type HarnessName = "codex" | "claude";
 export type WorkerSshTrustMode = "pinned" | "accept-new";
+export type UsageAdapter = "manual";
 
 export interface PreDispatchClassifierConfig {
   enabled: boolean;
@@ -63,7 +64,7 @@ export interface FactoryConfig {
   workersFileExplicit?: boolean;
   workersFileInitiallyLoaded?: boolean;
   workers: FactoryWorkerConfig[];
-  usageAdapter: string;
+  usageAdapter: UsageAdapter;
   harness: HarnessName;
   harnessBin: string;
   codexBin: string;
@@ -173,6 +174,14 @@ function normalizeTransport(value: string | undefined, fallback: WorkerTransport
 
 function normalizeHarness(value: string | undefined): HarnessName {
   return value === "claude" ? "claude" : "codex";
+}
+
+function normalizeUsageAdapter(value: string | undefined): UsageAdapter {
+  const adapter = value?.trim() || "manual";
+  if (adapter === "manual") {
+    return "manual";
+  }
+  throw new Error(`Unsupported FACTORY_USAGE_ADAPTER=${adapter}; supported value: manual`);
 }
 
 function normalizeSshTrustMode(value: string | null | undefined, transport: WorkerTransport): WorkerSshTrustMode {
@@ -354,7 +363,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
     workersFileExplicit: workerSource.explicit,
     workersFileInitiallyLoaded: workerSource.loaded,
     workers,
-    usageAdapter: env.FACTORY_USAGE_ADAPTER?.trim() || "manual",
+    usageAdapter: normalizeUsageAdapter(env.FACTORY_USAGE_ADAPTER),
     harness,
     harnessBin,
     codexBin: env.FACTORY_CODEX_BIN?.trim() || (harness === "codex" ? harnessBin : "codex"),

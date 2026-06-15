@@ -915,12 +915,6 @@ export class CommandHandler {
         return;
       }
 
-      const legacyCronShortcut = parsed.command.match(/^\/cron_(show|run|pause|resume)_?(\d+)$/);
-      if (legacyCronShortcut) {
-        await this.telegram.sendText(target, "Numeric cron shortcuts expire when the job list changes. Use /crons to refresh the list.");
-        return;
-      }
-
       const cronLatestShortcut = parsed.command.match(/^\/cron_(show|run|pause|resume)_?(latest|last)$/);
       if (cronLatestShortcut) {
         const jobs = this.cronManager.listRelevantJobs(boundContext, target);
@@ -939,7 +933,7 @@ export class CommandHandler {
         return;
       }
 
-      const proposalShortcut = parsed.command.match(/^\/proposal_(accept|approve|reject)_([a-z0-9]{6,10})_(\d+)$/);
+      const proposalShortcut = parsed.command.match(/^\/proposal_(accept|reject)_([a-z0-9]{6,10})_(\d+)$/);
       if (proposalShortcut) {
         const proposal = this.resolveProposalSnapshotShortcut(proposalShortcut[2] || "", proposalShortcut[3] || "", target);
         if (!proposal) {

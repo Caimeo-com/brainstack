@@ -8,8 +8,10 @@
     "dev": "bun --watch src/main.ts",
     "build": "bun build src/main.ts --target bun --outdir dist",
     "test": "bun test",
-    "doctor": "./scripts/doctor.sh",
-    "bootstrap:codex": "./scripts/bootstrap-codex.sh"
+    "doctor": "echo 'apps/telemux doctor is legacy-only; prefer brainctl doctor --config ~/.config/brainstack/brainstack.yaml --workers' >&2; ./scripts/doctor.sh",
+    "bootstrap:codex": "echo 'apps/telemux bootstrap:codex is legacy-only; prefer brainctl hooks/skills lifecycle commands' >&2; ./scripts/bootstrap-codex.sh",
+    "legacy:doctor": "./scripts/doctor.sh",
+    "legacy:bootstrap:codex": "./scripts/bootstrap-codex.sh"
   },
   "devDependencies": {
     "@types/bun": "1.3.11"

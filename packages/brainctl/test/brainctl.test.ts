@@ -979,7 +979,7 @@ telemux:
     try {
       const configDir = join(dir, ".config", "brainstack");
       await mkdir(configDir, { recursive: true });
-      const candidate = join(configDir, "current-control.brainstack.yaml");
+      const candidate = join(configDir, "current-install.brainstack.yaml");
       await writeFile(candidate, "schema_version: 1\nprofile: control\n");
       const missing = join(configDir, "brainstack.yaml");
       const result = runBrainctl(["doctor", "--config", missing], { HOME: dir });
@@ -7941,7 +7941,7 @@ describe("public release hygiene", () => {
       expect(sshArgs).toContain(`UserKnownHostsFile=${join(configRoot, "ssh_known_hosts")}`);
       expect(sshArgs).toContain("operator@control.example");
       expect(sshArgs).toContain("/home/operator/brainstack");
-      expect(sshArgs).toContain("curator install --config");
+      expect(sshArgs).toContain("'\\''curator'\\'' '\\''install'\\'' --config");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -8002,12 +8002,87 @@ describe("public release hygiene", () => {
       expect(sshArgs).toContain(`UserKnownHostsFile=${join(configRoot, "ssh_known_hosts")}`);
       expect(sshArgs).toContain("operator@control.example");
       expect(sshArgs).toContain("/home/operator/brainstack");
-      expect(sshArgs).toContain("proposals reject '\\''proposal-1'\\'' --config");
-      expect(sshArgs).toContain("--reason '\\''not useful'\\''");
+      expect(sshArgs).toContain("'\\''proposals'\\'' '\\''reject'\\'' '\\''proposal-1'\\''");
+      expect(sshArgs).toContain("'\\''--reason'\\'' '\\''not useful'\\''");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
   }, 10_000);
+
+  test("client remote control creates custom known-hosts parent for accept-new trust", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-control-accept-new-known-hosts-"));
+    try {
+      const binDir = join(dir, "bin");
+      const configRoot = join(dir, "config");
+      await mkdir(binDir, { recursive: true });
+      await mkdir(configRoot, { recursive: true });
+      const argsCapture = join(dir, "ssh-args.txt");
+      const fakeSsh = join(binDir, "ssh");
+      await writeFile(
+        fakeSsh,
+        [
+          "#!/usr/bin/env bash",
+          "set -euo pipefail",
+          `printf '<%s>\\n' "$@" > '${argsCapture}'`,
+          "echo 'proposal=proposal-1 action=reject status=rejected'",
+          ""
+        ].join("\n")
+      );
+      await chmod(fakeSsh, 0o755);
+
+      const configPath = join(dir, "client.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: mac-client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  configRoot: ${configRoot}`,
+          "client:",
+          "  telegramVia: operator@control.example",
+          "  telegramRemoteRepo: /home/operator/brainstack",
+          ""
+        ].join("\n")
+      );
+
+      const knownHostsPath = join(configRoot, "nested", "control_known_hosts");
+      const result = runBrainctl(
+        [
+          "proposals",
+          "reject",
+          "proposal-1",
+          "--config",
+          configPath,
+          "--known-hosts",
+          knownHostsPath,
+          "--ssh-trust",
+          "accept-new"
+        ],
+        {
+          PATH: `${binDir}:${process.env.PATH || ""}`,
+          BRAIN_ADMIN_TOKEN: ""
+        }
+      );
+      expectSuccess(result);
+      expect(existsSync(dirname(knownHostsPath))).toBe(true);
+      const sshArgs = await readFile(argsCapture, "utf8");
+      expect(sshArgs).toContain("StrictHostKeyChecking=accept-new");
+      expect(sshArgs).toContain(`UserKnownHostsFile=${knownHostsPath}`);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("rotate-token rejects non-owned token kinds", () => {
+    const result = runBrainctl(["rotate-token", "--kind", "telegram-placeholder"]);
+    expect(result.code).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("rotate-token requires --kind import|admin");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("BotFather");
+  });
 
   test("telegram send-file rejects unsafe local files before opening SSH", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-telegram-send-file-unsafe-"));

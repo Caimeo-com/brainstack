@@ -92,7 +92,7 @@ brainctl remember --repo PATH --summary TEXT [--project NAME] [--domain NAME] [-
 brainctl propose --title TITLE --body BODY [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF]
 ```
 
-Reads are unauthenticated within the tailnet; accept/reject/apply require `BRAIN_ADMIN_TOKEN` on the control host. The old `approve` command is retained for compatibility with staged approval workflows, but normal review should use `apply`/Accept. On an enrolled client, proposal decision commands can forward over the explicit control SSH route from `--via`, `BRAINSTACK_TELEGRAM_VIA`, or `client.telegramVia`, using the configured pinned known-hosts file by default. `curator run`/`curator install` talk to the local telemux dashboard control endpoints.
+Reads are unauthenticated within the tailnet; accept/reject/apply require `BRAIN_ADMIN_TOKEN` on the control host. The CLI `approve` command is retained for approval-mode workflows, but normal review should use `apply`/Accept. On an enrolled client, proposal decision commands can forward over the explicit control SSH route from `--via`, `BRAINSTACK_TELEGRAM_VIA`, or `client.telegramVia`, using the configured pinned known-hosts file by default. `curator run`/`curator install` use the local telemux dashboard control endpoints when telemux is enabled; enrolled clients without local telemux forward them over the configured control SSH route, including the `client.remoteSsh` fallback for curator commands.
 
 Telegram mirrors the basics:
 
@@ -107,7 +107,7 @@ Telegram mirrors the basics:
 
 Run `/curation` in the Telegram topic you want to use for proposal review. It binds that topic to a durable `proposal-curation` scratch context, makes the built-in `brain-curator` routine target that topic, and prints the useful proposal review commands. It accepts an optional machine override: `/curation <machine>`.
 
-Telegram Accept applies the proposed wiki change when the proposal carries one (drift still parks it as `needs-human`). Context-only candidates without a target page must be enriched or merged before they can be accepted. Accept/reject from Telegram require the optional `FACTORY_BRAIN_ADMIN_TOKEN` in the telemux env; without it, Telegram stays read-only for proposals. The old `/proposal_approve_<token>_<n>` shortcut is accepted as a compatibility alias for Accept.
+Telegram Accept applies the proposed wiki change when the proposal carries one (drift still parks it as `needs-human`). Context-only candidates without a target page must be enriched or merged before they can be accepted. Accept/reject from Telegram require the optional `FACTORY_BRAIN_ADMIN_TOKEN` in the telemux env; without it, Telegram stays read-only for proposals.
 
 Useful review flows:
 

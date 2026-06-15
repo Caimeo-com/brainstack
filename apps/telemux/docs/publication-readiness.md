@@ -46,7 +46,7 @@ Those are survivable privately, but they are poor defaults for a public repo.
 - `README.md`, `docs/architecture.md`, `docs/operations.md`, and `NEXT_STEPS.md` were pushed toward generic control-host / remote-worker language.
 - `docs/fresh-machine-bootstrap.md` now documents the full machine rebuild path, including passwordless sudo and Codex permanent yolo mode.
 - `templates/codex/config.toml.example` and `templates/sudoers/factory-nopasswd` were added so critical non-repo state has tracked templates.
-- `templates/codex/AGENTS.md` and `scripts/bootstrap-codex.sh` now make the Codex dotfile bootstrap one command instead of a manual copy exercise.
+- `templates/codex/AGENTS.md` and `scripts/bootstrap-codex.sh` document the legacy direct Codex dotfile bootstrap; fresh Brainstack installs should use the repo-level `brainctl` lifecycle and skills/hooks commands.
 - An MIT [LICENSE](../LICENSE) file is now present.
 
 ## Remaining safe steps before a public GitHub push

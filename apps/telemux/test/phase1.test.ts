@@ -2137,18 +2137,9 @@ test("basic loops install the brain-curator routine and curator commands work en
     expect(decisions.length).toBe(1);
     expect(fixture.telegram.sent.at(-1)?.text).toContain("no wiki change attached");
 
-    // Legacy approve shortcuts remain an alias for the guarded Accept path.
-    await fixture.commands.handleMessage(telegramMessage(`/proposal_approve_${token}_2`, 90));
-    expect(decisions.length).toBe(1);
-    expect(fixture.telegram.sent.at(-1)?.text).toContain("no wiki change attached");
-
-    await fixture.commands.handleMessage(telegramMessage(`/proposal_approve_${token}_1`, 90));
-    await waitFor(() => decisions.length === 2);
-    expect(decisions[1].path).toBe("/api/proposals/20260610t060000z-status-update/apply");
-
     await fixture.commands.handleMessage(telegramMessage(`/proposal_reject_${token}_1`, 90));
-    await waitFor(() => decisions.length === 3);
-    expect(decisions[2].path).toBe("/api/proposals/20260610t060000z-status-update/reject");
+    await waitFor(() => decisions.length === 2);
+    expect(decisions[1].path).toBe("/api/proposals/20260610t060000z-status-update/reject");
 
     // Manual curator run dispatches the codex routine and reports status to braind.
     await fixture.commands.handleMessage(telegramMessage("/curator_run", 90));
@@ -2505,6 +2496,45 @@ test("context usage and manual compaction stay concise and harness-aware", async
     await fixture.commands.handleMessage(telegramMessage("emit final compact event without newline", 90));
     await waitFor(() => fixture.telegram.sent.slice(beforeFinalCompactCount).some((entry) => entry.text === "Compacting thread…"));
     await waitFor(() => fixture.telegram.sent.slice(beforeFinalCompactCount).some((entry) => entry.text.includes("Reply turn 4 for compact-lab.")));
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("usage adapter config is manual-only and legacy context adapters are explicit", async () => {
+  expect(() => loadConfig({ ...process.env, FACTORY_USAGE_ADAPTER: "openai_codex" })).toThrow(
+    "Unsupported FACTORY_USAGE_ADAPTER=openai_codex"
+  );
+  expect(() => loadConfig({ ...process.env, FACTORY_USAGE_ADAPTER: "typo" })).toThrow(
+    "Unsupported FACTORY_USAGE_ADAPTER=typo"
+  );
+
+  const fixture = await createFixture();
+  try {
+    const context = fixture.contexts.createOrUpdateContext({
+      slug: "legacy-usage",
+      machine: "control",
+      kind: "scratch",
+      state: "active",
+      transport: "local",
+      target: "scratch",
+      rootPath: join(fixture.factoryRoot, "scratch", "legacy-usage"),
+      worktreePath: join(fixture.factoryRoot, "scratch", "legacy-usage"),
+      branchName: null,
+      baseBranch: null,
+      usageAdapter: "openai_codex",
+      chatId: null,
+      threadId: null
+    });
+    fixture.contexts.bindContext(context.slug, 4242, 93);
+
+    await fixture.commands.handleMessage(telegramMessage("/usage", 93));
+    const usageText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(usageText).toContain("Context: legacy-usage");
+    expect(usageText).toContain("Unsupported usage adapter: openai_codex");
+    expect(usageText).toContain("Brainstack only supports the manual local run-log parser now.");
+    expect(usageText).not.toContain("Turns counted:");
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
@@ -2936,9 +2966,6 @@ test("cron shortcuts use stable scoped snapshots and cron ids cannot cross topic
     await fixture.cronManager.updateJob(alpha, { executionContextSlug: "topic-b", targetThreadId: 83 });
     await fixture.commands.handleMessage(telegramMessage(runShortcut!, 82));
     expect(fixture.telegram.sent.at(-1)?.text).toContain("shortcut expired or the job was deleted");
-
-    await fixture.commands.handleMessage(telegramMessage("/cron_run_1", 82));
-    expect(fixture.telegram.sent.at(-1)?.text).toContain("Numeric cron shortcuts expire");
 
     await fixture.commands.handleMessage(telegramMessage(`/cron show ${beta.id}`, 82));
     expect(fixture.telegram.sent.at(-1)?.text).toContain("Error: No cron job matched in this topic/context");

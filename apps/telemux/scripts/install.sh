@@ -7,6 +7,8 @@ BUN_BIN="${BUN_BIN:-$HOME/.bun/bin/bun}"
 OWNER_USER="${USER}"
 OWNER_GROUP="$(id -gn)"
 
+echo "Legacy telemux installer: fresh Brainstack installs should use brainctl provision/init/lifecycle instead. Continuing with direct /srv compatibility setup." >&2
+
 if [[ "${EUID}" -eq 0 ]]; then
   echo "Run ./scripts/install.sh as your normal user, not with sudo."
   echo "The script will call sudo itself for /srv setup and linger."

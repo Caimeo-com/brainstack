@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUN_BIN="${BUN_BIN:-$HOME/.bun/bin/bun}"
 
+echo "Legacy telemux doctor: fresh Brainstack installs should use brainctl doctor --config ~/.config/brainstack/brainstack.yaml --workers." >&2
+
 if [[ "${EUID}" -eq 0 ]]; then
   echo "Run ./scripts/doctor.sh as your normal user, not with sudo."
   exit 1

@@ -5,6 +5,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 FORCE=0
 
+echo "Legacy Codex bootstrap: fresh Brainstack installs should use brainctl enroll plus skills/hooks lifecycle commands." >&2
+
 usage() {
   cat <<'EOF'
 Usage: ./scripts/bootstrap-codex.sh [--force] [--codex-home PATH]

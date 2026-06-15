@@ -10,12 +10,15 @@ Phase 1 is intentionally usable without a remote worker. `host` and `scratch` to
 
 ## Quickstart
 
-1. Copy `.env.example` to `.env`.
-2. Copy `workers.example.json` to `workers.json`.
-3. Set `FACTORY_TELEGRAM_BOT_TOKEN` in `.env`.
-4. Run `./scripts/install.sh` as your normal user. It will prompt for `sudo` only for the `/srv` and linger setup.
-5. Run `./scripts/doctor.sh` as your normal user.
-6. Open `http://127.0.0.1:8787/`.
+For fresh Brainstack installs, use the repo-level lifecycle path:
+
+```bash
+brainctl provision --profile control --out ~/.config/brainstack/brainstack.yaml
+brainctl init --profile control --config ~/.config/brainstack/brainstack.yaml
+brainctl doctor --config ~/.config/brainstack/brainstack.yaml --workers
+```
+
+The direct `apps/telemux/scripts/install.sh` and `doctor.sh` path is legacy-only for `/srv/telemux` and `/srv/factory` compatibility migrations.
 
 If you want the worker file somewhere else, set `FACTORY_WORKERS_FILE` in `.env`.
 
