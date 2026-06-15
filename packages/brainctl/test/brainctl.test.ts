@@ -8720,6 +8720,10 @@ describe("public release hygiene", () => {
     expect(releaseWorkflow).toContain("menu-app-release:");
     expect(releaseWorkflow).toContain("include_menu_app");
     expect(releaseWorkflow).toContain("must match package.json version");
+    expect(releaseWorkflow).toContain("actions/checkout@v6");
+    expect(releaseWorkflow).not.toContain("actions/checkout@v4");
+    expect(releaseWorkflow).not.toContain("node -e");
+    expect(releaseWorkflow).toContain("sed -n");
     expect(installDoc).not.toContain("--invite-file FILE|-");
     expect(installDoc).toContain("Debian/Ubuntu");
     expect(installDoc).toContain("Arch/Omarchy");
