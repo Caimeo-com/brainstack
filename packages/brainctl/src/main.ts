@@ -4499,8 +4499,8 @@ function remoteControlSourceScript(remoteRepo: string): string {
 set -u
 repo=${quoteForBash(remoteRepo || "~/brainstack")}
 case "$repo" in
-  "~") repo="$HOME" ;;
-  "~/"*) repo="$HOME/\${repo#~/}" ;;
+  \\~) repo="$HOME" ;;
+  \\~/*) repo="$HOME/\${repo#\\~/}" ;;
 esac
 printf 'repo=%s\\n' "$repo"
 if [ ! -d "$repo/.git" ]; then
@@ -4849,8 +4849,8 @@ function fleetProbeScript(productRepo: string, services: string[], fetch: boolea
 set -u
 brainstack_expand_home() {
   case "$1" in
-    "~") printf '%s\\n' "$HOME" ;;
-    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
+    \\~) printf '%s\\n' "$HOME" ;;
+    \\~/*) printf '%s/%s\\n' "$HOME" "\${1#\\~/}" ;;
     *) printf '%s\\n' "$1" ;;
   esac
 }
@@ -4971,8 +4971,8 @@ function remoteFleetControlScript(remoteRepo: string, argv: string[]): string {
 set -euo pipefail
 brainstack_expand_home() {
   case "$1" in
-    "~") printf '%s\\n' "$HOME" ;;
-    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
+    \\~) printf '%s\\n' "$HOME" ;;
+    \\~/*) printf '%s/%s\\n' "$HOME" "\${1#\\~/}" ;;
     *) printf '%s\\n' "$1" ;;
   esac
 }
@@ -8124,8 +8124,8 @@ function telegramRemoteSendScript(options: {
 set -euo pipefail
 brainstack_expand_home() {
   case "$1" in
-    "~") printf '%s\\n' "$HOME" ;;
-    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
+    \\~) printf '%s\\n' "$HOME" ;;
+    \\~/*) printf '%s/%s\\n' "$HOME" "\${1#\\~/}" ;;
     *) printf '%s\\n' "$1" ;;
   esac
 }
@@ -11148,8 +11148,8 @@ function proposalDecisionRemoteScript(remoteRepo: string, action: ProposalDecisi
 set -euo pipefail
 brainstack_expand_home() {
   case "$1" in
-    "~") printf '%s\\n' "$HOME" ;;
-    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
+    \\~) printf '%s\\n' "$HOME" ;;
+    \\~/*) printf '%s/%s\\n' "$HOME" "\${1#\\~/}" ;;
     *) printf '%s\\n' "$1" ;;
   esac
 }
@@ -11439,8 +11439,8 @@ function curatorRemoteControlScript(remoteRepo: string, subcommand: "run" | "ins
 set -euo pipefail
 brainstack_expand_home() {
   case "$1" in
-    "~") printf '%s\\n' "$HOME" ;;
-    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#~/}" ;;
+    \\~) printf '%s\\n' "$HOME" ;;
+    \\~/*) printf '%s/%s\\n' "$HOME" "\${1#\\~/}" ;;
     *) printf '%s\\n' "$1" ;;
   esac
 }
@@ -11843,7 +11843,7 @@ function fleetUpdateScript(configPath: string, role: FleetMachineStatus["role"],
     "brainstack_expand_home() {",
     "  case \"$1\" in",
     "    \"~\") printf '%s\\n' \"$HOME\" ;;",
-    "    \"~/\"*) printf '%s/%s\\n' \"$HOME\" \"${1#~/}\" ;;",
+    "    \\~/*) printf '%s/%s\\n' \"$HOME\" \"${1#\\~/}\" ;;",
     "    *) printf '%s\\n' \"$1\" ;;",
     "  esac",
     "}",

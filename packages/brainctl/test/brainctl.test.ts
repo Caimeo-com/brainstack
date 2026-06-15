@@ -955,6 +955,8 @@ telemux:
       expect(dryRun.stdout).toContain("OK brain-control");
       expect(dryRun.stdout).toContain("git pull --ff-only");
       expect(dryRun.stdout).toContain("~/.config/brainstack/brainstack.yaml");
+      expect(dryRun.stdout).toContain("\\~/*)");
+      expect(dryRun.stdout).toContain("${1#\\~/}");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
