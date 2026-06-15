@@ -8929,6 +8929,7 @@ describe("public release hygiene", () => {
     const installDoc = await readFile(join(PRODUCT_ROOT, "docs", "install-one-line.md"), "utf8");
     const makeApp = await readFile(join(PRODUCT_ROOT, "apps", "brainstack-menu", "scripts", "make-app.sh"), "utf8");
     const appModel = await readFile(join(PRODUCT_ROOT, "apps", "brainstack-menu", "Sources", "BrainstackMenu", "AppModel.swift"), "utf8");
+    const brainctlSource = await readFile(join(PRODUCT_ROOT, "packages", "brainctl", "src", "main.ts"), "utf8");
     for (const text of [packageJson, releaseScript]) {
       expect(text).toContain("--no-compile-autoload-dotenv");
       expect(text).toContain("--no-compile-autoload-bunfig");
@@ -8937,6 +8938,10 @@ describe("public release hygiene", () => {
     expect(releaseScript).toContain("darwin-x64");
     expect(releaseScript).toContain("dist/install.sh");
     expect(releaseScript).toContain("manifest.json");
+    expect(brainctlSource).toContain('brainctl_tmp=\\"$HOME/.local/bin/.brainctl.$$\\"');
+    expect(brainctlSource).toContain('--outfile \\"$brainctl_tmp\\"');
+    expect(brainctlSource).toContain('mv -f \\"$brainctl_tmp\\" \\"$brainctl_bin\\"');
+    expect(brainctlSource).not.toContain('--outfile \\"$brainctl_bin\\"');
     const installScript = await readFile(join(PRODUCT_ROOT, "scripts", "install.sh"), "utf8");
     expect(installScript).toContain("sha256sum");
     expect(installScript).toContain("shasum -a 256");
