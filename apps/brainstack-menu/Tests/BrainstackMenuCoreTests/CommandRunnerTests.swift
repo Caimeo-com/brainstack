@@ -33,6 +33,14 @@ final class CommandRunnerTests: XCTestCase {
     XCTAssertEqual(OverallStateMapper.map(report: outcome.report), .green)
   }
 
+  func testStatusUsesDefaultBrainctlBudget() async throws {
+    let argsPath = scratch.appendingPathComponent("status-args.txt")
+    let binary = try fakeBrainctl("printf '%s\\n' \"$@\" > '\(argsPath.path)'; echo '{\"ok\": true, \"degraded\": false, \"sections\": {}}'")
+    let outcome = await client(binary).fetchStatus()
+    XCTAssertNil(outcome.failure)
+    XCTAssertEqual(try String(contentsOf: argsPath), "status\n--json\n--config\n/tmp/test.yaml\n--timeout-ms\n1500\n")
+  }
+
   func testInvalidJsonProducesParseFailure() async throws {
     let binary = try fakeBrainctl("echo 'this is not json'; echo 'warning noise' >&2")
     let outcome = await client(binary).fetchStatus()

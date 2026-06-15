@@ -76,7 +76,7 @@ public struct BrainctlClient: Sendable {
   // MARK: - Status
 
   public func fetchStatus() async -> StatusFetchOutcome {
-    let perSectionBudgetMs = 750
+    let perSectionBudgetMs = 1500
     let result = await CommandRunner.run(
       executable: binaryPath,
       arguments: ["status", "--json", "--config", configPath, "--timeout-ms", String(perSectionBudgetMs)],
