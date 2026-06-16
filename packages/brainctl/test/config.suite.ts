@@ -246,6 +246,71 @@ telemux:
     }
   });
 
+  test("voice capability install expands home-relative install roots on the target", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-voice-home-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      const modelPath = join(dir, "fake-whisper.llamafile");
+      await writeExecutable(
+        modelPath,
+        `#!/usr/bin/env bash
+exit 0
+`
+      );
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: valkyrie",
+          "paths:",
+          `  home: ${dir}`,
+          `  configRoot: ${join(dir, "config")}`,
+          "brain:",
+          "  publicBaseUrl: https://valkyrie.example.ts.net",
+          "telemux:",
+          "  enabled: true",
+          "  localMachine: valkyrie",
+          "  workers:",
+          "    - name: valkyrie",
+          "      transport: local",
+          ""
+        ].join("\n")
+      );
+
+      const install = runBrainctl(
+        [
+          "capabilities",
+          "install",
+          "voice",
+          "--target",
+          "valkyrie",
+          "--config",
+          configPath,
+          "--install-root",
+          "~/.local/share/brainstack/capabilities/voice",
+          "--model-url",
+          `file://${modelPath}`,
+          "--file-name",
+          "fake-whisper.llamafile",
+          "--allow-insecure-model-url",
+          "--no-restart"
+        ],
+        { HOME: dir }
+      );
+      expectSuccess(install);
+
+      const cfg = await loadConfig(configPath, "control");
+      const expectedCommand = join(dir, ".local", "share", "brainstack", "capabilities", "voice", "fake-whisper.llamafile");
+      expect(cfg.capabilities.voice.command).toBe(expectedCommand);
+      expect(cfg.capabilities.voice.command).not.toContain("/~/");
+      expect(install.stdout).toContain(`command=${expectedCommand}`);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("proposals and curator CLI commands talk to the brain API with correct auth", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-proposals-cli-"));
     const port = 46_000 + Math.floor(Math.random() * 1_000);
