@@ -94,7 +94,7 @@ func statusSummaryLine(for report: StatusReport) -> String {
     guard let section = report.sections[name], section.state == .warn else {
       return false
     }
-    return !isBenignProductWarning(name: name, section: section)
+    return !isBenignWarning(name: name, section: section, report: report)
   }
   if !warnings.isEmpty {
     return "needs attention: \(warnings.map(sectionLabel).joined(separator: ", "))"
@@ -146,6 +146,22 @@ func isBenignProductWarning(name: String, section: StatusSection) -> Bool {
   return section.state == .disabled
     || section.detail.contains("not a git checkout")
     || section.detail.contains("source checkout not installed")
+}
+
+func isBenignProposalLatencyWarning(name: String, section: StatusSection, report: StatusReport) -> Bool {
+  guard name == "proposals", section.state == .warn else {
+    return false
+  }
+  guard let curator = report.sections["curator"], curator.state == .ok else {
+    return false
+  }
+  let error = (section.error ?? "").lowercased()
+  return error.contains("timed out") || error.contains("operation timed out")
+}
+
+func isBenignWarning(name: String, section: StatusSection, report: StatusReport) -> Bool {
+  isBenignProductWarning(name: name, section: section)
+    || isBenignProposalLatencyWarning(name: name, section: section, report: report)
 }
 
 func sectionLabel(_ name: String) -> String {

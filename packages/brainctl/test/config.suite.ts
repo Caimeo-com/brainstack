@@ -600,6 +600,63 @@ telemux:
     }
   }, 10_000);
 
+  test("status json uses curator summary when the full proposal list times out", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-status-proposal-fallback-"));
+    const port = 47_000 + Math.floor(Math.random() * 1_000);
+    const serverScript = join(dir, "proposal-slow-brain.ts");
+    await writeFile(
+      serverScript,
+      [
+        `Bun.serve({`,
+        `  hostname: "127.0.0.1",`,
+        `  port: ${port},`,
+        `  fetch(req) {`,
+        `    const url = new URL(req.url);`,
+        `    if (url.pathname === "/ping") return Response.json({ ok: true });`,
+        `    if (url.pathname === "/healthz") return Response.json({ ok: true, service: "braind" });`,
+        `    if (url.pathname === "/readyz") return Response.json({ ok: true, service: "braind", search_ready: true, pending_reindex: { present: false } });`,
+        `    if (url.pathname === "/api/curator/status") {`,
+        `      return Response.json({ ok: true, mode: "approval", curator: { installed: true, last_run_ok: true, last_run_failures: [] }, proposal_counts: { pending: 2, approved: 0, applied: 1, rejected: 0, superseded: 0, "needs-human": 1 } });`,
+        `    }`,
+        `    if (url.pathname === "/api/proposals") return new Promise(() => {});`,
+        `    return Response.json({ error: "unexpected" }, { status: 500 });`,
+        `  }`,
+        `});`
+      ].join("\n")
+    );
+    const server = Bun.spawn(["bun", "run", serverScript], { stdout: "ignore", stderr: "ignore" });
+    try {
+      await waitForCondition(async () => {
+        try {
+          return (await fetch(`http://127.0.0.1:${port}/ping`)).ok;
+        } catch {
+          return false;
+        }
+      }, "proposal fallback fake brain server startup");
+      const configPath = join(dir, "config.yaml");
+      await writeFixtureConfig(configPath);
+      const result = runBrainctl(["status", "--json", "--config", configPath, "--timeout-ms", "150"], {
+        HOME: dir,
+        BRAIN_BASE_URL: `http://127.0.0.1:${port}`
+      });
+      expectSuccess(result);
+      const parsed = JSON.parse(result.stdout) as Record<string, any>;
+      expect(parsed.sections.brain_api.state).toBe("ok");
+      expect(parsed.sections.curator.state).toBe("ok");
+      expect(parsed.sections.curator.data.open_proposals).toBe(3);
+      expect(parsed.sections.proposals.state).toBe("ok");
+      expect(parsed.sections.proposals.detail).toContain("using curator summary");
+      expect(parsed.sections.proposals.data.count).toBe(3);
+      expect(parsed.sections.proposals.data.by_status.pending).toBe(2);
+      expect(parsed.sections.proposals.data["list_available"]).toBe(false);
+      expect(String(parsed.sections.proposals.data["list_error"]).toLowerCase()).toContain("timed out");
+    } finally {
+      server.kill();
+      await server.exited;
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
   test("status json treats missing product checkout as informational for clients", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-status-client-product-"));
     try {

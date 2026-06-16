@@ -348,7 +348,7 @@ struct DashboardView: View {
       }
       if section.state == .fail {
         items.append(AttentionItem(title: "\(sectionLabel(name)) failed", detail: sectionMessage(name: name, section: section), severity: .fail, repair: repairKind(forSection: name)))
-      } else if section.state == .warn && !(name == "fleet" && !staleFleet.isEmpty) && !isBenignProductWarning(name: name, section: section) && !isOldControlEndpointWarning(section) {
+      } else if section.state == .warn && !(name == "fleet" && !staleFleet.isEmpty) && !isBenignWarning(name: name, section: section, report: report) && !isOldControlEndpointWarning(section) {
         items.append(AttentionItem(title: "\(sectionLabel(name)) needs attention", detail: sectionMessage(name: name, section: section), severity: .warn, repair: repairKind(forSection: name)))
       }
     }

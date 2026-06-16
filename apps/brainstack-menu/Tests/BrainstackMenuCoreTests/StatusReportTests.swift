@@ -49,6 +49,20 @@ final class StatusReportTests: XCTestCase {
     XCTAssertEqual(report.sections["proposals"]?.state, .warn)
   }
 
+  func testProposalSummaryFallbackMapsGreen() throws {
+    let json = """
+    {"ok": true, "degraded": false, "sections": {
+      "config": {"state": "ok", "ok": true, "available": true, "detail": "config loaded"},
+      "curator": {"state": "ok", "ok": true, "available": true, "detail": "mode=approval installed=true open_proposals=3", "data": {"open_proposals": 3, "curator": {"installed": true}}},
+      "proposals": {"state": "ok", "ok": true, "available": true, "detail": "open_proposals=3 (proposal list refresh slow; using curator summary)", "data": {"count": 3, "list_available": false, "fallback_source": "curator", "list_error": "The operation timed out."}}
+    }}
+    """
+    let report = try StatusReport.parse(data: Data(json.utf8))
+    XCTAssertEqual(report.sections["proposals"]?.state, .ok)
+    XCTAssertEqual(report.sections["proposals"]?.data?["list_available"]?.boolValue, false)
+    XCTAssertEqual(OverallStateMapper.map(report: report), .green)
+  }
+
   func testUnknownSectionsAndStatesDoNotCrash() throws {
     let report = try StatusReport.parse(data: fixture("status-unknown-sections"))
     XCTAssertTrue(report.sectionNames.contains("quantum_sync"))

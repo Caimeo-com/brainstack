@@ -81,7 +81,7 @@ final class AppModel: ObservableObject {
       guard let section = report.sections[name], section.state == .warn else {
         return false
       }
-      return !isBenignProductWarning(name: name, section: section)
+      return !isBenignWarning(name: name, section: section, report: report)
     }
     if actionableWarning || controlHostLooksOld(report) || curatorRoutineMissing(report) {
       return .yellow

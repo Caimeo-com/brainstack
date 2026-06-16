@@ -1400,12 +1400,52 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
     });
   }
 
-  async function collectProposalsStatusSection(cfg: BrainstackConfig, timeoutMs: number): Promise<BrainctlStatusSection> {
+  function proposalSummaryFallbackFromCurator(curatorSection: BrainctlStatusSection | undefined, error: unknown): BrainctlStatusSection | null {
+    if (!curatorSection || curatorSection.state !== "ok" || !curatorSection.data || typeof curatorSection.data !== "object" || Array.isArray(curatorSection.data)) {
+      return null;
+    }
+    const curatorData = curatorSection.data as Record<string, unknown>;
+    const open = Number(curatorData.open_proposals);
+    if (!Number.isFinite(open)) {
+      return null;
+    }
+    const counts =
+      curatorData.proposal_counts && typeof curatorData.proposal_counts === "object" && !Array.isArray(curatorData.proposal_counts)
+        ? (curatorData.proposal_counts as Record<string, unknown>)
+        : {};
+    const byStatus: Record<string, number> = {};
+    for (const [key, value] of Object.entries(counts)) {
+      const count = Number(value);
+      if (Number.isFinite(count)) {
+        byStatus[key] = count;
+      }
+    }
+    return statusSection("ok", `open_proposals=${open} (proposal list refresh slow; using curator summary)`, {
+      count: open,
+      by_status: byStatus,
+      review_groups: [],
+      proposals: [],
+      list_available: false,
+      fallback_source: "curator",
+      list_error: sanitizeStatusError(error)
+    });
+  }
+
+  async function collectProposalsStatusSection(cfg: BrainstackConfig, timeoutMs: number, curatorSection?: BrainctlStatusSection): Promise<BrainctlStatusSection> {
     const base = safeBrainApiBaseUrl(cfg);
     if (!base.baseUrl) {
       return statusSection("disabled", "proposal status unavailable without brain API base URL", undefined, { available: false, error: base.error });
     }
-    const response = await statusFetchJson(base.baseUrl, "/api/proposals?status=open", timeoutMs);
+    let response: Record<string, unknown>;
+    try {
+      response = await statusFetchJson(base.baseUrl, "/api/proposals?status=open", timeoutMs);
+    } catch (error) {
+      const fallback = proposalSummaryFallbackFromCurator(curatorSection, error);
+      if (fallback) {
+        return fallback;
+      }
+      throw error;
+    }
     if (!response.ok) {
       return statusSection("warn", `open proposal list unavailable HTTP ${response.http_status}`, response, { available: false });
     }
@@ -1709,7 +1749,7 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
     report.sections.skills = await collectStatusSection(() => collectSkillsStatusSection(cfg!), timeoutMs);
     report.sections.brain_api = await collectStatusSection(() => collectBrainApiStatusSection(cfg!, timeoutMs), timeoutMs + 250);
     report.sections.curator = await collectStatusSection(() => collectCuratorStatusSection(cfg!, timeoutMs), timeoutMs + 250);
-    report.sections.proposals = await collectStatusSection(() => collectProposalsStatusSection(cfg!, timeoutMs), timeoutMs + 250);
+    report.sections.proposals = await collectStatusSection(() => collectProposalsStatusSection(cfg!, timeoutMs, report.sections.curator), timeoutMs + 250);
     report.sections.telemux = await collectStatusSection(() => collectTelemuxStatusSection(cfg!, timeoutMs), timeoutMs + 250);
     const fleetTimeoutMs = Math.min(Math.max(timeoutMs * 4, 3000), 15_000);
     report.sections.fleet = await collectStatusSection(() => collectFleetStatusSection(cfg!, args, fleetTimeoutMs), fleetTimeoutMs + 500);
