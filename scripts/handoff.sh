@@ -442,8 +442,13 @@ if [ "$mode" = "forensic" ] && [ -n "$handoff_factory_root" ] && [ -d "$handoff_
   factory_head="$(git -C "$handoff_factory_root" rev-parse HEAD)"
 fi
 
-# Exactly one source representation: source/.
-git archive --format=tar HEAD | tar -C "$bundle_dir/source" -xf -
+# Exactly one source representation: source/. Keep this as two explicit steps:
+# under pipefail, archive/extract pipelines can surface SIGPIPE from either side
+# instead of the real handoff failure status.
+source_archive="$(mktemp "${TMPDIR:-/tmp}/brainstack-handoff-source.XXXXXX.tar")"
+register_cleanup_path "$source_archive"
+git archive --format=tar --output="$source_archive" HEAD
+tar -C "$bundle_dir/source" -xf "$source_archive"
 source_tree_note="source/ contains tracked HEAD after handoff path/private-literal sanitization; Product HEAD is the canonical source identity."
 if [ "$allow_dirty" = "1" ] && [ -n "$dirty_status" ]; then
   apply_dirty_worktree_snapshot "$dirty_overlay_paths_file"
