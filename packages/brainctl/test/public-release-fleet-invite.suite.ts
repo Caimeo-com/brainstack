@@ -1720,7 +1720,12 @@ describe("public release hygiene - fleet remote control invites and release", ()
     const installDoc = await readFile(join(PRODUCT_ROOT, "docs", "install-one-line.md"), "utf8");
     const makeApp = await readFile(join(PRODUCT_ROOT, "apps", "brainstack-menu", "scripts", "make-app.sh"), "utf8");
     const appModel = await readFile(join(PRODUCT_ROOT, "apps", "brainstack-menu", "Sources", "BrainstackMenu", "AppModel.swift"), "utf8");
-    const brainctlSource = await readFile(join(PRODUCT_ROOT, "packages", "brainctl", "src", "main.ts"), "utf8");
+    const brainctlSrc = join(PRODUCT_ROOT, "packages", "brainctl", "src");
+    const commandFiles = (await readdir(join(brainctlSrc, "commands"))).filter((name) => name.endsWith(".ts")).sort();
+    const brainctlSource = [
+      await readFile(join(brainctlSrc, "main.ts"), "utf8"),
+      ...(await Promise.all(commandFiles.map((name) => readFile(join(brainctlSrc, "commands", name), "utf8"))))
+    ].join("\n");
     for (const text of [packageJson, releaseScript]) {
       expect(text).toContain("--no-compile-autoload-dotenv");
       expect(text).toContain("--no-compile-autoload-bunfig");
