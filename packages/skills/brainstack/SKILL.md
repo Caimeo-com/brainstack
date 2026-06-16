@@ -146,7 +146,7 @@ brainctl capabilities doctor voice --config "$BRAINSTACK_CONFIG"
 brainctl capabilities test voice --file /path/to/sample.ogg --config "$BRAINSTACK_CONFIG"
 ```
 
-From Telegram, phrases such as `install voice on erbine`, `install transcription on valkyrie`, `/voice install erbine`, and `/voice status` should delegate to the same command. The installer downloads Mozilla `whisperfile` on the selected target, writes `capabilities.voice` in `brainstack.yaml`, updates `telemux.runtime.env`, and restarts or schedules a restart for Telemux. First installs can take minutes; Telemux should acknowledge immediately and then send low-frequency progress heartbeats, controlled by `FACTORY_CAPABILITY_PROGRESS_INTERVAL_MS`.
+From Telegram, phrases such as `install voice on erbine`, `install transcription on valkyrie`, `/voice install erbine`, and `/voice status` should delegate to the same command. The installer verifies `ffmpeg`, downloads Mozilla `whisperfile` on the selected target, writes `capabilities.voice` in `brainstack.yaml`, updates `telemux.runtime.env`, and restarts or schedules a restart for Telemux. First installs can take minutes; Telemux should acknowledge immediately and then send low-frequency progress heartbeats, controlled by `FACTORY_CAPABILITY_PROGRESS_INTERVAL_MS`.
 
 Do not treat `FACTORY_TRANSCRIPTION_*` as the primary setup path. Those env values are generated runtime mirrors. If voice is broken, inspect `capabilities.voice` in config first, then run `brainctl capabilities doctor voice`.
 

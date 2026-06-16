@@ -323,7 +323,7 @@ printf 'converted voice payload' > "$output"
           "--allow-insecure-model-url",
           "--no-restart"
         ],
-        { HOME: dir }
+        { HOME: dir, PATH: `${binDir}:${process.env.PATH || ""}` }
       );
       expectSuccess(install);
 

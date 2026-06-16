@@ -283,6 +283,10 @@ install_root="$(brainstack_expand_home ${quote(installRoot)})"
 url=${quote(spec.url)}
 file_name=${quote(spec.fileName)}
 expected_sha=${quote(expectedSha)}
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "missing ffmpeg on target machine; install ffmpeg before voice transcription" >&2
+  exit 127
+fi
 mkdir -p "$install_root"
 command_path="$install_root/$file_name"
 if [ -x "$command_path" ]; then
@@ -480,6 +484,12 @@ if [ -x "$command_path" ]; then
   printf 'executable=1\\n'
 else
   printf 'executable=0\\n'
+  exit 66
+fi
+if command -v ffmpeg >/dev/null 2>&1; then
+  printf 'ffmpeg=ok\\n'
+else
+  printf 'ffmpeg=missing\\n'
   exit 66
 fi
 "$command_path" --help >/dev/null 2>&1 || true

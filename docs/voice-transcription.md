@@ -23,6 +23,7 @@ Telegram sends an immediate acknowledgement, then periodic progress messages whi
 The command:
 
 - checks the target machine from `brainstack.yaml`
+- verifies `ffmpeg` is available on the selected processor
 - downloads a Mozilla `whisperfile` executable model on that target
 - verifies the pinned checksum when one is known
 - writes `capabilities.voice` into `brainstack.yaml`
@@ -90,6 +91,7 @@ Targets:
 Command contract:
 
 - Telemux streams downloaded audio bytes into a temporary file on the selected target.
+- If `ffmpeg` is available, Telemux converts the input to 16 kHz mono WAV before transcription. This is the reliable path for Telegram voice notes, which usually arrive as OGG/Opus.
 - The configured command is executed with `args`.
 - `{input}` as a whole argument is replaced by the temporary audio file path. If no argument is exactly `{input}`, Brainstack appends it.
 - Stdout is treated as the transcript. Non-zero exit, timeout, empty stdout, oversize files, and over-duration files are reported in the same Telegram topic and do not start the harness.
