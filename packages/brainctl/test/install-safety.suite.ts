@@ -908,6 +908,68 @@ describe("brainctl install safety", () => {
     }
   });
 
+  test("hooks status and remove surface malformed configs instead of clobbering them", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-hooks-malformed-"));
+    try {
+      const home = join(dir, "home");
+      const configPath = join(dir, "client.yaml");
+      const hooksPath = join(home, ".codex", "hooks.json");
+      await writeFixtureClientConfig(configPath, { home, stateRoot: join(dir, "state"), localPath: join(dir, "shared-brain") });
+      await mkdir(dirname(hooksPath), { recursive: true });
+      await writeFile(hooksPath, "{not-json");
+
+      const status = runBrainctl(["hooks", "status", "--target", "codex", "--config", configPath], { HOME: home });
+      expect(status.code).not.toBe(0);
+      expect(`${status.stdout}\n${status.stderr}`).toContain("codex: error");
+      expect(`${status.stdout}\n${status.stderr}`).toContain("hooks status found 1 malformed config file");
+
+      const aggregate = runBrainctl(["status", "--json", "--config", configPath, "--timeout-ms", "500"], { HOME: home });
+      expectSuccess(aggregate);
+      const report = JSON.parse(aggregate.stdout) as Record<string, any>;
+      expect(report.sections.hooks.state).toBe("warn");
+      const codexHooks = report.sections.hooks.data.hooks.find((entry: Record<string, unknown>) => entry.target === "codex") as Record<string, unknown>;
+      expect(String(codexHooks.error)).toContain("JSON Parse error");
+
+      await mkdir(join(home, ".claude"), { recursive: true });
+      await writeFile(
+        join(home, ".claude", "settings.json"),
+        `${JSON.stringify(
+          {
+            hooks: {
+              SessionStart: [
+                {
+                  hooks: [
+                    {
+                      type: "command",
+                      command: `brainctl hook run --harness claude --event SessionStart --config ${configPath}`
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          null,
+          2
+        )}\n`
+      );
+      await writeFile(configPath, `${await readFile(configPath, "utf8")}harness:\n  name: claude\n  bin: claude\n`);
+      const selectedHealthyButOtherMalformed = runBrainctl(["status", "--json", "--config", configPath, "--timeout-ms", "500"], { HOME: home });
+      expectSuccess(selectedHealthyButOtherMalformed);
+      const selectedReport = JSON.parse(selectedHealthyButOtherMalformed.stdout) as Record<string, any>;
+      expect(selectedReport.sections.hooks.state).toBe("warn");
+      expect(selectedReport.sections.hooks.detail).toContain("claude hooks installed errors=1");
+      expect(selectedReport.degraded).toBe(true);
+      const selectedClaude = selectedReport.sections.hooks.data.hooks.find((entry: Record<string, unknown>) => entry.target === "claude") as Record<string, unknown>;
+      expect(selectedClaude.installed).toBe(true);
+
+      const remove = runBrainctl(["hooks", "remove", "--target", "codex", "--config", configPath], { HOME: home });
+      expect(remove.code).not.toBe(0);
+      expect(await readFile(hooksPath, "utf8")).toBe("{not-json");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("daemon once keeps the local shared-brain clone fresh and records status", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-daemon-once-"));
     try {

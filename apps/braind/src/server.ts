@@ -2088,7 +2088,7 @@ async function proposalDecisionFromRequest(request: Request, id: string, action:
   if (!isSafeProposalId(id)) {
     reject(400, "proposal id is not a valid identifier");
   }
-  const body = await readJsonBody(request).catch(() => ({}) as Record<string, unknown>);
+  const body = await readJsonBody(request);
   const decidedBy = typeof body.decided_by === "string" && body.decided_by.trim() ? body.decided_by.trim().slice(0, 120) : "admin";
   const reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim().slice(0, 2_000) : null;
   return await withMutationGate(async () =>

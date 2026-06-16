@@ -1769,12 +1769,19 @@ interface SkillPackageFile {
     const targets = hookTargetsFromArgs(args);
     const configPath = abs(requireFlagValue(args, "config") || brainstackDefaultConfigPath());
     const brainctlCommand = currentBrainctlHookCommand(args);
+    let statusErrors = 0;
     for (const target of targets) {
       const path = hookConfigPath(target);
       if (subcommand === "status") {
-        const raw = await readJsonObject(path).catch(() => ({}));
-        const count = target === "cursor" ? countCursorManagedHooks(raw, target) : countCodexStyleManagedHooks(raw, target);
-        console.log(`${target}: ${count ? "installed" : "missing"} hooks=${count} path=${path}`);
+        try {
+          const raw = await readJsonObject(path);
+          const count = target === "cursor" ? countCursorManagedHooks(raw, target) : countCodexStyleManagedHooks(raw, target);
+          console.log(`${target}: ${count ? "installed" : "missing"} hooks=${count} path=${path}`);
+        } catch (error) {
+          statusErrors += 1;
+          const message = error instanceof Error ? error.message : String(error);
+          console.log(`${target}: error hooks=0 path=${path} error=${message}`);
+        }
         continue;
       }
       if (subcommand === "install") {
@@ -1790,7 +1797,7 @@ interface SkillPackageFile {
         continue;
       }
       if (subcommand === "remove") {
-        const raw = await readJsonObject(path).catch(() => ({}));
+        const raw = await readJsonObject(path);
         const hooks = raw.hooks && typeof raw.hooks === "object" && !Array.isArray(raw.hooks) ? (raw.hooks as Record<string, unknown>) : {};
         const removed = target === "cursor" ? removeCursorManagedHooks(hooks, target) : removeCodexStyleManagedHooks(hooks, target);
         const next = { ...raw, hooks };
@@ -1803,6 +1810,9 @@ interface SkillPackageFile {
         continue;
       }
       throw new Error("hooks subcommand must be install|status|remove");
+    }
+    if (subcommand === "status" && statusErrors > 0) {
+      throw new Error(`hooks status found ${statusErrors} malformed config file(s)`);
     }
   }
 

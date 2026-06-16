@@ -1122,6 +1122,25 @@ describe("braind write safety", () => {
       const unauthorized = await decide(firstId, "approve", {}, "import-test-token");
       expect(unauthorized.status).toBe(403);
 
+      const malformedDecisionCandidate = await propose(
+        {
+          title: "Malformed Decision Candidate",
+          body: "This should remain pending after malformed admin JSON.",
+          source_harness: "test-harness",
+          source_machine: "test-machine"
+        },
+        "proposal-lifecycle-malformed-decision"
+      );
+      const malformedDecisionId = String(((await malformedDecisionCandidate.json()) as Record<string, unknown>).proposal_id);
+      const malformedDecision = await fetch(`http://127.0.0.1:${port}/api/proposals/${encodeURIComponent(malformedDecisionId)}/reject`, {
+        method: "POST",
+        headers: { Authorization: "Bearer admin-test-token", "Content-Type": "application/json" },
+        body: "{not-json"
+      });
+      expect(malformedDecision.status).toBe(400);
+      expect(existsSync(join(staging, "proposals", "pending", `${malformedDecisionId}.md`))).toBe(true);
+      expect(existsSync(join(staging, "proposals", "rejected", `${malformedDecisionId}.md`))).toBe(false);
+
       const approved = await decide(firstId, "approve", { decided_by: "tester" });
       expect(approved.status).toBe(200);
       expect(((await approved.json()) as Record<string, unknown>).status).toBe("approved");

@@ -1756,6 +1756,14 @@ describe("public release hygiene - fleet remote control invites and release", ()
     expect(releaseWorkflow).toContain("menu-app-release:");
     expect(releaseWorkflow).toContain("include_menu_app");
     expect(releaseWorkflow).toContain("must match package.json version");
+    expect(releaseWorkflow).toContain("Guard privileged release ref");
+    expect(releaseWorkflow).toContain("manual release publishing/signing must run from");
+    expect(releaseWorkflow).toContain("Verify release provenance");
+    expect(releaseWorkflow).toContain("release tag commit must be reachable from origin/$DEFAULT_BRANCH");
+    expect(releaseWorkflow).toContain("manual release commit must be reachable from origin/$DEFAULT_BRANCH");
+    expect(releaseWorkflow).toMatch(/permissions:\n  contents: read/);
+    expect(releaseWorkflow).toMatch(/publish-release:[\s\S]*permissions:\n      contents: write/);
+    expect(releaseWorkflow).toContain("persist-credentials: false");
     expect(releaseWorkflow).toContain("actions/checkout@v6");
     expect(releaseWorkflow).toContain("actions/download-artifact@v4");
     expect(releaseWorkflow).not.toContain("actions/checkout@v4");

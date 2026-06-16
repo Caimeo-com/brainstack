@@ -1299,7 +1299,7 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
       let count = 0;
       let error: string | null = null;
       try {
-        const raw = await readJsonObject(path).catch(() => ({}));
+        const raw = await readJsonObject(path);
         count = target === "cursor" ? countCursorManagedHooks(raw, target) : countCodexStyleManagedHooks(raw, target);
       } catch (hookError) {
         error = sanitizeStatusError(hookError);
@@ -1308,7 +1308,10 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
     }
     const selected = hooks.find((entry) => entry.target === cfg.harness.name);
     const selectedInstalled = Boolean(selected?.installed);
-    return statusSection(selectedInstalled ? "ok" : "warn", `${cfg.harness.name} hooks ${selectedInstalled ? "installed" : "missing"}`, {
+    const errorCount = hooks.filter((entry) => typeof entry.error === "string" && entry.error).length;
+    const state: BrainctlStatusState = selectedInstalled && errorCount === 0 ? "ok" : "warn";
+    const detail = `${cfg.harness.name} hooks ${selectedInstalled ? "installed" : "missing"}${errorCount ? ` errors=${errorCount}` : ""}`;
+    return statusSection(state, detail, {
       selected_target: cfg.harness.name,
       hooks
     });
