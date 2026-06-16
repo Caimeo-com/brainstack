@@ -27,10 +27,16 @@ import {
 import {
   extractTelegramInput,
   filterPhaseOneTelegramInput,
-  isAudioOnlyTelegramInput,
   telegramMessageText,
   type TelegramInboundMessageInput
 } from "./telegram-inputs";
+import {
+  formatTranscriptEcho,
+  hasAudioTelegramInput,
+  mergeTelegramTextAndTranscript,
+  transcribeTelegramAudioInput,
+  withoutAudioTelegramInput
+} from "./transcription";
 import {
   builtinRoutineCommandToken,
   builtinRoutineDraft,
@@ -88,6 +94,103 @@ interface ProposalListRequest {
   limit: number;
   help: boolean;
   error: string | null;
+}
+
+type VoiceCapabilityAction = "install" | "doctor" | "list";
+
+interface VoiceCapabilityIntent {
+  action: VoiceCapabilityAction;
+  target: string | null;
+  model: string | null;
+  help: boolean;
+  error: string | null;
+}
+
+function voiceCapabilityUsage(): string {
+  return [
+    "Voice transcription commands:",
+    "/voice install <machine> [model tiny.en|small.en|medium.en|large-v2|large-v3]",
+    "/voice status",
+    "",
+    "Plain language also works:",
+    "install voice on erbine",
+    "install transcription on valkyrie"
+  ].join("\n");
+}
+
+function parseVoiceModel(parts: string[]): string | null {
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index]?.toLowerCase();
+    if ((part === "model" || part === "using" || part === "with") && parts[index + 1]) {
+      return parts[index + 1] || null;
+    }
+    const keyed = parts[index]?.match(/^(?:model|using)[:=]([A-Za-z0-9._-]+)$/i)?.[1];
+    if (keyed) {
+      return keyed;
+    }
+  }
+  return null;
+}
+
+function parseVoiceCapabilityCommand(rest: string): VoiceCapabilityIntent {
+  const parts = rest.split(/\s+/).map((part) => part.trim()).filter(Boolean);
+  if (!parts.length || ["help", "--help", "-h"].includes(parts[0]?.toLowerCase() || "")) {
+    return { action: "list", target: null, model: null, help: true, error: null };
+  }
+
+  const action = parts[0]?.toLowerCase();
+  if (["status", "doctor", "check"].includes(action || "")) {
+    return { action: "doctor", target: null, model: null, help: false, error: null };
+  }
+  if (["list", "show"].includes(action || "")) {
+    return { action: "list", target: null, model: null, help: false, error: null };
+  }
+  if (!["install", "setup", "enable"].includes(action || "")) {
+    return { action: "list", target: null, model: null, help: false, error: `Unknown voice action: ${action || "(missing)"}` };
+  }
+
+  const model = parseVoiceModel(parts);
+  const target = parts.slice(1).find((part) => {
+    const normalized = part.toLowerCase();
+    return !["on", "to", "for", "machine", "voice", "transcription", "model", "using", "with"].includes(normalized) && !/^model[:=]/i.test(part);
+  }) || null;
+  return {
+    action: "install",
+    target,
+    model,
+    help: false,
+    error: target ? null : "Install needs a target machine, for example /voice install erbine."
+  };
+}
+
+function parseNaturalVoiceCapabilityIntent(text: string): VoiceCapabilityIntent | null {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return null;
+  }
+
+  const statusMatch = normalized.match(/^(?:voice|transcription)\s+(?:status|doctor|check)$/i);
+  if (statusMatch) {
+    return { action: "doctor", target: null, model: null, help: false, error: null };
+  }
+
+  const installMatch = normalized.match(
+    /^(?:please\s+)?(?:install|setup|set up|enable)\s+(?:voice|voice transcription|transcription)(?:\s+(?:on|to|for)\s+([A-Za-z0-9._-]+))?(?:\s+(.*))?$/i
+  );
+  if (!installMatch) {
+    return null;
+  }
+
+  const tail = installMatch[2] || "";
+  const model = parseVoiceModel(tail.split(/\s+/).filter(Boolean));
+  const target = installMatch[1] || null;
+  return {
+    action: "install",
+    target,
+    model,
+    help: false,
+    error: target ? null : "Install needs a target machine, for example: install voice on erbine."
+  };
 }
 
 function proposalListUsage(): string {
@@ -233,6 +336,13 @@ function compact(text: string | null, limit = 280): string {
   }
 
   return `${normalized.slice(0, limit - 1)}…`;
+}
+
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
 }
 
 function snippet(text: string | null, limit = 240): string {
@@ -543,10 +653,6 @@ const TEXT_COALESCE_MAX_PARTS = 25;
 const TEXT_COALESCE_MAX_CHARS = 120_000;
 const TEXT_COALESCE_MAX_PENDING = 100;
 
-function audioNotSupportedText(): string {
-  return "Audio and voice Telegram messages are not forwarded to Codex yet. Phase 2 will transcribe them first.";
-}
-
 function codexModeSummary(context: ContextRecord): string {
   return formatCodexModeSummary(context);
 }
@@ -726,7 +832,7 @@ export class CommandHandler {
   async handleMessage(message: TelegramMessage): Promise<void> {
     const text = telegramMessageText(message);
     const rawTelegramInput = extractTelegramInput(message);
-    const telegramInput = rawTelegramInput ? filterPhaseOneTelegramInput(rawTelegramInput) : null;
+    let telegramInput = rawTelegramInput ? filterPhaseOneTelegramInput(rawTelegramInput) : null;
 
     if (!text && !rawTelegramInput?.attachments.length) {
       return;
@@ -766,6 +872,17 @@ export class CommandHandler {
       }
     }
 
+    const voiceIntent =
+      parsed?.command === "/voice" || parsed?.command === "/transcription"
+        ? parseVoiceCapabilityCommand(parsed.rest)
+        : !parsed && !hasAttachments
+          ? parseNaturalVoiceCapabilityIntent(text)
+          : null;
+    if (voiceIntent) {
+      await this.handleVoiceCapabilityIntent(voiceIntent, target);
+      return;
+    }
+
     if (parsed?.command === "/whoami") {
       await this.telegram.sendText(
         target,
@@ -794,17 +911,23 @@ export class CommandHandler {
           return;
         }
 
-        if (rawTelegramInput && isAudioOnlyTelegramInput(rawTelegramInput)) {
-          await this.telegram.sendText(target, audioNotSupportedText());
+        let effectiveText = text;
+        if (rawTelegramInput && hasAudioTelegramInput(rawTelegramInput)) {
+          const prepared = await this.transcribeTelegramInputForDispatch(rawTelegramInput, text, target);
+          if (!prepared) {
+            return;
+          }
+          effectiveText = prepared.text;
+          telegramInput = prepared.telegramInput;
+        }
+
+        const hasNonAudioAttachments = Boolean(telegramInput?.attachments.length);
+        if (!hasNonAudioAttachments && this.config.textCoalesceMs > 0) {
+          this.enqueuePendingText(boundContext, effectiveText, target, message.from?.id ?? null);
           return;
         }
 
-        if (!hasAttachments && this.config.textCoalesceMs > 0) {
-          this.enqueuePendingText(boundContext, text, target, message.from?.id ?? null);
-          return;
-        }
-
-        await this.handleBoundPlainText(boundContext, text, target, telegramInput, message.from?.id ?? null);
+        await this.handleBoundPlainText(boundContext, effectiveText, target, telegramInput, message.from?.id ?? null);
         return;
       }
 
@@ -965,6 +1088,7 @@ export class CommandHandler {
               "/whoami",
               "/workers",
               "/updates",
+              "/voice",
               "/context",
               "/compact",
               "/crons",
@@ -997,6 +1121,7 @@ export class CommandHandler {
               "Use /shred to list tokenized cleanup shortcuts.",
               "Use /mode, /model, and /effort to change Codex runtime behavior for this topic without rebinding it.",
               "Use /context or /usage to inspect the current topic state. Use /compact to compact Codex topics when supported.",
+              "Use /voice install <machine> to install local voice transcription for Telegram voice notes.",
               "Use /curation in a proposal-review topic to bind it as Brainstack's proposal curation surface.",
               "Use /crons to inspect scheduled jobs linked to this topic/context. Use /cron install update-check, brain-curator, or daily-checkin to add built-in routines.",
               "Use /cron_run <id|label> or the shortcuts from /crons to test a scheduled job immediately."
@@ -1596,13 +1721,19 @@ export class CommandHandler {
           }
 
           const mode = parsed.command.slice(1) as "run" | "resume" | "loop";
-          if (rawTelegramInput && isAudioOnlyTelegramInput(rawTelegramInput)) {
-            await this.telegram.sendText(target, audioNotSupportedText());
-            return;
+          let instruction = parsed.rest;
+          let commandTelegramInput = telegramInput;
+          if (rawTelegramInput && hasAudioTelegramInput(rawTelegramInput)) {
+            const prepared = await this.transcribeTelegramInputForDispatch(rawTelegramInput, parsed.rest, target);
+            if (!prepared) {
+              return;
+            }
+            instruction = prepared.text;
+            commandTelegramInput = prepared.telegramInput;
           }
 
-          const response = await this.dispatcher.dispatch(mode, boundContext, parsed.rest, target, {
-            telegramInput,
+          const response = await this.dispatcher.dispatch(mode, boundContext, instruction, target, {
+            telegramInput: commandTelegramInput,
             userId: message.from?.id ?? null
           });
           if (response.message) {
@@ -1722,6 +1853,142 @@ export class CommandHandler {
       const messageText = error instanceof Error ? error.message : String(error);
       await this.telegram.sendText(target, `Error: ${messageText}`);
     }
+  }
+
+  private async handleVoiceCapabilityIntent(intent: VoiceCapabilityIntent, target: TelegramTarget): Promise<void> {
+    if (intent.help) {
+      await this.telegram.sendText(target, voiceCapabilityUsage());
+      return;
+    }
+    if (intent.error) {
+      await this.telegram.sendText(target, `${intent.error}\n\n${voiceCapabilityUsage()}`);
+      return;
+    }
+
+    const baseArgs = ["capabilities", intent.action, "voice", "--config", this.config.brainstackConfigPath];
+    if (intent.action === "install") {
+      if (!intent.target) {
+        await this.telegram.sendText(target, `Install needs a target machine.\n\n${voiceCapabilityUsage()}`);
+        return;
+      }
+      baseArgs.push("--target", intent.target, "--restart-delay-ms", "1500");
+      if (intent.model) {
+        baseArgs.push("--model", intent.model);
+      }
+      await this.telegram.sendText(
+        target,
+        [
+          `Installing voice transcription on ${intent.target}.`,
+          "I will check requirements, install the processor, update Brainstack config, and reload Telemux when done."
+        ].join("\n")
+      );
+    }
+
+    if (intent.action === "doctor") {
+      await this.telegram.sendText(target, "Checking voice transcription status.");
+    }
+
+    let progressTimer: ReturnType<typeof setInterval> | null = null;
+    if (intent.action === "install" && intent.target) {
+      progressTimer = this.startCapabilityProgressMessages(target, intent.target);
+    }
+
+    let result: { ok: boolean; exitCode: number | null; timedOut: boolean; stdout: string; stderr: string };
+    try {
+      result = await this.runBrainctlCapability(baseArgs, intent.action === "install" ? 40 * 60_000 : 90_000);
+    } finally {
+      if (progressTimer) {
+        clearInterval(progressTimer);
+      }
+    }
+    const output = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n");
+    const trimmed = output.length > 3200 ? `${output.slice(0, 3200)}\n... truncated` : output;
+    if (!result.ok) {
+      await this.telegram.sendText(
+        target,
+        [`Voice ${intent.action} failed${result.timedOut ? " (timed out)" : ` (exit ${result.exitCode})`}.`, trimmed || "No output."].join(
+          "\n\n"
+        )
+      );
+      return;
+    }
+
+    const suffix =
+      intent.action === "install"
+        ? "Test it by sending a Telegram voice note in any bound Brainstack topic. If Telemux was reloaded, wait a few seconds first."
+        : null;
+    await this.telegram.sendText(target, [`Voice ${intent.action} complete.`, trimmed || "ok", suffix].filter(Boolean).join("\n\n"));
+  }
+
+  private startCapabilityProgressMessages(target: TelegramTarget, machine: string): ReturnType<typeof setInterval> | null {
+    const intervalMs = this.config.capabilityProgressIntervalMs;
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+      return null;
+    }
+
+    const startedAt = Date.now();
+    let count = 0;
+    const timer = setInterval(() => {
+      count += 1;
+      const elapsed = formatElapsed(Date.now() - startedAt);
+      const extra =
+        count === 1
+          ? "First install can take several minutes while the model downloads and verifies."
+          : "Still waiting on the installer; I will post the final result here.";
+      void this.telegram
+        .sendText(target, [`Still installing voice transcription on ${machine} (${elapsed}).`, extra].join("\n"))
+        .catch((error) => {
+          console.warn("failed to send voice capability progress message", error);
+        });
+    }, intervalMs);
+    timer.unref?.();
+    return timer;
+  }
+
+  private async runBrainctlCapability(
+    args: string[],
+    timeoutMs: number
+  ): Promise<{ ok: boolean; exitCode: number | null; timedOut: boolean; stdout: string; stderr: string }> {
+    let proc: ReturnType<typeof Bun.spawn>;
+    try {
+      proc = Bun.spawn([this.config.brainctlBin, ...args], {
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "ignore"
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        exitCode: 127,
+        timedOut: false,
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error)
+      };
+    }
+
+    const stdoutPromise = new Response(proc.stdout).text();
+    const stderrPromise = new Response(proc.stderr).text();
+    let timedOut = false;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const timeoutPromise = new Promise<number | null>((resolve) => {
+      timeout = setTimeout(() => {
+        timedOut = true;
+        proc.kill();
+        resolve(124);
+      }, timeoutMs);
+    });
+    const exitCode = await Promise.race([proc.exited, timeoutPromise]);
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+    return {
+      ok: !timedOut && exitCode === 0,
+      exitCode,
+      timedOut,
+      stdout,
+      stderr
+    };
   }
 
   private pendingKey(target: TelegramTarget, userId: number | null): string {
@@ -2003,6 +2270,46 @@ export class CommandHandler {
     }
 
     return { accepted: response.accepted };
+  }
+
+  private async transcribeTelegramInputForDispatch(
+    input: TelegramInboundMessageInput,
+    text: string,
+    target: TelegramTarget
+  ): Promise<{ text: string; telegramInput: TelegramInboundMessageInput | null } | null> {
+    let result: Awaited<ReturnType<typeof transcribeTelegramAudioInput>>;
+    try {
+      result = await transcribeTelegramAudioInput({
+        input,
+        config: this.config,
+        telegram: this.telegram,
+        workers: this.workers
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.telegram.sendText(target, `Voice transcription failed: ${message}`);
+      return null;
+    }
+
+    if (!result.ok) {
+      await this.telegram.sendText(target, result.message);
+      return null;
+    }
+
+    const mergedText = mergeTelegramTextAndTranscript(text, result.transcript);
+    if (!mergedText) {
+      await this.telegram.sendText(target, "Voice transcription produced no text.");
+      return null;
+    }
+
+    if (this.config.transcription.echoTranscript) {
+      await this.telegram.sendText(target, formatTranscriptEcho(result.transcript));
+    }
+
+    return {
+      text: mergedText,
+      telegramInput: withoutAudioTelegramInput(input, mergedText)
+    };
   }
 
   private logPreDispatchRoute(context: ContextRecord, classification: Awaited<ReturnType<typeof classifyPreDispatch>>): void {

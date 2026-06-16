@@ -678,20 +678,34 @@ export function createInstallEnrollCommands(deps: InstallEnrollDeps) {
 
   function telemuxRuntimeEnv(cfg: BrainstackConfig): string {
     const toolPath = brainstackToolPath(cfg);
+    const voice = cfg.capabilities.voice;
+    const voiceArgs = voice.args.length ? voice.args : ["-f", "{input}", "-pc"];
     return [
       `PATH=${toolPath}`,
       `BRAINSTACK_WORKER_PATH=${toolPath}`,
+      `BRAINSTACK_CONFIG=${join(cfg.paths.configRoot, "brainstack.yaml")}`,
+      "FACTORY_BRAINCTL_BIN=brainctl",
       `FACTORY_DASHBOARD_HOST=${cfg.telemux.dashboardHost}`,
       `FACTORY_DASHBOARD_PORT=${cfg.telemux.dashboardPort}`,
       "FACTORY_TELEGRAM_POLL_TIMEOUT_SECONDS=30",
       "FACTORY_TEXT_COALESCE_MS=1500",
       "FACTORY_TEXT_COALESCE_RECOVERY_MAX_AGE_MS=300000",
+      "FACTORY_CAPABILITY_PROGRESS_INTERVAL_MS=45000",
       "FACTORY_PRE_DISPATCH_CLASSIFIER=0",
       "FACTORY_PRE_DISPATCH_CLASSIFIER_MODEL=gpt-5.4-mini",
       "FACTORY_PRE_DISPATCH_CLASSIFIER_REASONING_EFFORT=minimal",
       "FACTORY_PRE_DISPATCH_CLASSIFIER_TIMEOUT_MS=800",
       "FACTORY_PRE_DISPATCH_CLASSIFIER_MAX_CHARS=600",
       "FACTORY_PRE_DISPATCH_CLASSIFIER_CONFIDENCE=0.75",
+      `FACTORY_TRANSCRIPTION_ENABLED=${voice.enabled ? "1" : "0"}`,
+      `FACTORY_TRANSCRIPTION_TARGET=${voice.target}`,
+      `FACTORY_TRANSCRIPTION_WORKER=${voice.worker || ""}`,
+      `FACTORY_TRANSCRIPTION_COMMAND=${voice.command}`,
+      `FACTORY_TRANSCRIPTION_ARGS_JSON=${JSON.stringify(voiceArgs)}`,
+      `FACTORY_TRANSCRIPTION_TIMEOUT_MS=${voice.timeoutMs}`,
+      `FACTORY_TRANSCRIPTION_ECHO=${voice.echoTranscript ? "1" : "0"}`,
+      `FACTORY_TRANSCRIPTION_MAX_BYTES=${voice.maxBytes}`,
+      `FACTORY_TRANSCRIPTION_MAX_DURATION_SECONDS=${voice.maxDurationSeconds ?? ""}`,
       "FACTORY_CRON_POLL_INTERVAL_SECONDS=30",
       `FACTORY_LOCAL_MACHINE=${cfg.telemux.localMachine}`,
       `BRAINSTACK_STATE_ROOT=${cfg.paths.stateRoot}`,

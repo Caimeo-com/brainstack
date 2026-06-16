@@ -243,6 +243,18 @@ function telegramVoiceMessage(threadId: number, fileId: string, userId = TEST_AL
   };
 }
 
+function telegramVoiceCaptionMessage(
+  caption: string,
+  threadId: number,
+  fileId: string,
+  userId = TEST_ALLOWED_TELEGRAM_USER_ID
+): TelegramMessage {
+  return {
+    ...telegramVoiceMessage(threadId, fileId, userId),
+    caption
+  };
+}
+
 async function makeExecutable(path: string, contents: string): Promise<void> {
   await writeFile(path, contents);
   await chmod(path, 0o755);
@@ -280,6 +292,9 @@ async function createFixture(envOverrides: Record<string, string> = {}) {
   const fakeClaude = join(binDir, "claude");
   const fakeSsh = join(binDir, "ssh");
   const fakeSudo = join(binDir, "sudo");
+  const fakeTranscriber = join(binDir, "fake-transcribe");
+  const fakeBrainctl = join(binDir, "brainctl");
+  const fakeBrainctlCalls = join(root, "brainctl-calls.txt");
 
   await mkdir(binDir, { recursive: true });
 
@@ -469,6 +484,10 @@ if [[ -n "\${FACTORY_TEST_CAPTURE_SSH_SCRIPT:-}" ]]; then
   echo "ssh capture: No route to host" >&2
   exit 255
 fi
+if [[ "\${FACTORY_TEST_FAKE_SSH_REMOTE_COMMAND:-}" == "1" ]]; then
+  remote_command="\${@: -1}"
+  exec bash -lc "$remote_command"
+fi
 if [[ "\${FACTORY_TEST_FAKE_SSH_EXEC:-}" == "1" ]]; then
   exec bash -s --
 fi
@@ -487,6 +506,61 @@ if [[ "\${1:-}" == "-n" && "\${2:-}" == "true" ]]; then
   exit 0
 fi
 exit 0
+`
+  );
+
+  await makeExecutable(
+    fakeTranscriber,
+    `#!/usr/bin/env bash
+set -euo pipefail
+input=""
+while (($#)); do
+  case "$1" in
+    -f|--file)
+      input="$2"
+      shift 2
+      ;;
+    *)
+      input="$1"
+      shift
+      ;;
+  esac
+done
+if [[ -z "$input" ]]; then
+  echo "missing input" >&2
+  exit 64
+fi
+printf 'transcribed: '
+cat "$input"
+`
+  );
+
+  await makeExecutable(
+    fakeBrainctl,
+    `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> ${JSON.stringify(fakeBrainctlCalls)}
+if [[ "$*" == *" fail-voice "* ]]; then
+  echo "fake brainctl failure" >&2
+  exit 2
+fi
+case "$*" in
+  *"capabilities install voice"*)
+    if [[ -n "\${FACTORY_TEST_BRAINCTL_INSTALL_SLEEP_SECONDS:-}" ]]; then
+      sleep "\${FACTORY_TEST_BRAINCTL_INSTALL_SLEEP_SECONDS}"
+    fi
+    echo "installed=voice"
+    echo "model=tiny.en command=/tmp/whisper-tiny.en.llamafile"
+    echo "restart=scheduled service=telemux.service delay_ms=1500"
+    echo "test=send a Telegram voice note"
+    ;;
+  *"capabilities doctor voice"*)
+    echo "voice=ok enabled=yes target=erbine command=/tmp/whisper-tiny.en.llamafile"
+    ;;
+  *)
+    echo "brainctl fake: $*"
+    ;;
+esac
 `
   );
 
@@ -580,6 +654,9 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
     FACTORY_CODEX_BIN: fakeCodex,
     FACTORY_HARNESS: selectedHarness,
     FACTORY_HARNESS_BIN: envOverrides.FACTORY_HARNESS_BIN || (selectedHarness === "claude" ? fakeClaude : fakeCodex),
+    FACTORY_BRAINCTL_BIN: fakeBrainctl,
+    BRAINSTACK_CONFIG: join(root, "brainstack.yaml"),
+    FACTORY_TRANSCRIPTION_COMMAND: fakeTranscriber,
     FACTORY_TEXT_COALESCE_MS: envOverrides.FACTORY_TEXT_COALESCE_MS || "20",
     FACTORY_TELEGRAM_BOT_TOKEN: "test-token",
     FACTORY_ALLOWED_TELEGRAM_USER_ID: String(TEST_ALLOWED_TELEGRAM_USER_ID),
@@ -608,6 +685,9 @@ printf 'Claude reply turn %s for %s.' "$turns" "$(basename "$PWD")"
     fakeClaude,
     fakeSsh,
     fakeSudo,
+    fakeTranscriber,
+    fakeBrainctl,
+    fakeBrainctlCalls,
     previousPath,
     config,
     db,
@@ -943,7 +1023,7 @@ exec sleep 30
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }
-}, 10_000);
+}, 15_000);
 
 test("/updates prefers the routines context and rejects non-active report contexts", async () => {
   const fixture = await createFixture({
@@ -3522,6 +3602,34 @@ test("SSH accept-new trust mode is bootstrap-only and refused for worker dispatc
   }
 }, 15_000);
 
+test("worker transcription streams audio bytes through the configured SSH worker", async () => {
+  const previousFakeRemoteCommand = process.env.FACTORY_TEST_FAKE_SSH_REMOTE_COMMAND;
+  process.env.FACTORY_TEST_FAKE_SSH_REMOTE_COMMAND = "1";
+  const fixture = await createFixture();
+
+  try {
+    const result = await fixture.workers.runTranscription("worker1", {
+      fileName: "voice.ogg",
+      bytes: new TextEncoder().encode("remote voice payload"),
+      command: "cat",
+      args: ["{input}"],
+      timeoutMs: 5_000
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.transport).toBe("ssh");
+    expect(result.stdout).toBe("remote voice payload");
+  } finally {
+    if (previousFakeRemoteCommand === undefined) {
+      delete process.env.FACTORY_TEST_FAKE_SSH_REMOTE_COMMAND;
+    } else {
+      process.env.FACTORY_TEST_FAKE_SSH_REMOTE_COMMAND = previousFakeRemoteCommand;
+    }
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
 test("SSH workers with explicit ports use the port for dispatch without leaking it into the remote target", async () => {
   const argsCapture = join(tmpdir(), `telemux-ssh-port-args-${Date.now()}.txt`);
   const fixture = await createFixture({
@@ -4250,9 +4358,93 @@ test("phase 1 inbound Telegram media stages files and only forwards images to Co
     const turnCountBeforeVoice = await readFile(join(mediaRoot, ".factory", "fake-turn-count"), "utf8");
     const voiceMessage = telegramVoiceMessage(60, "voice-main");
     await fixture.commands.handleMessage(voiceMessage);
-    expect(fixture.telegram.sent.at(-1)?.text).toContain("Audio and voice Telegram messages are not forwarded to Codex yet.");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Audio and voice Telegram messages are not forwarded to the harness until transcription is installed.");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("install voice on <machine>");
     expect(await readFile(join(mediaRoot, ".factory", "fake-turn-count"), "utf8")).toBe(turnCountBeforeVoice);
   } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("voice transcription routes through configured worker and dispatches transcript as plain text", async () => {
+  const fixture = await createFixture({
+    FACTORY_TRANSCRIPTION_ENABLED: "1",
+    FACTORY_TRANSCRIPTION_TARGET: "worker",
+    FACTORY_TRANSCRIPTION_WORKER: "control",
+    FACTORY_TRANSCRIPTION_ARGS_JSON: '["-f","{input}"]',
+    FACTORY_TRANSCRIPTION_ECHO: "1",
+    FACTORY_TEXT_COALESCE_MS: "1"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx voice control scratch", 61));
+    fixture.telegram.registerRemoteFile("voice-main", "voice/message.ogg", "please inspect redis slots");
+
+    await fixture.commands.handleMessage(telegramVoiceMessage(61, "voice-main"));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for voice.")));
+
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("Transcribed voice:\ntranscribed: please inspect redis slots"))).toBe(
+      true
+    );
+    const voiceRoot = join(fixture.factoryRoot, "scratch", "voice");
+    const prompt = await readFile(join(voiceRoot, ".factory", "control-plane.prompt.md"), "utf8");
+    expect(prompt).toContain("Instruction:\n\ntranscribed: please inspect redis slots");
+    expect(prompt).not.toContain("Voice transcript");
+    expect(prompt).not.toContain("Telegram inbound message:");
+
+    fixture.telegram.registerRemoteFile("voice-run", "voice/run.ogg", "run the explicit redis check");
+    await fixture.commands.handleMessage(telegramVoiceCaptionMessage("/run", 61, "voice-run"));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 2 for voice.")));
+
+    const runPrompt = await readFile(join(voiceRoot, ".factory", "control-plane.prompt.md"), "utf8");
+    expect(runPrompt).toContain("Instruction:\n\ntranscribed: run the explicit redis check");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("voice install requests delegate to canonical brainctl capability command without a bound context", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("install voice on erbine", 62));
+    expect(fixture.telegram.sent[0]?.text).toContain("Installing voice transcription on erbine.");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Voice install complete.");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Test it by sending a Telegram voice note");
+
+    const calls = await readFile(fixture.fakeBrainctlCalls, "utf8");
+    expect(calls).toContain(`capabilities install voice --config ${join(fixture.root, "brainstack.yaml")} --target erbine --restart-delay-ms 1500`);
+
+    await fixture.commands.handleMessage(telegramMessage("/voice status", 62));
+    const updatedCalls = await readFile(fixture.fakeBrainctlCalls, "utf8");
+    expect(updatedCalls).toContain(`capabilities doctor voice --config ${join(fixture.root, "brainstack.yaml")}`);
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Voice doctor complete.");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("voice install sends progress messages during slow capability setup", async () => {
+  const fixture = await createFixture({ FACTORY_CAPABILITY_PROGRESS_INTERVAL_MS: "25" });
+  const previousSleep = process.env.FACTORY_TEST_BRAINCTL_INSTALL_SLEEP_SECONDS;
+  process.env.FACTORY_TEST_BRAINCTL_INSTALL_SLEEP_SECONDS = "1";
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("install voice on erbine", 63));
+
+    const messages = fixture.telegram.sent.map((entry) => entry.text);
+    expect(messages[0]).toContain("Installing voice transcription on erbine.");
+    expect(messages.some((text) => text.includes("Still installing voice transcription on erbine"))).toBe(true);
+    expect(messages.at(-1)).toContain("Voice install complete.");
+  } finally {
+    if (previousSleep === undefined) {
+      delete process.env.FACTORY_TEST_BRAINCTL_INSTALL_SLEEP_SECONDS;
+    } else {
+      process.env.FACTORY_TEST_BRAINCTL_INSTALL_SLEEP_SECONDS = previousSleep;
+    }
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }

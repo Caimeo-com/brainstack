@@ -26,6 +26,7 @@ import {
 export { loadConfig, parseSimpleYaml } from "./config";
 import { createDoctorStatusCommands } from "./commands/doctor-status";
 import { createInstallEnrollCommands } from "./commands/install-enroll";
+import { createCapabilitiesCommands } from "./commands/capabilities";
 import { createProjectOutboxCommands } from "./commands/project-outbox";
 import { createSkillHookCommands } from "./commands/skills-hooks";
 import {
@@ -282,6 +283,44 @@ const commandFleet = doctorStatusCommands.commandFleet;
 const commandUpdates = doctorStatusCommands.commandUpdates;
 const commandStatus = doctorStatusCommands.commandStatus;
 const commandWorkerCache = doctorStatusCommands.commandWorkerCache;
+
+const capabilitiesCommands = createCapabilitiesCommands({
+  loadConfig,
+  defaultWorkers,
+  runWorkerShell,
+  workerRemoteTarget,
+  workerSshPortArgs,
+  workerSshTrustArgs,
+  runRemoteBrainctl: async (cfg, args, argv, timeoutMs) => {
+    const via = controlSshTarget(cfg, args, "capabilities control SSH target", { allowRemoteSshFallback: true });
+    if (!via) {
+      return false;
+    }
+    const remoteRepo =
+      requireFlagValue(args, "remote-repo") ||
+      process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() ||
+      cfg.client.telegramRemoteRepo ||
+      "~/brainstack";
+    const result = runControlRemoteScript(
+      cfg,
+      args,
+      "capabilities control SSH target",
+      remoteBrainctlScript(remoteRepo, argv, { preferInstalledBinary: true }),
+      timeoutMs,
+      { allowRemoteSshFallback: true }
+    );
+    if (!result) {
+      return false;
+    }
+    if (result.code !== 0) {
+      throw new Error(`capabilities command failed over ssh with exit ${result.code}\n${result.stderr || result.stdout}`);
+    }
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    return true;
+  }
+});
+const commandCapabilities = capabilitiesCommands.commandCapabilities;
 
 const projectOutboxCommands = createProjectOutboxCommands({
   clientEnvPathAbs,
@@ -3045,6 +3084,9 @@ async function main(): Promise<void> {
       return await commandUpdates(args);
     case "fleet":
       return await commandFleet(args);
+    case "capabilities":
+    case "capability":
+      return await commandCapabilities(args);
     case "expose":
       return await commandExpose(args);
     case "import":

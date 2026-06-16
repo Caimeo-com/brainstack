@@ -31,6 +31,8 @@ export type WorkerSshTrustMode = "pinned" | "accept-new";
 export type ControlSshTrustMode = WorkerSshTrustMode | "default";
 export type SecurityPosture = "local" | "trusted-tailnet" | "guarded";
 export type TrustedExposure = "none" | "tailscale-serve" | "vpn" | "manual";
+export type VoiceCapabilityTarget = "local" | "worker";
+export type VoiceCapabilityEngine = "whisperfile";
 
 export const CONFIG_SCHEMA_VERSION = 1;
 export const MIN_BUN_VERSION = "1.3.10";
@@ -167,6 +169,25 @@ export interface BrainstackConfig {
     localMachine: string;
     workers: BrainstackWorkerConfig[];
   };
+  capabilities: {
+    voice: {
+      enabled: boolean;
+      target: VoiceCapabilityTarget;
+      worker: string | null;
+      engine: VoiceCapabilityEngine;
+      model: string;
+      installRoot: string;
+      command: string;
+      args: string[];
+      timeoutMs: number;
+      echoTranscript: boolean;
+      maxBytes: number;
+      maxDurationSeconds: number | null;
+      modelUrl: string;
+      sha256: string | null;
+      installedAt: string | null;
+    };
+  };
   tailscale: {
     tailnetHost: string;
     controlTag: string;
@@ -299,6 +320,7 @@ const ALLOWED_TOP_LEVEL_CONFIG_KEYS = new Set([
   "brain",
   "repos",
   "telemux",
+  "capabilities",
   "tailscale",
   "client",
   "curation"
@@ -340,6 +362,22 @@ export function normalizeTrustedExposure(value: string | null | undefined): Trus
     return normalized;
   }
   throw new Error(`Unsupported trusted exposure: ${value}. Expected none, tailscale-serve, vpn, or manual.`);
+}
+
+export function normalizeVoiceCapabilityTarget(value: string | null | undefined): VoiceCapabilityTarget {
+  const normalized = (value || "local").trim().toLowerCase();
+  if (normalized === "local" || normalized === "worker") {
+    return normalized;
+  }
+  throw new Error(`Unsupported capabilities.voice.target: ${value}. Expected local or worker.`);
+}
+
+export function normalizeVoiceCapabilityEngine(value: string | null | undefined): VoiceCapabilityEngine {
+  const normalized = (value || "whisperfile").trim().toLowerCase();
+  if (normalized === "whisperfile") {
+    return normalized;
+  }
+  throw new Error(`Unsupported capabilities.voice.engine: ${value}. Expected whisperfile.`);
 }
 
 function splitKeyValue(text: string): [string, string] {
@@ -657,6 +695,8 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
   const security = objectAt(raw, "security");
   const brain = objectAt(raw, "brain");
   const telemux = objectAt(raw, "telemux");
+  const capabilities = objectAt(raw, "capabilities");
+  const voiceCapability = objectAt(capabilities, "voice");
   const tailscale = objectAt(raw, "tailscale");
   const client = objectAt(raw, "client");
   const curation = objectAt(raw, "curation");
@@ -757,6 +797,26 @@ export async function loadConfig(configPath?: string, profileOverride?: string, 
       factoryRoot: root ? join(stateRoot, "factory") : absWithHome(stringAt(telemux, "factoryRoot", join(stateRoot, "factory")), home),
       localMachine: stringAt(telemux, "localMachine", machineName),
       workers: []
+    },
+    capabilities: {
+      voice: {
+        enabled: booleanAt(voiceCapability, "enabled", false),
+        target: normalizeVoiceCapabilityTarget(optionalStringAt(voiceCapability, "target")),
+        worker: optionalStringAt(voiceCapability, "worker"),
+        engine: normalizeVoiceCapabilityEngine(optionalStringAt(voiceCapability, "engine")),
+        model: stringAt(voiceCapability, "model", "tiny.en"),
+        installRoot: stringAt(voiceCapability, "installRoot", "~/.local/share/brainstack/capabilities/voice"),
+        command: stringAt(voiceCapability, "command", ""),
+        args: arrayAt(voiceCapability, "args").map(String).filter(Boolean),
+        timeoutMs: numberAt(voiceCapability, "timeoutMs", 120_000),
+        echoTranscript: booleanAt(voiceCapability, "echoTranscript", true),
+        maxBytes: numberAt(voiceCapability, "maxBytes", 20 * 1024 * 1024),
+        maxDurationSeconds:
+          voiceCapability.maxDurationSeconds === null ? null : numberAt(voiceCapability, "maxDurationSeconds", 300),
+        modelUrl: stringAt(voiceCapability, "modelUrl", ""),
+        sha256: optionalStringAt(voiceCapability, "sha256"),
+        installedAt: optionalStringAt(voiceCapability, "installedAt")
+      }
     },
     tailscale: {
       tailnetHost: stringAt(tailscale, "tailnetHost", publicBaseUrl.replace(/^https?:\/\//, "")),

@@ -181,6 +181,71 @@ telemux:
     }
   });
 
+  test("voice capability config renders Telemux transcription env", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-voice-capability-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      const outDir = join(dir, "rendered");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: valkyrie",
+          "paths:",
+          `  home: ${dir}`,
+          `  configRoot: ${join(dir, "config")}`,
+          "brain:",
+          "  publicBaseUrl: https://valkyrie.example.ts.net",
+          "telemux:",
+          "  enabled: true",
+          "  localMachine: valkyrie",
+          "  workers:",
+          "    - name: valkyrie",
+          "      transport: local",
+          "    - name: erbine",
+          "      transport: ssh",
+          "      sshTarget: erbine",
+          "capabilities:",
+          "  voice:",
+          "    enabled: true",
+          "    target: worker",
+          "    worker: erbine",
+          "    model: tiny.en",
+          "    installRoot: ~/.local/share/brainstack/capabilities/voice",
+          "    command: /home/operator/.local/share/brainstack/capabilities/voice/whisper-tiny.en.llamafile",
+          "    args: [\"-f\", \"{input}\", \"-pc\"]",
+          "    echoTranscript: true",
+          ""
+        ].join("\n")
+      );
+
+      const cfg = await loadConfig(configPath, "control");
+      expect(cfg.capabilities.voice.enabled).toBe(true);
+      expect(cfg.capabilities.voice.target).toBe("worker");
+      expect(cfg.capabilities.voice.worker).toBe("erbine");
+      expect(cfg.capabilities.voice.args).toEqual(["-f", "{input}", "-pc"]);
+
+      expectSuccess(runBrainctl(["render", "--profile", "control", "--config", configPath, "--out", outDir]));
+      const env = await readFile(join(outDir, "env", "telemux.runtime.env"), "utf8");
+      expect(env).toContain("FACTORY_TRANSCRIPTION_ENABLED=1");
+      expect(env).toContain("FACTORY_TRANSCRIPTION_TARGET=worker");
+      expect(env).toContain("FACTORY_TRANSCRIPTION_WORKER=erbine");
+      expect(env).toContain("FACTORY_TRANSCRIPTION_COMMAND=/home/operator/.local/share/brainstack/capabilities/voice/whisper-tiny.en.llamafile");
+      expect(env).toContain('FACTORY_TRANSCRIPTION_ARGS_JSON=["-f","{input}","-pc"]');
+      expect(env).toContain("FACTORY_TRANSCRIPTION_ECHO=1");
+      expect(env).toContain("FACTORY_CAPABILITY_PROGRESS_INTERVAL_MS=45000");
+
+      const dryRun = runBrainctl(["capabilities", "install", "voice", "--target", "erbine", "--config", configPath, "--dry-run"]);
+      expectSuccess(dryRun);
+      expect(dryRun.stdout).toContain("would_install=voice target=erbine transport=ssh");
+      expect(dryRun.stdout).toContain("would_restart=telemux.service");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("proposals and curator CLI commands talk to the brain API with correct auth", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-proposals-cli-"));
     const port = 46_000 + Math.floor(Math.random() * 1_000);

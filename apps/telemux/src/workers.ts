@@ -65,6 +65,14 @@ export interface CodexRunOptions {
   reasoningEffortOverride?: CodexReasoningEffort | null;
 }
 
+export interface WorkerTranscriptionRequest {
+  fileName: string;
+  bytes: Uint8Array;
+  command: string;
+  args: string[];
+  timeoutMs: number;
+}
+
 interface ContextBootstrapRequest {
   slug: string;
   machine: string;
@@ -87,6 +95,23 @@ function nowIso(): string {
 
 function quoteSh(value: string): string {
   return `'${value.replaceAll("'", `'\"'\"'`)}'`;
+}
+
+function safeTempFileName(value: string): string {
+  const cleaned = value.replaceAll("\\", "/").split("/").pop()?.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return cleaned || "audio";
+}
+
+function transcriptionCommandLine(command: string, args: string[]): string {
+  const normalizedArgs = args.length ? [...args] : ["{input}"];
+  if (!normalizedArgs.includes("{input}")) {
+    normalizedArgs.push("{input}");
+  }
+
+  return [
+    quoteSh(command),
+    ...normalizedArgs.map((arg) => (arg === "{input}" ? '"$input"' : quoteSh(arg)))
+  ].join(" ");
 }
 
 interface WorkerEnvCacheRecord {
@@ -967,6 +992,98 @@ wait "$harness_pid"
       ...result,
       sessionId: seenSessionId || parseSessionId(result.stdout) || context.codexSessionId || null
     };
+  }
+
+  async runTranscription(workerName: string, request: WorkerTranscriptionRequest): Promise<WorkerExecResult> {
+    const worker = this.requireWorker(workerName);
+    const command = request.command.trim();
+    if (!command) {
+      return {
+        ok: false,
+        host: worker.name,
+        transport: worker.transport,
+        exitCode: 64,
+        stdout: "",
+        stderr: "FACTORY_TRANSCRIPTION_COMMAND is not set",
+        durationMs: 0,
+        commandLabel: "transcription config"
+      };
+    }
+
+    const fileName = safeTempFileName(request.fileName);
+    const shellCommand = transcriptionCommandLine(command, request.args);
+    const script = `
+set -euo pipefail
+${workerUserPathPrelude()}
+tmp_dir="$(mktemp -d "\${TMPDIR:-/tmp}/brainstack-transcribe.XXXXXX")"
+cleanup() {
+  rm -rf "$tmp_dir"
+}
+trap cleanup EXIT
+input="$tmp_dir/${fileName}"
+cat > "$input"
+${shellCommand}
+`.trim();
+    const timeoutSeconds = Math.max(1, Math.ceil(request.timeoutMs / 1000));
+    const remoteShellCommand = `bash -lc ${quoteSh(script)}`;
+
+    switch (worker.transport) {
+      case "local":
+        return this.spawnAndCapture(
+          ["bash", "-lc", script],
+          request.bytes,
+          worker.name,
+          "local",
+          undefined,
+          timeoutSeconds,
+          undefined,
+          this.config.workerCaptureMaxBytes
+        );
+      case "ssh":
+        if (worker.sshTrustMode === "accept-new" && !truthyEnv(process.env.BRAINSTACK_ALLOW_ACCEPT_NEW_DISPATCH)) {
+          return {
+            ok: false,
+            host: worker.name,
+            transport: worker.transport,
+            exitCode: 78,
+            stdout: "",
+            stderr: `worker ${worker.name} uses sshTrustMode=accept-new, which is bootstrap-only. Pin the host key with brainctl trust-worker and set sshTrustMode: pinned before transcription dispatch.`,
+            durationMs: 0,
+            commandLabel: "ssh trust refused"
+          };
+        }
+        return this.spawnAndCapture(
+          [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            ...sshTrustArgs(this.config, worker),
+            ...workerSshPortArgs(worker),
+            this.remoteTarget(worker),
+            remoteShellCommand
+          ],
+          request.bytes,
+          worker.name,
+          "ssh",
+          undefined,
+          timeoutSeconds,
+          undefined,
+          this.config.workerCaptureMaxBytes
+        );
+      case "tailscale-ssh":
+        return this.spawnAndCapture(
+          ["tailscale", "ssh", this.remoteTarget(worker), remoteShellCommand],
+          request.bytes,
+          worker.name,
+          "tailscale-ssh",
+          undefined,
+          timeoutSeconds,
+          undefined,
+          this.config.workerCaptureMaxBytes
+        );
+    }
   }
 
   async runUpdateCheck(context: ContextRecord, logPath?: string): Promise<WorkerExecResult & { reportPath: string | null }> {
@@ -2103,7 +2220,7 @@ printf 'BRANCH=%s\\n' "$branch_name"
 
   private async spawnAndCapture(
     args: string[],
-    script: string,
+    script: string | Uint8Array,
     host: string,
     transport: string,
     logPath?: string,

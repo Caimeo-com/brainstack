@@ -31,6 +31,7 @@ export const TELEGRAM_BOT_COMMANDS: TelegramBotCommand[] = [
   { command: "whoami", description: "Show Telegram ids and current binding" },
   { command: "workers", description: "List worker status and transport" },
   { command: "updates", description: "Show manual update and harness version status" },
+  { command: "voice", description: "Install or check voice transcription" },
   { command: "context", description: "Show current context, runtime, and session state" },
   { command: "compact", description: "Compact the current Codex thread when supported" },
   { command: "crons", description: "List scheduled jobs for this topic/context" },

@@ -184,6 +184,7 @@ describe("public release hygiene - fleet remote control invites and release", ()
       const missingOutputFlag = runBrainctl(["updates", "--config", configPath], {
         PATH: `${binDir}:${process.env.PATH || ""}`,
         BRAINSTACK_SKIP_USER_PATH_RESOLVE: "1",
+        BRAINSTACK_UPDATE_PROBE_TIMEOUT_MS: "5000",
         BRAINSTACK_UPDATE_PROBE_COMMANDS: "none"
       });
       expectSuccess(missingOutputFlag);

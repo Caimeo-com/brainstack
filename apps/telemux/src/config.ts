@@ -5,6 +5,7 @@ export type WorkerTransport = "local" | "ssh" | "tailscale-ssh";
 export type HarnessName = "codex" | "claude";
 export type WorkerSshTrustMode = "pinned" | "accept-new";
 export type UsageAdapter = "manual";
+export type TranscriptionTarget = "local" | "worker";
 
 export interface PreDispatchClassifierConfig {
   enabled: boolean;
@@ -14,6 +15,18 @@ export interface PreDispatchClassifierConfig {
   timeoutMs: number;
   maxChars: number;
   confidenceThreshold: number;
+}
+
+export interface TranscriptionConfig {
+  enabled: boolean;
+  target: TranscriptionTarget;
+  worker: string | null;
+  command: string;
+  args: string[];
+  timeoutMs: number;
+  echoTranscript: boolean;
+  maxBytes: number;
+  maxDurationSeconds: number | null;
 }
 
 export interface FactoryWorkerConfig {
@@ -68,6 +81,9 @@ export interface FactoryConfig {
   harness: HarnessName;
   harnessBin: string;
   codexBin: string;
+  brainctlBin: string;
+  brainstackConfigPath: string;
+  capabilityProgressIntervalMs: number;
   brainBaseUrl: string;
   brainImportToken: string;
   brainAdminToken: string;
@@ -75,6 +91,7 @@ export interface FactoryConfig {
   textCoalesceMs: number;
   pendingTextRecoveryMaxAgeMs: number;
   preDispatchClassifier: PreDispatchClassifierConfig;
+  transcription: TranscriptionConfig;
 }
 
 export interface WorkerConfigInput {
@@ -103,6 +120,16 @@ function readNumber(env: NodeJS.ProcessEnv, name: string, fallback: number): num
 
   const value = Number(raw);
   return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function readNonNegativeNumber(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name]?.trim();
+  if (!raw) {
+    return fallback;
+  }
+
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
 function readOptionalNumber(env: NodeJS.ProcessEnv, name: string): number | null {
@@ -182,6 +209,27 @@ function normalizeUsageAdapter(value: string | undefined): UsageAdapter {
     return "manual";
   }
   throw new Error(`Unsupported FACTORY_USAGE_ADAPTER=${adapter}; supported value: manual`);
+}
+
+function normalizeTranscriptionTarget(value: string | undefined): TranscriptionTarget {
+  return value?.trim() === "worker" ? "worker" : "local";
+}
+
+function readJsonStringArray(env: NodeJS.ProcessEnv, name: string, fallback: string[] = []): string[] {
+  const raw = env[name]?.trim();
+  if (!raw) {
+    return fallback;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed) || !parsed.every((value) => typeof value === "string")) {
+      return fallback;
+    }
+    return parsed;
+  } catch {
+    return fallback;
+  }
 }
 
 function normalizeSshTrustMode(value: string | null | undefined, transport: WorkerTransport): WorkerSshTrustMode {
@@ -367,6 +415,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
     harness,
     harnessBin,
     codexBin: env.FACTORY_CODEX_BIN?.trim() || (harness === "codex" ? harnessBin : "codex"),
+    brainctlBin: env.FACTORY_BRAINCTL_BIN?.trim() || "brainctl",
+    brainstackConfigPath: env.BRAINSTACK_CONFIG?.trim()
+      ? resolvePath(env.BRAINSTACK_CONFIG.trim())
+      : resolve(process.env.HOME || ".", ".config", "brainstack", "brainstack.yaml"),
+    capabilityProgressIntervalMs: readNonNegativeNumber(env, "FACTORY_CAPABILITY_PROGRESS_INTERVAL_MS", 45_000),
     brainBaseUrl: env.BRAIN_BASE_URL?.trim() || "",
     brainImportToken: env.BRAIN_IMPORT_TOKEN?.trim() || "",
     brainAdminToken: env.FACTORY_BRAIN_ADMIN_TOKEN?.trim() || env.BRAIN_ADMIN_TOKEN?.trim() || "",
@@ -381,6 +434,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
       timeoutMs: readNumber(env, "FACTORY_PRE_DISPATCH_CLASSIFIER_TIMEOUT_MS", 800),
       maxChars: readNumber(env, "FACTORY_PRE_DISPATCH_CLASSIFIER_MAX_CHARS", 600),
       confidenceThreshold: readRatio(env, "FACTORY_PRE_DISPATCH_CLASSIFIER_CONFIDENCE", 0.75)
+    },
+    transcription: {
+      enabled: readBoolean(env, "FACTORY_TRANSCRIPTION_ENABLED", false),
+      target: normalizeTranscriptionTarget(env.FACTORY_TRANSCRIPTION_TARGET),
+      worker: env.FACTORY_TRANSCRIPTION_WORKER?.trim() || null,
+      command: env.FACTORY_TRANSCRIPTION_COMMAND?.trim() || "",
+      args: readJsonStringArray(env, "FACTORY_TRANSCRIPTION_ARGS_JSON", []),
+      timeoutMs: readNumber(env, "FACTORY_TRANSCRIPTION_TIMEOUT_MS", 120_000),
+      echoTranscript: readBoolean(env, "FACTORY_TRANSCRIPTION_ECHO", false),
+      maxBytes: readNumber(env, "FACTORY_TRANSCRIPTION_MAX_BYTES", 20 * 1024 * 1024),
+      maxDurationSeconds: readOptionalNumber(env, "FACTORY_TRANSCRIPTION_MAX_DURATION_SECONDS")
     }
   };
 }

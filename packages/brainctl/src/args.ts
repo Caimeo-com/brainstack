@@ -16,6 +16,7 @@ export function usage(): string {
   brainctl daemon run|once|status|install|uninstall|logs --config brainstack.yaml [--json]
   brainctl updates --config brainstack.yaml [--profile ...]
   brainctl fleet status|update --config brainstack.yaml [machine|--all] [--json] [--dry-run]
+  brainctl capabilities list|install|doctor|test [voice] --config brainstack.yaml [--target MACHINE] [--model tiny.en|small.en|medium.en|large-v2|large-v3]
   brainctl expose tailscale --config brainstack.yaml --dry-run|--apply
   brainctl backup --config brainstack.yaml [--out DIR] [--pause-telemux]
   brainctl restore --backup DIR_OR_TGZ --target DIR [--apply]
