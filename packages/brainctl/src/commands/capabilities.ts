@@ -87,7 +87,8 @@ function capabilitiesUsage(): string {
   return [
     "Usage:",
     "  brainctl capabilities list --config brainstack.yaml",
-    "  brainctl capabilities install voice --target MACHINE [--model tiny.en|small.en|medium.en|large-v2|large-v3] [--install-root DIR] [--echo|--no-echo] [--dry-run]",
+    "  brainctl capabilities install voice --target MACHINE [--model tiny.en|small.en|medium.en|large-v2|large-v3] [--install-root DIR] [--echo|--no-echo] [--no-install-deps] [--dry-run]",
+    "  brainctl capabilities uninstall voice --config brainstack.yaml [--target MACHINE] [--remove-files] [--dry-run]",
     "  brainctl capabilities doctor voice --config brainstack.yaml [--json]",
     "  brainctl capabilities test voice --file AUDIO_FILE --config brainstack.yaml [--json]",
     "",
@@ -258,8 +259,9 @@ function commandLine(command: string, args: string[]): string {
   return [quote(command), ...normalizedArgs.map((arg) => (arg === "{input}" ? '"$input"' : quote(arg)))].join(" ");
 }
 
-function installScript(spec: VoiceModelSpec, installRoot: string): string {
+function installScript(spec: VoiceModelSpec, installRoot: string, installDeps: boolean): string {
   const expectedSha = spec.sha256 || "";
+  const shouldInstallDeps = installDeps ? "1" : "0";
   return `
 set -euo pipefail
 brainstack_expand_home() {
@@ -279,14 +281,59 @@ brainstack_sha256() {
     return 127
   fi
 }
+brainstack_run_as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+    return $?
+  fi
+  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    sudo -n "$@"
+    return $?
+  fi
+  return 1
+}
+brainstack_install_ffmpeg() {
+  if command -v ffmpeg >/dev/null 2>&1; then
+    printf 'ffmpeg=present\\n'
+    return 0
+  fi
+  if [ ${quote(shouldInstallDeps)} != "1" ]; then
+    echo "missing ffmpeg on target machine; rerun without --no-install-deps or install ffmpeg manually" >&2
+    return 127
+  fi
+  printf 'ffmpeg=installing\\n'
+  if command -v brew >/dev/null 2>&1; then
+    brew install ffmpeg
+  elif command -v apt-get >/dev/null 2>&1; then
+    brainstack_run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
+    brainstack_run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg
+  elif command -v pacman >/dev/null 2>&1; then
+    brainstack_run_as_root pacman -S --needed --noconfirm ffmpeg
+  elif command -v dnf >/dev/null 2>&1; then
+    brainstack_run_as_root dnf install -y ffmpeg
+  elif command -v yum >/dev/null 2>&1; then
+    brainstack_run_as_root yum install -y ffmpeg
+  elif command -v zypper >/dev/null 2>&1; then
+    brainstack_run_as_root zypper --non-interactive install ffmpeg
+  elif command -v apk >/dev/null 2>&1; then
+    brainstack_run_as_root apk add --no-cache ffmpeg
+  else
+    echo "missing ffmpeg and no supported package manager found; install ffmpeg or rerun after adding brew, apt-get, pacman, dnf, yum, zypper, or apk" >&2
+    return 127
+  fi
+  hash -r >/dev/null 2>&1 || true
+  if command -v ffmpeg >/dev/null 2>&1; then
+    printf 'ffmpeg=ok\\n'
+    return 0
+  fi
+  echo "ffmpeg install finished but ffmpeg is still not on PATH" >&2
+  return 127
+}
 install_root="$(brainstack_expand_home ${quote(installRoot)})"
 url=${quote(spec.url)}
 file_name=${quote(spec.fileName)}
 expected_sha=${quote(expectedSha)}
-if ! command -v ffmpeg >/dev/null 2>&1; then
-  echo "missing ffmpeg on target machine; install ffmpeg before voice transcription" >&2
-  exit 127
-fi
+brainstack_install_ffmpeg
 mkdir -p "$install_root"
 command_path="$install_root/$file_name"
 if [ -x "$command_path" ]; then
@@ -323,7 +370,51 @@ trap - EXIT
 "$command_path" --help >/dev/null 2>&1 || true
 printf 'installed=downloaded\\n'
 printf 'command=%s\\n' "$command_path"
-`.trim();
+  `.trim();
+}
+
+function uninstallScript(installRoot: string, commandPath: string): string {
+  return `
+set -euo pipefail
+brainstack_expand_home() {
+  case "$1" in
+    "~") printf '%s\\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\\n' "$HOME" "\${1#\\~/}" ;;
+    *) printf '%s\\n' "$1" ;;
+  esac
+}
+install_root="$(brainstack_expand_home ${quote(installRoot)})"
+command_path="$(brainstack_expand_home ${quote(commandPath)})"
+removed=0
+case "$install_root" in
+  "$HOME"/.local/share/brainstack/capabilities/voice|"$HOME"/.local/share/brainstack/capabilities/voice/*|*/brainstack/capabilities/voice|*/brainstack/capabilities/voice/*)
+    safe_root=1
+    ;;
+  *)
+    safe_root=0
+    ;;
+esac
+if [ -n "$command_path" ] && [ -e "$command_path" ]; then
+  case "$command_path" in
+    "$install_root"/*)
+      rm -f "$command_path"
+      printf 'removed_command=%s\\n' "$command_path"
+      removed=1
+      ;;
+    *)
+      printf 'skipped_command_outside_install_root=%s\\n' "$command_path"
+      ;;
+  esac
+fi
+if [ "$safe_root" = "1" ] && [ -d "$install_root" ]; then
+  rm -rf "$install_root"
+  printf 'removed_root=%s\\n' "$install_root"
+  removed=1
+elif [ -d "$install_root" ]; then
+  printf 'skipped_unsafe_root=%s\\n' "$install_root"
+fi
+printf 'removed=%s\\n' "$removed"
+  `.trim();
 }
 
 function stdoutValue(output: string, key: string): string | null {
@@ -417,6 +508,38 @@ async function persistVoiceCapability(options: {
     modelUrl: spec.url,
     sha256: spec.sha256,
     installedAt: new Date().toISOString()
+  };
+  capabilities.voice = voice;
+  raw.capabilities = capabilities;
+  await writeRawConfigObject(configPath, raw);
+  await upsertEnvMany(join(cfg.paths.configRoot, "telemux.runtime.env"), voiceRuntimeUpdates(cfg, configPath, voice));
+  return voice;
+}
+
+async function disableVoiceCapability(options: {
+  cfg: BrainstackConfig;
+  configPath: string;
+}): Promise<Record<string, unknown>> {
+  const { cfg, configPath } = options;
+  const raw = await loadRawConfigObject(configPath);
+  const capabilities = objectAt(raw, "capabilities");
+  const args = cfg.capabilities.voice.args.length ? cfg.capabilities.voice.args : ["-f", "{input}", "-pc"];
+  const voice = {
+    enabled: false,
+    target: "local",
+    worker: null,
+    engine: "whisperfile",
+    model: cfg.capabilities.voice.model || "tiny.en",
+    installRoot: cfg.capabilities.voice.installRoot || "~/.local/share/brainstack/capabilities/voice",
+    command: "",
+    args,
+    timeoutMs: cfg.capabilities.voice.timeoutMs || 120_000,
+    echoTranscript: cfg.capabilities.voice.echoTranscript,
+    maxBytes: cfg.capabilities.voice.maxBytes || 20 * 1024 * 1024,
+    maxDurationSeconds: cfg.capabilities.voice.maxDurationSeconds ?? 300,
+    modelUrl: "",
+    sha256: null,
+    installedAt: null
   };
   capabilities.voice = voice;
   raw.capabilities = capabilities;
@@ -567,6 +690,18 @@ function configuredVoiceWorker(cfg: BrainstackConfig, deps: CapabilityDeps): Bra
   return local;
 }
 
+function configuredOrRequestedVoiceWorker(
+  cfg: BrainstackConfig,
+  deps: CapabilityDeps,
+  args: ParsedArgs
+): { worker: BrainstackWorkerConfig; targetMode: "local" | "worker" } {
+  if (requireFlagValue(args, "target") || requireFlagValue(args, "machine") || args.positional[2]) {
+    return resolveTargetWorker(deps, cfg, args);
+  }
+  const worker = configuredVoiceWorker(cfg, deps);
+  return { worker, targetMode: cfg.capabilities.voice.target };
+}
+
 function printVoiceStatus(cfg: BrainstackConfig, deps: CapabilityDeps): void {
   const voice = cfg.capabilities.voice;
   const workers = deps.defaultWorkers(cfg);
@@ -595,7 +730,8 @@ export function createCapabilitiesCommands(deps: CapabilityDeps) {
       !hasFlag(args, "no-remote") &&
       sub !== "list" &&
       !(sub === "test" && (requireFlagValue(args, "file") || args.positional[2]));
-    if (shouldForward && (await deps.runRemoteBrainctl(cfg, args, parsedArgsToCanonicalArgv(args), sub === "install" ? 35 * 60_000 : 120_000))) {
+    const forwardTimeoutMs = sub === "install" ? 35 * 60_000 : sub === "uninstall" ? 5 * 60_000 : 120_000;
+    if (shouldForward && (await deps.runRemoteBrainctl(cfg, args, parsedArgsToCanonicalArgv(args), forwardTimeoutMs))) {
       return;
     }
 
@@ -612,16 +748,18 @@ export function createCapabilitiesCommands(deps: CapabilityDeps) {
         const spec = selectedVoiceModel(args);
         const installRoot = safeInstallRoot(args, cfg);
         const target = resolveTargetWorker(deps, cfg, args);
+        const installDeps = !hasFlag(args, "no-install-deps");
         if (hasFlag(args, "dry-run")) {
           console.log(`would_install=voice target=${target.worker.name} transport=${target.worker.transport}`);
           console.log(`model=${spec.id} file=${spec.fileName} size=${spec.size}`);
           console.log(`download=${spec.url}`);
           console.log(`install_root=${installRoot}`);
+          console.log(`install_deps=${installDeps ? "yes" : "no"}`);
           console.log(`would_update=${configPathForArgs(args)}`);
           console.log(`would_restart=${cfg.telemux.enabled ? TELEMUX_SERVICE_NAME : "no (telemux disabled)"}`);
           return;
         }
-        const result = deps.runWorkerShell(cfg, target.worker, installScript(spec, installRoot), 35 * 60, false);
+        const result = deps.runWorkerShell(cfg, target.worker, installScript(spec, installRoot, installDeps), 35 * 60, false);
         if (result.code !== 0) {
           throw new Error(`voice install failed on ${target.worker.name} with exit ${result.code}\n${result.stderr || result.stdout}`);
         }
@@ -629,6 +767,10 @@ export function createCapabilitiesCommands(deps: CapabilityDeps) {
         if (!commandPath) {
           throw new Error(`voice install on ${target.worker.name} did not report command path\n${result.stdout}`);
         }
+        const installDetails = result.stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => /^(ffmpeg|installed)=/.test(line));
         const configPath = configPathForArgs(args);
         const voice = await persistVoiceCapability({
           cfg,
@@ -642,11 +784,66 @@ export function createCapabilitiesCommands(deps: CapabilityDeps) {
         });
         const restart = await restartTelemux(cfg, args);
         console.log(`installed=voice target=${target.worker.name} mode=${target.targetMode}`);
+        for (const line of installDetails) {
+          console.log(line);
+        }
         console.log(`model=${spec.id} command=${commandPath}`);
         console.log(`config=${configPath}`);
         console.log(restart);
         console.log(`echo=${voice.echoTranscript ? "yes" : "no"}`);
         console.log("test=send a Telegram voice note in any bound topic, or run: brainctl capabilities test voice --file /path/to/audio.ogg");
+        return;
+      }
+      case "uninstall":
+      case "remove":
+      case "disable": {
+        const capability = args.positional[1] || "voice";
+        if (capability !== "voice" && capability !== "transcription") {
+          throw new Error(`Unknown capability: ${capability}`);
+        }
+        const configPath = configPathForArgs(args);
+        const removeFiles = hasFlag(args, "remove-files") || hasFlag(args, "purge");
+        const installRoot = cfg.capabilities.voice.installRoot || "~/.local/share/brainstack/capabilities/voice";
+        const commandPath = cfg.capabilities.voice.command || "";
+        let target: { worker: BrainstackWorkerConfig; targetMode: "local" | "worker" } | null = null;
+        if (removeFiles) {
+          target = configuredOrRequestedVoiceWorker(cfg, deps, args);
+        } else {
+          try {
+            target = configuredOrRequestedVoiceWorker(cfg, deps, args);
+          } catch {
+            target = null;
+          }
+        }
+        if (hasFlag(args, "dry-run")) {
+          console.log(`would_uninstall=voice config=${configPath}`);
+          console.log(`would_disable_runtime=${cfg.telemux.enabled ? "yes" : "yes (telemux disabled)"}`);
+          console.log(`would_remove_files=${removeFiles ? "yes" : "no"}`);
+          if (target) {
+            console.log(`target=${target.worker.name} transport=${target.worker.transport}`);
+          }
+          if (removeFiles) {
+            console.log(`install_root=${installRoot}`);
+            console.log(`command=${commandPath || "(none)"}`);
+          }
+          console.log(`would_restart=${cfg.telemux.enabled ? TELEMUX_SERVICE_NAME : "no (telemux disabled)"}`);
+          return;
+        }
+        let removeResult: ShellResult | null = null;
+        if (removeFiles && target) {
+          removeResult = deps.runWorkerShell(cfg, target.worker, uninstallScript(installRoot, commandPath), 120, false);
+          if (removeResult.code !== 0) {
+            throw new Error(`voice uninstall file removal failed on ${target.worker.name} with exit ${removeResult.code}\n${removeResult.stderr || removeResult.stdout}`);
+          }
+        }
+        await disableVoiceCapability({ cfg, configPath });
+        const restart = await restartTelemux(cfg, args);
+        console.log(`uninstalled=voice config=${configPath}`);
+        console.log(`files=${removeFiles ? "removed" : "kept"}${target ? ` target=${target.worker.name}` : ""}`);
+        if (removeResult?.stdout.trim()) console.log(removeResult.stdout.trim());
+        if (removeResult?.stderr.trim()) console.error(removeResult.stderr.trim());
+        console.log(restart);
+        console.log("install=brainctl capabilities install voice --target MACHINE");
         return;
       }
       case "doctor":

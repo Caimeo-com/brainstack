@@ -341,6 +341,129 @@ printf 'converted voice payload' > "$output"
       });
       expectSuccess(voiceTest);
       expect(voiceTest.stdout).toContain("converted voice payload");
+
+      const uninstall = runBrainctl(["capabilities", "uninstall", "voice", "--target", "valkyrie", "--config", configPath, "--remove-files", "--no-restart"], {
+        HOME: dir,
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      });
+      expectSuccess(uninstall);
+      expect(uninstall.stdout).toContain("uninstalled=voice");
+      expect(uninstall.stdout).toContain(`removed_root=${join(dir, ".local", "share", "brainstack", "capabilities", "voice")}`);
+      expect(existsSync(expectedCommand)).toBe(false);
+
+      const disabled = await loadConfig(configPath, "control");
+      expect(disabled.capabilities.voice.enabled).toBe(false);
+      expect(disabled.capabilities.voice.command).toBe("");
+      const runtimeEnv = await readFile(join(dir, "config", "telemux.runtime.env"), "utf8");
+      expect(runtimeEnv).toContain("FACTORY_TRANSCRIPTION_ENABLED=0");
+      expect(runtimeEnv).toContain("FACTORY_TRANSCRIPTION_COMMAND=");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("voice capability install bootstraps ffmpeg with an available package manager", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-voice-deps-"));
+    try {
+      const configPath = join(dir, "config.yaml");
+      const binDir = join(dir, "bin");
+      const modelPath = join(dir, "fake-whisper.llamafile");
+      await mkdir(binDir, { recursive: true });
+      await writeExecutable(join(binDir, "bun"), `#!/usr/bin/env sh\nexec ${shellQuote(process.execPath)} "$@"\n`);
+      await writeExecutable(
+        modelPath,
+        `#!/usr/bin/env bash
+set -euo pipefail
+input=""
+while (($#)); do
+  case "$1" in
+    -f|--file)
+      input="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [[ -n "$input" && -f "$input" ]]; then
+  cat "$input"
+fi
+exit 0
+`
+      );
+      await writeExecutable(
+        join(binDir, "brew"),
+        `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" != "install" || "\${2:-}" != "ffmpeg" ]]; then
+  echo "unexpected brew invocation: $*" >&2
+  exit 2
+fi
+bin_dir="$(cd "$(dirname "$0")" && pwd)"
+cat > "$bin_dir/ffmpeg" <<'FFMPEG'
+#!/usr/bin/env bash
+set -euo pipefail
+output="\${@: -1}"
+printf 'converted by installed ffmpeg' > "$output"
+FFMPEG
+chmod 0755 "$bin_dir/ffmpeg"
+printf 'brew_installed=ffmpeg\\n'
+`
+      );
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: valkyrie",
+          "paths:",
+          `  home: ${dir}`,
+          `  configRoot: ${join(dir, "config")}`,
+          "brain:",
+          "  publicBaseUrl: https://valkyrie.example.ts.net",
+          "telemux:",
+          "  enabled: true",
+          "  localMachine: valkyrie",
+          "  workers:",
+          "    - name: valkyrie",
+          "      transport: local",
+          ""
+        ].join("\n")
+      );
+
+      const env = { HOME: dir, PATH: `${binDir}:/usr/bin:/bin:/usr/sbin:/sbin` };
+      const install = runBrainctl(
+        [
+          "capabilities",
+          "install",
+          "voice",
+          "--target",
+          "valkyrie",
+          "--config",
+          configPath,
+          "--install-root",
+          "~/.local/share/brainstack/capabilities/voice",
+          "--model-url",
+          `file://${modelPath}`,
+          "--file-name",
+          "fake-whisper.llamafile",
+          "--allow-insecure-model-url",
+          "--no-restart"
+        ],
+        env
+      );
+      expectSuccess(install);
+      expect(install.stdout).toContain("ffmpeg=installing");
+      expect(install.stdout).toContain("ffmpeg=ok");
+      expect(existsSync(join(binDir, "ffmpeg"))).toBe(true);
+
+      const sourceAudio = join(dir, "sample.ogg");
+      await writeFile(sourceAudio, "raw opus bytes");
+      const voiceTest = runBrainctl(["capabilities", "test", "voice", "--file", sourceAudio, "--config", configPath], env);
+      expectSuccess(voiceTest);
+      expect(voiceTest.stdout).toContain("converted by installed ffmpeg");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

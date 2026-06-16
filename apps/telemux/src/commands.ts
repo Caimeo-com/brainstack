@@ -96,7 +96,7 @@ interface ProposalListRequest {
   error: string | null;
 }
 
-type VoiceCapabilityAction = "install" | "doctor" | "list";
+type VoiceCapabilityAction = "install" | "uninstall" | "doctor" | "list";
 
 interface VoiceCapabilityIntent {
   action: VoiceCapabilityAction;
@@ -110,10 +110,12 @@ function voiceCapabilityUsage(): string {
   return [
     "Voice transcription commands:",
     "/voice install <machine> [model tiny.en|small.en|medium.en|large-v2|large-v3]",
+    "/voice uninstall [machine]",
     "/voice status",
     "",
     "Plain language also works:",
     "install voice on erbine",
+    "uninstall voice on erbine",
     "install transcription on valkyrie"
   ].join("\n");
 }
@@ -145,6 +147,13 @@ function parseVoiceCapabilityCommand(rest: string): VoiceCapabilityIntent {
   if (["list", "show"].includes(action || "")) {
     return { action: "list", target: null, model: null, help: false, error: null };
   }
+  if (["uninstall", "remove", "disable", "purge"].includes(action || "")) {
+    const target = parts.slice(1).find((part) => {
+      const normalized = part.toLowerCase();
+      return !["on", "to", "for", "machine", "voice", "transcription"].includes(normalized);
+    }) || null;
+    return { action: "uninstall", target, model: null, help: false, error: null };
+  }
   if (!["install", "setup", "enable"].includes(action || "")) {
     return { action: "list", target: null, model: null, help: false, error: `Unknown voice action: ${action || "(missing)"}` };
   }
@@ -172,6 +181,13 @@ function parseNaturalVoiceCapabilityIntent(text: string): VoiceCapabilityIntent 
   const statusMatch = normalized.match(/^(?:voice|transcription)\s+(?:status|doctor|check)$/i);
   if (statusMatch) {
     return { action: "doctor", target: null, model: null, help: false, error: null };
+  }
+
+  const uninstallMatch = normalized.match(
+    /^(?:please\s+)?(?:uninstall|remove|disable|purge)\s+(?:voice|voice transcription|transcription)(?:\s+(?:on|from|to|for)\s+([A-Za-z0-9._-]+))?$/i
+  );
+  if (uninstallMatch) {
+    return { action: "uninstall", target: uninstallMatch[1] || null, model: null, help: false, error: null };
   }
 
   const installMatch = normalized.match(
@@ -1884,13 +1900,29 @@ export class CommandHandler {
       );
     }
 
+    if (intent.action === "uninstall") {
+      baseArgs.push("--remove-files", "--restart-delay-ms", "1500");
+      if (intent.target) {
+        baseArgs.push("--target", intent.target);
+      }
+      await this.telegram.sendText(
+        target,
+        [
+          `Uninstalling voice transcription${intent.target ? ` on ${intent.target}` : ""}.`,
+          "I will disable Brainstack voice config, remove Brainstack-owned voice files, and reload Telemux when done."
+        ].join("\n")
+      );
+    }
+
     if (intent.action === "doctor") {
       await this.telegram.sendText(target, "Checking voice transcription status.");
     }
 
     let progressTimer: ReturnType<typeof setInterval> | null = null;
     if (intent.action === "install" && intent.target) {
-      progressTimer = this.startCapabilityProgressMessages(target, intent.target);
+      progressTimer = this.startCapabilityProgressMessages(target, intent.target, "installing");
+    } else if (intent.action === "uninstall") {
+      progressTimer = this.startCapabilityProgressMessages(target, intent.target || "configured machine", "uninstalling");
     }
 
     let result: { ok: boolean; exitCode: number | null; timedOut: boolean; stdout: string; stderr: string };
@@ -1916,11 +1948,13 @@ export class CommandHandler {
     const suffix =
       intent.action === "install"
         ? "Test it by sending a Telegram voice note in any bound Brainstack topic. If Telemux was reloaded, wait a few seconds first."
-        : null;
+        : intent.action === "uninstall"
+          ? "To retest from scratch, send `install voice on <machine>` and then send a Telegram voice note."
+          : null;
     await this.telegram.sendText(target, [`Voice ${intent.action} complete.`, trimmed || "ok", suffix].filter(Boolean).join("\n\n"));
   }
 
-  private startCapabilityProgressMessages(target: TelegramTarget, machine: string): ReturnType<typeof setInterval> | null {
+  private startCapabilityProgressMessages(target: TelegramTarget, machine: string, verb = "installing"): ReturnType<typeof setInterval> | null {
     const intervalMs = this.config.capabilityProgressIntervalMs;
     if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
       return null;
@@ -1933,10 +1967,12 @@ export class CommandHandler {
       const elapsed = formatElapsed(Date.now() - startedAt);
       const extra =
         count === 1
-          ? "First install can take several minutes while the model downloads and verifies."
-          : "Still waiting on the installer; I will post the final result here.";
+          ? verb === "installing"
+            ? "First install can take several minutes while dependencies, the model, and verification finish."
+            : "Removal is usually quick; I am still waiting for the capability command to finish."
+          : `Still waiting on the ${verb === "installing" ? "installer" : "uninstaller"}; I will post the final result here.`;
       void this.telegram
-        .sendText(target, [`Still installing voice transcription on ${machine} (${elapsed}).`, extra].join("\n"))
+        .sendText(target, [`Still ${verb} voice transcription on ${machine} (${elapsed}).`, extra].join("\n"))
         .catch((error) => {
           console.warn("failed to send voice capability progress message", error);
         });

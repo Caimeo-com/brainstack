@@ -23,13 +23,15 @@ Telegram sends an immediate acknowledgement, then periodic progress messages whi
 The command:
 
 - checks the target machine from `brainstack.yaml`
-- verifies `ffmpeg` is available on the selected processor
+- installs or verifies `ffmpeg` on the selected processor
 - downloads a Mozilla `whisperfile` executable model on that target
 - verifies the pinned checksum when one is known
 - writes `capabilities.voice` into `brainstack.yaml`
 - updates the live `telemux.runtime.env`
 - restarts or schedules a restart of `telemux.service`
 - prints how to test
+
+`ffmpeg` is a voice-capability dependency because Telegram voice notes normally arrive as OGG/Opus. The installer tries the detected package manager in this order: Homebrew/Linuxbrew, `apt-get`, `pacman`, `dnf`, `yum`, `zypper`, then `apk`. Package installs are non-interactive; Linux system package managers require root or passwordless `sudo`. Pass `--no-install-deps` when you want Brainstack to fail instead of installing missing dependencies.
 
 The default model is `tiny.en`, because it is small enough for a first install and good enough for short Telegram voice notes. Larger options are available:
 
@@ -40,6 +42,24 @@ brainctl capabilities install voice --target erbine --model large-v3
 ```
 
 Use `--install-root DIR` to choose where the model executable is stored on the target machine. The default is `~/.local/share/brainstack/capabilities/voice`.
+
+## Uninstall And Reset
+
+Use the reset path when you want to retest installation from scratch:
+
+```bash
+brainctl capabilities uninstall voice --target erbine --remove-files
+```
+
+Equivalent Telegram operator phrases are supported:
+
+```text
+uninstall voice on erbine
+disable transcription
+/voice uninstall erbine
+```
+
+Uninstall disables `capabilities.voice`, rewrites the Telemux runtime env with transcription off, and restarts or schedules a restart of `telemux.service`. With `--remove-files`, it also removes the Brainstack-owned voice install root on the configured or selected target. It does not uninstall machine-level packages such as `ffmpeg`.
 
 ## Status And Test
 

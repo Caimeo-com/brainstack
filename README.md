@@ -36,6 +36,7 @@ bun run packages/brainctl/src/main.ts import skills --config ~/.config/brainstac
 bun run packages/brainctl/src/main.ts import skill ~/.codex/skills/brainstack/SKILL.md --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts status --json --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts capabilities install voice --target erbine --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts capabilities uninstall voice --target erbine --remove-files --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts proposals groups --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts proposals merge-group GROUP_KEY --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts proposals reprocess --config ~/.config/brainstack/brainstack.yaml --limit 5

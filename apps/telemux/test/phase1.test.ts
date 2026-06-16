@@ -554,12 +554,17 @@ case "$*" in
     echo "restart=scheduled service=telemux.service delay_ms=1500"
     echo "test=send a Telegram voice note"
     ;;
-  *"capabilities doctor voice"*)
-    echo "voice=ok enabled=yes target=erbine command=/tmp/whisper-tiny.en.llamafile"
-    ;;
-  *)
-    echo "brainctl fake: $*"
-    ;;
+	  *"capabilities doctor voice"*)
+	    echo "voice=ok enabled=yes target=erbine command=/tmp/whisper-tiny.en.llamafile"
+	    ;;
+	  *"capabilities uninstall voice"*)
+	    echo "uninstalled=voice"
+	    echo "files=removed target=erbine"
+	    echo "restart=scheduled service=telemux.service delay_ms=1500"
+	    ;;
+	  *)
+	    echo "brainctl fake: $*"
+	    ;;
 esac
 `
   );
@@ -4486,10 +4491,27 @@ test("voice install requests delegate to canonical brainctl capability command w
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
-  }
-}, 15_000);
+	  }
+	}, 15_000);
 
-test("voice install sends progress messages during slow capability setup", async () => {
+  test("voice uninstall requests delegate to canonical brainctl capability command", async () => {
+    const fixture = await createFixture();
+
+    try {
+      await fixture.commands.handleMessage(telegramMessage("uninstall voice on erbine", 62));
+      expect(fixture.telegram.sent[0]?.text).toContain("Uninstalling voice transcription on erbine.");
+      expect(fixture.telegram.sent.at(-1)?.text).toContain("Voice uninstall complete.");
+      expect(fixture.telegram.sent.at(-1)?.text).toContain("install voice on <machine>");
+
+      const calls = await readFile(fixture.fakeBrainctlCalls, "utf8");
+      expect(calls).toContain(`capabilities uninstall voice --config ${join(fixture.root, "brainstack.yaml")} --remove-files --restart-delay-ms 1500 --target erbine`);
+    } finally {
+      process.env.PATH = fixture.previousPath;
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+	test("voice install sends progress messages during slow capability setup", async () => {
   const fixture = await createFixture({ FACTORY_CAPABILITY_PROGRESS_INTERVAL_MS: "25" });
   const previousSleep = process.env.FACTORY_TEST_BRAINCTL_INSTALL_SLEEP_SECONDS;
   process.env.FACTORY_TEST_BRAINCTL_INSTALL_SLEEP_SECONDS = "1";
