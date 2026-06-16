@@ -500,6 +500,12 @@ cleanup() { rm -rf "$tmp_dir"; }
 trap cleanup EXIT
 input="$tmp_dir/${safeFileName(fileName)}"
 cat > "$input"
+converted_input="$tmp_dir/input.wav"
+if command -v ffmpeg >/dev/null 2>&1; then
+  if ffmpeg -hide_banner -loglevel error -y -i "$input" -ar 16000 -ac 1 "$converted_input" >/dev/null 2>&1; then
+    input="$converted_input"
+  fi
+fi
 ${commandLine(command, args)}
 `.trim();
 }

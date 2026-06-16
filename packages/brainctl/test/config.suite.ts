@@ -250,11 +250,37 @@ telemux:
     const dir = await mkdtemp(join(tmpdir(), "brainctl-voice-home-"));
     try {
       const configPath = join(dir, "config.yaml");
+      const binDir = join(dir, "bin");
       const modelPath = join(dir, "fake-whisper.llamafile");
+      await mkdir(binDir, { recursive: true });
       await writeExecutable(
         modelPath,
         `#!/usr/bin/env bash
+set -euo pipefail
+input=""
+while (($#)); do
+  case "$1" in
+    -f|--file)
+      input="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [[ -n "$input" && -f "$input" ]]; then
+  cat "$input"
+fi
 exit 0
+`
+      );
+      await writeExecutable(
+        join(binDir, "ffmpeg"),
+        `#!/usr/bin/env bash
+set -euo pipefail
+output="\${@: -1}"
+printf 'converted voice payload' > "$output"
 `
       );
       await writeFile(
@@ -306,6 +332,15 @@ exit 0
       expect(cfg.capabilities.voice.command).toBe(expectedCommand);
       expect(cfg.capabilities.voice.command).not.toContain("/~/");
       expect(install.stdout).toContain(`command=${expectedCommand}`);
+
+      const sourceAudio = join(dir, "sample.ogg");
+      await writeFile(sourceAudio, "raw opus bytes");
+      const voiceTest = runBrainctl(["capabilities", "test", "voice", "--file", sourceAudio, "--config", configPath], {
+        HOME: dir,
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      });
+      expectSuccess(voiceTest);
+      expect(voiceTest.stdout).toContain("converted voice payload");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

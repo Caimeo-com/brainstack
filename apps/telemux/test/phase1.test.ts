@@ -3630,6 +3630,35 @@ test("worker transcription streams audio bytes through the configured SSH worker
   }
 }, 15_000);
 
+test("worker transcription preconverts Telegram audio with ffmpeg when available", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await makeExecutable(
+      join(fixture.root, "bin", "ffmpeg"),
+      `#!/usr/bin/env bash
+set -euo pipefail
+output="\${@: -1}"
+printf 'converted voice payload' > "$output"
+`
+    );
+
+    const result = await fixture.workers.runTranscription("control", {
+      fileName: "telegram-voice.ogg",
+      bytes: new TextEncoder().encode("raw opus bytes"),
+      command: fixture.fakeTranscriber,
+      args: ["-f", "{input}"],
+      timeoutMs: 5_000
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.stdout).toBe("transcribed: converted voice payload");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
 test("SSH workers with explicit ports use the port for dispatch without leaking it into the remote target", async () => {
   const argsCapture = join(tmpdir(), `telemux-ssh-port-args-${Date.now()}.txt`);
   const fixture = await createFixture({
@@ -4399,6 +4428,39 @@ test("voice transcription routes through configured worker and dispatches transc
 
     const runPrompt = await readFile(join(voiceRoot, ".factory", "control-plane.prompt.md"), "utf8");
     expect(runPrompt).toContain("Instruction:\n\ntranscribed: run the explicit redis check");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("voice transcription reports diagnostics when a command exits successfully without text", async () => {
+  const fixture = await createFixture({
+    FACTORY_TRANSCRIPTION_ENABLED: "1",
+    FACTORY_TRANSCRIPTION_TARGET: "worker",
+    FACTORY_TRANSCRIPTION_WORKER: "control",
+    FACTORY_TRANSCRIPTION_ARGS_JSON: '["{input}"]',
+    FACTORY_TEXT_COALESCE_MS: "1"
+  });
+
+  try {
+    const silentTranscriber = join(fixture.root, "bin", "silent-transcribe");
+    await makeExecutable(
+      silentTranscriber,
+      `#!/usr/bin/env bash
+set -euo pipefail
+echo "failed to read audio file" >&2
+exit 0
+`
+    );
+    fixture.config.transcription.command = silentTranscriber;
+
+    await fixture.commands.handleMessage(telegramMessage("/newctx silent-voice control scratch", 64));
+    fixture.telegram.registerRemoteFile("voice-empty", "voice/empty.ogg", "not really audio");
+    await fixture.commands.handleMessage(telegramVoiceMessage(64, "voice-empty"));
+
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Voice transcription on control produced no text.");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Diagnostics: failed to read audio file");
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });

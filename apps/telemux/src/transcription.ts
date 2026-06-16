@@ -55,7 +55,7 @@ function stripAnsi(value: string): string {
 function cleanTranscriptOutput(value: string): string {
   return stripAnsi(value)
     .split(/\r?\n/)
-    .map((line) => line.trim())
+    .map((line) => line.trim().replace(/^\[[^\]]+-->\s*[^\]]+\]\s*/, "").trim())
     .filter(Boolean)
     .join("\n")
     .trim();
@@ -74,6 +74,13 @@ function formatWorkerFailure(workerName: string, result: WorkerExecResult): stri
   const reason = result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`;
   const prefix = result.exitCode === 124 ? "Voice transcription timed out" : "Voice transcription failed";
   return `${prefix} on ${workerName}: ${compact(reason)}`;
+}
+
+function formatNoTranscript(workerName: string, result: WorkerExecResult): string {
+  const diagnostics = result.stderr.trim() || result.stdout.trim();
+  return diagnostics
+    ? `Voice transcription on ${workerName} produced no text. Diagnostics: ${compact(diagnostics)}`
+    : `Voice transcription on ${workerName} produced no text.`;
 }
 
 export async function transcribeTelegramAudioInput(options: {
@@ -155,7 +162,7 @@ export async function transcribeTelegramAudioInput(options: {
 
     const transcript = cleanTranscriptOutput(result.stdout);
     if (!transcript) {
-      return { ok: false, message: `Voice transcription on ${workerName} produced no text.` };
+      return { ok: false, message: formatNoTranscript(workerName, result) };
     }
 
     transcripts.push(transcript);

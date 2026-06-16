@@ -114,6 +114,17 @@ function transcriptionCommandLine(command: string, args: string[]): string {
   ].join(" ");
 }
 
+function transcriptionPreprocessScript(): string {
+  return `
+converted_input="$tmp_dir/input.wav"
+if command -v ffmpeg >/dev/null 2>&1; then
+  if ffmpeg -hide_banner -loglevel error -y -i "$input" -ar 16000 -ac 1 "$converted_input" >/dev/null 2>&1; then
+    input="$converted_input"
+  fi
+fi
+`.trim();
+}
+
 interface WorkerEnvCacheRecord {
   worker: string;
   fingerprint: string;
@@ -1022,6 +1033,7 @@ cleanup() {
 trap cleanup EXIT
 input="$tmp_dir/${fileName}"
 cat > "$input"
+${transcriptionPreprocessScript()}
 ${shellCommand}
 `.trim();
     const timeoutSeconds = Math.max(1, Math.ceil(request.timeoutMs / 1000));
