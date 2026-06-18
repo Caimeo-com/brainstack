@@ -5,7 +5,6 @@ import { basename, dirname, join } from "node:path";
 import {
   appendLogEntry,
   getRepoPaths,
-  isSafeManifestId,
   isoNow,
   parseFrontmatter,
   safeRepoPath,
@@ -125,8 +124,10 @@ export function proposalContentFileName(id: string): string {
   return `${id}.content.md`;
 }
 
+const PROPOSAL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,239}$/;
+
 export function isSafeProposalId(id: string): boolean {
-  return isSafeManifestId(id) && !id.endsWith(".content");
+  return PROPOSAL_ID_PATTERN.test(id) && !id.includes("..") && !id.endsWith(".content");
 }
 
 function sha256Hex(text: string): string {

@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync, realpathSync } from "node:fs";
 import { mkdir, open, readFile, readdir, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
 
@@ -283,6 +283,29 @@ export function slugify(input: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
+}
+
+const MAX_CREATED_PROPOSAL_ID_LENGTH = 128;
+
+function shortHash(input: string): string {
+  return createHash("sha256").update(input).digest("hex").slice(0, 10);
+}
+
+function truncateSlug(slug: string, maxLength: number): string {
+  if (slug.length <= maxLength) {
+    return slug;
+  }
+  return slug.slice(0, maxLength).replace(/-+$/g, "");
+}
+
+function createProposalId(title: string, body: string): string {
+  const timestamp = isoNow().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z").toLowerCase();
+  const suffix = shortHash(`${title}\n${body}`);
+  const prefix = `${timestamp}-`;
+  const hashPart = `-${suffix}`;
+  const slugBudget = Math.max(1, MAX_CREATED_PROPOSAL_ID_LENGTH - prefix.length - hashPart.length);
+  const titleSlug = truncateSlug(slugify(title) || "proposal", slugBudget) || "proposal";
+  return `${prefix}${titleSlug}${hashPart}`;
 }
 
 export function titleToPageStem(title: string): string {
@@ -2007,7 +2030,7 @@ export async function createProposal(
     throw new Error("Proposal title and body are required");
   }
   const paths = getRepoPaths(repoRoot);
-  const proposalId = `${isoNow().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z").toLowerCase()}-${slugify(input.title)}`;
+  const proposalId = createProposalId(input.title, input.body);
   const fileName = `${proposalId}.md`;
   const absolutePath = join(paths.proposalsPendingDir, fileName);
   const quality = evaluateProposalQuality(input);

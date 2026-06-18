@@ -1063,6 +1063,66 @@ describe("braind write safety", () => {
       expect(shownProposal.quality_decision).toBe("ready");
       expect(typeof shownProposal.quality_score).toBe("number");
 
+      // Long proposal titles must not create IDs that the detail/decision APIs
+      // reject. New IDs are capped, while already-created long path-safe IDs
+      // remain addressable so old queues do not become unrecoverable.
+      const longTitle = `Remember: ${"Slack EA Chief of Staff channel routing investigation ".repeat(8)}`;
+      const longTitleProposal = await propose(
+        {
+          title: longTitle,
+          body: "Long title proposals should still produce bounded path-safe ids that can be listed and shown.",
+          source_harness: "codex",
+          source_machine: "test-machine",
+          source_type: "remember",
+          related_repo: "/work/lindy-debug",
+          project: "lindy-debug",
+          domain: "slack-ea",
+          scope: "repo",
+          memory_kind: "project_lesson",
+          applicability: "Use when reviewing long remembered investigation titles.",
+          evidence_refs: ["repo:/work/lindy-debug"]
+        },
+        "proposal-lifecycle-long-title"
+      );
+      expect(longTitleProposal.status).toBe(200);
+      const longTitleBody = (await longTitleProposal.json()) as Record<string, unknown>;
+      const longTitleId = String(longTitleBody.proposal_id);
+      expect(longTitleId.length).toBeLessThanOrEqual(128);
+      const longTitleShow = await fetch(`http://127.0.0.1:${port}/api/proposals/${encodeURIComponent(longTitleId)}`);
+      expect(longTitleShow.status).toBe(200);
+
+      const existingLongId =
+        "20260618t173847z-remember-lindy-debug-slack-ea-chief-of-staff-channel-routing-investigation-live-slack-to-imessage-timer-sends-currently-work-by-storing-the";
+      expect(existingLongId.length).toBeGreaterThan(128);
+      await writeFile(
+        join(staging, "proposals", "pending", `${existingLongId}.md`),
+        [
+          "---",
+          "title: Existing Long Proposal",
+          "type: proposal",
+          `proposal_id: ${existingLongId}`,
+          "created_at: 2026-06-18T17:38:47Z",
+          "updated_at: 2026-06-18T17:38:47Z",
+          "status: pending",
+          "tags:",
+          "  - proposal",
+          "---",
+          "",
+          "# Existing Long Proposal",
+          "",
+          "This fixture simulates a proposal created before proposal IDs were capped.",
+          ""
+        ].join("\n"),
+        "utf8"
+      );
+      git(["add", `proposals/pending/${existingLongId}.md`], staging);
+      git(["commit", "-m", "test: add legacy long proposal"], staging);
+      git(["push", "origin", "HEAD"], staging);
+      const existingLongShow = await fetch(`http://127.0.0.1:${port}/api/proposals/${encodeURIComponent(existingLongId)}`);
+      expect(existingLongShow.status).toBe(200);
+      const existingLongReject = await decide(existingLongId, "reject", { decided_by: "tester", reason: "legacy long id remains addressable" });
+      expect(existingLongReject.status).toBe(200);
+
       // Memory-shaped proposals without scope/applicability context are parked for
       // human review instead of entering the normal approval queue as vague canon.
       const vagueMemory = await propose(
@@ -1259,7 +1319,7 @@ describe("braind write safety", () => {
       expect(curator.cursor).toBe("2026-06-11T00:00:00Z");
       const counts = (statusAfter.proposal_counts || {}) as Record<string, number>;
       expect(counts.applied).toBe(2);
-      expect(counts.rejected).toBe(1);
+      expect(counts.rejected).toBe(2);
       expect(counts.superseded).toBe(1);
 
       // Wiki home shows the curation panel.
