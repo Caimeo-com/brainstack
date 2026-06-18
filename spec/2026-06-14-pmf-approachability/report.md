@@ -232,13 +232,169 @@ Acceptance criteria:
 - Import commands explain what will become globally available before writing.
 - Shareable reports redact tokens, hostnames where appropriate, and local paths if requested.
 
+## 2026-06-16 Update: Voice Capability As A PMF Signal
+
+Since this report was written, Brainstack gained a working bundled voice transcription capability. The operator can say `install voice on erbine` through Telegram, Brainstack installs or verifies the processor dependency, installs the local Whisper model on the selected machine, updates config/runtime state, restarts Telemux, and treats future Telegram voice notes as normal text instructions in the same topic.
+
+This is important for PMF because it turns Brainstack from "memory/control infrastructure" into a visible product that can safely add useful powers across a personal fleet. The winning pattern is not voice by itself; it is the canonical capability lifecycle:
+
+- Discover: user asks naturally from CLI, Telegram, or eventually the Mac app.
+- Install: `brainctl capabilities install <capability>` owns prerequisites and progress.
+- Verify: `brainctl capabilities doctor|test <capability>` proves the capability works.
+- Use: Telemux/harnesses consume the capability without creating a separate harness.
+- Reset: `brainctl capabilities uninstall <capability> --remove-files` removes Brainstack-owned artifacts and config without deleting shared system packages.
+
+Problem:
+The current public story does not yet have a place for this. Voice is too useful and concrete to bury in operator docs, but the landing page is already too dense. If voice, skills, imports, hooks, menubar, workers, and proposals all compete in the first viewport, the page will regress into a runbook.
+
+Potential fix:
+Add a dedicated docs/product navigation layer:
+
+- `Docs`: task-oriented pages for install, Mac/Codex, capabilities, skills, proposals, trust, Telegram, and operators.
+- `Capabilities`: a product section/page listing bundled capabilities with install/test/reset commands, supported surfaces, privacy posture, and current status.
+- `Skills`: a separate section/page explaining public Brainstack skills, imported shared skills, refresh behavior, source-backed skills, and harness support.
+- `Landing page`: lighten it to category, smallest safe demo, proof clips/screenshots, proposal-memory moat, and role paths. Link out to docs for details.
+
+Estimated ROI:
+Very high. Voice is an understandable "aha" demo: send a voice note, Brainstack transcribes it locally on a chosen machine, and the normal agent receives the text. It also proves fleet routing, capability install, privacy, and natural-language control in one story.
+
+Effort:
+Medium. The implementation exists; the work is information architecture, screenshots/recordings, docs pages, and Mac app affordances.
+
+Risk:
+Medium. The public page could over-index on voice and make Brainstack look like a Telegram transcription bot. The copy must frame voice as one example of a broader capability lifecycle.
+
+Acceptance criteria:
+- The landing page mentions voice only as a proof point, not the product category.
+- A docs page explains `brainctl capabilities list|install|doctor|test|uninstall`.
+- The Mac app has a "Bundled Capabilities" area or equivalent entry point.
+- The skills and capabilities concepts are clearly separated.
+- Voice docs state that local processing avoids OpenAI APIs when using the installed local Whisper backend.
+
+## Capability And Skill Roadmap After Voice
+
+These are the next product-side ideas to evaluate. The priority should be capabilities that create a fast "it just did something useful across my tools/machines" moment without increasing the dependency-injection or SaaS-memory surface.
+
+### A. Capability Catalog And Cross-Surface Installer
+
+Problem:
+Voice now has a working lifecycle, but users should not need to know whether setup lives in Telemux, `brainctl`, the Mac app, or a skill.
+
+Potential fix:
+Make `brainctl capabilities` the canonical registry and have every surface delegate to it. The Mac app should show installed/not installed/needs attention, support "Install on machine", and surface progress. Telemux should keep natural language aliases. Docs should show the same command shapes.
+
+Estimated ROI:
+Very high. This converts hidden power into product affordance.
+
+### B. Attachment OCR And Document Intake
+
+Problem:
+Telegram and desktop workflows often include screenshots, PDFs, scans, and copied images. Today these either go to the harness as attachments or are ignored by memory/proposal flows unless manually described.
+
+Potential fix:
+Add an installable OCR/document capability that can run locally or on a worker. It should extract text from screenshots/PDFs/images, echo a bounded preview, preserve the original file as evidence, and pass extracted text as normal instruction/context when safe.
+
+Estimated ROI:
+High. It complements voice and makes mobile-to-agent workflows much more natural.
+
+### C. Import Existing Knowledge As A First-Run Moment
+
+Problem:
+Brainstack's biggest promise is continuity, but a new install starts empty unless the user imports existing memory, skills, notes, and rules.
+
+Potential fix:
+Make import a guided first-run step: scan Codex memory, Claude/Cursor skills/rules, local markdown folders, and selected repo docs; produce a dry-run plan; then import selected items into shared brain as proposals or shared skill packages.
+
+Estimated ROI:
+High. This reduces cold-start friction and creates an immediate "Brainstack understands my setup" moment.
+
+### D. Proposal Grooming And Review Surface
+
+Problem:
+The proposal system is a moat, but stale pending proposals can become a new inbox.
+
+Potential fix:
+Add "review queue" affordances across docs, Telegram, and the Mac app: filter by project/status/quality, merge obvious duplicates, enrich needs-context items, approve/apply in one action where policy allows, and show recent accepted/rejected imports in the wiki.
+
+Estimated ROI:
+High. This makes curated memory feel like a product benefit instead of homework.
+
+### E. Shareable Readiness Report
+
+Problem:
+Open-source users need help debugging installs, and maintainers need safe evidence without secrets.
+
+Potential fix:
+Add a redacted `brainctl doctor --share` or `brainctl status --share` report that summarizes install health, version, capabilities, hooks, daemon, fleet, and proposal state without tokens or private topology by default.
+
+Estimated ROI:
+Medium to high. This helps support, demos, and social proof.
+
+### F. Repo/Project Onboarding Snapshot
+
+Problem:
+Users want Codex to stop re-learning a repo, but Brainstack still relies on existing memory and curation flows rather than a crisp first-run "understand this repo" workflow.
+
+Potential fix:
+Add a guided project onboarding command that captures repo metadata, docs, scripts, test commands, ownership boundaries, and known skills into proposal-ready evidence.
+
+Estimated ROI:
+Medium. Strong for developer adoption, but needs careful scoping to avoid becoming another generic code indexer.
+
+### G. Capability Safety Model
+
+Problem:
+As capabilities grow, users need to know what each one can read, write, install, and expose.
+
+Potential fix:
+For every bundled capability, document: install target, dependencies, local/worker execution, external API usage, data retained, uninstall behavior, and failure mode. Make this visible in docs and Mac app details.
+
+Estimated ROI:
+Medium. This protects trust as the product grows.
+
 ## Recommended Execution Order
 
-1. Fix immediate UX papercuts in Telegram/context binding and menubar status copy.
-2. Add the smallest safe local demo path.
-3. Rewrite the Brainstack page around category, demo, and role paths.
-4. Add real proof assets and remove placeholders.
-5. Publish the trust model and Mac/Codex install path.
-6. Make proposal curation visually obvious as the product moat.
-7. Add growth/import/report loops after the first-use path is clean.
+1. Lighten the landing page around category, smallest safe demo, proof, proposal-memory moat, and role paths.
+2. Add a docs section with first-class pages for install, Mac/Codex, capabilities, skills, proposals, trust, Telegram, and operators.
+3. Add a capabilities page using voice as the reference implementation.
+4. Add a skills page that separates bundled public skills from imported shared skills.
+5. Add real proof assets: one-line install, menubar health, voice install/use, proposal curation, and shared-brain import.
+6. Publish the trust model and Mac/Codex install path.
+7. Build the smallest safe local demo path.
+8. Add Mac app "Bundled Capabilities" controls.
+9. Add growth/import/report loops after the first-use path is clean.
+10. Evaluate the next capability after voice, likely OCR/document intake or first-run knowledge import.
 
+## 2026-06-19 Update: Landing Page And Docs Polish Pass
+
+This pass applied the obvious website and docs improvements that did not require new Brainstack product code. It deliberately avoided claiming the final "no-source local demo" or shareable readiness report exists.
+
+Implemented:
+
+- Sharpened the Brainstack hero around the category: git-backed memory for existing AI tools, not a hosted assistant replacement.
+- Added a "smallest proof" landing-page section and docs page for the current disposable local smoke path.
+- Added a proposal-memory section that explains raw evidence, curator proposals, and accepted memory as separate states.
+- Added persona entry points for solo developers, Mac/Codex users, SRE/incident leads, team leads, and self-hosters.
+- Added a dedicated trust-model docs page with read/write boundaries, tokens, Telegram risk, prompt-injection posture, offline behavior, and uninstall expectations.
+- Expanded capabilities docs with `capabilities list`, install, doctor, test, uninstall/reset, and local Whisper/no-OpenAI-API positioning for the installed voice backend.
+- Expanded skills docs to make dry-run imports the default first step and `--apply` the explicit write step.
+- Added Telegram proposal-filter examples and clarified proposal review shortcuts.
+- Added a landing-page import/readiness section that positions imports and `brainctl status --json` as growth/support loops without pretending `doctor --share` exists.
+- Removed the simulated product/operator screenshot from the landing page so real proof assets carry the page.
+
+Status ledger:
+
+| Report item | Status after 2026-06-19 pass | Evidence | Remaining work |
+| --- | --- | --- | --- |
+| Smallest safe first use | Partial | `/brainstack/#local-proof`, `/docs/brainstack/local-proof/` | Build a true release-installed demo path: `brainctl demo init`, `context`, `search`, `remember`, and visible proposal artifact without source checkout. |
+| Reframe hero around category | Done for copy | Brainstack hero now leads with git-backed memory for existing AI tools | Validate with external readers after next deploy. |
+| Mac/Codex onboarding wedge | Partial | `/docs/brainstack/install/`, menu app section, menu app docs | Add a more guided Mac app first-run/install sequence and make missing-prereq states visual. |
+| Evidence-to-proposal memory loop | Partial | Landing proposal-memory section, `/docs/brainstack/proposals/` | Add real proposal-review screenshot or short clip using live data. |
+| Replace placeholders/simulated proof | Partial | Simulated product/operator screenshot removed; real pitch video and menu screenshot exist | Replace or relocate the remaining simulated architecture visual if it keeps feeling heavy. |
+| Split landing page from operator runbook | Improved | Landing links to focused docs; docs now carry more detail | Continue trimming low-conversion feature inventory from the landing page. |
+| Compact security/trust boundary | Done for docs v1 | `/docs/brainstack/trust/` | Keep it synced with product security docs and add a short visual trust table to the landing page when useful. |
+| Menubar app productization | Partial | Landing menu app section, real screenshot, docs page | Add bundled capability controls and stronger first-run/install copy once the app exposes them. |
+| Persona-specific paths | Done for landing v1 | "Pick your first win" section | Add role-specific doc pages only if analytics or feedback shows people need deeper segmentation. |
+| Import and shareable proof growth loops | Partial | Landing import/readiness section, skills import docs | Build `brainctl doctor --share` or `status --share`, redaction rules, and a first-run import wizard. |
+| Capability catalog/cross-surface installer | Partial | Capabilities docs use voice lifecycle and Telegram aliases | Mac app capability install UI and progress remains product work. |
+| Next capability after voice | Not started | OCR/document intake remains documented as candidate | Design and implement OCR/document intake or first-run knowledge import as the next capability. |
