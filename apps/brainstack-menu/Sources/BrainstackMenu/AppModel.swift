@@ -22,6 +22,9 @@ final class AppModel: ObservableObject {
   @Published private(set) var loadingDetailId: String?
   @Published private(set) var detailErrors: [String: String] = [:]
   @Published private(set) var installerRunning = false
+  @Published private(set) var pendingVerificationSections = Set<String>()
+  @Published private(set) var isRefreshingFleet = false
+  @Published private(set) var lastFleetChecked: Date?
 
   @Published var binaryPathPreference: String? {
     didSet { preferences.binaryPathPreference = binaryPathPreference }
@@ -58,6 +61,10 @@ final class AppModel: ObservableObject {
   private var pollTimer: Timer?
   private var lastDurations: [String: TimeInterval] = [:]
   private var triedTailscaleAutoStart = false
+  private var refreshQueued = false
+  private var fleetRefreshQueued = false
+  private var cachedFleetSection: StatusSection?
+  private var cachedFleetRawSection: JSONValue?
 
   var onStateChange: (() -> Void)?
 
@@ -114,10 +121,28 @@ final class AppModel: ObservableObject {
     if let lastFailure, lastReport == nil {
       return Diagnostics.describe(lastFailure)
     }
+    if let pending = pendingVerificationSummary {
+      return pending
+    }
     guard let report = lastReport else {
       return "no status yet"
     }
     return statusSummaryLine(for: report)
+  }
+
+  var pendingVerificationSummary: String? {
+    guard !pendingVerificationSections.isEmpty else {
+      return nil
+    }
+    let labels = pendingVerificationSections.sorted().map { sectionLabel($0).lowercased() }
+    if labels.count == 1, let label = labels.first {
+      return "checking updated \(label) status"
+    }
+    return "checking updated status: \(labels.joined(separator: ", "))"
+  }
+
+  func isSectionVerificationPending(_ name: String) -> Bool {
+    pendingVerificationSections.contains(name)
   }
 
   private func client() -> BrainctlClient? {
@@ -131,6 +156,7 @@ final class AppModel: ObservableObject {
 
   func refresh() {
     guard !isRefreshing else {
+      refreshQueued = true
       return
     }
     guard !installerRunning else {
@@ -144,8 +170,18 @@ final class AppModel: ObservableObject {
 
   private func performRefresh() async {
     defer {
+      let shouldRefreshAgain = refreshQueued
+      refreshQueued = false
+      if !shouldRefreshAgain {
+        pendingVerificationSections = Set(pendingVerificationSections.filter { name in
+          name == "fleet" && (isRefreshingFleet || fleetRefreshQueued)
+        })
+      }
       isRefreshing = false
       onStateChange?()
+      if shouldRefreshAgain {
+        refresh()
+      }
     }
     guard let client = client() else {
       lastFailure = .binaryMissing(binaryPathPreference ?? "~/.local/bin/brainctl")
@@ -160,7 +196,7 @@ final class AppModel: ObservableObject {
       lastDurations["status"] = result.duration
     }
     if let report = outcome.report {
-      lastReport = report
+      lastReport = reportWithCachedFleet(report)
       lastFailure = nil
       stale = false
       maybeAutoOpenTailscale(for: report)
@@ -169,7 +205,87 @@ final class AppModel: ObservableObject {
       lastFailure = outcome.failure
       stale = lastReport != nil
     }
+    refreshFleet()
     notifyTransitions()
+  }
+
+  private func reportWithCachedFleet(_ report: StatusReport) -> StatusReport {
+    guard let cachedFleetSection else {
+      return report
+    }
+    return report.replacingSection("fleet", with: cachedFleetSection, rawSection: cachedFleetRawSection)
+  }
+
+  func refreshFleet() {
+    guard !isRefreshingFleet else {
+      fleetRefreshQueued = true
+      return
+    }
+    guard !installerRunning else {
+      return
+    }
+    guard client() != nil else {
+      return
+    }
+    isRefreshingFleet = true
+    Task {
+      await self.performFleetRefresh()
+    }
+  }
+
+  private func performFleetRefresh() async {
+    defer {
+      let shouldRefreshAgain = fleetRefreshQueued
+      fleetRefreshQueued = false
+      if !shouldRefreshAgain {
+        pendingVerificationSections.remove("fleet")
+      }
+      isRefreshingFleet = false
+      onStateChange?()
+      if shouldRefreshAgain {
+        refreshFleet()
+      }
+    }
+    guard let client = client() else {
+      return
+    }
+    let outcome = await client.fetchFleetStatus()
+    lastFleetChecked = Date()
+    if let result = outcome.result {
+      lastDurations["fleet status"] = result.duration
+    }
+    guard let section = outcome.section else {
+      return
+    }
+    guard shouldAcceptFleetSection(section) else {
+      return
+    }
+    cachedFleetSection = section
+    cachedFleetRawSection = outcome.rawSection
+    if let report = lastReport {
+      lastReport = report.replacingSection("fleet", with: section, rawSection: outcome.rawSection)
+    }
+    notifyTransitions()
+  }
+
+  private func shouldAcceptFleetSection(_ section: StatusSection) -> Bool {
+    guard let cachedFleetSection else {
+      return true
+    }
+    let newMachines = fleetMachineNames(in: section)
+    let cachedMachines = fleetMachineNames(in: cachedFleetSection)
+    guard !cachedMachines.isEmpty else {
+      return true
+    }
+    guard !newMachines.isEmpty else {
+      return false
+    }
+    return newMachines.count >= cachedMachines.count
+  }
+
+  private func fleetMachineNames(in section: StatusSection) -> Set<String> {
+    let machines = section.data?["machines"]?.arrayValue?.compactMap { $0["name"]?.stringValue } ?? []
+    return Set(machines)
   }
 
   private func notifyTransitions() {
@@ -207,7 +323,12 @@ final class AppModel: ObservableObject {
 
   // MARK: - Actions
 
-  func runAction(_ title: String, refreshAfter: Bool = true, _ operation: @escaping (BrainctlClient) async -> ActionOutcome) {
+  func runAction(
+    _ title: String,
+    refreshAfter: Bool = true,
+    verifying sections: Set<String> = [],
+    _ operation: @escaping (BrainctlClient) async -> ActionOutcome
+  ) {
     guard busyAction == nil else {
       return
     }
@@ -221,6 +342,9 @@ final class AppModel: ObservableObject {
       await MainActor.run {
         self.record(outcome)
         self.busyAction = nil
+        if outcome.succeeded {
+          self.pendingVerificationSections.formUnion(sections)
+        }
         if outcome.adminUnavailable {
           self.adminAvailability = .unavailable
         }
@@ -244,7 +368,7 @@ final class AppModel: ObservableObject {
   }
 
   func updateFleetMachine(_ machine: String) {
-    runAction("Update \(machine)") { client in
+    runAction("Update \(machine)", verifying: ["fleet"]) { client in
       await client.fleetUpdate(machine: machine)
     }
   }
@@ -268,6 +392,7 @@ final class AppModel: ObservableObject {
         self.busyAction = nil
         if outcome.succeeded {
           self.binaryPathPreference = BrainstackMenuInstaller.defaultInstallPath()
+          self.pendingVerificationSections.formUnion(["daemon", "hooks", "skills", "shared_brain", "outbox"])
         }
         self.refresh()
       }
@@ -445,6 +570,7 @@ final class AppModel: ObservableObject {
       duration: 0
     ))
     if opened {
+      pendingVerificationSections.insert("tailscale")
       DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
         self?.refresh()
       }

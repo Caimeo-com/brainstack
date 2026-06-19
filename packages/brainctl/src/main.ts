@@ -1047,14 +1047,13 @@ async function commandDaemonInstall(args: ParsedArgs): Promise<void> {
   if (hasFlag(args, "start")) {
     if (platform === "systemd") {
       run(["systemctl", "--user", "daemon-reload"], { check: false });
-      run(["systemctl", "--user", "enable", "--now", BRAINSTACK_DAEMON_SERVICE], { check: false });
+      run(["systemctl", "--user", "enable", BRAINSTACK_DAEMON_SERVICE], { check: false });
       run(["systemctl", "--user", "restart", BRAINSTACK_DAEMON_SERVICE], { check: false });
     } else {
       const uid = typeof process.getuid === "function" ? process.getuid() : null;
       const domain = uid === null ? `gui/${process.env.UID || ""}` : `gui/${uid}`;
       run(["launchctl", "bootout", domain, path], { check: false });
       run(["launchctl", "bootstrap", domain, path], { check: false });
-      run(["launchctl", "kickstart", "-k", `${domain}/${BRAINSTACK_DAEMON_LABEL}`], { check: false });
     }
   }
   console.log(`daemon installed: platform=${platform} path=${path}`);

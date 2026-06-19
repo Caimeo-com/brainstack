@@ -17,6 +17,13 @@ public struct StatusFetchOutcome: Sendable {
   public let result: CommandResult?
 }
 
+public struct FleetStatusFetchOutcome: Sendable {
+  public let section: StatusSection?
+  public let rawSection: JSONValue?
+  public let failure: StatusFailure?
+  public let result: CommandResult?
+}
+
 public struct ActionOutcome: Sendable {
   public let title: String
   public let succeeded: Bool
@@ -79,7 +86,7 @@ public struct BrainctlClient: Sendable {
     let perSectionBudgetMs = 1500
     let result = await CommandRunner.run(
       executable: binaryPath,
-      arguments: ["status", "--json", "--config", configPath, "--timeout-ms", String(perSectionBudgetMs)],
+      arguments: ["status", "--json", "--skip-fleet", "--config", configPath, "--timeout-ms", String(perSectionBudgetMs)],
       timeout: statusTimeout
     )
     if result.launchFailure != nil {
@@ -105,6 +112,55 @@ public struct BrainctlClient: Sendable {
       }
     }
     return StatusFetchOutcome(report: nil, failure: .commandFailed(exitCode: result.exitCode, stderr: result.stderr), result: result)
+  }
+
+  public func fetchFleetStatus() async -> FleetStatusFetchOutcome {
+    let fleetBudgetMs = 6000
+    let result = await CommandRunner.run(
+      executable: binaryPath,
+      arguments: ["fleet", "status", "--json", "--config", configPath, "--timeout-ms", String(fleetBudgetMs), "--no-fetch"],
+      timeout: 10
+    )
+    if result.launchFailure != nil {
+      return FleetStatusFetchOutcome(section: nil, rawSection: nil, failure: .binaryMissing(binaryPath), result: result)
+    }
+    if result.timedOut {
+      return FleetStatusFetchOutcome(section: nil, rawSection: nil, failure: .timedOut, result: result)
+    }
+    if Self.looksUnsupported(result) {
+      return FleetStatusFetchOutcome(section: nil, rawSection: nil, failure: .unsupportedBinary(binaryPath), result: result)
+    }
+    guard let data = result.stdout.data(using: .utf8), !result.stdout.isEmpty else {
+      return FleetStatusFetchOutcome(section: nil, rawSection: nil, failure: .commandFailed(exitCode: result.exitCode, stderr: result.stderr), result: result)
+    }
+    do {
+      let report = try JSONDecoder().decode(JSONValue.self, from: data)
+      let section = Self.fleetSection(from: report, duration: result.duration)
+      return FleetStatusFetchOutcome(section: section, rawSection: section.jsonValue, failure: nil, result: result)
+    } catch {
+      if result.exitCode != 0 {
+        return FleetStatusFetchOutcome(section: nil, rawSection: nil, failure: .commandFailed(exitCode: result.exitCode, stderr: result.stderr), result: result)
+      }
+      return FleetStatusFetchOutcome(section: nil, rawSection: nil, failure: .parseFailed(detail: String(describing: error), stderr: result.stderr), result: result)
+    }
+  }
+
+  private static func fleetSection(from report: JSONValue, duration: TimeInterval) -> StatusSection {
+    let summary = report["summary"]
+    let total = Int(summary?["total"]?.numberValue ?? report["machines"]?.arrayValue.map { Double($0.count) } ?? 0)
+    let reachable = Int(summary?["reachable"]?.numberValue ?? 0)
+    let needsUpdate = Int(summary?["needs_update"]?.numberValue ?? 0)
+    let unhealthy = Int(summary?["unhealthy"]?.numberValue ?? 0)
+    let state: SectionState = unhealthy > 0 ? .warn : .ok
+    return StatusSection(
+      state: state,
+      ok: state == .ok,
+      available: true,
+      detail: "machines=\(total) reachable=\(reachable) needs_update=\(needsUpdate) unhealthy=\(unhealthy)",
+      data: report,
+      error: nil,
+      durationMs: duration * 1000
+    )
   }
 
   // MARK: - Actions

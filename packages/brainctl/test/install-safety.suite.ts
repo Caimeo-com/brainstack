@@ -1164,6 +1164,45 @@ describe("brainctl install safety", () => {
     }
   });
 
+  test("daemon launchd start does not double-restart after bootstrap", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-daemon-launchd-start-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const configPath = join(dir, "client.yaml");
+      const binDir = join(dir, "bin");
+      const logPath = join(dir, "launchctl.log");
+      await mkdir(binDir, { recursive: true });
+      await writeFixtureClientConfig(configPath, { home, stateRoot, localPath: join(home, "shared-brain") });
+      await writeExecutable(
+        join(binDir, "launchctl"),
+        [
+          "#!/usr/bin/env sh",
+          `printf '%s\\n' "$*" >> ${shellQuote(logPath)}`,
+          "exit 0",
+          ""
+        ].join("\n")
+      );
+
+      const result = runBrainctl(["daemon", "install", "--start", "--platform", "launchd", "--config", configPath, "--brainctl", "brainctl"], {
+        HOME: home,
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      });
+      expectSuccess(result);
+
+      const uid = typeof process.getuid === "function" ? process.getuid() : process.env.UID || "";
+      const servicePath = join(home, "Library", "LaunchAgents", "com.brainstack.daemon.plist");
+      const calls = (await readFile(logPath, "utf8")).trim().split(/\r?\n/);
+      expect(calls).toEqual([
+        `bootout gui/${uid} ${servicePath}`,
+        `bootstrap gui/${uid} ${servicePath}`
+      ]);
+      expect(calls.some((call) => call.includes("kickstart"))).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("remember uses the enrolled default config when --config is omitted", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-default-config-"));
     try {

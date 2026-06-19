@@ -1,6 +1,6 @@
 # Brainstack Menu
 
-Native macOS menu bar installer and companion for Brainstack machines. A signed DMG includes the app plus a bundled standalone `brainctl`; first launch can install that binary to `~/.local/bin/brainctl`, enroll the Mac from an invite, and run lifecycle repair. After setup, the app stays a lightweight status/control surface: all data and actions go through stable `brainctl` CLI surfaces, primarily `brainctl status --json`.
+Native macOS menu bar installer and companion for Brainstack machines. A signed DMG includes the app plus a bundled standalone `brainctl`; first launch can install that binary to `~/.local/bin/brainctl`, enroll the Mac from an invite, and run lifecycle repair. After setup, the app stays a lightweight status/control surface: all data and actions go through stable `brainctl` CLI surfaces, primarily fast `brainctl status --json --skip-fleet` plus a separately cached `brainctl fleet status --json --no-fetch` lane.
 
 ## First-run setup
 
@@ -24,7 +24,7 @@ The menu bar icon is the status surface:
 - **Gray** — `brainctl` missing, config missing, status timed out, or unparseable.
 - Dimmed icon — showing the last good status because the latest refresh failed (stale).
 
-The dropdown shows local sections (daemon, shared brain, outbox, hooks, skills), control sections (brain API, curator, proposals, product updates), and a Fleet section with each known machine, reachability, source head, dirty/behind state, and service status. Unknown future sections render generically by `state`/`detail`.
+The dropdown shows local sections (daemon, shared brain, outbox, hooks, skills), control sections (brain API, curator, proposals, product updates), and a Fleet section with each known machine, reachability, source head, dirty/behind state, and service status. Fleet is refreshed independently from the main status check so local/control health can render quickly; the app keeps the last complete fleet list when a transient partial probe returns fewer machines. Unknown future sections render generically by `state`/`detail`.
 
 Tailscale is shown as a first-class local prerequisite when the profile depends on a tailnet control host. If Tailscale is stopped or missing, the app shows one root-cause attention row with an **Open** action and suppresses the downstream Brain API, curator, proposal, fleet, control-host, and remote-only daemon freshness warnings from the top summary until Tailscale is online.
 

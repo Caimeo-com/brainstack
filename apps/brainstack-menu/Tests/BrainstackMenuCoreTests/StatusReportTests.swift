@@ -93,6 +93,41 @@ final class StatusReportTests: XCTestCase {
     XCTAssertEqual(OverallStateMapper.map(report: report), .yellow)
   }
 
+  func testReplacingFleetSectionPreservesOrderAndUpdatesRawJson() throws {
+    let base = try StatusReport.parse(data: Data(#"{"ok": true, "degraded": false, "sections": {"config": {"state": "ok", "ok": true, "available": true, "detail": "config loaded"}, "daemon": {"state": "ok", "ok": true, "available": true, "detail": "running"}}}"#.utf8))
+    let fleetData: JSONValue = .object([
+      "machines": .array([
+        .object([
+          "name": .string("erbine"),
+          "role": .string("worker"),
+          "transport": .string("ssh"),
+          "reachable": .bool(true),
+          "status": .string("warn"),
+          "update_state": .string("behind"),
+          "needs_update": .bool(true),
+          "detail": .string("behind origin by 2 commits"),
+          "behind": .number(2)
+        ])
+      ]),
+      "summary": .object([
+        "total": .number(1),
+        "reachable": .number(1),
+        "needs_update": .number(1),
+        "unhealthy": .number(1)
+      ])
+    ])
+    let fleet = StatusSection(state: .warn, ok: false, available: true, detail: "machines=1 reachable=1 needs_update=1 unhealthy=1", data: fleetData, error: nil, durationMs: 1200)
+
+    let merged = base.replacingSection("fleet", with: fleet)
+
+    XCTAssertEqual(merged.sectionNames, ["config", "daemon", "fleet"])
+    XCTAssertEqual(merged.sections["fleet"]?.state, .warn)
+    XCTAssertEqual(merged.fleetMachines.first?.name, "erbine")
+    XCTAssertFalse(merged.ok)
+    XCTAssertTrue(merged.degraded)
+    XCTAssertEqual(merged.raw["sections"]?["fleet"]?["data"]?["summary"]?["needs_update"]?.numberValue, 1)
+  }
+
   func testNilAndEmptyReportsMapGray() throws {
     XCTAssertEqual(OverallStateMapper.map(report: nil), .gray)
     let empty = try StatusReport.parse(data: Data(#"{"ok": false, "degraded": true, "sections": {}}"#.utf8))

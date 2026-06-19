@@ -25,6 +25,24 @@ public struct StatusSection: Sendable {
   public let error: String?
   public let durationMs: Double?
 
+  public init(
+    state: SectionState,
+    ok: Bool?,
+    available: Bool,
+    detail: String,
+    data: JSONValue?,
+    error: String?,
+    durationMs: Double?
+  ) {
+    self.state = state
+    self.ok = ok
+    self.available = available
+    self.detail = detail
+    self.data = data
+    self.error = error
+    self.durationMs = durationMs
+  }
+
   public init(json: JSONValue) {
     self.state = SectionState(raw: json["state"]?.stringValue)
     self.ok = json["ok"]?.boolValue
@@ -33,6 +51,27 @@ public struct StatusSection: Sendable {
     self.data = json["data"]
     self.error = json["error"]?.stringValue
     self.durationMs = json["duration_ms"]?.numberValue
+  }
+
+  public var jsonValue: JSONValue {
+    var object: [String: JSONValue] = [
+      "state": .string(state.rawValue),
+      "available": .bool(available),
+      "detail": .string(detail)
+    ]
+    if let ok {
+      object["ok"] = .bool(ok)
+    }
+    if let data {
+      object["data"] = data
+    }
+    if let error {
+      object["error"] = .string(error)
+    }
+    if let durationMs {
+      object["duration_ms"] = .number(durationMs)
+    }
+    return .object(object)
   }
 }
 
@@ -86,6 +125,30 @@ public struct StatusReport: Sendable {
   public let sections: [String: StatusSection]
   public let raw: JSONValue
 
+  private static let preferredSectionOrder = ["config", "daemon", "tailscale", "shared_brain", "outbox", "hooks", "skills", "brain_api", "curator", "proposals", "telemux", "fleet", "control_source", "product"]
+
+  public init(
+    generatedAt: String?,
+    configPath: String?,
+    profile: String?,
+    machine: String?,
+    ok: Bool,
+    degraded: Bool,
+    sectionNames: [String],
+    sections: [String: StatusSection],
+    raw: JSONValue
+  ) {
+    self.generatedAt = generatedAt
+    self.configPath = configPath
+    self.profile = profile
+    self.machine = machine
+    self.ok = ok
+    self.degraded = degraded
+    self.sectionNames = sectionNames
+    self.sections = sections
+    self.raw = raw
+  }
+
   public init(json: JSONValue) throws {
     guard let object = json.objectValue else {
       throw StatusParseError.notAnObject
@@ -100,10 +163,7 @@ public struct StatusReport: Sendable {
     var parsed: [String: StatusSection] = [:]
     if let sectionsObject = object["sections"]?.objectValue {
       // Render in a stable, contract-first order; unknown sections follow alphabetically.
-      let preferredOrder = ["config", "daemon", "tailscale", "shared_brain", "outbox", "hooks", "skills", "brain_api", "curator", "proposals", "telemux", "fleet", "control_source", "product"]
-      let known = preferredOrder.filter { sectionsObject.keys.contains($0) }
-      let unknown = sectionsObject.keys.filter { !preferredOrder.contains($0) }.sorted()
-      names = known + unknown
+      names = Self.orderedSectionNames(Array(sectionsObject.keys))
       for name in names {
         if let sectionJson = sectionsObject[name] {
           parsed[name] = StatusSection(json: sectionJson)
@@ -115,6 +175,34 @@ public struct StatusReport: Sendable {
     self.raw = json
   }
 
+  public func replacingSection(_ name: String, with section: StatusSection, rawSection: JSONValue? = nil) -> StatusReport {
+    var nextSections = sections
+    nextSections[name] = section
+    let nextNames = Self.orderedSectionNames(Array(nextSections.keys))
+    let states = nextNames.compactMap { nextSections[$0]?.state }
+    let nextOk = !states.isEmpty && !states.contains(.warn) && !states.contains(.fail) && !states.contains(.unknown)
+    var nextRaw = raw
+    if case .object(var root) = nextRaw {
+      var rawSections = root["sections"]?.objectValue ?? [:]
+      rawSections[name] = rawSection ?? section.jsonValue
+      root["sections"] = .object(rawSections)
+      root["ok"] = .bool(nextOk)
+      root["degraded"] = .bool(!nextOk)
+      nextRaw = .object(root)
+    }
+    return StatusReport(
+      generatedAt: generatedAt,
+      configPath: configPath,
+      profile: profile,
+      machine: machine,
+      ok: nextOk,
+      degraded: !nextOk,
+      sectionNames: nextNames,
+      sections: nextSections,
+      raw: nextRaw
+    )
+  }
+
   public static func parse(data: Data) throws -> StatusReport {
     let decoded: JSONValue
     do {
@@ -123,6 +211,13 @@ public struct StatusReport: Sendable {
       throw StatusParseError.invalidJson(String(describing: error))
     }
     return try StatusReport(json: decoded)
+  }
+
+  private static func orderedSectionNames(_ keys: [String]) -> [String] {
+    let keySet = Set(keys)
+    let known = preferredSectionOrder.filter { keySet.contains($0) }
+    let unknown = keys.filter { !preferredSectionOrder.contains($0) }.sorted()
+    return known + unknown
   }
 }
 

@@ -91,7 +91,7 @@ struct DashboardView: View {
         Text(headerSubtitle).font(.caption).foregroundColor(.secondary)
       }
       Spacer()
-      if model.isRefreshing {
+      if model.isRefreshing || model.isRefreshingFleet {
         ProgressView().controlSize(.small)
       } else {
         Button {
@@ -151,15 +151,15 @@ struct DashboardView: View {
     case .checkUpdates:
       model.runAction("Check Stack Updates", refreshAfter: false) { await $0.updates() }
     case .flushOutbox:
-      model.runAction("Flush Outbox") { await $0.outboxFlush() }
+      model.runAction("Flush Outbox", verifying: ["outbox"]) { await $0.outboxFlush() }
     case .refreshSkills:
-      model.runAction("Refresh Skills") { await $0.skillsRefresh() }
+      model.runAction("Refresh Skills", verifying: ["skills"]) { await $0.skillsRefresh() }
     case .restartDaemon:
-      model.runAction("Install/Restart Daemon") { await $0.daemonInstall() }
+      model.runAction("Install/Restart Daemon", verifying: ["daemon"]) { await $0.daemonInstall() }
     case .repairHooks:
-      model.runAction("Install/Repair Hooks") { await $0.hooksInstall() }
+      model.runAction("Install/Repair Hooks", verifying: ["hooks"]) { await $0.hooksInstall() }
     case .installCurator:
-      model.runAction("Install Curator") { await $0.curatorInstall() }
+      model.runAction("Install Curator", verifying: ["curator"]) { await $0.curatorInstall() }
     case .openTailscale:
       model.openTailscale()
     }
@@ -226,7 +226,7 @@ struct DashboardView: View {
         sectionGroup(title: "Other", names: extra)
       }
       if let config = model.lastReport?.sections["config"], config.state != .ok {
-        SectionRowView(name: "config", section: config)
+        SectionRowView(name: "config", section: config, isVerifying: model.isSectionVerificationPending("config"))
       }
     }
   }
@@ -239,10 +239,26 @@ struct DashboardView: View {
         .font(.caption2)
         .foregroundColor(.secondary)
         .padding(.top, 4)
+      if model.isRefreshingFleet {
+        Text("checking fleet status...")
+          .font(.system(size: 11))
+          .foregroundColor(.secondary)
+      }
       ForEach(machines) { machine in
-        FleetMachineRowView(machine: machine, isBusy: model.busyAction != nil) {
+        FleetMachineRowView(machine: machine, isBusy: model.busyAction != nil || model.isSectionVerificationPending("fleet")) {
           updateFleetMachine(machine)
         }
+      }
+    } else if model.isRefreshingFleet {
+      Text("FLEET")
+        .font(.caption2)
+        .foregroundColor(.secondary)
+        .padding(.top, 4)
+      HStack(spacing: 6) {
+        ProgressView().controlSize(.small)
+        Text("checking fleet status...")
+          .font(.system(size: 11))
+          .foregroundColor(.secondary)
       }
     } else if let section = model.lastReport?.sections["fleet"] {
       Text("FLEET")
@@ -309,6 +325,20 @@ struct DashboardView: View {
       return []
     }
     var items: [AttentionItem] = []
+    if let pending = model.pendingVerificationSummary {
+      items.append(AttentionItem(
+        title: "Checking updated status",
+        detail: "The repair finished; \(pending) before reporting the final state.",
+        severity: .info
+      ))
+    }
+    if model.isRefreshingFleet && report.fleetMachines.isEmpty {
+      items.append(AttentionItem(
+        title: "Checking fleet status",
+        detail: "Local status is available; fleet reachability and update buttons will appear when the fleet check finishes.",
+        severity: .info
+      ))
+    }
     if controlHostLooksOld(report) {
       items.append(AttentionItem(
         title: "Control host needs update",
@@ -317,7 +347,7 @@ struct DashboardView: View {
         repair: .checkUpdates
       ))
     }
-    if tailscaleNeedsStart(report) {
+    if tailscaleNeedsStart(report), !model.isSectionVerificationPending("tailscale") {
       items.append(AttentionItem(
         title: tailscaleSummary(report),
         detail: "Start Tailscale to reach the Brainstack control host. Remote API, curator, proposals, fleet, and control-host checks are blocked until Tailscale is online.",
@@ -326,7 +356,7 @@ struct DashboardView: View {
       ))
     }
     let staleFleet = report.fleetMachines.filter(\.needsUpdate)
-    if !staleFleet.isEmpty && !tailscaleNeedsStart(report) {
+    if !staleFleet.isEmpty && !tailscaleNeedsStart(report) && !model.isSectionVerificationPending("fleet") {
       let names = staleFleet.map(\.name).joined(separator: ", ")
       items.append(AttentionItem(
         title: "\(staleFleet.count) machine\(staleFleet.count == 1 ? "" : "s") need update",
@@ -334,7 +364,7 @@ struct DashboardView: View {
         severity: .warn
       ))
     }
-    if let curator = report.sections["curator"], curator.state == .ok {
+    if let curator = report.sections["curator"], curator.state == .ok, !model.isSectionVerificationPending("curator") {
       let installed = curator.data?["curator"]?["installed"]?.boolValue
       if installed == false {
         items.append(AttentionItem(
@@ -358,6 +388,9 @@ struct DashboardView: View {
         continue
       }
       if isBlockedByTailscaleRootCause(name: name, section: section, report: report) {
+        continue
+      }
+      if model.isSectionVerificationPending(name) {
         continue
       }
       if section.state == .fail {
@@ -391,7 +424,7 @@ struct DashboardView: View {
         .padding(.top, 4)
       ForEach(present, id: \.self) { name in
         if let section = model.lastReport?.sections[name] {
-          SectionRowView(name: name, section: section)
+          SectionRowView(name: name, section: section, isVerifying: model.isSectionVerificationPending(name))
         }
       }
     }
@@ -426,6 +459,11 @@ struct DashboardView: View {
         HStack(spacing: 6) {
           ProgressView().controlSize(.small)
           Text("Loading proposals…").font(.caption).foregroundColor(.secondary)
+        }
+      } else if model.isRefreshingFleet {
+        HStack(spacing: 6) {
+          ProgressView().controlSize(.small)
+          Text("Checking fleet…").font(.caption).foregroundColor(.secondary)
         }
       }
     }
@@ -494,6 +532,7 @@ func color(for state: OverallState) -> Color {
 struct SectionRowView: View {
   let name: String
   let section: StatusSection
+  var isVerifying = false
 
   var body: some View {
     HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -503,7 +542,7 @@ struct SectionRowView: View {
       Text(label)
         .font(.system(size: 12, weight: .medium))
         .frame(width: 92, alignment: .leading)
-      Text(sectionMessage(name: name, section: section))
+      Text(message)
         .font(.system(size: 11))
         .foregroundColor(.secondary)
         .lineLimit(2)
@@ -519,7 +558,7 @@ struct SectionRowView: View {
   }
 
   private var helpText: String {
-    var parts = [sectionMessage(name: name, section: section)]
+    var parts = [message]
     if let error = section.error {
       parts.append("error: \(error)")
     }
@@ -530,12 +569,22 @@ struct SectionRowView: View {
   }
 
   private var stateColor: Color {
+    if isVerifying {
+      return .blue
+    }
     switch section.state {
     case .ok: return .green
     case .warn, .unknown: return .yellow
     case .fail: return .red
     case .disabled: return .gray
     }
+  }
+
+  private var message: String {
+    if isVerifying {
+      return "checking updated status..."
+    }
+    return sectionMessage(name: name, section: section)
   }
 }
 

@@ -1856,11 +1856,18 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
     report.sections.hooks = await collectStatusSection(() => collectHooksStatusSection(cfg!), timeoutMs);
     report.sections.skills = await collectStatusSection(() => collectSkillsStatusSection(cfg!), timeoutMs);
     report.sections.brain_api = await collectStatusSection(() => collectBrainApiStatusSection(cfg!, timeoutMs), timeoutMs + 250);
-    report.sections.curator = await collectStatusSection(() => collectCuratorStatusSection(cfg!, timeoutMs), timeoutMs + 250);
-    report.sections.proposals = await collectStatusSection(() => collectProposalsStatusSection(cfg!, timeoutMs, report.sections.curator), timeoutMs + 250);
+    if (report.sections.brain_api.available === false) {
+      report.sections.curator = statusSection("disabled", "blocked by unavailable Brain API", undefined, { available: false });
+      report.sections.proposals = statusSection("disabled", "blocked by unavailable Brain API", undefined, { available: false });
+    } else {
+      report.sections.curator = await collectStatusSection(() => collectCuratorStatusSection(cfg!, timeoutMs), timeoutMs + 250);
+      report.sections.proposals = await collectStatusSection(() => collectProposalsStatusSection(cfg!, timeoutMs, report.sections.curator), timeoutMs + 250);
+    }
     report.sections.telemux = await collectStatusSection(() => collectTelemuxStatusSection(cfg!, timeoutMs), timeoutMs + 250);
-    const fleetTimeoutMs = Math.min(Math.max(timeoutMs * 4, 3000), 15_000);
-    report.sections.fleet = await collectStatusSection(() => collectFleetStatusSection(cfg!, args, fleetTimeoutMs), fleetTimeoutMs + 500);
+    if (!hasFlag(args, "skip-fleet")) {
+      const fleetTimeoutMs = Math.min(Math.max(timeoutMs * 4, 3000), 15_000);
+      report.sections.fleet = await collectStatusSection(() => collectFleetStatusSection(cfg!, args, fleetTimeoutMs), fleetTimeoutMs + 500);
+    }
     const controlSourceTimeoutMs = cfg.client.telegramVia ? Math.max(Math.min(timeoutMs, 3000), 2500) : timeoutMs;
     report.sections.control_source = await collectStatusSection(() => collectControlSourceStatusSection(cfg!, controlSourceTimeoutMs), controlSourceTimeoutMs + 250);
     report.sections.product = await collectStatusSection(() => collectProductStatusSection(cfg!, Math.min(timeoutMs, 2000)), timeoutMs);

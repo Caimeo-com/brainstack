@@ -877,10 +877,12 @@ printf 'brew_installed=ffmpeg\\n'
       expect(parsed.sections.config.state).toBe("ok");
       expect(parsed.sections.brain_api.state).toBe("warn");
       expect(parsed.sections.brain_api.available).toBe(false);
-      expect(parsed.sections.curator.state).toBe("warn");
+      expect(parsed.sections.curator.state).toBe("disabled");
       expect(parsed.sections.curator.available).toBe(false);
-      expect(parsed.sections.proposals.state).toBe("warn");
+      expect(parsed.sections.curator.detail).toContain("blocked by unavailable Brain API");
+      expect(parsed.sections.proposals.state).toBe("disabled");
       expect(parsed.sections.proposals.available).toBe(false);
+      expect(parsed.sections.proposals.detail).toContain("blocked by unavailable Brain API");
     } finally {
       server.kill();
       await server.exited;
@@ -1069,6 +1071,15 @@ printf 'brew_installed=ffmpeg\\n'
       expect(aggregate.sections.fleet.state).toBe("ok");
       expect(aggregate.sections.fleet.data.summary.total).toBe(3);
       expect(aggregate.sections.fleet.data.machines.some((machine: Record<string, unknown>) => machine.name === "worker-a")).toBe(true);
+
+      const fastStatus = runBrainctl(["status", "--json", "--skip-fleet", "--config", configPath, "--timeout-ms", "500"], {
+        HOME: home,
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      });
+      expectSuccess(fastStatus);
+      const fastAggregate = JSON.parse(fastStatus.stdout) as Record<string, any>;
+      expect(fastAggregate.sections.control_source.state).toBe("ok");
+      expect(fastAggregate.sections.fleet).toBeUndefined();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

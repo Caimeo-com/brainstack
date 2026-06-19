@@ -38,7 +38,21 @@ final class CommandRunnerTests: XCTestCase {
     let binary = try fakeBrainctl("printf '%s\\n' \"$@\" > '\(argsPath.path)'; echo '{\"ok\": true, \"degraded\": false, \"sections\": {}}'")
     let outcome = await client(binary).fetchStatus()
     XCTAssertNil(outcome.failure)
-    XCTAssertEqual(try String(contentsOf: argsPath), "status\n--json\n--config\n/tmp/test.yaml\n--timeout-ms\n1500\n")
+    XCTAssertEqual(try String(contentsOf: argsPath), "status\n--json\n--skip-fleet\n--config\n/tmp/test.yaml\n--timeout-ms\n1500\n")
+  }
+
+  func testFleetStatusUsesDedicatedNoFetchCommand() async throws {
+    let argsPath = scratch.appendingPathComponent("fleet-args.txt")
+    let binary = try fakeBrainctl("""
+    printf '%s\\n' "$@" > '\(argsPath.path)'
+    echo '{"schema_version":1,"generated_at":"2026-06-19T00:00:00Z","source_machine":"mac","profile":"client-macos","ok":false,"degraded":true,"machines":[{"name":"valkyrie","role":"control","transport":"ssh","reachable":true,"status":"warn","update_state":"behind","needs_update":true,"detail":"behind","short":"abc","behind":2}],"summary":{"total":1,"reachable":1,"needs_update":1,"unhealthy":1}}'
+    """)
+    let outcome = await client(binary).fetchFleetStatus()
+    XCTAssertNil(outcome.failure)
+    XCTAssertEqual(try String(contentsOf: argsPath), "fleet\nstatus\n--json\n--config\n/tmp/test.yaml\n--timeout-ms\n6000\n--no-fetch\n")
+    XCTAssertEqual(outcome.section?.state, .warn)
+    XCTAssertEqual(outcome.section?.data?["machines"]?.arrayValue?.count, 1)
+    XCTAssertEqual(outcome.section?.data?["summary"]?["needs_update"]?.numberValue, 1)
   }
 
   func testInvalidJsonProducesParseFailure() async throws {
