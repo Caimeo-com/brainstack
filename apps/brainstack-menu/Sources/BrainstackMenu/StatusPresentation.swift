@@ -14,6 +14,8 @@ enum RepairKind: Equatable, Sendable {
   case doctor
   case flushOutbox
   case retryOutbox
+  case discardOutbox
+  case discardCorruptOutbox
   case refreshSkills
   case restartDaemon
   case repairHooks
@@ -26,6 +28,8 @@ enum RepairKind: Equatable, Sendable {
     case .doctor: return "Run Doctor"
     case .flushOutbox: return "Send"
     case .retryOutbox: return "Retry"
+    case .discardOutbox: return "Discard"
+    case .discardCorruptOutbox: return "Discard Damaged"
     case .refreshSkills: return "Refresh"
     case .restartDaemon: return "Restart"
     case .repairHooks: return "Repair"
@@ -44,6 +48,10 @@ enum RepairKind: Equatable, Sendable {
       return ("Send Saved Writes", "Send saved outbox writes to the shared brain now?")
     case .retryOutbox:
       return ("Retry Saved Writes", "Retry paused saved writes? If the original cause is still present, Brainstack will pause them again instead of losing data.")
+    case .discardOutbox:
+      return ("Discard Saved Writes", "Permanently delete the local saved writes from this Mac? Use this only when those imports, memories, or proposals are obsolete.")
+    case .discardCorruptOutbox:
+      return ("Discard Damaged Saved Writes", "Permanently delete damaged saved write files from this Mac? Use this only when those local files are unrecoverable.")
     case .refreshSkills:
       return ("Refresh Skills", "Refresh shared skills from the shared brain?")
     case .restartDaemon:
@@ -80,14 +88,25 @@ func repairKind(forSection name: String, section: StatusSection) -> RepairKind? 
   return repairKind(forSection: name)
 }
 
+func discardKind(forOutbox summary: OutboxStatusSummary) -> RepairKind? {
+  if summary.corrupt > 0 {
+    return .discardCorruptOutbox
+  }
+  if summary.hasSavedWrites {
+    return .discardOutbox
+  }
+  return nil
+}
+
 struct AttentionItem: Identifiable, Equatable, Sendable {
   let title: String
   let detail: String
   let severity: AttentionSeverity
   var repair: RepairKind? = nil
+  var secondaryRepair: RepairKind? = nil
 
   var id: String {
-    "\(title)\n\(detail)\n\(severity)"
+    "\(title)\n\(detail)\n\(severity)\n\(String(describing: repair))\n\(String(describing: secondaryRepair))"
   }
 }
 

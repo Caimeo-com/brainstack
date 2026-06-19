@@ -1361,7 +1361,7 @@ function readEnvFile(path: string): Record<string, string> {
 
   function mergedIntoReason(record: Record<string, unknown>): string | null {
     const reason = stringFromRecord(record, "reason") || "";
-    const match = reason.match(/^merged into\s+(.+)$/i);
+    const match = reason.match(/^(?:merged|absorbed) into\s+(.+)$/i);
     return match?.[1]?.trim() || null;
   }
 
@@ -1372,6 +1372,132 @@ function readEnvFile(path: string): Record<string, string> {
     }
     const bodyLine = firstUsefulProposalLine(detail.body);
     return bodyLine || `Review proposal ${detail.id}`;
+  }
+
+  function proposalMatchesReviewGroup(proposal: Record<string, unknown>, groupKey: string): boolean {
+    return stringFromRecord(proposal, "cluster_key") === groupKey || stringFromRecord(proposal, "cluster_label") === groupKey;
+  }
+
+  function selectedProposalIdSet(args: ParsedArgs): Set<string> {
+    return new Set(flagValues(args, "id").map((value) => value.trim()).filter(Boolean));
+  }
+
+  function firstUsefulProposalText(detail: { id: string; proposal: Record<string, unknown>; body: string }): string {
+    return [
+      stripRememberPrefix(stringFromRecord(detail.proposal, "title") || ""),
+      stringFromRecord(detail.proposal, "context") || "",
+      stringFromRecord(detail.proposal, "applicability") || "",
+      firstUsefulProposalLine(detail.body)
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  function proposalCreatedDay(record: Record<string, unknown>): string {
+    const created = stringFromRecord(record, "created_at") || stringFromRecord(record, "createdAt") || "";
+    const match = created.match(/^(\d{4}-\d{2}-\d{2})/);
+    return match?.[1] || "unknown-date";
+  }
+
+  const topicBuckets: Array<{ key: string; label: string; patterns: RegExp[] }> = [
+    { key: "frontend-ui", label: "front-end/UI", patterns: [/\bfront[- ]?end\b/i, /\bui\b/i, /\bux\b/i, /\bview\b/i, /\bswiftui\b/i, /\bmenu(?:bar)?\b/i, /\boperator\b/i, /\bdashboard\b/i, /\blanding\b/i, /\bcss\b/i, /\blayout\b/i, /\bvisual\b/i] },
+    { key: "docs-content", label: "docs/content", patterns: [/\bdocs?\b/i, /\breadme\b/i, /\bcopy\b/i, /\bcontent\b/i, /\bwebsite\b/i, /\bseo\b/i, /\baso\b/i, /\bmarketing\b/i, /\bpage\b/i] },
+    { key: "curation-proposals", label: "curation/proposals", patterns: [/\bcurat(?:e|ion|or)\b/i, /\bproposal[- ]review\b/i, /\bproposal[- ]queue\b/i, /\bmerge\b/i, /\bsupersed(?:e|ed)\b/i] },
+    { key: "install-lifecycle", label: "install/lifecycle", patterns: [/\binstall(?:er|ation)?\b/i, /\benroll(?:ment)?\b/i, /\binvite\b/i, /\blifecycle\b/i, /\bupgrade\b/i, /\buninstall\b/i, /\brepair\b/i] },
+    { key: "daemon-fleet", label: "daemon/fleet", patterns: [/\bdaemon\b/i, /\bbrainstackd\b/i, /\bfleet\b/i, /\bworker\b/i, /\bmachine\b/i, /\btailscale\b/i, /\bssh\b/i] },
+    { key: "telemux-telegram", label: "Telegram/telemux", patterns: [/\btelegram\b/i, /\btg\b/i, /\btelemux\b/i, /\bvoice\b/i, /\btranscri(?:be|ption)\b/i, /\bwhisper\b/i] },
+    { key: "outbox-sync", label: "outbox/sync", patterns: [/\boutbox\b/i, /\bflush\b/i, /\bretry\b/i, /\bdiscard\b/i, /\bsync\b/i] },
+    { key: "tests-ci", label: "tests/CI", patterns: [/\btest(?:s|ing)?\b/i, /\bci\b/i, /\bworkflow\b/i, /\bgithub\b/i, /\brelease\b/i, /\bbuild\b/i] },
+    { key: "security-safety", label: "security/safety", patterns: [/\bsecurity\b/i, /\bsafety\b/i, /\btoken\b/i, /\bsecret\b/i, /\bauth\b/i, /\bpermission\b/i] },
+    { key: "performance-latency", label: "performance/latency", patterns: [/\bperformance\b/i, /\blatency\b/i, /\btimeout\b/i, /\bhung?\b/i, /\bslow\b/i] }
+  ];
+
+  const relationStopwords = new Set([
+    "about",
+    "added",
+    "after",
+    "again",
+    "against",
+    "also",
+    "auto",
+    "brainstack",
+    "candidate",
+    "candidates",
+    "change",
+    "changes",
+    "code",
+    "consolidate",
+    "context",
+    "default",
+    "during",
+    "fix",
+    "fixed",
+    "from",
+    "group",
+    "lesson",
+    "lessons",
+    "local",
+    "machine",
+    "memory",
+    "merge",
+    "merged",
+    "must",
+    "needs",
+    "proposal",
+    "proposals",
+    "repo",
+    "review",
+    "scope",
+    "shared",
+    "should",
+    "source",
+    "status",
+    "summary",
+    "support",
+    "system",
+    "that",
+    "this",
+    "when",
+    "with",
+    "work",
+    "working"
+  ]);
+
+  function topicBucketForDetail(detail: { id: string; proposal: Record<string, unknown>; body: string }): { key: string; label: string } {
+    const text = firstUsefulProposalText(detail);
+    for (const bucket of topicBuckets) {
+      if (bucket.patterns.some((pattern) => pattern.test(text))) {
+        return { key: bucket.key, label: bucket.label };
+      }
+    }
+    const projectWords = uniqueNonEmptyStrings([
+      stringFromRecord(detail.proposal, "project"),
+      stringFromRecord(detail.proposal, "domain"),
+      stringFromRecord(detail.proposal, "memory_kind"),
+      stringFromRecord(detail.proposal, "scope")
+    ].filter(Boolean) as string[])
+      .flatMap((value) => value.toLowerCase().split(/[^a-z0-9]+/))
+      .filter(Boolean);
+    const localStopwords = new Set([...relationStopwords, ...projectWords]);
+    const tokens = uniqueNonEmptyStrings(
+      text
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((token) => token.length >= 4 && !localStopwords.has(token) && !/^\d+$/.test(token))
+    ).slice(0, 3);
+    const key = tokens.length ? tokens.join("-") : "misc";
+    return { key, label: tokens.length ? tokens.join(" ") : "misc" };
+  }
+
+  function targetPageForRelationBatch(groupLabel: string, groupKey: string, topicKey: string, day: string): string {
+    const labelSubject = groupLabel.split("/")[0]?.trim() || groupKey;
+    const parts = [slugPart(labelSubject || groupKey) || "review-group", slugPart(topicKey) || "topic", day === "unknown-date" ? "" : day.replaceAll("-", "")].filter(Boolean);
+    return `wiki/Syntheses/${parts.join("-")}-lessons.md`;
+  }
+
+  function titleForRelationBatch(groupLabel: string, topicLabel: string, day: string): string {
+    const suffix = [topicLabel, day === "unknown-date" ? null : day].filter(Boolean).join(", ");
+    return suffix ? `Consolidate: ${groupLabel} (${suffix})` : `Consolidate: ${groupLabel}`;
   }
 
   function buildReviewGroupContent(input: {
@@ -1436,7 +1562,10 @@ function readEnvFile(path: string): Record<string, string> {
     const status = requireFlagValue(args, "status") || (closeSources ? "open,rejected" : "open");
     const result = await brainApiRequest(cfg, "GET", `/api/proposals?status=${encodeURIComponent(status)}`);
     const proposals = Array.isArray(result.proposals) ? (result.proposals as Array<Record<string, unknown>>) : [];
-    const matching = proposals.filter((proposal) => stringFromRecord(proposal, "cluster_key") === groupKey || stringFromRecord(proposal, "cluster_label") === groupKey);
+    const requestedIds = selectedProposalIdSet(args);
+    const matching = proposals
+      .filter((proposal) => proposalMatchesReviewGroup(proposal, groupKey))
+      .filter((proposal) => !requestedIds.size || requestedIds.has(stringFromRecord(proposal, "id") || ""));
     if (matching.length < 2) {
       throw new Error(`review group ${groupKey} has ${matching.length} matching proposal(s); merge-group requires at least 2`);
     }
@@ -1550,17 +1679,164 @@ function readEnvFile(path: string): Record<string, string> {
           closed.push(detail.id);
           continue;
         }
-        await brainApiRequest(cfg, "POST", `/api/proposals/${encodeURIComponent(detail.id)}/reject`, {
+        await brainApiRequest(cfg, "POST", `/api/proposals/${encodeURIComponent(detail.id)}/supersede`, {
           admin: true,
           body: {
             decided_by: `${process.env.USER || "operator"}@${cfg.machine.name}`,
-            reason: `merged into ${mergedId}`
+            reason: `absorbed into ${mergedId}`
           }
         });
         closed.push(detail.id);
       }
     }
     return { payload, selected: details.length, conflicts, dryRun, write, closed };
+  }
+
+  function numericRecordValue(record: Record<string, unknown>, key: string): number {
+    const value = record[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  }
+
+  async function createAutomaticReviewGroupMerges(
+    cfg: BrainstackConfig,
+    args: ParsedArgs
+  ): Promise<{
+    dryRun: boolean;
+    considered: number;
+    selected: number;
+    merged: Array<{ groupKey: string; relationKey: string; selected: number; conflicts: string[]; targetPage: string; closed: string[]; writeStatus: string | null }>;
+    skipped: Array<{ groupKey: string; reason: string }>;
+  }> {
+    const status = requireFlagValue(args, "status") || "open";
+    const minSize = parsePositiveIntegerFlag(args, "min-size", 2);
+    const maxGroupSize = parsePositiveIntegerFlag(args, "max-group-size", 6);
+    const limitGroups = hasFlag(args, "all-groups") ? Number.POSITIVE_INFINITY : parsePositiveIntegerFlag(args, "limit-groups", 5);
+    const sourceGroupLimit = hasFlag(args, "all-source-groups") ? Number.POSITIVE_INFINITY : parsePositiveIntegerFlag(args, "max-source-group-size", 50);
+    const allowLargeGroups = hasFlag(args, "all") || hasFlag(args, "allow-large-groups");
+    const relationWindow = (requireFlagValue(args, "relation-window") || "day").toLowerCase();
+    if (relationWindow !== "day" && relationWindow !== "all") {
+      throw new Error("--relation-window must be day or all");
+    }
+    const dryRun = !hasFlag(args, "submit") && !hasFlag(args, "apply") && !hasFlag(args, "yes");
+    const groupsResult = await brainApiRequest(
+      cfg,
+      "GET",
+      `/api/proposals/groups?status=${encodeURIComponent(status)}&min_size=${encodeURIComponent(String(minSize))}`
+    );
+    const groups = proposalReviewGroupsFromResult(groupsResult);
+    const proposalsResult = await brainApiRequest(cfg, "GET", `/api/proposals?status=${encodeURIComponent(status)}`);
+    const proposals = Array.isArray(proposalsResult.proposals) ? (proposalsResult.proposals as Array<Record<string, unknown>>) : [];
+    const skipped: Array<{ groupKey: string; reason: string }> = [];
+    const selectedBatches: Array<{
+      groupKey: string;
+      groupLabel: string;
+      relationKey: string;
+      topicKey: string;
+      topicLabel: string;
+      day: string;
+      ids: string[];
+    }> = [];
+    for (const group of groups) {
+      const groupKey = stringFromRecord(group, "id") || stringFromRecord(group, "label") || "";
+      const groupLabel = stringFromRecord(group, "label") || groupKey;
+      const count = numericRecordValue(group, "count");
+      const legacyCount = numericRecordValue(group, "legacyCount");
+      const needsContextCount = numericRecordValue(group, "needsContextCount");
+      if (!groupKey) {
+        skipped.push({ groupKey: "(unknown)", reason: "missing review group id" });
+        continue;
+      }
+      if (count < minSize) {
+        skipped.push({ groupKey, reason: `below min size ${minSize}` });
+        continue;
+      }
+      if (count > sourceGroupLimit && !allowLargeGroups) {
+        skipped.push({ groupKey, reason: `review group has ${count} proposals; max automatic source group size is ${sourceGroupLimit}` });
+        continue;
+      }
+      if (legacyCount > 0 && !hasFlag(args, "include-legacy")) {
+        skipped.push({ groupKey, reason: "contains legacy proposals" });
+        continue;
+      }
+      if (needsContextCount > 0 && !hasFlag(args, "include-needs-context")) {
+        skipped.push({ groupKey, reason: "contains proposals that need context" });
+        continue;
+      }
+      const matching = proposals.filter((proposal) => proposalMatchesReviewGroup(proposal, groupKey));
+      if (matching.length < minSize) {
+        skipped.push({ groupKey, reason: `only ${matching.length} readable proposals matched this group` });
+        continue;
+      }
+      const details: Array<{ id: string; proposal: Record<string, unknown>; body: string }> = [];
+      for (const item of matching.slice(0, Math.max(count, matching.length))) {
+        const id = stringFromRecord(item, "id");
+        if (!id) continue;
+        const detail = await fetchProposalDetail(cfg, id);
+        details.push({ id, proposal: { ...item, ...detail.proposal }, body: detail.body });
+      }
+      const batches = new Map<string, { topicKey: string; topicLabel: string; day: string; ids: string[] }>();
+      for (const detail of details) {
+        const topic = topicBucketForDetail(detail);
+        const day = relationWindow === "day" ? proposalCreatedDay(detail.proposal) : "all-dates";
+        const relationKey = `${groupKey}:${day}:${topic.key}`;
+        const existing = batches.get(relationKey) || { topicKey: topic.key, topicLabel: topic.label, day, ids: [] };
+        existing.ids.push(detail.id);
+        batches.set(relationKey, existing);
+      }
+      let selectedForGroup = 0;
+      for (const [relationKey, batch] of [...batches.entries()].sort((a, b) => b[1].ids.length - a[1].ids.length || a[0].localeCompare(b[0]))) {
+        if (batch.ids.length < minSize) {
+          continue;
+        }
+        if (batch.ids.length > maxGroupSize && !allowLargeGroups) {
+          skipped.push({ groupKey, reason: `related batch ${relationKey} has ${batch.ids.length} proposals; max automatic batch size is ${maxGroupSize}` });
+          continue;
+        }
+        selectedBatches.push({ groupKey, groupLabel, relationKey, topicKey: batch.topicKey, topicLabel: batch.topicLabel, day: batch.day, ids: batch.ids });
+        selectedForGroup += 1;
+        if (selectedBatches.length >= limitGroups) {
+          break;
+        }
+      }
+      if (!selectedForGroup) {
+        skipped.push({ groupKey, reason: "no related date/topic batch met the minimum size" });
+      }
+      if (selectedBatches.length >= limitGroups) {
+        break;
+      }
+    }
+    if (Number.isFinite(limitGroups) && selectedBatches.length >= limitGroups) {
+      skipped.push({ groupKey: "(remaining)", reason: `limit-groups ${limitGroups} reached` });
+    }
+    const merged: Array<{ groupKey: string; relationKey: string; selected: number; conflicts: string[]; targetPage: string; closed: string[]; writeStatus: string | null }> = [];
+    for (const batch of selectedBatches) {
+      const mergeArgs: ParsedArgs = {
+        ...args,
+        positional: ["merge-group", batch.groupKey],
+        flags: {
+          ...args.flags,
+          status,
+          id: batch.ids,
+          title: requireFlagValue(args, "title") || titleForRelationBatch(batch.groupLabel, batch.topicLabel, batch.day),
+          "target-page": requireFlagValue(args, "target-page") || targetPageForRelationBatch(batch.groupLabel, batch.groupKey, batch.topicKey, batch.day),
+          limit: String(Math.max(maxGroupSize, batch.ids.length)),
+          ...(allowLargeGroups ? { all: true } : {}),
+          ...(dryRun ? {} : { submit: true }),
+          ...(dryRun || hasFlag(args, "keep-sources") ? {} : { "close-sources": true })
+        }
+      };
+      const result = await createReviewGroupMergeProposal(cfg, mergeArgs, batch.groupKey);
+      merged.push({
+        groupKey: batch.groupKey,
+        relationKey: batch.relationKey,
+        selected: result.selected,
+        conflicts: result.conflicts,
+        targetPage: String(result.payload.target_page || ""),
+        closed: result.closed || [],
+        writeStatus: result.write?.status || null
+      });
+    }
+    return { dryRun, considered: groups.length, selected: selectedBatches.length, merged, skipped };
   }
 
   function crossBrainAllowKey(sourceId: string, targetId: string): string {
@@ -2341,6 +2617,7 @@ function readEnvFile(path: string): Record<string, string> {
     proposalEnrichmentPayload,
     proposalReviewGroupsFromResult,
     createReviewGroupMergeProposal,
+    createAutomaticReviewGroupMerges,
     commandSearch,
     commandRemember,
     commandAllow,

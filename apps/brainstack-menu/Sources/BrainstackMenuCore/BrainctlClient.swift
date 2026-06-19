@@ -258,6 +258,14 @@ public struct BrainctlClient: Sendable {
     )
   }
 
+  public func outboxDiscardAll() async -> ActionOutcome {
+    await runAction(title: "Discard Saved Writes", arguments: ["outbox", "purge", "--yes", "--config", configPath])
+  }
+
+  public func outboxDiscardCorrupt() async -> ActionOutcome {
+    await runAction(title: "Discard Damaged Saved Writes", arguments: ["outbox", "purge-corrupt", "--yes", "--config", configPath])
+  }
+
   public func skillsRefresh() async -> ActionOutcome {
     await runAction(title: "Refresh Skills", arguments: ["skills", "refresh", "--config", configPath])
   }
@@ -354,5 +362,21 @@ public struct BrainctlClient: Sendable {
   public func proposalDecision(id: String, action: String) async -> ActionOutcome {
     let title = action == "apply" ? "Accept Proposal" : "\(action.capitalized) Proposal"
     return await runAction(title: title, arguments: ["proposals", action, id, "--config", configPath], timeout: 60)
+  }
+
+  public func proposalMergeGroup(groupKey: String) async -> ActionOutcome {
+    await runAction(
+      title: "Merge Proposal Group",
+      arguments: ["proposals", "merge-group", groupKey, "--submit", "--close-sources", "--config", configPath],
+      timeout: 120
+    )
+  }
+
+  public func proposalAutoMerge() async -> ActionOutcome {
+    await runAction(
+      title: "Look for Merges",
+      arguments: ["proposals", "auto-merge", "--submit", "--max-group-size", "6", "--limit-groups", "5", "--config", configPath],
+      timeout: 180
+    )
   }
 }

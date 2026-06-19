@@ -13,7 +13,7 @@ Every proposal is a markdown file with machine frontmatter, plus an optional `<i
 | `needs-human` | `proposals/pending/` | Parked: curator flagged it, or apply was blocked by target drift. |
 | `applied` | `proposals/applied/` | Proposed content written to the target wiki page. |
 | `rejected` | `proposals/rejected/` | Declined, with an optional reason. |
-| `superseded` | `proposals/superseded/` | Another proposal for the same target was applied. |
+| `superseded` | `proposals/superseded/` | Absorbed by a consolidated proposal, or made stale by applying another proposal for the same target. |
 
 Machine frontmatter fields: `proposal_id`, `status`, `target_page`, `base_sha256` (drift guard: sha256 of the target content the proposal was computed against, or `absent` for new pages), `risk` (`low|medium|high`), `confidence` (0..1), `curator_run_id`, `reason`, `source_ids`, `decided_at`, `decided_by`.
 
@@ -33,7 +33,9 @@ Use `brainctl proposals enrich <id>` when a legacy or context-poor memory has en
 
 Use `brainctl proposals reprocess` for bounded legacy cleanup. It is dry-run by default, selects `needs-human` / `needs-context` proposals, and prints the structured replacement payloads it would create. Add `--apply` to submit the replacement proposals. This is still a proposal-generation step, not wiki mutation.
 
-Use `brainctl proposals merge-group <group-key|label>` when two or more proposals describe the same scoped lesson. It builds one deterministic consolidated wiki proposal from the source proposals, preserves `proposal:<id>` evidence refs, dedupes exact/title-normalized lesson lines, and marks the merged proposal `needs-human` when the source group has conflicts or missing context. It is dry-run by default; add `--submit` to create the consolidated proposal. Review groups default to 20 proposals; use `--limit N` or `--all` deliberately for larger groups. `--close-sources` closes source proposals after the merge and is retry-aware for sources already rejected as `merged into ...`. No embeddings or cosine thresholds are used.
+Use `brainctl proposals merge-group <group-key|label>` when two or more proposals describe the same scoped lesson. It builds one deterministic consolidated wiki proposal from the source proposals, preserves `proposal:<id>` evidence refs, dedupes exact/title-normalized lesson lines, and marks the merged proposal `needs-human` when the source group has conflicts or missing context. It is dry-run by default; add `--submit` to create the consolidated proposal. Review groups default to 20 proposals; use `--limit N` or `--all` deliberately for larger groups, or pass repeated/comma-separated `--id` values to merge only a specific subset. `--close-sources` marks source proposals as `superseded` with an `absorbed into ...` reason after the merge, and remains retry-aware for older sources already closed as `merged into ...`. No embeddings or cosine thresholds are used.
+
+Use `brainctl proposals auto-merge` for unattended consolidation of obvious related batches. It is dry-run by default and inspects deterministic review groups, but it does not turn a whole group into one proposal automatically. Instead it splits each group by relation key: same review group, same created day by default, and a coarse topic bucket such as front-end/UI, docs/content, curation/proposals, install/lifecycle, daemon/fleet, Telegram/telemux, outbox/sync, tests/CI, security/safety, or performance/latency. Each selected batch needs at least 2 proposals, at most 6 proposals by default, no legacy proposals, and no `needs-context` proposals unless the operator explicitly opts in. Add `--submit` for the scheduled curator/control host path; submitted auto-merges create one consolidated proposal and supersede the absorbed source candidates unless `--keep-sources` is set. It still does not apply wiki edits.
 
 Applying a proposal:
 
@@ -68,7 +70,8 @@ The `brain-curator` routine installs automatically (daily) into the `brainstack-
 2. Reviews imports/logs/proposals newer than the cursor, grouped by context, repo, source type, and deterministic review group hints.
 3. Submits sourced machine proposals via `brainctl propose --target-page ... --content-file ... --base-sha256 ... --risk ... --confidence ... --source-ids ... --curator-run-id ...`.
 4. For memory candidates, includes the envelope fields (`--project`, `--domain`, `--scope`, `--memory-kind`, `--applicability`, `--non-applicability`, and `--evidence`) or lets `brainctl remember` provide conservative repo-scoped defaults.
-5. telemux reports run outcome, failures, next run, and the new cursor to `POST /api/curator/status` (requires `FACTORY_BRAIN_ADMIN_TOKEN` in the telemux env).
+5. Runs `brainctl proposals auto-merge --submit --json` to collapse safe related date/topic batches inside review groups into one consolidated proposal and mark absorbed sources `superseded`. Oversized, legacy, context-poor, or one-off batches stay in the operator queue.
+6. telemux reports run outcome, failures, next run, and the new cursor to `POST /api/curator/status` (requires `FACTORY_BRAIN_ADMIN_TOKEN` in the telemux env).
 
 The wiki home page shows the curation panel: mode, curator installed, last/next run, last-run failures, open proposals, recently applied changes, and imports awaiting curation.
 
@@ -80,9 +83,11 @@ brainctl proposals groups [--status open|pending|approved|applied|rejected|super
 brainctl proposals show <id> [--json]
 brainctl proposals enrich <id> [--summary TEXT] [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF] [--dry-run|--json]
 brainctl proposals reprocess [--status needs-human|open] [--group KEY] [--id ID] [--limit N] [--apply] [--json] [enrichment flags...]
-brainctl proposals merge-group <group-key|group-label> [--status open] [--submit] [--limit N|--all] [--target-page wiki/PATH.md] [--needs-human] [--close-sources] [--json]
+brainctl proposals merge-group <group-key|group-label> [--id ID] [--status open] [--submit] [--limit N|--all] [--target-page wiki/PATH.md] [--needs-human] [--close-sources] [--json]
+brainctl proposals auto-merge [--status open] [--submit] [--min-size N] [--max-group-size N|--allow-large-groups] [--max-source-group-size N|--all-source-groups] [--limit-groups N|--all-groups] [--relation-window day|all] [--include-legacy] [--include-needs-context] [--keep-sources] [--json]
 brainctl proposals approve <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
 brainctl proposals reject <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
+brainctl proposals supersede <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
 brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
 brainctl curator status [--json]
 brainctl curator run

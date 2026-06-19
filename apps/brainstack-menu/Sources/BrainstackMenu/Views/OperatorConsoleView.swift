@@ -67,15 +67,23 @@ struct OperatorConsoleView: View {
       .padding(.horizontal, 12)
       .padding(.vertical, 10)
 
-      Picker("", selection: $statusFilter) {
-        Text("All (\(model.proposals.count))").tag("all")
-        ForEach(statusCounts, id: \.status) { entry in
-          Text("\(entry.status) (\(entry.count))").tag(entry.status)
+      HStack(spacing: 8) {
+        Picker("", selection: $statusFilter) {
+          Text("All (\(model.proposals.count))").tag("all")
+          ForEach(statusCounts, id: \.status) { entry in
+            Text("\(entry.status) (\(entry.count))").tag(entry.status)
+          }
         }
+        .pickerStyle(.menu)
+        .labelsHidden()
+
+        Button("Look for Merges…") {
+          lookForMerges()
+        }
+        .help("Find related proposals, create consolidated proposals, and mark absorbed sources superseded. Wiki edits are not applied.")
+        .disabled(model.busyAction != nil || model.isLoadingProposals || model.proposals.count < 2)
       }
-      .pickerStyle(.menu)
       .controlSize(.small)
-      .labelsHidden()
       .padding(.horizontal, 12)
       .padding(.bottom, 6)
 
@@ -145,6 +153,18 @@ struct OperatorConsoleView: View {
     .frame(width: 28)
     .help("Curator tools")
     .disabled(model.busyAction != nil)
+  }
+
+  private func lookForMerges() {
+    let message = [
+      "Brainstack will scan open proposals for safe related batches.",
+      "",
+      "When it finds a batch, it creates a new consolidated proposal and marks the absorbed source proposals superseded.",
+      "It does not accept proposals or apply wiki edits."
+    ].joined(separator: "\n")
+    if Confirm.ask(title: "Look for Proposal Merges", message: message) {
+      model.lookForProposalMerges()
+    }
   }
 
   private var sidebarFooter: some View {
@@ -242,6 +262,7 @@ private struct ProposalListRow: View {
 private struct ProposalDetailPane: View {
   @ObservedObject var model: AppModel
   let proposal: ProposalSummary
+  @State private var showRawProposal = false
 
   private var detail: ProposalDetail? {
     model.proposalDetails[proposal.id]
@@ -253,6 +274,26 @@ private struct ProposalDetailPane: View {
       Divider()
       ScrollView {
         VStack(alignment: .leading, spacing: 14) {
+          if let lesson = memoryLesson {
+            labeledBlock(lessonTitle) {
+              Text(lesson)
+                .font(.callout)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+          }
+          if sameGroupCount > 1 {
+            labeledBlock("Related Candidates") {
+              VStack(alignment: .leading, spacing: 6) {
+                Text("\(sameGroupCount) proposals share this review group.")
+                  .font(.callout.weight(.medium))
+                  .textSelection(.enabled)
+                Text("Merge them into one memory card, then review the consolidated proposal instead of accepting each raw capture.")
+                  .font(.caption)
+                  .foregroundColor(.secondary)
+              }
+            }
+          }
           metadataGrid
           if let reason = detail?.reason, !reason.isEmpty {
             labeledBlock("Reason") {
@@ -299,11 +340,27 @@ private struct ProposalDetailPane: View {
             }
           }
           if let body = detail?.body, !body.isEmpty {
-            labeledBlock("Request") {
-              Text(body)
-                .font(.system(size: 12))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if isMemoryCandidate {
+              DisclosureGroup("Raw Proposal", isExpanded: $showRawProposal) {
+                Text(body)
+                  .font(.system(size: 12))
+                  .textSelection(.enabled)
+                  .frame(maxWidth: .infinity, alignment: .leading)
+                  .padding(.top, 6)
+              }
+              .font(.caption.weight(.semibold))
+              .foregroundColor(.secondary)
+              .padding(10)
+              .frame(maxWidth: .infinity, alignment: .leading)
+              .background(Color(nsColor: .underPageBackgroundColor))
+              .clipShape(RoundedRectangle(cornerRadius: 6))
+            } else {
+              labeledBlock("Request") {
+                Text(body)
+                  .font(.system(size: 12))
+                  .textSelection(.enabled)
+                  .frame(maxWidth: .infinity, alignment: .leading)
+              }
             }
           }
           if let diff = detail?.diff, !diff.isEmpty {
@@ -412,6 +469,60 @@ private struct ProposalDetailPane: View {
     return parts.isEmpty ? nil : parts.joined(separator: " @ ")
   }
 
+  private var sameGroupCount: Int {
+    guard let key = detail?.clusterKey ?? proposal.clusterKey, !key.isEmpty else {
+      return 0
+    }
+    return model.proposals.filter { $0.clusterKey == key }.count
+  }
+
+  private var canMergeGroup: Bool {
+    sameGroupCount > 1 && (detail?.clusterKey ?? proposal.clusterKey)?.isEmpty == false
+  }
+
+  private var isMemoryCandidate: Bool {
+    let sourceType = detail?.sourceType?.lowercased()
+    return sourceType == "remember"
+      || sourceType == "memory"
+      || detail?.memoryKind != nil
+      || proposal.memoryKind != nil
+      || detail?.legacyFormat == true
+      || proposal.legacyFormat
+  }
+
+  private var lessonTitle: String {
+    memoryLesson?.contains("\n- ") == true ? "Lessons" : "Lesson"
+  }
+
+  private var memoryLesson: String? {
+    guard isMemoryCandidate, let body = detail?.body else {
+      return nil
+    }
+    if let lesson = markdownSection(named: "Lesson", in: body) {
+      return lesson
+    }
+    if let lessons = markdownSection(named: "Lessons", in: body) {
+      return lessons
+    }
+    if let request = markdownSection(named: "Request", in: body), !request.hasPrefix("#") {
+      return request
+    }
+    return nil
+  }
+
+  private func markdownSection(named name: String, in body: String) -> String? {
+    let lines = body.components(separatedBy: .newlines)
+    let marker = "## \(name)"
+    guard let start = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(marker) == .orderedSame }) else {
+      return nil
+    }
+    let content = lines[(start + 1)...]
+      .prefix { !$0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("## ") }
+      .joined(separator: "\n")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    return content.isEmpty ? nil : content
+  }
+
   @ViewBuilder
   private func metadataRow(_ label: String, _ value: String?) -> some View {
     if let value, !value.isEmpty {
@@ -445,6 +556,9 @@ private struct ProposalDetailPane: View {
         .font(.caption2)
         .foregroundColor(.secondary)
       Spacer()
+      if canMergeGroup {
+        Button("Merge Group…") { mergeGroup() }
+      }
       Button("Reject…") { decide("reject") }
       if proposal.targetPage != nil {
         Button("Accept…") { decide("apply") }
@@ -481,6 +595,23 @@ private struct ProposalDetailPane: View {
     let title = action == "apply" ? "Accept Proposal" : "\(action.capitalized) Proposal"
     if Confirm.ask(title: title, message: message) {
       model.decideProposal(proposal, action: action)
+    }
+  }
+
+  private func mergeGroup() {
+    guard let groupKey = detail?.clusterKey ?? proposal.clusterKey else {
+      return
+    }
+    let groupLabel = detail?.clusterLabel ?? proposal.clusterLabel ?? groupKey
+    let message = [
+      "Review group: \(groupLabel)",
+      "Candidates: \(sameGroupCount)",
+      "",
+      "This creates one consolidated memory proposal and marks these source candidates as superseded/absorbed.",
+      "It does not apply wiki edits; you will review the merged proposal next."
+    ].joined(separator: "\n")
+    if Confirm.ask(title: "Merge Proposal Group", message: message) {
+      model.mergeProposalGroup(proposal)
     }
   }
 }

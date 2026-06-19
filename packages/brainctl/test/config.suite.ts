@@ -482,10 +482,16 @@ printf 'brew_installed=ffmpeg\\n'
         `const receivedPath = ${JSON.stringify(receivedPath)};`,
         `const proposals = [`,
         `  { id: "20260611t000000z-cli-proposal", title: "Remember: CLI proposal needs context", status: "needs-human", legacy_format: true, quality_decision: "needs-context", cluster_key: "cli:needs-context:legacy_memory", cluster_label: "CLI / needs-context / legacy_memory", target_page: "wiki/Status/CLI.md", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:00:00Z", source_ids: ["art-1"] },`,
-        `  { id: "p1", title: "Remember (cli): CLI proposal output should be bounded", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", quality_decision: "ready", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:01:00Z", source_ids: ["art-1"] },`,
-        `  { id: "p2", title: "Remember (cli): CLI proposal merge should preserve evidence", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", quality_decision: "ready", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:02:00Z", source_ids: ["art-2"] }`,
+        `  { id: "p1", title: "Remember (cli): Front-end proposal output cards should be bounded", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", quality_decision: "ready", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:01:00Z", source_ids: ["art-1"] },`,
+        `  { id: "p2", title: "Remember (cli): UI proposal merge should preserve evidence", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", quality_decision: "ready", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:02:00Z", source_ids: ["art-2"] },`,
+        `  { id: "p3", title: "Remember (cli): Docs proposal copy should use end-user language", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", quality_decision: "ready", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:03:00Z", source_ids: ["art-3"] },`,
+        `  { id: "p4", title: "Remember (cli): UI proposal detail panes need clearer actions", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", quality_decision: "ready", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", risk: "low", confidence: 0.8, created_at: "2026-06-12T00:02:00Z", source_ids: ["art-4"] }`,
         `];`,
-        `const reviewGroups = [{ id: "cli:repo:project_lesson", label: "CLI / repo / project_lesson", count: 2, legacyCount: 0, needsContextCount: 0, proposalIds: ["p1", "p2"] }];`,
+        `const reviewGroups = [`,
+        `  { id: "cli:repo:project_lesson", label: "CLI / repo / project_lesson", count: 4, legacyCount: 0, needsContextCount: 0, proposalIds: ["p1", "p2", "p3", "p4"] },`,
+        `  { id: "wide:repo:project_lesson", label: "Wide / repo / project_lesson", count: 9, legacyCount: 0, needsContextCount: 0, proposalIds: [] },`,
+        `  { id: "needs:repo:project_lesson", label: "Needs / repo / project_lesson", count: 2, legacyCount: 0, needsContextCount: 1, proposalIds: [] }`,
+        `];`,
         `Bun.serve({`,
         `  hostname: "127.0.0.1",`,
         `  port: ${port},`,
@@ -516,6 +522,9 @@ printf 'brew_installed=ffmpeg\\n'
         `    }`,
         `    if (req.method === "POST" && url.pathname.endsWith("/reject")) {`,
         `      return Response.json({ ok: true, status: "rejected" });`,
+        `    }`,
+        `    if (req.method === "POST" && url.pathname.endsWith("/supersede")) {`,
+        `      return Response.json({ ok: true, status: "superseded" });`,
         `    }`,
         `    if (req.method === "POST" && url.pathname.endsWith("/apply")) {`,
         `      return Response.json({ ok: true, status: "applied" });`,
@@ -557,12 +566,12 @@ printf 'brew_installed=ffmpeg\\n'
       expectSuccess(list);
       expect(list.stdout).toContain("20260611t000000z-cli-proposal");
       expect(list.stdout).toContain("status=needs-human");
-      expect(list.stdout).toContain("review_groups=1");
+      expect(list.stdout).toContain("review_groups=3");
       expect((await readRequests()).at(-1)?.auth).toBeNull();
 
       const clusterList = runBrainctl(["proposals", "groups", "--config", configPath], env);
       expectSuccess(clusterList);
-      expect(clusterList.stdout).toContain("proposal review groups=1");
+      expect(clusterList.stdout).toContain("proposal review groups=3");
       expect(clusterList.stdout).toContain("cli:repo:project_lesson");
 
       const mergePlan = runBrainctl(["proposals", "merge-group", "cli:repo:project_lesson", "--config", configPath], env);
@@ -580,6 +589,8 @@ printf 'brew_installed=ffmpeg\\n'
       expect(mergeRequest?.body?.target_page).toBe("wiki/Syntheses/cli-lessons.md");
       expect(String(mergeRequest?.body?.proposed_content || "")).toContain("proposal:p1");
       expect(String(mergeRequest?.body?.proposed_content || "")).toContain("proposal:p2");
+      expect(String(mergeRequest?.body?.proposed_content || "")).toContain("proposal:p3");
+      expect(String(mergeRequest?.body?.proposed_content || "")).toContain("proposal:p4");
 
       const mergeClose = runBrainctl(["proposals", "merge-group", "cli:repo:project_lesson", "--submit", "--close-sources", "--config", configPath], {
         ...env,
@@ -591,8 +602,48 @@ printf 'brew_installed=ffmpeg\\n'
         .filter((entry) => entry.path === "/api/propose" && String(entry.body?.title || "").startsWith("Consolidate: CLI"))
         .at(-1);
       expect(closeProposeRequest?.auth).toBe("Bearer cli-admin-token");
-      const closeRejects = closeRequests.filter((entry) => entry.path.endsWith("/reject") && String(entry.body?.reason || "").includes("merged into x"));
-      expect(closeRejects.map((entry) => entry.path).sort()).toEqual(["/api/proposals/p1/reject", "/api/proposals/p2/reject"]);
+      const closeSupersedes = closeRequests.filter((entry) => entry.path.endsWith("/supersede") && String(entry.body?.reason || "").includes("absorbed into x"));
+      expect(closeSupersedes.map((entry) => entry.path).sort()).toEqual([
+        "/api/proposals/p1/supersede",
+        "/api/proposals/p2/supersede",
+        "/api/proposals/p3/supersede",
+        "/api/proposals/p4/supersede"
+      ]);
+
+      const autoPlan = runBrainctl(["proposals", "auto-merge", "--config", configPath, "--json"], env);
+      expectSuccess(autoPlan);
+      const autoPlanBody = JSON.parse(autoPlan.stdout) as Record<string, any>;
+      expect(autoPlanBody.dryRun).toBe(true);
+      expect(autoPlanBody.considered).toBe(3);
+      expect(autoPlanBody.selected).toBe(1);
+      expect(autoPlanBody.merged[0].groupKey).toBe("cli:repo:project_lesson");
+      expect(autoPlanBody.merged[0].relationKey).toBe("cli:repo:project_lesson:2026-06-11:frontend-ui");
+      expect(autoPlanBody.skipped.map((item: any) => item.reason)).toEqual(
+        expect.arrayContaining([
+          "only 0 readable proposals matched this group",
+          "contains proposals that need context"
+        ])
+      );
+
+      const autoSubmit = runBrainctl(["proposals", "auto-merge", "--submit", "--config", configPath, "--json"], {
+        ...env,
+        BRAIN_ADMIN_TOKEN: "cli-admin-token"
+      });
+      expectSuccess(autoSubmit);
+      const autoSubmitBody = JSON.parse(autoSubmit.stdout) as Record<string, any>;
+      expect(autoSubmitBody.dryRun).toBe(false);
+      expect(autoSubmitBody.selected).toBe(1);
+      expect(autoSubmitBody.merged[0].closed).toEqual(["p1", "p2"]);
+      expect(autoSubmitBody.merged[0].relationKey).toBe("cli:repo:project_lesson:2026-06-11:frontend-ui");
+      const autoRequests = await readRequests();
+      const autoProposeRequest = autoRequests
+        .filter((entry) => entry.path === "/api/propose" && String(entry.body?.title || "").startsWith("Consolidate: CLI"))
+        .at(-1);
+      expect(autoProposeRequest?.auth).toBe("Bearer cli-admin-token");
+      const autoSupersedes = autoRequests
+        .filter((entry) => entry.path.endsWith("/supersede") && String(entry.body?.reason || "").includes("absorbed into x"))
+        .slice(-2);
+      expect(autoSupersedes.map((entry) => entry.path).sort()).toEqual(["/api/proposals/p1/supersede", "/api/proposals/p2/supersede"]);
 
       const show = runBrainctl(["proposals", "show", "20260611t000000z-cli-proposal", "--config", configPath], env);
       expectSuccess(show);
@@ -625,7 +676,7 @@ printf 'brew_installed=ffmpeg\\n'
       expect(aggregate.sections.curator.state).toBe("ok");
       expect(aggregate.sections.curator.data.open_proposals).toBe(1);
       expect(aggregate.sections.proposals.state).toBe("ok");
-      expect(aggregate.sections.proposals.data.count).toBe(3);
+      expect(aggregate.sections.proposals.data.count).toBe(5);
 
       // propose with machine fields posts them to /api/propose.
       const contentFile = join(dir, "proposed.md");
@@ -798,8 +849,8 @@ printf 'brew_installed=ffmpeg\\n'
         `      return proposal ? Response.json({ ok: true, proposal, body: "## Request\\n\\n" + proposal.title, diff: "" }) : Response.json({ error: "missing" }, { status: 404 });`,
         `    }`,
         `    if (req.method === "POST" && url.pathname === "/api/propose") return Response.json({ error: "must not create duplicate merge" }, { status: 500 });`,
-        `    if (req.method === "POST" && url.pathname === "/api/proposals/p1/reject") return Response.json({ error: "already rejected" }, { status: 409 });`,
-        `    if (req.method === "POST" && url.pathname === "/api/proposals/p2/reject") return Response.json({ ok: true, status: "rejected" });`,
+        `    if (req.method === "POST" && url.pathname === "/api/proposals/p1/supersede") return Response.json({ error: "already rejected" }, { status: 409 });`,
+        `    if (req.method === "POST" && url.pathname === "/api/proposals/p2/supersede") return Response.json({ ok: true, status: "superseded" });`,
         `    return Response.json({ error: "unexpected" }, { status: 500 });`,
         `  }`,
         `});`
@@ -824,10 +875,10 @@ printf 'brew_installed=ffmpeg\\n'
       expectSuccess(result);
       const requests = await readRequests();
       expect(requests.some((entry) => entry.path === "/api/propose")).toBe(false);
-      expect(requests.some((entry) => entry.path === "/api/proposals/p1/reject")).toBe(false);
-      const p2Reject = requests.find((entry) => entry.path === "/api/proposals/p2/reject");
-      expect(p2Reject?.auth).toBe("Bearer cli-admin-token");
-      expect(p2Reject?.body?.reason).toBe("merged into old-merge");
+      expect(requests.some((entry) => entry.path === "/api/proposals/p1/supersede")).toBe(false);
+      const p2Supersede = requests.find((entry) => entry.path === "/api/proposals/p2/supersede");
+      expect(p2Supersede?.auth).toBe("Bearer cli-admin-token");
+      expect(p2Supersede?.body?.reason).toBe("absorbed into old-merge");
     } finally {
       server.kill();
       await server.exited;

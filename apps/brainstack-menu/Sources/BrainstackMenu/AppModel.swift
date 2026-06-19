@@ -465,6 +465,54 @@ final class AppModel: ObservableObject {
     }
   }
 
+  func mergeProposalGroup(_ proposal: ProposalSummary) {
+    guard busyAction == nil, let client = client(), let groupKey = proposal.clusterKey, !groupKey.isEmpty else {
+      return
+    }
+    busyAction = "Merge \(groupKey)"
+    Task {
+      let outcome = await client.proposalMergeGroup(groupKey: groupKey)
+      await MainActor.run {
+        self.record(outcome)
+        self.busyAction = nil
+        if outcome.adminUnavailable {
+          self.adminAvailability = .unavailable
+        } else if outcome.succeeded {
+          self.adminAvailability = .available
+        } else {
+          self.adminAvailability = .unavailable
+        }
+        self.proposalDetails.removeAll()
+        self.refresh()
+        self.loadProposals()
+      }
+    }
+  }
+
+  func lookForProposalMerges() {
+    guard busyAction == nil, let client = client() else {
+      return
+    }
+    busyAction = "Looking for merges"
+    Task {
+      let outcome = await client.proposalAutoMerge()
+      await MainActor.run {
+        self.record(outcome)
+        self.busyAction = nil
+        if outcome.adminUnavailable {
+          self.adminAvailability = .unavailable
+        } else if outcome.succeeded {
+          self.adminAvailability = .available
+        } else {
+          self.adminAvailability = .unavailable
+        }
+        self.proposalDetails.removeAll()
+        self.refresh()
+        self.loadProposals()
+      }
+    }
+  }
+
   /// Fetch the full proposal body/diff for the console detail pane (cached per id).
   func loadProposalDetail(_ id: String, force: Bool = false) {
     guard operatorModeEnabled, let client = client() else {

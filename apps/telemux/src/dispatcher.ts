@@ -136,7 +136,7 @@ function codexErrorMessage(errorText: string): string | null {
   return unique[0] || null;
 }
 
-function formatRunFailureForTelegram(errorText: string | null, logPath: string, manualCompaction: boolean): string {
+export function formatRunFailureForTelegram(errorText: string | null, logPath: string, manualCompaction: boolean): string {
   const message = errorText?.trim() || "unknown error";
   const parsedCodexMessage = codexErrorMessage(message);
   if (manualCompaction || /(?:codex_core::compact_remote|remote compaction failed|compact_error=|compaction failed)/i.test(message)) {

@@ -123,6 +123,12 @@ struct DashboardView: View {
         Button("Run Doctor") { performRepair(.doctor) }
         Button("Check Stack Updates") { performRepair(.checkUpdates) }
         Button("Send Saved Writes…") { performRepair(.flushOutbox) }
+        if model.operatorModeEnabled, outboxSummary?.needsRetry == true {
+          Button("Retry Saved Writes…") { performRepair(.retryOutbox) }
+        }
+        if model.operatorModeEnabled, let discardRepair = outboxDiscardRepair {
+          Button("Discard Saved Writes…") { performRepair(discardRepair) }
+        }
         Button("Refresh Skills…") { performRepair(.refreshSkills) }
         Button("Install/Restart Daemon…") { performRepair(.restartDaemon) }
         Button("Install/Repair Hooks…") { performRepair(.repairHooks) }
@@ -154,6 +160,10 @@ struct DashboardView: View {
       model.runAction("Flush Outbox", verifying: ["outbox"]) { await $0.outboxFlush() }
     case .retryOutbox:
       model.runAction("Retry Saved Writes", verifying: ["outbox"]) { await $0.outboxRetryAllAndFlush() }
+    case .discardOutbox:
+      model.runAction("Discard Saved Writes", verifying: ["outbox"]) { await $0.outboxDiscardAll() }
+    case .discardCorruptOutbox:
+      model.runAction("Discard Damaged Saved Writes", verifying: ["outbox"]) { await $0.outboxDiscardCorrupt() }
     case .refreshSkills:
       model.runAction("Refresh Skills", verifying: ["skills"]) { await $0.skillsRefresh() }
     case .restartDaemon:
@@ -177,6 +187,20 @@ struct DashboardView: View {
     }
     parts.append(model.summaryLine)
     return parts.joined(separator: " · ")
+  }
+
+  private var outboxSummary: OutboxStatusSummary? {
+    guard let section = model.lastReport?.sections["outbox"] else {
+      return nil
+    }
+    return OutboxStatusSummary(section: section)
+  }
+
+  private var outboxDiscardRepair: RepairKind? {
+    guard let outboxSummary else {
+      return nil
+    }
+    return discardKind(forOutbox: outboxSummary)
   }
 
   private var setupGuidance: some View {
@@ -306,11 +330,22 @@ struct DashboardView: View {
             .buttonStyle(.plain)
             .help("Open the Operator Console")
           } else {
-            AttentionRowView(item: item, repairTitle: item.repair?.buttonTitle, isBusy: model.busyAction != nil) {
-              if let repair = item.repair {
-                performRepair(repair)
+            AttentionRowView(
+              item: item,
+              repairTitle: item.repair?.buttonTitle,
+              secondaryRepairTitle: item.secondaryRepair?.buttonTitle,
+              isBusy: model.busyAction != nil,
+              onRepair: {
+                if let repair = item.repair {
+                  performRepair(repair)
+                }
+              },
+              onSecondaryRepair: {
+                if let repair = item.secondaryRepair {
+                  performRepair(repair)
+                }
               }
-            }
+            )
           }
         }
         if items.count > 4 {
@@ -411,7 +446,8 @@ struct DashboardView: View {
         title: outbox.attentionTitle,
         detail: outbox.userMessage,
         severity: severity,
-        repair: repairKind(forSection: name, section: section)
+        repair: repairKind(forSection: name, section: section),
+        secondaryRepair: model.operatorModeEnabled ? discardKind(forOutbox: outbox) : nil
       )
     }
     return AttentionItem(
@@ -678,9 +714,11 @@ struct FleetMachineRowView: View {
 
 struct AttentionRowView: View {
   let item: AttentionItem
-  var repairTitle: String?
+  var repairTitle: String? = nil
+  var secondaryRepairTitle: String? = nil
   var isBusy = false
   var onRepair: () -> Void = {}
+  var onSecondaryRepair: () -> Void = {}
 
   var body: some View {
     HStack(alignment: .top, spacing: 8) {
@@ -697,12 +735,21 @@ struct AttentionRowView: View {
           .fixedSize(horizontal: false, vertical: true)
       }
       Spacer(minLength: 0)
-      if let repairTitle {
-        // The fix lives on the problem, not in a button farm below it.
-        Button(repairTitle) { onRepair() }
-          .controlSize(.small)
-          .disabled(isBusy)
-          .padding(.top, 1)
+      if repairTitle != nil || secondaryRepairTitle != nil {
+        VStack(alignment: .trailing, spacing: 4) {
+          if let repairTitle {
+            // The fix lives on the problem, not in a button farm below it.
+            Button(repairTitle) { onRepair() }
+              .controlSize(.small)
+              .disabled(isBusy)
+          }
+          if let secondaryRepairTitle {
+            Button(secondaryRepairTitle) { onSecondaryRepair() }
+              .controlSize(.small)
+              .disabled(isBusy)
+          }
+        }
+        .padding(.top, 1)
       }
     }
     .padding(8)

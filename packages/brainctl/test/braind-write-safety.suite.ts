@@ -1277,6 +1277,32 @@ describe("braind write safety", () => {
       };
       expect(rejectedList.proposals.some((proposal) => proposal.id === rejectableId)).toBe(true);
 
+      // Supersede marks source candidates as absorbed by a better proposal; this is
+      // distinct from rejection because the source remains provenance for a merge.
+      const absorbable = await propose(
+        {
+          title: "Absorbable Memory Candidate",
+          body: "This candidate should be absorbed by a consolidated memory card.",
+          source_harness: "test-harness",
+          source_machine: "test-machine",
+          source_type: "remember",
+          project: "brainstack",
+          domain: "operator",
+          scope: "repo",
+          memory_kind: "project_lesson"
+        },
+        "proposal-lifecycle-supersede"
+      );
+      const absorbableId = String(((await absorbable.json()) as Record<string, unknown>).proposal_id);
+      const superseded = await decide(absorbableId, "supersede", { decided_by: "tester", reason: "absorbed into consolidated-card" });
+      const supersededBody = (await superseded.json()) as Record<string, unknown>;
+      expect(supersededBody.status).toBe("superseded");
+      expect(existsSync(join(staging, "proposals", "superseded", `${absorbableId}.md`))).toBe(true);
+      const supersededList = (await (await fetch(`http://127.0.0.1:${port}/api/proposals?status=superseded`)).json()) as {
+        proposals: Array<Record<string, unknown>>;
+      };
+      expect(supersededList.proposals.some((proposal) => proposal.id === absorbableId && proposal.reason === "absorbed into consolidated-card")).toBe(true);
+
       // needs-human can be set at proposal time.
       const parked = await propose(
         {
@@ -1320,7 +1346,7 @@ describe("braind write safety", () => {
       const counts = (statusAfter.proposal_counts || {}) as Record<string, number>;
       expect(counts.applied).toBe(2);
       expect(counts.rejected).toBe(2);
-      expect(counts.superseded).toBe(1);
+      expect(counts.superseded).toBe(2);
 
       // Wiki home shows the curation panel.
       const home = await (await fetch(`http://127.0.0.1:${port}/`)).text();

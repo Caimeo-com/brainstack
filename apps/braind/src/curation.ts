@@ -728,6 +728,31 @@ export async function rejectProposal(repoRoot: string, id: string, decidedBy: st
   return { record: found.record, touchedFiles: touched };
 }
 
+export async function supersedeProposal(repoRoot: string, id: string, decidedBy: string, reason: string | null): Promise<ProposalDecisionResult> {
+  const found = await findProposal(repoRoot, id);
+  if (!found) {
+    throw new Error(`proposal not found: ${id}`);
+  }
+  if (!OPEN_PROPOSAL_STATUSES.includes(found.record.status)) {
+    throw new Error(`proposal ${id} is ${found.record.status}; only open proposals can be superseded`);
+  }
+  found.record.status = "superseded";
+  found.record.decidedAt = isoNow();
+  found.record.decidedBy = decidedBy;
+  found.record.reason = reason || "absorbed into a consolidated proposal";
+  const touched = await saveRecord(repoRoot, found.record, found.absolutePath);
+  touched.push(
+    await appendLogEntry(repoRoot, "proposal-supersede", found.record.path, found.record.title, [
+      `operation: proposal-supersede`,
+      `inputs: decided_by=${decidedBy}; reason=${found.record.reason}`,
+      `files: [[${found.record.path}]]`,
+      `commit: pending`,
+      `summary: Superseded proposal ${id}.`
+    ])
+  );
+  return { record: found.record, touchedFiles: touched };
+}
+
 export interface ApplyProposalResult {
   applied: boolean;
   record: ProposalRecord;

@@ -117,7 +117,25 @@ public enum OutboxActionPresentation {
     let kept = integer(named: "kept", in: rawOutput) ?? 0
     let terminal = integer(named: "terminal_failures", in: rawOutput) ?? integer(named: "terminal", in: rawOutput) ?? 0
     let corrupt = integer(named: "corrupt", in: rawOutput) ?? 0
+    let purged = integer(named: "purged", in: rawOutput) ?? 0
+    let purgedCorrupt = integer(named: "purged_corrupt", in: rawOutput) ?? 0
     let reason = terminalReason(in: rawOutput)
+
+    if title.lowercased().contains("discard") && succeeded {
+      if purgedCorrupt > 0 {
+        return OutboxActionGuide(
+          summary: "Damaged saved writes discarded.",
+          output: "Brainstack deleted \(plural(purgedCorrupt, "damaged saved write file", "damaged saved write files"))."
+        )
+      }
+      if purged > 0 {
+        return OutboxActionGuide(
+          summary: "Saved writes discarded.",
+          output: "Brainstack deleted \(plural(purged, "local saved-write queue", "local saved-write queues"))."
+        )
+      }
+      return OutboxActionGuide(summary: "No saved writes were waiting.", output: "The outbox is already clear.")
+    }
 
     if corrupt > 0 {
       return OutboxActionGuide(

@@ -171,6 +171,20 @@ final class StatusReportTests: XCTestCase {
     XCTAssertTrue(guide?.output.contains("refresh its import token") ?? false)
     XCTAssertFalse(guide?.output.contains("terminal_failures") ?? true)
   }
+
+  func testOutboxActionPresentationHumanizesDiscard() {
+    let guide = OutboxActionPresentation.guide(title: "Discard Saved Writes", succeeded: true, rawOutput: "purged=2")
+    XCTAssertEqual(guide?.summary, "Saved writes discarded.")
+    XCTAssertTrue(guide?.output.contains("local saved-write queues") ?? false)
+    XCTAssertFalse(guide?.output.contains("purged=2") ?? true)
+  }
+
+  func testOutboxActionPresentationHumanizesDamagedDiscard() {
+    let guide = OutboxActionPresentation.guide(title: "Discard Damaged Saved Writes", succeeded: true, rawOutput: "purged_corrupt=3")
+    XCTAssertEqual(guide?.summary, "Damaged saved writes discarded.")
+    XCTAssertTrue(guide?.output.contains("damaged saved write files") ?? false)
+    XCTAssertFalse(guide?.output.contains("purged_corrupt") ?? true)
+  }
 }
 
 final class ProposalTests: XCTestCase {

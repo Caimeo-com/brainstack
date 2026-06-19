@@ -47,6 +47,7 @@ import {
   readProposedContent,
   rejectProposal,
   renderUnifiedDiff,
+  supersedeProposal,
   validateProposalTargetPage,
   writeCuratorStatus
 } from "./curation";
@@ -2079,7 +2080,7 @@ async function proposeFromRequest(request: Request, authScope: AuthScope): Promi
   });
 }
 
-const PROPOSAL_DECISION_ACTIONS = new Set(["approve", "reject", "apply"]);
+const PROPOSAL_DECISION_ACTIONS = new Set(["approve", "reject", "apply", "supersede"]);
 
 async function proposalDecisionFromRequest(request: Request, id: string, action: string): Promise<Record<string, unknown>> {
   if (!PROPOSAL_DECISION_ACTIONS.has(action)) {
@@ -2102,6 +2103,8 @@ async function proposalDecisionFromRequest(request: Request, id: string, action:
           result = await approveProposal(writeRepoRoot, id, decidedBy);
         } else if (action === "reject") {
           result = await rejectProposal(writeRepoRoot, id, decidedBy, reason);
+        } else if (action === "supersede") {
+          result = await supersedeProposal(writeRepoRoot, id, decidedBy, reason);
         } else {
           const applyResult = await applyProposal(writeRepoRoot, id, decidedBy);
           result = applyResult;
@@ -2652,7 +2655,7 @@ const server = Bun.serve({
         if (proposalShow) {
           return await showProposalResponse(decodeURIComponent(proposalShow[1]));
         }
-        const proposalAction = request.method === "POST" ? url.pathname.match(/^\/api\/proposals\/([^/]+)\/(approve|reject|apply)$/) : null;
+        const proposalAction = request.method === "POST" ? url.pathname.match(/^\/api\/proposals\/([^/]+)\/(approve|reject|apply|supersede)$/) : null;
         if (proposalAction) {
           assertAdminAuth(request);
           assertWriteRateLimit(request, "admin", "proposal-decision", null);

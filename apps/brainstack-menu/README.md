@@ -30,13 +30,13 @@ Tailscale is shown as a first-class local prerequisite when the profile depends 
 
 ## Safe actions
 
-Refresh, Open Wiki, Open Shared Brain/Config folders, Copy Redacted Diagnostics, Run Doctor, and confirmation-gated Flush Outbox, Refresh Skills, Install/Restart Daemon, Install/Repair Hooks. Fleet machine rows show an Update button only when that machine is behind; the button runs `brainctl fleet update <machine>` and confirms before pulling, rebuilding, upgrading, and restarting services. Every command runs off the main thread with a hard timeout.
+Refresh, Open Wiki, Open Shared Brain/Config folders, Copy Redacted Diagnostics, Run Doctor, and confirmation-gated Send Saved Writes, Retry Saved Writes, Refresh Skills, Install/Restart Daemon, and Install/Repair Hooks. When Operator Mode is enabled and saved writes are paused or damaged, the outbox attention row also shows a destructive Discard action; it deletes only the local saved-write queue after confirmation and should be used only when those imports, memories, or proposals are obsolete. Fleet machine rows show an Update button only when that machine is behind; the button runs `brainctl fleet update <machine>` and confirms before pulling, rebuilding, upgrading, and restarting services. Every command runs off the main thread with a hard timeout.
 
 ## Operator Mode
 
 Opt-in via Preferences. Adds curator status/run and proposal list review with Accept/reject decisions. Accept calls the concrete `brainctl proposals apply` path, so every wiki-mutating action shows a confirmation dialog with the proposal id, title, and target. The app never auto-accepts or auto-applies anything, and it never stores or prints tokens. Admin actions work when `brainctl` can reach `BRAIN_ADMIN_TOKEN` locally, or when an enrolled client config has an explicit control-host SSH route so `brainctl` can forward the proposal decision to the control host. When neither path works, the app shows the decision path as blocked with command output for diagnosis.
 
-Proposal review renders the shared `brainctl proposals show --json` contract, including project/scope, memory kind, applicability, evidence refs, legacy-format markers, review group hints, and the deterministic quality gate. Vague or old title/body-only memory candidates should show as `needs-human`/`needs-context` instead of looking like ordinary canon candidates.
+Proposal review renders the shared `brainctl proposals show --json` contract, including project/scope, memory kind, applicability, evidence refs, legacy-format markers, review group hints, and the deterministic quality gate. Vague or old title/body-only memory candidates should show as `needs-human`/`needs-context` instead of looking like ordinary canon candidates. When multiple candidates share a review group, the console offers **Merge Group** to create one consolidated memory proposal and mark the raw source candidates as superseded/absorbed evidence before review.
 
 ## Build, sign, and distribute
 

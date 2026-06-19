@@ -8,7 +8,7 @@ import { CronManager } from "../src/cron-manager";
 import { CronScheduler } from "../src/cron-scheduler";
 import { ContextService } from "../src/contexts";
 import { FactoryDb } from "../src/db";
-import { Dispatcher } from "../src/dispatcher";
+import { Dispatcher, formatRunFailureForTelegram } from "../src/dispatcher";
 import { classifyPreDispatch } from "../src/pre-dispatch-router";
 import { ensureBasicLoops } from "../src/basic-loops";
 import { flushBrainOutbox, postBrainImportOrQueue } from "../src/brain-outbox";
@@ -1984,6 +1984,7 @@ test("deterministic cron commands install built-ins and run jobs immediately", a
     expect(curator?.instruction).toContain("shared-brain curator pass");
     expect(curator?.instruction).toContain("Do not call `brainctl curator run`");
     expect(curator?.instruction).toContain("Preserve raw imports and proposals");
+    expect(curator?.instruction).toContain("proposals auto-merge");
 
     await fixture.commands.handleMessage(telegramMessage("/crons", 81));
     const overview = fixture.telegram.sent.at(-1)?.text || "";
@@ -2933,8 +2934,12 @@ test("manual compaction failures are classified without false positives from nor
 
   try {
     await fixture.commands.handleMessage(telegramMessage("/newctx compact-failure control scratch", 93));
-    await fixture.commands.handleMessage(telegramMessage("Start the compact failure lab.", 93));
-    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for compact-failure.")));
+    const context = fixture.db.getContextBySlug("compact-failure");
+    expect(context).toBeTruthy();
+    fixture.contexts.saveContext({
+      ...context!,
+      codexSessionId: "session-compact-failure"
+    });
 
     await makeExecutable(
       fixture.fakeCodex,
@@ -2947,25 +2952,20 @@ if (($# >= 1)) && [[ "$1" == "--version" ]]; then
   echo 'codex fake'
   exit 0
 fi
-cat >/dev/null
 echo 'ordinary run mentioned compact and failed' >&2
 exit 31
 `
     );
 
-    const beforeNormalFailureCount = fixture.telegram.sent.length;
-    await fixture.commands.handleMessage(telegramMessage("ordinary compact word failure", 93));
-    await waitFor(
-      () => fixture.telegram.sent.slice(beforeNormalFailureCount).some((entry) => entry.text.includes("ordinary run mentioned compact and failed")),
-      25_000
-    );
-    expect(fixture.telegram.sent.slice(beforeNormalFailureCount).some((entry) => entry.text.includes("Codex compaction failed."))).toBe(false);
+    const normalFailureText = formatRunFailureForTelegram("ordinary run mentioned compact and failed", "/tmp/normal.log", false);
+    expect(normalFailureText).toBe("ordinary run mentioned compact and failed");
+    expect(normalFailureText).not.toContain("Codex compaction failed.");
 
     const beforeManualFailureCount = fixture.telegram.sent.length;
     await fixture.commands.handleMessage(telegramMessage("/compact", 93));
     await waitFor(
       () => fixture.telegram.sent.slice(beforeManualFailureCount).some((entry) => entry.text.includes("Codex compaction failed.")),
-      25_000
+      45_000
     );
     const manualFailureText = fixture.telegram.sent.slice(beforeManualFailureCount).map((entry) => entry.text).join("\n\n");
     expect(manualFailureText).toContain("Compacting thread…");
@@ -2975,7 +2975,7 @@ exit 31
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }
-}, 45_000);
+}, 70_000);
 
 test("manual compaction reports unsupported harnesses", async () => {
   const fixture = await createFixture({

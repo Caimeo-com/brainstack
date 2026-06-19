@@ -146,6 +146,30 @@ final class CommandRunnerTests: XCTestCase {
     XCTAssertEqual(outcome.title, "Accept Proposal")
   }
 
+  func testProposalMergeGroupUsesSubmitAndCloseSources() async throws {
+    let argsPath = scratch.appendingPathComponent("proposal-merge-args.txt")
+    let binary = try fakeBrainctl("printf '%s\\n' \"$@\" > '\(argsPath.path)'; echo 'merged'")
+    let outcome = await client(binary).proposalMergeGroup(groupKey: "app:repo:project_lesson")
+    XCTAssertTrue(outcome.succeeded)
+    XCTAssertEqual(
+      try String(contentsOf: argsPath),
+      "proposals\nmerge-group\napp:repo:project_lesson\n--submit\n--close-sources\n--config\n/tmp/test.yaml\n"
+    )
+    XCTAssertEqual(outcome.title, "Merge Proposal Group")
+  }
+
+  func testProposalAutoMergeUsesBoundedSubmit() async throws {
+    let argsPath = scratch.appendingPathComponent("proposal-auto-merge-args.txt")
+    let binary = try fakeBrainctl("printf '%s\\n' \"$@\" > '\(argsPath.path)'; echo 'merged=1'")
+    let outcome = await client(binary).proposalAutoMerge()
+    XCTAssertTrue(outcome.succeeded)
+    XCTAssertEqual(
+      try String(contentsOf: argsPath),
+      "proposals\nauto-merge\n--submit\n--max-group-size\n6\n--limit-groups\n5\n--config\n/tmp/test.yaml\n"
+    )
+    XCTAssertEqual(outcome.title, "Look for Merges")
+  }
+
   func testCuratorInstallUsesNamedArguments() async throws {
     let argsPath = scratch.appendingPathComponent("args.txt")
     let binary = try fakeBrainctl("printf '%s\\n' \"$@\" > '\(argsPath.path)'; echo 'installed'")
