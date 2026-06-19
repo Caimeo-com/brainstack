@@ -194,31 +194,33 @@ public struct BrainctlClient: Sendable {
   static func outcome(title: String, result: CommandResult, timeout: TimeInterval) -> ActionOutcome {
     let unsupported = Self.looksUnsupported(result)
     let adminUnavailable = Self.looksAdminUnavailable(result)
-    let summary: String
+    let baseSummary: String
     if result.launchFailure != nil {
-      summary = "brainctl is missing; choose the binary in Preferences."
+      baseSummary = "brainctl is missing; choose the binary in Preferences."
     } else if result.timedOut {
-      summary = "\(title) timed out after \(Int(timeout))s."
+      baseSummary = "\(title) timed out after \(Int(timeout))s."
     } else if unsupported {
-      summary = "Unsupported by installed brainctl; update Brainstack on this machine."
+      baseSummary = "Unsupported by installed brainctl; update Brainstack on this machine."
     } else if adminUnavailable {
-      summary = "Admin auth is unavailable to brainctl on this machine."
+      baseSummary = "Admin auth is unavailable to brainctl on this machine."
     } else if result.exitCode == 0 {
-      summary = "\(title) succeeded."
+      baseSummary = "\(title) succeeded."
     } else {
-      summary = "\(title) failed (exit \(result.exitCode.map(String.init) ?? "n/a"))."
+      baseSummary = "\(title) failed (exit \(result.exitCode.map(String.init) ?? "n/a"))."
     }
-    let output = [result.stdout, result.stderr]
+    let rawOutput = [result.stdout, result.stderr]
       .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
       .filter { !$0.isEmpty }
       .joined(separator: "\n")
+    let redactedOutput = Redaction.redact(String(rawOutput.prefix(8_000)))
+    let outboxGuide = OutboxActionPresentation.guide(title: title, succeeded: result.succeeded, rawOutput: redactedOutput)
     return ActionOutcome(
       title: title,
       succeeded: result.succeeded,
       unsupported: unsupported,
       adminUnavailable: adminUnavailable,
-      summary: summary,
-      output: Redaction.redact(String(output.prefix(8_000))),
+      summary: outboxGuide?.summary ?? baseSummary,
+      output: outboxGuide?.output ?? redactedOutput,
       duration: result.duration
     )
   }
@@ -231,6 +233,29 @@ public struct BrainctlClient: Sendable {
 
   public func outboxFlush() async -> ActionOutcome {
     await runAction(title: "Flush Outbox", arguments: ["outbox", "flush", "--config", configPath])
+  }
+
+  public func outboxRetryAllAndFlush() async -> ActionOutcome {
+    let retry = await runAction(title: "Retry Saved Writes", arguments: ["outbox", "retry", "--all", "--config", configPath])
+    guard retry.succeeded else {
+      return retry
+    }
+    let flush = await outboxFlush()
+    let output = [
+      "Retry step: requeued paused saved writes.",
+      flush.output
+    ]
+      .filter { !$0.isEmpty }
+      .joined(separator: "\n\n")
+    return ActionOutcome(
+      title: "Retry Saved Writes",
+      succeeded: flush.succeeded,
+      unsupported: retry.unsupported || flush.unsupported,
+      adminUnavailable: retry.adminUnavailable || flush.adminUnavailable,
+      summary: flush.summary,
+      output: output,
+      duration: retry.duration + flush.duration
+    )
   }
 
   public func skillsRefresh() async -> ActionOutcome {

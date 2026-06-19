@@ -13,6 +13,7 @@ enum AttentionSeverity: Sendable {
 enum RepairKind: Equatable, Sendable {
   case doctor
   case flushOutbox
+  case retryOutbox
   case refreshSkills
   case restartDaemon
   case repairHooks
@@ -23,7 +24,8 @@ enum RepairKind: Equatable, Sendable {
   var buttonTitle: String {
     switch self {
     case .doctor: return "Run Doctor"
-    case .flushOutbox: return "Flush"
+    case .flushOutbox: return "Send"
+    case .retryOutbox: return "Retry"
     case .refreshSkills: return "Refresh"
     case .restartDaemon: return "Restart"
     case .repairHooks: return "Repair"
@@ -39,7 +41,9 @@ enum RepairKind: Equatable, Sendable {
     case .doctor, .checkUpdates, .openTailscale:
       return nil
     case .flushOutbox:
-      return ("Flush Outbox", "Flush queued outbox writes to the brain now?")
+      return ("Send Saved Writes", "Send saved outbox writes to the shared brain now?")
+    case .retryOutbox:
+      return ("Retry Saved Writes", "Retry paused saved writes? If the original cause is still present, Brainstack will pause them again instead of losing data.")
     case .refreshSkills:
       return ("Refresh Skills", "Refresh shared skills from the shared brain?")
     case .restartDaemon:
@@ -63,6 +67,17 @@ func repairKind(forSection name: String) -> RepairKind? {
   case "shared_brain", "config": return .doctor
   default: return nil
   }
+}
+
+func repairKind(forSection name: String, section: StatusSection) -> RepairKind? {
+  if name == "outbox" {
+    let outbox = OutboxStatusSummary(section: section)
+    if outbox.corrupt > 0 {
+      return nil
+    }
+    return outbox.needsRetry ? .retryOutbox : .flushOutbox
+  }
+  return repairKind(forSection: name)
 }
 
 struct AttentionItem: Identifiable, Equatable, Sendable {
@@ -239,6 +254,9 @@ func sectionLabel(_ name: String) -> String {
 }
 
 func sectionMessage(name: String, section: StatusSection) -> String {
+  if name == "outbox" {
+    return OutboxStatusSummary(section: section).compactMessage
+  }
   if name == "tailscale" {
     if section.data?["installed"]?.boolValue == false {
       return "Install Tailscale, then refresh Brainstack."

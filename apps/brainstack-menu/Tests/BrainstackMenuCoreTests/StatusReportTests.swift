@@ -138,6 +138,39 @@ final class StatusReportTests: XCTestCase {
     XCTAssertThrowsError(try StatusReport.parse(data: Data("not json".utf8)))
     XCTAssertThrowsError(try StatusReport.parse(data: Data("[1,2,3]".utf8)))
   }
+
+  func testOutboxStatusPresentationHumanizesTerminalAuthFailure() throws {
+    let json = """
+    {"state": "warn", "ok": false, "available": true, "detail": "queued=3 terminal=3 corrupt=0", "data": {
+      "queued": 3,
+      "terminal": 3,
+      "corrupt": 0,
+      "terminal_errors": [{"message": "HTTP 401 unauthorized", "count": 3}]
+    }}
+    """
+    let value = try JSONDecoder().decode(JSONValue.self, from: Data(json.utf8))
+    let section = StatusSection(json: value)
+    let summary = OutboxStatusSummary(section: section)
+    XCTAssertEqual(summary.attentionTitle, "Saved writes need review")
+    XCTAssertEqual(summary.compactMessage, "3 paused: authorization failed")
+    XCTAssertTrue(summary.needsRetry)
+    XCTAssertTrue(summary.userMessage.contains("import credential"))
+    XCTAssertTrue(summary.userMessage.contains("refresh its import token"))
+    XCTAssertFalse(summary.userMessage.contains("terminal=3"))
+  }
+
+  func testOutboxActionPresentationHumanizesFailedFlush() {
+    let raw = """
+    flushed=0 kept=0 terminal_failures=3 corrupt=0
+    terminal_reasons=HTTP 401 unauthorized x3
+    saved outbox writes are paused after non-retryable failures
+    """
+    let guide = OutboxActionPresentation.guide(title: "Flush Outbox", succeeded: false, rawOutput: raw)
+    XCTAssertEqual(guide?.summary, "Saved writes still need attention.")
+    XCTAssertTrue(guide?.output.contains("import credential") ?? false)
+    XCTAssertTrue(guide?.output.contains("refresh its import token") ?? false)
+    XCTAssertFalse(guide?.output.contains("terminal_failures") ?? true)
+  }
 }
 
 final class ProposalTests: XCTestCase {

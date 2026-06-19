@@ -1189,9 +1189,10 @@ describe("public release hygiene - project context and outbox", () => {
         );
         expectSuccess(retryable);
         expect(`${retryable.stdout}\n${retryable.stderr}`).toContain("shared-brain write queued");
-        const status = runBrainctl(["outbox", "status", "--config", configPath]);
-        expectSuccess(status);
-        expect(status.stdout).toContain("queued=1");
+      const status = runBrainctl(["outbox", "status", "--config", configPath]);
+      expectSuccess(status);
+      expect(status.stdout).toContain("queued=1");
+      expect(status.stdout).toContain("terminal=0");
       } finally {
         retryableServer.kill();
         await retryableServer.exited;
@@ -1264,9 +1265,10 @@ describe("public release hygiene - project context and outbox", () => {
         );
         expect(rejected.code).not.toBe(0);
         expect(rejected.stderr).toContain("brain rejected import with HTTP 401");
-        const authStatus = runBrainctl(["outbox", "status", "--config", authConfigPath]);
-        expectSuccess(authStatus);
-        expect(authStatus.stdout).toContain("queued=0");
+      const authStatus = runBrainctl(["outbox", "status", "--config", authConfigPath]);
+      expectSuccess(authStatus);
+      expect(authStatus.stdout).toContain("queued=0");
+      expect(authStatus.stdout).toContain("terminal=0");
       } finally {
         authServer.kill();
         await authServer.exited;
@@ -1366,14 +1368,30 @@ describe("public release hygiene - project context and outbox", () => {
         });
         expect(terminalFlush.code).not.toBe(0);
         expect(terminalFlush.stdout).toContain("terminal_failures=1");
-        expect(terminalFlush.stderr).toContain("terminal write failures");
+        expect(terminalFlush.stdout).toContain("terminal_reasons=HTTP 401 unauthorized x1");
+        expect(terminalFlush.stderr).toContain("saved outbox writes are paused");
+        const terminalStatusAfter = runBrainctl(["outbox", "status", "--config", terminalConfigPath], {
+          BRAIN_BASE_URL: `http://127.0.0.1:${authPort}`,
+          BRAIN_IMPORT_TOKEN: "outbox-token"
+        });
+        expectSuccess(terminalStatusAfter);
+        expect(terminalStatusAfter.stdout).toContain("queued=1");
+        expect(terminalStatusAfter.stdout).toContain("terminal=1");
+        const terminalStatusJson = runBrainctl(["status", "--json", "--skip-fleet", "--config", terminalConfigPath], {
+          BRAIN_BASE_URL: `http://127.0.0.1:${authPort}`,
+          BRAIN_IMPORT_TOKEN: "outbox-token",
+          BRAINSTACK_STATUS_TIMEOUT_MS: "750"
+        });
+        expectSuccess(terminalStatusJson);
+        const parsedStatus = JSON.parse(terminalStatusJson.stdout);
+        expect(parsedStatus.sections.outbox.data.terminal_errors).toEqual([{ message: "HTTP 401 unauthorized", count: 1 }]);
         const terminalList = runBrainctl(["outbox", "list", "--config", terminalConfigPath], {
           BRAIN_BASE_URL: `http://127.0.0.1:${authPort}`,
           BRAIN_IMPORT_TOKEN: "outbox-token"
         });
         expectSuccess(terminalList);
         expect(terminalList.stdout).toContain("status=terminal");
-        expect(terminalList.stdout).toContain("HTTP 401");
+        expect(terminalList.stdout).toContain("HTTP 401 unauthorized x1");
       } finally {
         terminalServer.kill();
         await terminalServer.exited;
@@ -1596,7 +1614,7 @@ describe("public release hygiene - project context and outbox", () => {
       const flush = runBrainctl(["outbox", "flush", "--config", configPath], env);
       expect(flush.code).not.toBe(0);
       expect(flush.stdout).toContain("flushed=0 kept=0 terminal_failures=0 corrupt=5");
-      expect(flush.stderr).toContain("corrupt/unsafe entries");
+      expect(flush.stderr).toContain("corrupt/unsafe files");
       const doctor = runBrainctl(["doctor", "--config", configPath], env);
       expect(doctor.code).not.toBe(0);
       expect(doctor.stdout).toContain("FAIL [outbox] corrupt-items: 5 corrupt/unsafe item(s)");
@@ -1774,7 +1792,7 @@ describe("public release hygiene - project context and outbox", () => {
       const listed = runBrainctl(["outbox", "list", "--config", configPath], env);
       expectSuccess(listed);
       expect(listed.stdout).toContain("status=terminal");
-      expect(listed.stdout).toContain("HTTP 425 persisted");
+      expect(listed.stdout).toContain("HTTP 425 idempotency review");
       const terminalId = listed.stdout.split(/\s+/).find((part) => part.startsWith("import-"));
       expect(typeof terminalId).toBe("string");
       const retry = runBrainctl(["outbox", "retry", terminalId!, "--config", configPath], env);
@@ -1824,7 +1842,7 @@ describe("public release hygiene - project context and outbox", () => {
       const listedProposal = runBrainctl(["outbox", "list", "--config", proposeConfigPath], env);
       expectSuccess(listedProposal);
       expect(listedProposal.stdout).toContain("propose status=terminal");
-      expect(listedProposal.stdout).toContain("HTTP 425 persisted");
+      expect(listedProposal.stdout).toContain("HTTP 425 idempotency review");
     } finally {
       if (server) {
         server.kill();

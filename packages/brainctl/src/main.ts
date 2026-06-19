@@ -29,6 +29,7 @@ import { createInstallEnrollCommands } from "./commands/install-enroll";
 import { createCapabilitiesCommands } from "./commands/capabilities";
 import { createProjectOutboxCommands } from "./commands/project-outbox";
 import { createSkillHookCommands } from "./commands/skills-hooks";
+import { formatOutboxErrorSummary, summarizeOutboxTerminalErrors } from "./outbox-summary";
 import {
   ensureDir,
   readEnvSecretOrFile,
@@ -1715,11 +1716,13 @@ async function commandOutbox(args: ParsedArgs): Promise<void> {
   const scans = await scanAllOutboxes(cfg);
   const items = scans.flatMap((scan) => scan.items);
   const corrupt = scans.flatMap((scan) => scan.corrupt);
+  const terminalItems = () => items.map((entry) => normalizeOutboxItem(entry.item)).filter((item) => item.terminal_error);
   switch (sub) {
     case "status":
       console.log(`outbox=${outboxRoot(cfg)}`);
       console.log(`namespaces=${scans.length}`);
       console.log(`queued=${items.length}`);
+      console.log(`terminal=${terminalItems().length}`);
       console.log(`corrupt=${corrupt.length}`);
       return;
     case "list":
@@ -1729,7 +1732,7 @@ async function commandOutbox(args: ParsedArgs): Promise<void> {
               .map(({ item }) => {
                 const normalized = normalizeOutboxItem(item);
                 const status = normalized.terminal_error ? "terminal" : normalized.last_error ? "queued-error" : "queued";
-                const detail = normalized.terminal_error || normalized.last_error;
+                const detail = formatOutboxErrorSummary(summarizeOutboxTerminalErrors([normalized.terminal_error || normalized.last_error]));
                 return [
                   normalized.id,
                   normalized.endpoint,
@@ -1738,7 +1741,7 @@ async function commandOutbox(args: ParsedArgs): Promise<void> {
                   normalized.brain_id ? `brain=${normalized.brain_id}` : null,
                   normalized.import_token_env ? `token_env=${normalized.import_token_env}` : null,
                   `source=${normalized.source_machine}/${normalized.source_harness}`,
-                  detail ? `error=${detail.replace(/\s+/g, " ").slice(0, 300)}` : null
+                  detail ? `error=${detail}` : null
                 ]
                   .filter(Boolean)
                   .join(" ");
@@ -1754,10 +1757,19 @@ async function commandOutbox(args: ParsedArgs): Promise<void> {
       const result = await flushOutbox(cfg);
       console.log(`flushed=${result.flushed} kept=${result.kept} terminal_failures=${result.terminalFailures} corrupt=${result.corrupt}`);
       if (result.terminalFailures > 0) {
-        throw new Error("outbox flush encountered terminal write failures; inspect `brainctl outbox list` and purge or repair affected items");
+        const after = await scanAllOutboxes(cfg);
+        const terminalErrors = summarizeOutboxTerminalErrors(
+          after
+            .flatMap((scan) => scan.items)
+            .map((entry) => normalizeOutboxItem(entry.item).terminal_error)
+        );
+        if (terminalErrors.length) {
+          console.log(`terminal_reasons=${formatOutboxErrorSummary(terminalErrors)}`);
+        }
+        throw new Error("saved outbox writes are paused after non-retryable failures; fix the reported cause, then run `brainctl outbox retry --all` and `brainctl outbox flush`, or purge only if the saved writes are obsolete");
       }
       if (result.corrupt > 0) {
-        throw new Error("outbox flush found corrupt/unsafe entries; inspect `brainctl outbox list` and purge or repair affected items");
+        throw new Error("saved outbox writes include corrupt/unsafe files; inspect `brainctl outbox list` and run `brainctl outbox purge-corrupt --yes` only if those saved writes are unrecoverable");
       }
       return;
     }

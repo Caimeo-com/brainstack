@@ -25,6 +25,7 @@ import {
 import { ensureDir, run, writeText } from "../runtime";
 import { createStatusFleetCommands } from "./status-fleet";
 import { createUpdatesCommand } from "./updates";
+import { summarizeOutboxTerminalErrors } from "../outbox-summary";
 
 type CommandProbeResult = { ok: boolean; output: string; code: number; timedOut: boolean };
 type RunResult = ReturnType<typeof run>;
@@ -1380,13 +1381,15 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
     const scans = await scanAllOutboxes(cfg);
     const items = scans.flatMap((scan) => scan.items.map((entry) => ({ ...entry, item: normalizeOutboxItem(entry.item) })));
     const corrupt = scans.flatMap((scan) => scan.corrupt);
-    const terminal = items.filter((entry) => entry.item.terminal_error).length;
+    const terminalItems = items.filter((entry) => entry.item.terminal_error);
+    const terminal = terminalItems.length;
     const state: BrainctlStatusState = corrupt.length ? "fail" : terminal ? "warn" : "ok";
     return statusSection(state, `queued=${items.length} terminal=${terminal} corrupt=${corrupt.length}`, {
       roots: scans.map((scan) => scan.root),
       queued: items.length,
       terminal,
-      corrupt: corrupt.length
+      corrupt: corrupt.length,
+      terminal_errors: summarizeOutboxTerminalErrors(terminalItems.map((entry) => entry.item.terminal_error))
     });
   }
 

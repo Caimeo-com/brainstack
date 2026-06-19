@@ -122,7 +122,7 @@ struct DashboardView: View {
         Button("Set Up / Repair Brainstack…") { openInstaller() }
         Button("Run Doctor") { performRepair(.doctor) }
         Button("Check Stack Updates") { performRepair(.checkUpdates) }
-        Button("Flush Outbox…") { performRepair(.flushOutbox) }
+        Button("Send Saved Writes…") { performRepair(.flushOutbox) }
         Button("Refresh Skills…") { performRepair(.refreshSkills) }
         Button("Install/Restart Daemon…") { performRepair(.restartDaemon) }
         Button("Install/Repair Hooks…") { performRepair(.repairHooks) }
@@ -152,6 +152,8 @@ struct DashboardView: View {
       model.runAction("Check Stack Updates", refreshAfter: false) { await $0.updates() }
     case .flushOutbox:
       model.runAction("Flush Outbox", verifying: ["outbox"]) { await $0.outboxFlush() }
+    case .retryOutbox:
+      model.runAction("Retry Saved Writes", verifying: ["outbox"]) { await $0.outboxRetryAllAndFlush() }
     case .refreshSkills:
       model.runAction("Refresh Skills", verifying: ["skills"]) { await $0.skillsRefresh() }
     case .restartDaemon:
@@ -394,12 +396,30 @@ struct DashboardView: View {
         continue
       }
       if section.state == .fail {
-        items.append(AttentionItem(title: "\(sectionLabel(name)) failed", detail: sectionMessage(name: name, section: section), severity: .fail, repair: repairKind(forSection: name)))
+        items.append(attentionItem(name: name, section: section, severity: .fail))
       } else if section.state == .warn && !(name == "fleet" && !staleFleet.isEmpty) && !isBenignWarning(name: name, section: section, report: report) && !isOldControlEndpointWarning(section) {
-        items.append(AttentionItem(title: "\(sectionLabel(name)) needs attention", detail: sectionMessage(name: name, section: section), severity: .warn, repair: repairKind(forSection: name)))
+        items.append(attentionItem(name: name, section: section, severity: .warn))
       }
     }
     return uniqueAttentionItems(items)
+  }
+
+  private func attentionItem(name: String, section: StatusSection, severity: AttentionSeverity) -> AttentionItem {
+    if name == "outbox" {
+      let outbox = OutboxStatusSummary(section: section)
+      return AttentionItem(
+        title: outbox.attentionTitle,
+        detail: outbox.userMessage,
+        severity: severity,
+        repair: repairKind(forSection: name, section: section)
+      )
+    }
+    return AttentionItem(
+      title: severity == .fail ? "\(sectionLabel(name)) failed" : "\(sectionLabel(name)) needs attention",
+      detail: sectionMessage(name: name, section: section),
+      severity: severity,
+      repair: repairKind(forSection: name, section: section)
+    )
   }
 
   private func uniqueAttentionItems(_ items: [AttentionItem]) -> [AttentionItem] {
