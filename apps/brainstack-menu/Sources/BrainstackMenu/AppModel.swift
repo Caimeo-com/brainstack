@@ -41,6 +41,9 @@ final class AppModel: ObservableObject {
   @Published var notificationsEnabled: Bool {
     didSet { preferences.notificationsEnabled = notificationsEnabled }
   }
+  @Published var startTailscaleOnLaunch: Bool {
+    didSet { preferences.startTailscaleOnLaunch = startTailscaleOnLaunch }
+  }
 
   enum AdminAvailability: String {
     case unknown
@@ -54,6 +57,7 @@ final class AppModel: ObservableObject {
   private var lastSnapshot: TransitionDetector.Snapshot?
   private var pollTimer: Timer?
   private var lastDurations: [String: TimeInterval] = [:]
+  private var triedTailscaleAutoStart = false
 
   var onStateChange: (() -> Void)?
 
@@ -64,6 +68,7 @@ final class AppModel: ObservableObject {
     self.pollInterval = preferences.pollInterval
     self.operatorModeEnabled = preferences.operatorModeEnabled
     self.notificationsEnabled = preferences.notificationsEnabled
+    self.startTailscaleOnLaunch = preferences.startTailscaleOnLaunch
   }
 
   var resolvedBinaryPath: String? {
@@ -158,6 +163,7 @@ final class AppModel: ObservableObject {
       lastReport = report
       lastFailure = nil
       stale = false
+      maybeAutoOpenTailscale(for: report)
     } else {
       // Keep the last good report and mark it stale instead of blanking the UI.
       lastFailure = outcome.failure
@@ -174,6 +180,14 @@ final class AppModel: ObservableObject {
       }
     }
     lastSnapshot = snapshot
+  }
+
+  private func maybeAutoOpenTailscale(for report: StatusReport) {
+    guard startTailscaleOnLaunch, !triedTailscaleAutoStart, tailscaleNeedsStart(report) else {
+      return
+    }
+    triedTailscaleAutoStart = true
+    openTailscale(title: "Open Tailscale", summaryPrefix: "Auto-start is enabled.")
   }
 
   func startPolling() {
@@ -398,6 +412,43 @@ final class AppModel: ObservableObject {
       return
     }
     NSWorkspace.shared.open(URL(fileURLWithPath: (path as NSString).expandingTildeInPath))
+  }
+
+  func openTailscale(title: String = "Open Tailscale", summaryPrefix: String? = nil) {
+    let appPath = "/Applications/Tailscale.app"
+    let workspace = NSWorkspace.shared
+    let appURL = workspace.urlForApplication(withBundleIdentifier: "io.tailscale.ipn.macos")
+      ?? (FileManager.default.fileExists(atPath: appPath) ? URL(fileURLWithPath: appPath) : nil)
+    guard let appURL else {
+      let downloadURL = URL(string: "https://tailscale.com/download/mac")!
+      let opened = workspace.open(downloadURL)
+      record(ActionOutcome(
+        title: title,
+        succeeded: opened,
+        unsupported: false,
+        adminUnavailable: false,
+        summary: opened ? "Tailscale.app was not found; opened the download page." : "Tailscale.app was not found and the download page could not be opened.",
+        output: downloadURL.absoluteString,
+        duration: 0
+      ))
+      return
+    }
+    let opened = workspace.open(appURL)
+    let prefix = summaryPrefix.map { "\($0) " } ?? ""
+    record(ActionOutcome(
+      title: title,
+      succeeded: opened,
+      unsupported: false,
+      adminUnavailable: false,
+      summary: opened ? "\(prefix)Tailscale opened." : "Could not open Tailscale.",
+      output: appURL.path,
+      duration: 0
+    ))
+    if opened {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        self?.refresh()
+      }
+    }
   }
 
   func copyDiagnostics() {

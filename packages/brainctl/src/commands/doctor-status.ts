@@ -1221,6 +1221,105 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
     }
   }
 
+  function configUsesTailscale(cfg: BrainstackConfig): boolean {
+    const brainUrl = cfg.brain.publicBaseUrl || "";
+    return cfg.profile === "client-macos"
+      || cfg.profile === "worker"
+      || cfg.security.trustedExposure === "tailscale-serve"
+      || Boolean(cfg.client.telegramVia || cfg.client.remoteSsh)
+      || /\.ts\.net(?::|\/|$)/.test(brainUrl)
+      || cfg.tailscale.enableSsh
+      || cfg.tailscale.advertiseTags.length > 0;
+  }
+
+  function tailscaleCommandPath(): string | null {
+    const explicit = process.env.BRAINSTACK_TAILSCALE_BIN?.trim();
+    if (explicit && existsSync(explicit)) {
+      return explicit;
+    }
+    const fromPath = commandPath("tailscale");
+    if (fromPath) {
+      return fromPath;
+    }
+    if (process.platform !== "darwin") {
+      return null;
+    }
+    const candidates = [
+      "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+      process.env.HOME ? join(process.env.HOME, "Applications", "Tailscale.app", "Contents", "MacOS", "Tailscale") : ""
+    ].filter(Boolean);
+    return candidates.find((candidate) => existsSync(candidate)) || null;
+  }
+
+  function tailscaleStoppedText(text: string): boolean {
+    const lower = text.toLowerCase();
+    return lower.includes("tailscale is stopped")
+      || lower.includes("not running")
+      || lower.includes("stopped");
+  }
+
+  function collectTailscaleStatusSection(cfg: BrainstackConfig, timeoutMs: number): BrainctlStatusSection {
+    if (!configUsesTailscale(cfg)) {
+      return statusSection("disabled", "Tailscale not required by this profile", {
+        required: false,
+        installed: null,
+        running: null,
+        action_hint: "none"
+      });
+    }
+    const command = tailscaleCommandPath();
+    if (!command) {
+      return statusSection(
+        "warn",
+        "Tailscale is not installed or the CLI is unavailable",
+        {
+          required: true,
+          installed: false,
+          running: false,
+          command: null,
+          action_hint: "install",
+          install_hint: installHint("tailscale")
+        },
+        { available: false, error: "tailscale command not found" }
+      );
+    }
+    const status = run([command, "status", "--json"], { check: false, env: userShellPathEnv(), timeoutMs });
+    const combined = `${status.stdout}\n${status.stderr}`.trim();
+    if (status.code !== 0 || status.timedOut) {
+      const stopped = tailscaleStoppedText(combined);
+      return statusSection(
+        "warn",
+        stopped ? "Tailscale is stopped" : summarizeLines(combined || `tailscale status failed with exit ${status.code}`, 2),
+        {
+          required: true,
+          installed: true,
+          running: false,
+          command,
+          exit_code: status.code,
+          timed_out: status.timedOut,
+          action_hint: "start"
+        },
+        { available: false, error: sanitizeStatusError(combined || `tailscale status failed with exit ${status.code}`) }
+      );
+    }
+    let backendState = "unknown";
+    try {
+      const parsed = JSON.parse(status.stdout) as Record<string, unknown>;
+      backendState = typeof parsed.BackendState === "string" ? parsed.BackendState : backendState;
+    } catch {
+      backendState = "running";
+    }
+    const running = backendState.toLowerCase() === "running";
+    return statusSection(running ? "ok" : "warn", running ? "Tailscale is running" : `Tailscale state=${backendState}`, {
+      required: true,
+      installed: true,
+      running,
+      command,
+      backend_state: backendState,
+      action_hint: running ? "none" : "start"
+    }, running ? {} : { available: false });
+  }
+
   function gitStatusProbe(args: string[], cwd: string, timeoutMs: number): { ok: boolean; output: string; code: number; timedOut: boolean } {
     const result = run(["git", ...args], { cwd, check: false, timeoutMs });
     return {
@@ -1467,7 +1566,15 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
 
   async function collectTelemuxStatusSection(cfg: BrainstackConfig, timeoutMs: number): Promise<BrainctlStatusSection> {
     if (!cfg.telemux.enabled) {
-      return statusSection("disabled", "telemux disabled in config", { enabled: false });
+      if (cfg.client.telegramVia) {
+        return statusSection("ok", `Telegram routed through control host ${cfg.client.telegramVia}; no local telemux service`, {
+          enabled: false,
+          mode: "remote-control-host",
+          via: cfg.client.telegramVia,
+          remote_repo: cfg.client.telegramRemoteRepo || "~/brainstack"
+        });
+      }
+      return statusSection("disabled", "local telemux service not enabled for this machine", { enabled: false, mode: "none" });
     }
     const baseUrl = `http://${cfg.telemux.dashboardHost}:${cfg.telemux.dashboardPort}`;
     const response = await statusFetchJson(baseUrl, "/healthz", timeoutMs);
@@ -1743,6 +1850,7 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
     }
 
     report.sections.daemon = await collectStatusSection(() => collectDaemonStatusSection(cfg!, args, timeoutMs), timeoutMs);
+    report.sections.tailscale = await collectStatusSection(() => Promise.resolve(collectTailscaleStatusSection(cfg!, timeoutMs)), timeoutMs);
     report.sections.shared_brain = await collectStatusSection(() => collectSharedBrainStatus(cfg!, Math.min(timeoutMs, 2000)), timeoutMs);
     report.sections.outbox = await collectStatusSection(() => collectOutboxStatusSection(cfg!), timeoutMs, "fail");
     report.sections.hooks = await collectStatusSection(() => collectHooksStatusSection(cfg!), timeoutMs);

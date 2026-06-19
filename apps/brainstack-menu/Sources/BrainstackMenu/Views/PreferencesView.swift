@@ -51,6 +51,10 @@ struct PreferencesView: View {
         Text("Notifications fire only on state transitions (broken, recovered, outbox stuck, curator failing).")
           .font(.caption)
           .foregroundColor(.secondary)
+        Toggle("Try to open Tailscale when Brainstack starts", isOn: $model.startTailscaleOnLaunch)
+        Text("When Brainstack sees that Tailscale is stopped, it can open the Tailscale app once after launch. It does not change Tailscale settings or store Tailscale credentials.")
+          .font(.caption)
+          .foregroundColor(.secondary)
       } header: {
         Text("Behavior")
       }
@@ -65,7 +69,7 @@ struct PreferencesView: View {
       }
     }
     .formStyle(.grouped)
-    .frame(width: 460, height: 420)
+    .frame(width: 460, height: 480)
     .onAppear {
       syncLaunchAtLoginStatus()
     }

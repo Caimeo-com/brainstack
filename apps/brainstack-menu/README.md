@@ -26,6 +26,8 @@ The menu bar icon is the status surface:
 
 The dropdown shows local sections (daemon, shared brain, outbox, hooks, skills), control sections (brain API, curator, proposals, product updates), and a Fleet section with each known machine, reachability, source head, dirty/behind state, and service status. Unknown future sections render generically by `state`/`detail`.
 
+Tailscale is shown as a first-class local prerequisite when the profile depends on a tailnet control host. If Tailscale is stopped or missing, the app shows one root-cause attention row with an **Open** action and suppresses the downstream Brain API, curator, proposal, fleet, control-host, and remote-only daemon freshness warnings from the top summary until Tailscale is online.
+
 ## Safe actions
 
 Refresh, Open Wiki, Open Shared Brain/Config folders, Copy Redacted Diagnostics, Run Doctor, and confirmation-gated Flush Outbox, Refresh Skills, Install/Restart Daemon, Install/Repair Hooks. Fleet machine rows show an Update button only when that machine is behind; the button runs `brainctl fleet update <machine>` and confirms before pulling, rebuilding, upgrading, and restarting services. Every command runs off the main thread with a hard timeout.
@@ -97,6 +99,7 @@ Preferences (stored in `UserDefaults`, never secrets):
 - Config path — defaults to `~/.config/brainstack/brainstack.yaml`.
 - Poll interval — 15s / 30s (default) / 60s / 5m; also refreshes when the menu opens.
 - Launch at login (bundled app only).
+- Try to open Tailscale when Brainstack starts — off by default; when enabled, the app opens Tailscale once after launch if `brainctl status --json` reports that Tailscale is stopped.
 - Notifications — off by default; fire only on state transitions (broken, recovered, outbox stuck, curator failing, proposals awaiting action in Operator Mode).
 - Enable Operator Mode.
 

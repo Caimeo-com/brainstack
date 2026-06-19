@@ -18,6 +18,7 @@ enum RepairKind: Equatable, Sendable {
   case repairHooks
   case checkUpdates
   case installCurator
+  case openTailscale
 
   var buttonTitle: String {
     switch self {
@@ -28,13 +29,14 @@ enum RepairKind: Equatable, Sendable {
     case .repairHooks: return "Repair"
     case .checkUpdates: return "Check Updates"
     case .installCurator: return "Install"
+    case .openTailscale: return "Open"
     }
   }
 
   /// Confirmation copy for mutating repairs; nil means run immediately.
   var confirmation: (title: String, message: String)? {
     switch self {
-    case .doctor, .checkUpdates:
+    case .doctor, .checkUpdates, .openTailscale:
       return nil
     case .flushOutbox:
       return ("Flush Outbox", "Flush queued outbox writes to the brain now?")
@@ -57,6 +59,7 @@ func repairKind(forSection name: String) -> RepairKind? {
   case "outbox": return .flushOutbox
   case "hooks": return .repairHooks
   case "skills": return .refreshSkills
+  case "tailscale": return .openTailscale
   case "shared_brain", "config": return .doctor
   default: return nil
   }
@@ -74,6 +77,9 @@ struct AttentionItem: Identifiable, Equatable, Sendable {
 }
 
 func statusSummaryLine(for report: StatusReport) -> String {
+  if tailscaleNeedsStart(report) {
+    return tailscaleSummary(report)
+  }
   if controlHostLooksOld(report) {
     return "control host needs update"
   }
@@ -95,6 +101,7 @@ func statusSummaryLine(for report: StatusReport) -> String {
       return false
     }
     return !isBenignWarning(name: name, section: section, report: report)
+      && !isBlockedByTailscaleRootCause(name: name, section: section, report: report)
   }
   if !warnings.isEmpty {
     return "needs attention: \(warnings.map(sectionLabel).joined(separator: ", "))"
@@ -103,6 +110,52 @@ func statusSummaryLine(for report: StatusReport) -> String {
     return "\(open) proposal\(open == 1 ? "" : "s") awaiting review"
   }
   return "healthy"
+}
+
+func tailscaleNeedsStart(_ report: StatusReport) -> Bool {
+  guard let section = report.sections["tailscale"], section.state == .warn else {
+    return false
+  }
+  if section.data?["running"]?.boolValue == false {
+    return true
+  }
+  let detail = section.detail.lowercased()
+  return detail.contains("stopped") || detail.contains("not installed") || detail.contains("unavailable")
+}
+
+func tailscaleSummary(_ report: StatusReport) -> String {
+  guard let section = report.sections["tailscale"] else {
+    return "Tailscale needs attention"
+  }
+  if section.data?["installed"]?.boolValue == false {
+    return "Tailscale is not installed"
+  }
+  return section.detail.isEmpty ? "Tailscale needs attention" : section.detail
+}
+
+func isRemoteDependencySection(_ name: String) -> Bool {
+  ["brain_api", "curator", "proposals", "fleet", "control_source"].contains(name)
+}
+
+func daemonWarningLooksRemoteOnly(_ section: StatusSection) -> Bool {
+  guard section.state == .warn else {
+    return false
+  }
+  let errorText = section.data?["status"]?["errors"]?.arrayValue?
+    .compactMap(\.stringValue)
+    .joined(separator: " ")
+    .lowercased() ?? ""
+  let combined = "\(section.detail) \(section.error ?? "") \(errorText)".lowercased()
+  return combined.contains("git pull failed")
+    || combined.contains("could not resolve hostname")
+    || combined.contains("tailscale")
+}
+
+func isBlockedByTailscaleRootCause(name: String, section: StatusSection, report: StatusReport) -> Bool {
+  guard tailscaleNeedsStart(report) else {
+    return false
+  }
+  return isRemoteDependencySection(name) || (name == "daemon" && daemonWarningLooksRemoteOnly(section))
 }
 
 func openProposalCount(_ report: StatusReport) -> Int? {
@@ -166,6 +219,7 @@ func isBenignWarning(name: String, section: StatusSection, report: StatusReport)
 
 func sectionLabel(_ name: String) -> String {
   switch name {
+  case "tailscale": return "Tailscale"
   case "brain_api": return "Brain API"
   case "shared_brain": return "Shared Brain"
   case "outbox": return "Outbox"
@@ -185,6 +239,14 @@ func sectionLabel(_ name: String) -> String {
 }
 
 func sectionMessage(name: String, section: StatusSection) -> String {
+  if name == "tailscale" {
+    if section.data?["installed"]?.boolValue == false {
+      return "Install Tailscale, then refresh Brainstack."
+    }
+    if section.data?["running"]?.boolValue == false {
+      return "Start Tailscale to reach the Brainstack control host."
+    }
+  }
   if isOldControlEndpointWarning(section) {
     return "The control host is running an older Brainstack. Update it, then refresh."
   }

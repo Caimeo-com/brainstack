@@ -100,7 +100,7 @@ public struct StatusReport: Sendable {
     var parsed: [String: StatusSection] = [:]
     if let sectionsObject = object["sections"]?.objectValue {
       // Render in a stable, contract-first order; unknown sections follow alphabetically.
-      let preferredOrder = ["config", "daemon", "shared_brain", "outbox", "hooks", "skills", "brain_api", "curator", "proposals", "telemux", "fleet", "control_source", "product"]
+      let preferredOrder = ["config", "daemon", "tailscale", "shared_brain", "outbox", "hooks", "skills", "brain_api", "curator", "proposals", "telemux", "fleet", "control_source", "product"]
       let known = preferredOrder.filter { sectionsObject.keys.contains($0) }
       let unknown = sectionsObject.keys.filter { !preferredOrder.contains($0) }.sorted()
       names = known + unknown

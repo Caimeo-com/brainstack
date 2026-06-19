@@ -958,6 +958,56 @@ printf 'brew_installed=ffmpeg\\n'
       const aggregate = JSON.parse(status.stdout) as Record<string, any>;
       expect(aggregate.sections.product.state).toBe("disabled");
       expect(aggregate.sections.product.detail).toContain("source checkout not installed");
+      expect(["ok", "warn"]).toContain(aggregate.sections.tailscale.state);
+      expect(aggregate.sections.tailscale.data.required).toBe(true);
+      expect(typeof aggregate.sections.tailscale.data.running).toBe("boolean");
+      expect(aggregate.sections.telemux.state).toBe("disabled");
+      expect(aggregate.sections.telemux.detail).toContain("local telemux service not enabled");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("status json reports stopped tailscale as a root cause", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-status-tailscale-stopped-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const binDir = join(dir, "bin");
+      const configPath = join(dir, "client.yaml");
+      await mkdir(binDir, { recursive: true });
+      await writeFile(
+        join(binDir, "tailscale"),
+        [
+          "#!/usr/bin/env bash",
+          "if [ \"${1:-}\" = \"status\" ]; then",
+          "  echo 'Tailscale is stopped.' >&2",
+          "  exit 1",
+          "fi",
+          "echo 'tailscale fake'",
+          ""
+        ].join("\n")
+      );
+      await chmod(join(binDir, "tailscale"), 0o755);
+      await writeFixtureClientConfig(configPath, {
+        home,
+        stateRoot,
+        productRepo: join(dir, "missing-product"),
+        telegramVia: "operator@brain-control"
+      });
+      const status = runBrainctl(["status", "--json", "--config", configPath, "--timeout-ms", "1000"], {
+        HOME: home,
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAINSTACK_TAILSCALE_BIN: join(binDir, "tailscale")
+      });
+      expectSuccess(status);
+      const aggregate = JSON.parse(status.stdout) as Record<string, any>;
+      expect(aggregate.sections.tailscale.state).toBe("warn");
+      expect(aggregate.sections.tailscale.detail).toBe("Tailscale is stopped");
+      expect(aggregate.sections.tailscale.available).toBe(false);
+      expect(aggregate.sections.tailscale.data.installed).toBe(true);
+      expect(aggregate.sections.tailscale.data.running).toBe(false);
+      expect(aggregate.sections.tailscale.data.action_hint).toBe("start");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -971,6 +1021,7 @@ printf 'brew_installed=ffmpeg\\n'
       const binDir = join(dir, "bin");
       const configPath = join(dir, "client.yaml");
       await mkdir(binDir, { recursive: true });
+      await writeFakeTailscale(binDir);
       await writeFile(
         join(binDir, "ssh"),
         [
@@ -1012,6 +1063,9 @@ printf 'brew_installed=ffmpeg\\n'
       expect(aggregate.sections.control_source.detail).toContain("control host up to date");
       expect(aggregate.sections.control_source.data.machine).toBe("operator@brain-control");
       expect(aggregate.sections.control_source.data.short).toBe("abcdef0");
+      expect(aggregate.sections.telemux.state).toBe("ok");
+      expect(aggregate.sections.telemux.detail).toContain("Telegram routed through control host operator@brain-control");
+      expect(aggregate.sections.telemux.data.mode).toBe("remote-control-host");
       expect(aggregate.sections.fleet.state).toBe("ok");
       expect(aggregate.sections.fleet.data.summary.total).toBe(3);
       expect(aggregate.sections.fleet.data.machines.some((machine: Record<string, unknown>) => machine.name === "worker-a")).toBe(true);

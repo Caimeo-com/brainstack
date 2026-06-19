@@ -12,6 +12,7 @@ public struct Preferences: @unchecked Sendable {
     static let operatorMode = "operatorModeEnabled"
     static let notifications = "notificationsEnabled"
     static let launchAtLogin = "launchAtLoginEnabled"
+    static let startTailscaleOnLaunch = "startTailscaleOnLaunch"
   }
 
   private let defaults: UserDefaults
@@ -51,5 +52,10 @@ public struct Preferences: @unchecked Sendable {
   public var launchAtLoginEnabled: Bool {
     get { defaults.bool(forKey: Keys.launchAtLogin) }
     nonmutating set { defaults.set(newValue, forKey: Keys.launchAtLogin) }
+  }
+
+  public var startTailscaleOnLaunch: Bool {
+    get { defaults.bool(forKey: Keys.startTailscaleOnLaunch) }
+    nonmutating set { defaults.set(newValue, forKey: Keys.startTailscaleOnLaunch) }
   }
 }

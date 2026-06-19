@@ -160,6 +160,8 @@ struct DashboardView: View {
       model.runAction("Install/Repair Hooks") { await $0.hooksInstall() }
     case .installCurator:
       model.runAction("Install Curator") { await $0.curatorInstall() }
+    case .openTailscale:
+      model.openTailscale()
     }
   }
 
@@ -212,12 +214,13 @@ struct DashboardView: View {
 
   private var sectionList: some View {
     VStack(alignment: .leading, spacing: 4) {
-      let localSections = ["daemon", "shared_brain", "outbox", "hooks", "skills"]
-      let controlSections = ["brain_api", "control_source", "curator", "proposals", "product"]
+      let localSections = ["daemon", "tailscale", "shared_brain", "outbox", "hooks", "skills"]
+      let controlSections = ["brain_api", "control_source", "curator", "proposals", "telemux"]
       sectionGroup(title: "Local", names: localSections)
       sectionGroup(title: "Control", names: controlSections)
       fleetSection
-      let known = Set(localSections + controlSections + ["fleet", "config"])
+      let hiddenSections = ["product"]
+      let known = Set(localSections + controlSections + hiddenSections + ["fleet", "config"])
       let extra = (model.lastReport?.sectionNames ?? []).filter { !known.contains($0) }
       if !extra.isEmpty {
         sectionGroup(title: "Other", names: extra)
@@ -314,8 +317,16 @@ struct DashboardView: View {
         repair: .checkUpdates
       ))
     }
+    if tailscaleNeedsStart(report) {
+      items.append(AttentionItem(
+        title: tailscaleSummary(report),
+        detail: "Start Tailscale to reach the Brainstack control host. Remote API, curator, proposals, fleet, and control-host checks are blocked until Tailscale is online.",
+        severity: .warn,
+        repair: .openTailscale
+      ))
+    }
     let staleFleet = report.fleetMachines.filter(\.needsUpdate)
-    if !staleFleet.isEmpty {
+    if !staleFleet.isEmpty && !tailscaleNeedsStart(report) {
       let names = staleFleet.map(\.name).joined(separator: ", ")
       items.append(AttentionItem(
         title: "\(staleFleet.count) machine\(staleFleet.count == 1 ? "" : "s") need update",
@@ -344,6 +355,9 @@ struct DashboardView: View {
     }
     for name in report.sectionNames {
       guard let section = report.sections[name] else {
+        continue
+      }
+      if isBlockedByTailscaleRootCause(name: name, section: section, report: report) {
         continue
       }
       if section.state == .fail {
