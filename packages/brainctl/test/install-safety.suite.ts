@@ -1036,6 +1036,81 @@ describe("brainctl install safety", () => {
       expect((status.skills as Record<string, unknown>).ok).toBe(false);
       expect((status.skills as Record<string, unknown>).detail).toContain("unsafe for skill refresh");
       expect(await Bun.file(join(home, ".codex", "skills")).exists()).toBe(false);
+
+      const daemonStatus = runBrainctl(["daemon", "status", "--config", configPath, "--platform", "systemd", "--json"], { HOME: home });
+      expectSuccess(daemonStatus);
+      const daemonBody = JSON.parse(daemonStatus.stdout) as Record<string, unknown>;
+      expect(daemonBody.fresh).toBe(true);
+      expect(daemonBody.last_run_ok).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("status separates daemon heartbeat freshness from last-run degradation", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-daemon-heartbeat-"));
+    try {
+      const home = join(dir, "home");
+      const stateRoot = join(dir, "state");
+      const configPath = join(dir, "client.yaml");
+      const clone = join(home, "shared-brain");
+      await mkdir(join(stateRoot, "daemon"), { recursive: true });
+      await mkdir(clone, { recursive: true });
+      await writeFixtureClientConfig(configPath, { home, stateRoot, localPath: clone });
+      await writeFile(
+        join(stateRoot, "daemon", "status.json"),
+        `${JSON.stringify(
+          {
+            schema_version: 1,
+            product: "brainstack",
+            daemon: "brainctl daemon run",
+            ok: false,
+            pid: process.pid,
+            machine: "client",
+            config_path: configPath,
+            state_path: join(stateRoot, "daemon", "status.json"),
+            started_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            iteration: 7,
+            repo: {
+              path: clone,
+              exists: true,
+              clean: true,
+              branch: "main",
+              head: "abc123",
+              last_pull_at: new Date().toISOString()
+            },
+            outbox: {
+              ok: false,
+              detail: "flushed=0 kept=0 terminal_failures=3 corrupt=0",
+              flushed: 0,
+              kept: 0,
+              terminal_failures: 3,
+              corrupt: 0
+            },
+            skills: {
+              ok: true,
+              detail: "refreshed shared skills from local clone",
+              targets: ["codex"],
+              installed: [],
+              skipped: []
+            },
+            errors: ["outbox: flushed=0 kept=0 terminal_failures=3 corrupt=0"],
+            next_run_after: new Date(Date.now() + 60_000).toISOString()
+          },
+          null,
+          2
+        )}\n`
+      );
+
+      const reportResult = runBrainctl(["status", "--config", configPath, "--platform", "systemd", "--timeout-ms", "500", "--json"], { HOME: home });
+      expectSuccess(reportResult);
+      const report = JSON.parse(reportResult.stdout) as Record<string, any>;
+      expect(report.sections.daemon.state).toBe("ok");
+      expect(report.sections.daemon.detail).toContain("heartbeat=fresh");
+      expect(report.sections.daemon.detail).toContain("last_run=degraded");
+      expect(report.sections.daemon.data.fresh).toBe(true);
+      expect(report.sections.daemon.data.last_run_ok).toBe(false);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

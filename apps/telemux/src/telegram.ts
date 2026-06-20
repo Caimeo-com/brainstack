@@ -40,6 +40,8 @@ export const TELEGRAM_BOT_COMMANDS: TelegramBotCommand[] = [
   { command: "curator_status", description: "Show brain curator mode, runs, and proposals" },
   { command: "curator_run", description: "Run the brain curator routine now" },
   { command: "proposals", description: "List or filter shared-brain proposals" },
+  { command: "proposal_groups", description: "Show proposal merge candidates" },
+  { command: "proposal_merges", description: "Look for safe proposal merges" },
   { command: "curation", description: "Set up this topic for proposal curation" },
   { command: "mode", description: "Set or show the Codex mode for this topic" },
   { command: "model", description: "Set or show the Codex model override" },

@@ -1615,13 +1615,23 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
           }
         : await daemonServiceStatus(cfg, args, timeoutMs);
     const active = service.running === true || pidAlive === true;
-    const state: BrainctlStatusState = status?.ok && fresh && active ? "ok" : "warn";
-    return statusSection(state, `service=${service.running === true ? "running" : service.running === false ? "stopped" : "unknown"} fresh=${fresh}`, {
+    const state: BrainctlStatusState = status && fresh && active ? "ok" : "warn";
+    return statusSection(
+      state,
+      [
+        `service=${service.running === true ? "running" : service.running === false ? "stopped" : "unknown"}`,
+        `heartbeat=${fresh ? "fresh" : "stale"}`,
+        `last_run=${status?.ok === true ? "ok" : status ? "degraded" : "missing"}`
+      ].join(" "),
+      {
       service,
       status,
       fresh,
+      last_run_ok: status?.ok ?? null,
       pid_alive: pidAlive
-    }, { available: Boolean(status) || service.running === true });
+      },
+      { available: Boolean(status) || service.running === true }
+    );
   }
 
   async function collectProductStatusSection(cfg: BrainstackConfig, timeoutMs: number): Promise<BrainctlStatusSection> {

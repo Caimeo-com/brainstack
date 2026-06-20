@@ -96,6 +96,15 @@ interface ProposalListRequest {
   error: string | null;
 }
 
+type ProposalManagementAction = "auto-merge" | "groups";
+
+interface ProposalManagementIntent {
+  action: ProposalManagementAction;
+  dryRun: boolean;
+  help: boolean;
+  error: string | null;
+}
+
 type VoiceCapabilityAction = "install" | "uninstall" | "doctor" | "list";
 
 interface VoiceCapabilityIntent {
@@ -215,8 +224,65 @@ function proposalListUsage(): string {
     "Examples:",
     "/proposals pending",
     "/proposals needs-human needs-context",
-    "/proposals open project:lindy limit=10"
+    "/proposals open project:lindy limit=10",
+    "",
+    "For consolidation, say: look for proposal merges"
   ].join("\n");
+}
+
+function proposalManagementUsage(): string {
+  return [
+    "Proposal merge commands:",
+    "/proposal_groups - show review groups with multiple open proposals",
+    "/proposal_merges - create safe consolidated proposals and supersede absorbed sources",
+    "/proposal_merges preview - show what would merge without changing proposals",
+    "",
+    "Plain language also works:",
+    "look for proposal merges",
+    "show proposal merge candidates",
+    "merge related proposals"
+  ].join("\n");
+}
+
+function parseProposalManagementCommand(action: ProposalManagementAction, rest: string): ProposalManagementIntent {
+  const parts = rest.split(/\s+/).map((part) => part.trim().toLowerCase()).filter(Boolean);
+  if (parts.some((part) => part === "help" || part === "--help" || part === "-h")) {
+    return { action, dryRun: false, help: true, error: null };
+  }
+  const dryRun = parts.some((part) => ["preview", "dry-run", "dryrun", "plan", "check"].includes(part));
+  const unknown = parts.find((part) => !["preview", "dry-run", "dryrun", "plan", "check", "submit", "apply", "now"].includes(part));
+  return {
+    action,
+    dryRun,
+    help: false,
+    error: unknown ? `Unknown proposal merge option: ${unknown}` : null
+  };
+}
+
+function parseNaturalProposalManagementIntent(text: string): ProposalManagementIntent | null {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return null;
+  }
+
+  if (/^(?:please\s+)?(?:show|list)\s+(?:proposal\s+)?(?:merge\s+)?(?:candidates|groups|review groups)$/i.test(normalized)) {
+    return { action: "groups", dryRun: false, help: false, error: null };
+  }
+
+  if (
+    /^(?:please\s+)?(?:look for|find|discover|check for)\s+(?:safe\s+)?(?:proposal\s+)?(?:merges|merge candidates|overlaps|duplicates|related proposals)$/i.test(normalized) ||
+    /^(?:please\s+)?(?:merge|consolidate|squash)\s+(?:safe\s+)?(?:related\s+)?proposals?$/i.test(normalized)
+  ) {
+    return { action: "auto-merge", dryRun: false, help: false, error: null };
+  }
+
+  if (
+    /^(?:please\s+)?(?:preview|dry run|plan|check)\s+(?:safe\s+)?(?:proposal\s+)?(?:merges|merge candidates|consolidation)$/i.test(normalized)
+  ) {
+    return { action: "auto-merge", dryRun: true, help: false, error: null };
+  }
+
+  return null;
 }
 
 function parseProposalListRequest(text: string): ProposalListRequest {
@@ -899,6 +965,19 @@ export class CommandHandler {
       return;
     }
 
+    const proposalManagementIntent =
+      parsed?.command === "/proposal_merges" || parsed?.command === "/proposals_merge" || parsed?.command === "/proposal_merge"
+        ? parseProposalManagementCommand("auto-merge", parsed.rest)
+        : parsed?.command === "/proposal_groups" || parsed?.command === "/proposal_review_groups"
+          ? parseProposalManagementCommand("groups", parsed.rest)
+          : !parsed && !hasAttachments
+            ? parseNaturalProposalManagementIntent(text)
+            : null;
+    if (proposalManagementIntent) {
+      await this.handleProposalManagementIntent(proposalManagementIntent, target);
+      return;
+    }
+
     if (parsed?.command === "/whoami") {
       await this.telegram.sendText(
         target,
@@ -1113,6 +1192,8 @@ export class CommandHandler {
               "/curator_status",
               "/curator_run",
               "/proposals",
+              "/proposal_groups",
+              "/proposal_merges",
               "/curation",
               "/mode [fast|normal|max|clear]",
               "/model [model-id|clear]",
@@ -1139,6 +1220,7 @@ export class CommandHandler {
               "Use /context or /usage to inspect the current topic state. Use /compact to compact Codex topics when supported.",
               "Use /voice install <machine> to install local voice transcription for Telegram voice notes.",
               "Use /curation in a proposal-review topic to bind it as Brainstack's proposal curation surface.",
+              "Use /proposal_merges, or say \"look for proposal merges\", to consolidate safe related proposals without applying wiki edits.",
               "Use /crons to inspect scheduled jobs linked to this topic/context. Use /cron install update-check, brain-curator, or daily-checkin to add built-in routines.",
               "Use /cron_run <id|label> or the shortcuts from /crons to test a scheduled job immediately."
             ].join("\n")
@@ -1927,7 +2009,7 @@ export class CommandHandler {
 
     let result: { ok: boolean; exitCode: number | null; timedOut: boolean; stdout: string; stderr: string };
     try {
-      result = await this.runBrainctlCapability(baseArgs, intent.action === "install" ? 40 * 60_000 : 90_000);
+      result = await this.runBrainctlCommand(baseArgs, intent.action === "install" ? 40 * 60_000 : 90_000);
     } finally {
       if (progressTimer) {
         clearInterval(progressTimer);
@@ -1981,16 +2063,161 @@ export class CommandHandler {
     return timer;
   }
 
-  private async runBrainctlCapability(
+  private async handleProposalManagementIntent(intent: ProposalManagementIntent, target: TelegramTarget): Promise<void> {
+    if (intent.help) {
+      await this.telegram.sendText(target, proposalManagementUsage());
+      return;
+    }
+    if (intent.error) {
+      await this.telegram.sendText(target, `${intent.error}\n\n${proposalManagementUsage()}`);
+      return;
+    }
+    if (intent.action === "auto-merge" && !intent.dryRun && !this.config.brainAdminToken) {
+      await this.telegram.sendText(
+        target,
+        "Proposal merge submission needs FACTORY_BRAIN_ADMIN_TOKEN. Use /proposal_merges preview for a read-only scan, or configure the admin token on the control host."
+      );
+      return;
+    }
+
+    const args =
+      intent.action === "groups"
+        ? ["proposals", "groups", "--status", "open", "--min-size", "2", "--json", "--config", this.config.brainstackConfigPath]
+        : [
+            "proposals",
+            "auto-merge",
+            ...(intent.dryRun ? [] : ["--submit"]),
+            "--max-group-size",
+            "6",
+            "--limit-groups",
+            "5",
+            "--json",
+            "--config",
+            this.config.brainstackConfigPath
+          ];
+
+    await this.telegram.sendText(
+      target,
+      intent.action === "groups"
+        ? "Looking for proposal review groups with multiple open items."
+        : intent.dryRun
+          ? "Previewing safe proposal merges. No proposals will be changed."
+          : "Looking for safe proposal merges. This may create consolidated proposals and mark absorbed sources superseded, but it will not apply wiki edits."
+    );
+
+    const result = await this.runBrainctlCommand(args, intent.action === "groups" ? 45_000 : 180_000);
+    const output = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n");
+    if (!result.ok) {
+      const trimmed = output.length > 3200 ? `${output.slice(0, 3200)}\n... truncated` : output;
+      await this.telegram.sendText(
+        target,
+        [
+          intent.action === "groups"
+            ? `Proposal group scan failed${result.timedOut ? " (timed out)" : ` (exit ${result.exitCode})`}.`
+            : `Proposal merge scan failed${result.timedOut ? " (timed out)" : ` (exit ${result.exitCode})`}.`,
+          trimmed || "No output."
+        ].join("\n\n")
+      );
+      return;
+    }
+
+    await this.telegram.sendText(
+      target,
+      intent.action === "groups" ? this.formatProposalGroupOutput(output) : this.formatProposalAutoMergeOutput(output, intent.dryRun)
+    );
+  }
+
+  private formatProposalGroupOutput(output: string): string {
+    try {
+      const parsed = JSON.parse(output) as Record<string, unknown>;
+      const groups = Array.isArray(parsed.review_groups)
+        ? (parsed.review_groups as Array<Record<string, unknown>>)
+        : Array.isArray(parsed.clusters)
+          ? (parsed.clusters as Array<Record<string, unknown>>)
+          : [];
+      if (!groups.length) {
+        return "No proposal review groups currently have multiple open items.";
+      }
+      const lines = [`Proposal merge candidates: ${groups.length} review group(s).`];
+      for (const group of groups.slice(0, 8)) {
+        lines.push(
+          [
+            `- ${String(group.label || group.id || "unknown")}`,
+            `count=${String(group.count ?? "?")}`,
+            Number(group.needsContextCount || 0) ? `needs_context=${String(group.needsContextCount)}` : null,
+            Number(group.legacyCount || 0) ? `legacy=${String(group.legacyCount)}` : null
+          ]
+            .filter(Boolean)
+            .join(" ")
+        );
+      }
+      if (groups.length > 8) {
+        lines.push(`Showing 8 of ${groups.length}.`);
+      }
+      lines.push("Say \"look for proposal merges\" to create safe consolidated proposals.");
+      return lines.join("\n");
+    } catch {
+      return output || "Proposal group scan completed, but produced no output.";
+    }
+  }
+
+  private formatProposalAutoMergeOutput(output: string, dryRun: boolean): string {
+    try {
+      const parsed = JSON.parse(output) as Record<string, unknown>;
+      const merged = Array.isArray(parsed.merged) ? (parsed.merged as Array<Record<string, unknown>>) : [];
+      const skipped = Array.isArray(parsed.skipped) ? (parsed.skipped as Array<Record<string, unknown>>) : [];
+      const lines = [
+        dryRun ? "Proposal merge preview complete." : "Proposal merge scan complete.",
+        `Considered ${String(parsed.considered ?? 0)} review group(s); selected ${String(parsed.selected ?? 0)} batch(es); ${dryRun ? "would create" : "created"} ${merged.length} consolidated proposal(s).`
+      ];
+      for (const item of merged.slice(0, 5)) {
+        lines.push(
+          [
+            `- ${String(item.groupKey || "group")}`,
+            `sources=${String(item.selected ?? "?")}`,
+            item.targetPage ? `target=${String(item.targetPage)}` : null,
+            item.writeStatus ? `status=${String(item.writeStatus)}` : dryRun ? "preview" : null
+          ]
+            .filter(Boolean)
+            .join(" ")
+        );
+      }
+      if (merged.length > 5) {
+        lines.push(`Showing 5 of ${merged.length} merged batch(es).`);
+      }
+      if (skipped.length) {
+        lines.push(`Skipped ${skipped.length} group/batch(es).`);
+        for (const item of skipped.slice(0, 3)) {
+          lines.push(`- ${String(item.groupKey || "group")}: ${String(item.reason || "skipped")}`);
+        }
+      }
+      lines.push(dryRun ? "No proposals were changed." : "No wiki edits were applied; review/accept consolidated proposals separately.");
+      return lines.join("\n");
+    } catch {
+      return output || "Proposal merge scan completed, but produced no output.";
+    }
+  }
+
+  private async runBrainctlCommand(
     args: string[],
     timeoutMs: number
   ): Promise<{ ok: boolean; exitCode: number | null; timedOut: boolean; stdout: string; stderr: string }> {
     let proc: ReturnType<typeof Bun.spawn>;
     try {
+      const env: Record<string, string> = {};
+      for (const [key, value] of Object.entries(process.env)) {
+        if (typeof value === "string") {
+          env[key] = value;
+        }
+      }
+      if (this.config.brainAdminToken && !env.BRAIN_ADMIN_TOKEN) {
+        env.BRAIN_ADMIN_TOKEN = this.config.brainAdminToken;
+      }
       proc = Bun.spawn([this.config.brainctlBin, ...args], {
         stdout: "pipe",
         stderr: "pipe",
-        stdin: "ignore"
+        stdin: "ignore",
+        env
       });
     } catch (error) {
       return {
@@ -2685,7 +2912,8 @@ export class CommandHandler {
           "Sets this Telegram topic up as Brainstack's proposal curation surface.",
           "It binds the topic to a durable proposal-curation scratch context and points the brain-curator routine at this topic.",
           "",
-          "Use /proposals pending, /proposals needs-human needs-context, /curator_status, and /curator_run here."
+          "Use /proposals pending, /proposals needs-human needs-context, /curator_status, and /curator_run here.",
+          "Say \"look for proposal merges\" when you want Brainstack to consolidate safe related proposals."
         ].join("\n")
       );
       return;
@@ -2718,8 +2946,11 @@ export class CommandHandler {
           "/proposals pending",
           "/proposals needs-human needs-context",
           "/proposals open limit=10",
+          "/proposal_groups",
+          "/proposal_merges",
           "",
-          "Accept/reject shortcuts from /proposals are scoped to the list you just loaded."
+          "Accept/reject shortcuts from /proposals are scoped to the list you just loaded.",
+          "You can also say \"look for proposal merges\" here; merge scans create consolidated proposals but do not apply wiki edits."
         ].join("\n")
       ]
         .filter(Boolean)

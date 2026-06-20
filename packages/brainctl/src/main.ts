@@ -937,7 +937,7 @@ async function daemonIteration(cfg: BrainstackConfig, args: ParsedArgs, status: 
 }
 
 function daemonStatusFresh(status: BrainstackDaemonStatus | null, maxAgeMs: number): boolean {
-  if (!status?.ok) {
+  if (!status) {
     return false;
   }
   const updated = Date.parse(status.updated_at || "");
@@ -1011,8 +1011,8 @@ async function commandDaemonStatus(args: ParsedArgs): Promise<void> {
   const fresh = daemonStatusFresh(status, 10 * 60_000);
   const pidAlive = typeof status?.pid === "number" ? processAlive(status.pid) : null;
   const active = service.running === true || pidAlive === true;
-  const ok = Boolean(status?.ok && fresh && active && service.installed && service.running !== false);
-  const body = { ok, fresh, pid_alive: pidAlive, service, status };
+  const ok = Boolean(status && fresh && active && service.installed && service.running !== false);
+  const body = { ok, fresh, last_run_ok: status?.ok ?? null, pid_alive: pidAlive, service, status };
   if (hasFlag(args, "json")) {
     console.log(JSON.stringify(body, null, 2));
     return;
@@ -1022,7 +1022,7 @@ async function commandDaemonStatus(args: ParsedArgs): Promise<void> {
     console.log(`daemon status: missing (${daemonStatusPath(cfg)})`);
     return;
   }
-  console.log(`daemon status: ok=${status.ok} fresh=${fresh} pid=${status.pid} pid_alive=${pidAlive ?? "unknown"} updated=${status.updated_at} iteration=${status.iteration}`);
+  console.log(`daemon status: heartbeat_fresh=${fresh} last_run_ok=${status.ok} pid=${status.pid} pid_alive=${pidAlive ?? "unknown"} updated=${status.updated_at} iteration=${status.iteration}`);
   console.log(`shared-brain: path=${status.repo.path} head=${status.repo.head || "unknown"} clean=${status.repo.clean ?? "unknown"} last_pull=${status.repo.last_pull_at || "never"}`);
   console.log(`outbox: ${status.outbox.detail}`);
   console.log(`skills: ${status.skills.detail}`);
