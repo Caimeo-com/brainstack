@@ -32,8 +32,18 @@ public struct ActionOutcome: Sendable {
   public let summary: String
   public let output: String
   public let duration: TimeInterval
+  public let recovery: ActionRecovery?
 
-  public init(title: String, succeeded: Bool, unsupported: Bool, adminUnavailable: Bool, summary: String, output: String, duration: TimeInterval) {
+  public init(
+    title: String,
+    succeeded: Bool,
+    unsupported: Bool,
+    adminUnavailable: Bool,
+    summary: String,
+    output: String,
+    duration: TimeInterval,
+    recovery: ActionRecovery? = nil
+  ) {
     self.title = title
     self.succeeded = succeeded
     self.unsupported = unsupported
@@ -41,6 +51,27 @@ public struct ActionOutcome: Sendable {
     self.summary = summary
     self.output = output
     self.duration = duration
+    self.recovery = recovery
+  }
+}
+
+public enum ActionRecoveryKind: String, Equatable, Sendable {
+  case updateControlHost
+}
+
+public struct ActionRecovery: Equatable, Sendable {
+  public let kind: ActionRecoveryKind
+  public let title: String
+  public let message: String
+  public let primaryButtonTitle: String
+  public let technicalHint: String?
+
+  public init(kind: ActionRecoveryKind, title: String, message: String, primaryButtonTitle: String, technicalHint: String? = nil) {
+    self.kind = kind
+    self.title = title
+    self.message = message
+    self.primaryButtonTitle = primaryButtonTitle
+    self.technicalHint = technicalHint
   }
 }
 
@@ -172,6 +203,7 @@ public struct BrainctlClient: Sendable {
     let combined = "\(result.stdout)\n\(result.stderr)".lowercased()
     return combined.contains("unknown command")
       || combined.contains("unknown subcommand")
+      || combined.contains("unknown ") && combined.contains(" subcommand")
       || combined.contains("unknown route")
       || combined.contains("http 404")
       || combined.contains("unknown ") && combined.contains(" command:")
@@ -192,21 +224,41 @@ public struct BrainctlClient: Sendable {
   }
 
   static func outcome(title: String, result: CommandResult, timeout: TimeInterval) -> ActionOutcome {
-    let unsupported = Self.looksUnsupported(result)
+    let remoteMergeUnsupported = title == "Look for Merges" && Self.looksRemoteProposalMergeUnsupported(result)
+    let unsupported = Self.looksUnsupported(result) && !remoteMergeUnsupported
     let adminUnavailable = Self.looksAdminUnavailable(result)
     let baseSummary: String
+    let recovery: ActionRecovery?
     if result.launchFailure != nil {
       baseSummary = "brainctl is missing; choose the binary in Preferences."
+      recovery = nil
     } else if result.timedOut {
       baseSummary = "\(title) timed out after \(Int(timeout))s."
+      recovery = nil
+    } else if remoteMergeUnsupported {
+      baseSummary = "Merge scan needs a control host update. Nothing was changed."
+      recovery = ActionRecovery(
+        kind: .updateControlHost,
+        title: "Update the control host",
+        message: "The control host does not support proposal merge discovery yet. Proposal review still works; update the control host, then retry the merge scan.",
+        primaryButtonTitle: "Update Control Host",
+        technicalHint: "This usually means the Mac app/brainctl is newer than the Brainstack checkout running on the control host."
+      )
     } else if unsupported {
       baseSummary = "Unsupported by installed brainctl; update Brainstack on this machine."
+      recovery = nil
     } else if adminUnavailable {
       baseSummary = "Admin auth is unavailable to brainctl on this machine."
+      recovery = nil
     } else if result.exitCode == 0 {
       baseSummary = "\(title) succeeded."
+      recovery = nil
+    } else if title == "Look for Merges", Self.looksCodexModelMismatch(result) {
+      baseSummary = "Codex cannot run the configured merge model; update Codex or choose a compatible harness binary."
+      recovery = nil
     } else {
       baseSummary = "\(title) failed (exit \(result.exitCode.map(String.init) ?? "n/a"))."
+      recovery = nil
     }
     let rawOutput = [result.stdout, result.stderr]
       .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -221,8 +273,27 @@ public struct BrainctlClient: Sendable {
       adminUnavailable: adminUnavailable,
       summary: outboxGuide?.summary ?? baseSummary,
       output: outboxGuide?.output ?? redactedOutput,
-      duration: result.duration
+      duration: result.duration,
+      recovery: recovery
     )
+  }
+
+  static func looksCodexModelMismatch(_ result: CommandResult) -> Bool {
+    let combined = "\(result.stdout)\n\(result.stderr)".lowercased()
+    return combined.contains("proposal merge harness failed")
+      && combined.contains("codex")
+      && (combined.contains("requires a newer version of codex") || combined.contains("model is not supported"))
+  }
+
+  static func looksRemoteProposalMergeUnsupported(_ result: CommandResult) -> Bool {
+    guard result.exitCode != 0 else {
+      return false
+    }
+    let combined = "\(result.stdout)\n\(result.stderr)".lowercased()
+    return combined.contains("proposal batch-merge failed over ssh")
+      && (combined.contains("unknown proposals subcommand: batch-merge")
+        || combined.contains("unknown subcommand")
+        || combined.contains("unknown command"))
   }
 
   // Named action builders so views never assemble argv strings.
@@ -290,8 +361,8 @@ public struct BrainctlClient: Sendable {
     await runAction(title: "Check Stack Updates", arguments: ["updates", "--config", configPath], timeout: 60)
   }
 
-  public func fleetUpdate(machine: String) async -> ActionOutcome {
-    await runAction(title: "Update \(machine)", arguments: ["fleet", "update", machine, "--config", configPath], timeout: 300)
+  public func fleetUpdate(machine: String, title: String? = nil) async -> ActionOutcome {
+    await runAction(title: title ?? "Update \(machine)", arguments: ["fleet", "update", machine, "--config", configPath], timeout: 300)
   }
 
   public func enroll(inviteFile: String, timeout: TimeInterval? = nil) async -> ActionOutcome {
@@ -375,8 +446,8 @@ public struct BrainctlClient: Sendable {
   public func proposalAutoMerge() async -> ActionOutcome {
     await runAction(
       title: "Look for Merges",
-      arguments: ["proposals", "auto-merge", "--submit", "--max-group-size", "6", "--limit-groups", "5", "--config", configPath],
-      timeout: 180
+      arguments: ["proposals", "batch-merge", "--submit", "--limit", "100", "--auto-threshold", "0.8", "--config", configPath],
+      timeout: 600
     )
   }
 }

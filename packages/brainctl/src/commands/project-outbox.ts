@@ -37,7 +37,7 @@ type ProjectOutboxDeps = {
   check: (status: import("../config").CheckStatus, section: string, name: string, detail: string, remediation?: string) => DoctorCheck;
   sha256Hex: (text: string) => string;
   parsePositiveIntegerFlag: (args: ParsedArgs, key: string, fallback: number) => number;
-  brainApiRequest: (cfg: BrainstackConfig, method: "GET" | "POST", path: string, options?: { admin?: boolean; body?: Record<string, unknown>; timeoutMs?: number }) => Promise<Record<string, unknown>>;
+  brainApiRequest: (cfg: BrainstackConfig, method: "GET" | "POST", path: string, options?: { admin?: boolean; body?: Record<string, unknown>; timeoutMs?: number; idempotencyKey?: string }) => Promise<Record<string, unknown>>;
   fetchProposalDetail: (cfg: BrainstackConfig, id: string) => Promise<{ proposal: Record<string, unknown>; body: string }>;
   proposalNeedsContext: (proposal: Record<string, unknown>) => boolean;
 };
@@ -1365,6 +1365,24 @@ function readEnvFile(path: string): Record<string, string> {
     return match?.[1]?.trim() || null;
   }
 
+  function proposalIsOpen(record: Record<string, unknown>): boolean {
+    return ["pending", "approved", "needs-human"].includes(stringFromRecord(record, "status") || "");
+  }
+
+  function proposalIdFromRef(ref: string): string | null {
+    const trimmed = ref.trim();
+    if (!trimmed) return null;
+    return trimmed.startsWith("proposal:") ? trimmed.slice("proposal:".length).trim() || null : null;
+  }
+
+  function proposalIdsFromRefs(refs: string[]): string[] {
+    return uniqueNonEmptyStrings(refs.map((ref) => proposalIdFromRef(ref)).filter(Boolean) as string[]);
+  }
+
+  function proposalIsMemoryMerge(record: Record<string, unknown>): boolean {
+    return stringFromRecord(record, "source_type") === "memory-merge";
+  }
+
   function proposalLessonLine(detail: { id: string; proposal: Record<string, unknown>; body: string }): string {
     const title = stripRememberPrefix(stringFromRecord(detail.proposal, "title") || detail.id);
     if (title.length >= 12) {
@@ -1837,6 +1855,635 @@ function readEnvFile(path: string): Record<string, string> {
       });
     }
     return { dryRun, considered: groups.length, selected: selectedBatches.length, merged, skipped };
+  }
+
+  function parseUnitNumberFlag(args: ParsedArgs, key: string, fallback: number): number {
+    const raw = requireFlagValue(args, key);
+    if (raw === undefined) return fallback;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+      throw new Error(`--${key} must be a number between 0 and 1`);
+    }
+    return parsed;
+  }
+
+  function truncateForPrompt(value: string, maxChars: number): string {
+    const normalized = value.replace(/\r\n/g, "\n").trim();
+    if (normalized.length <= maxChars) return normalized;
+    return `${normalized.slice(0, maxChars)}\n[truncated ${normalized.length - maxChars} chars]`;
+  }
+
+  function proposalPromptRecord(detail: { id: string; proposal: Record<string, unknown>; body: string }): Record<string, unknown> {
+    const proposal = detail.proposal;
+    return {
+      id: detail.id,
+      title: stringFromRecord(proposal, "title"),
+      status: stringFromRecord(proposal, "status"),
+      created_at: stringFromRecord(proposal, "created_at"),
+      target_page: stringFromRecord(proposal, "target_page"),
+      project: stringFromRecord(proposal, "project"),
+      domain: stringFromRecord(proposal, "domain"),
+      scope: stringFromRecord(proposal, "scope"),
+      memory_kind: stringFromRecord(proposal, "memory_kind"),
+      review_group: stringFromRecord(proposal, "cluster_label") || stringFromRecord(proposal, "cluster_key"),
+      source_type: stringFromRecord(proposal, "source_type"),
+      quality_decision: stringFromRecord(proposal, "quality_decision"),
+      confidence: proposal.confidence,
+      evidence_refs: stringArrayFromRecord(proposal, "evidence_refs").slice(0, 8),
+      source_ids: stringArrayFromRecord(proposal, "source_ids").slice(0, 8),
+      body: truncateForPrompt(detail.body, 1_400)
+    };
+  }
+
+  function extractJsonObject(text: string): Record<string, unknown> {
+    const trimmed = text.trim();
+    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)?.[1]?.trim();
+    const candidates = [trimmed, fenced].filter(Boolean) as string[];
+    for (const candidate of candidates) {
+      try {
+        const parsed = JSON.parse(candidate);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Try the next shape.
+      }
+    }
+    const first = trimmed.indexOf("{");
+    const last = trimmed.lastIndexOf("}");
+    if (first >= 0 && last > first) {
+      try {
+        const parsed = JSON.parse(trimmed.slice(first, last + 1));
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Fall through to the uniform error below.
+      }
+    }
+    throw new Error("proposal merge harness did not return a JSON object");
+  }
+
+  function buildHarnessMergePrompt(input: {
+    totalOpen: number;
+    limit: number;
+    overflow: boolean;
+    autoThreshold: number;
+    proposals: Array<{ id: string; proposal: Record<string, unknown>; body: string }>;
+  }): string {
+    return [
+      "You are Brainstack's proposal merge planner.",
+      "",
+      "Task: review the supplied open proposal candidates and find related subsets that should be consolidated into fewer durable memory/wiki proposals.",
+      "",
+      "Rules:",
+      "- Return JSON only.",
+      "- Do not invent proposal ids; every source_ids entry must come from the supplied proposal ids.",
+      "- Each merge candidate must contain 2 to 12 source ids.",
+      "- Prefer specific related work, such as the same product area, repo, day, UI surface, incident, or docs pass.",
+      "- Do not merge broad unrelated project activity just because it happened in the same repository.",
+      "- Do not merge source-page curator proposals with memory lessons unless they clearly describe the same final lesson.",
+      "- Confidence >= 0.80 means the candidate is safe for automatic consolidation; below that means human review.",
+      "- If there are no good merges, return an empty merge_candidates array.",
+      "",
+      "Return shape:",
+      JSON.stringify({
+        merge_candidates: [
+          {
+            title: "short consolidated proposal title",
+            source_ids: ["proposal-id-1", "proposal-id-2"],
+            confidence: 0.87,
+            topic: "front-end UI polish",
+            project: "project or null",
+            domain: "domain or null",
+            scope: "repo|project|global|machine|harness",
+            memory_kind: "project_lesson",
+            summary: "the consolidated durable lesson",
+            applicability: "where this applies",
+            non_applicability: "where this should not be applied",
+            reason: "why these proposals belong together"
+          }
+        ],
+        warnings: ["optional warning"]
+      }, null, 2),
+      "",
+      `Open proposals available: ${input.totalOpen}. Supplied in this prompt: ${input.proposals.length}.`,
+      input.overflow ? `Only the top ${input.limit} proposals are supplied. The operator must rerun after this batch to cover the rest.` : "All open proposals are supplied.",
+      `Automatic consolidation threshold: ${input.autoThreshold}.`,
+      "",
+      "Proposals:",
+      JSON.stringify(input.proposals.map(proposalPromptRecord), null, 2)
+    ].join("\n");
+  }
+
+  function proposalMergeHarnessEnv(sourceEnv: NodeJS.ProcessEnv = process.env): Record<string, string> {
+    const allowedExact = new Set([
+      "HOME",
+      "PATH",
+      "SHELL",
+      "TERM",
+      "TMPDIR",
+      "USER",
+      "LOGNAME",
+      "LANG",
+      "LC_ALL",
+      "CODEX_HOME",
+      "CODEX_CLI_PATH",
+      "CLAUDE_CONFIG_DIR",
+      "ANTHROPIC_BASE_URL",
+      "OPENAI_BASE_URL",
+      "OPENAI_ORG_ID",
+      "OPENAI_PROJECT"
+    ]);
+    const allowedSensitiveExceptions = new Set(["SSH_AUTH_SOCK"]);
+    const allowedPrefixes = ["XDG_"];
+    const denyPattern = /(?:TOKEN|SECRET|PASSWORD|PASS|KEY|COOKIE|AUTH|CREDENTIAL|WEBHOOK)/i;
+    const deniedPrefixes = ["BRAIN_", "BRAINSTACK_", "FACTORY_", "TELEGRAM_", "TG_"];
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(sourceEnv)) {
+      if (typeof value !== "string") {
+        continue;
+      }
+      if (allowedSensitiveExceptions.has(key) || allowedExact.has(key) || allowedPrefixes.some((prefix) => key.startsWith(prefix))) {
+        if (deniedPrefixes.some((prefix) => key.startsWith(prefix))) {
+          continue;
+        }
+        env[key] = value;
+        continue;
+      }
+      if (deniedPrefixes.some((prefix) => key.startsWith(prefix)) || denyPattern.test(key)) {
+        continue;
+      }
+    }
+    return env;
+  }
+
+  function harnessMergeIdempotencyKey(targetPage: string, sourceIds: string[]): string {
+    const normalizedSources = uniqueNonEmptyStrings(sourceIds).sort();
+    return `proposal-merge:${sha256Hex(JSON.stringify({ targetPage, sourceIds: normalizedSources })).slice(0, 48)}`;
+  }
+
+  async function runProposalMergeHarness(
+    cfg: BrainstackConfig,
+    args: ParsedArgs,
+    prompt: string
+  ): Promise<{ output: Record<string, unknown>; harness: string; stderr: string }> {
+    const harness = (requireFlagValue(args, "harness") || cfg.harness.name || "codex").toLowerCase();
+    const bin = resolveHarnessExecutable(
+      requireFlagValue(args, "harness-bin") || process.env.BRAINSTACK_PROPOSAL_MERGE_HARNESS_BIN || cfg.harness.bin || harness
+    );
+    const timeoutMs = parsePositiveIntegerFlag(args, "harness-timeout-ms", 300_000);
+    const tmpRoot = join(cfg.paths.stateRoot, "tmp");
+    await ensureDir(tmpRoot, 0o700);
+    const nonce = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const outputPath = join(tmpRoot, `proposal-merge-${nonce}.txt`);
+    const argv =
+      harness === "codex"
+        ? [
+            bin,
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "-c",
+            "model_reasoning_effort=\"medium\"",
+            "--output-last-message",
+            outputPath,
+            "-"
+          ]
+        : harness === "claude"
+          ? [bin, "-p", "--output-format", "text"]
+          : (() => {
+              throw new Error(`proposal batch merge supports codex or claude harnesses, not ${harness}`);
+            })();
+    const proc = Bun.spawn(argv, {
+      cwd: proposalMergeHarnessCwd(cfg),
+      env: proposalMergeHarnessEnv(),
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe"
+    });
+    const stdoutPromise = new Response(proc.stdout).text();
+    const stderrPromise = new Response(proc.stderr).text();
+    proc.stdin.write(prompt);
+    await proc.stdin.flush();
+    proc.stdin.end();
+    const timeout = setTimeout(() => {
+      try {
+        proc.kill();
+      } catch {
+        // Process may already have exited.
+      }
+    }, timeoutMs);
+    const [code, stdout, stderr] = await Promise.all([proc.exited, stdoutPromise, stderrPromise]).finally(() => clearTimeout(timeout));
+    const finalMessage = existsSync(outputPath) ? await readFile(outputPath, "utf8").catch(() => "") : "";
+    await rm(outputPath, { force: true }).catch(() => undefined);
+    if (code !== 0) {
+      throw new Error(formatProposalMergeHarnessFailure(code, bin, stderr, stdout));
+    }
+    const text = finalMessage.trim() || stdout.trim();
+    if (!text) {
+      throw new Error("proposal merge harness returned no output");
+    }
+    return { output: extractJsonObject(text), harness, stderr };
+  }
+
+  function resolveHarnessExecutable(rawBin: string): string {
+    const expanded = rawBin.startsWith("~/") && process.env.HOME ? join(process.env.HOME, rawBin.slice(2)) : rawBin;
+    if (expanded.includes("/") || existsSync(expanded)) {
+      return expanded;
+    }
+    for (const candidate of preferredHarnessCandidates(expanded)) {
+      if (existsSync(candidate)) {
+        return candidate;
+      }
+    }
+    const found = commandPath(expanded);
+    if (found) {
+      return found;
+    }
+    const candidates = [
+      process.env.HOME ? join(process.env.HOME, ".local", "bin", expanded) : null,
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+      process.env.HOME ? join(process.env.HOME, ".bun", "bin", expanded) : null,
+      expanded === "codex" ? "/Applications/Codex.app/Contents/Resources/codex" : null,
+      expanded === "claude" ? "/Applications/Claude.app/Contents/MacOS/Claude" : null
+    ]
+      .filter((candidate): candidate is string => Boolean(candidate))
+      .map((candidate) => (candidate.endsWith(expanded) ? candidate : join(candidate, expanded)));
+    for (const candidate of candidates) {
+      if (existsSync(candidate)) {
+        return candidate;
+      }
+    }
+    return expanded;
+  }
+
+  function preferredHarnessCandidates(name: string): string[] {
+    if (name === "codex") {
+      return [
+        process.env.CODEX_CLI_PATH || null,
+        "/Applications/Codex.app/Contents/Resources/codex"
+      ].filter((candidate): candidate is string => Boolean(candidate));
+    }
+    return [];
+  }
+
+  function proposalMergeHarnessCwd(cfg: BrainstackConfig): string {
+    const candidates = [
+      cfg.paths.productRepo,
+      cfg.paths.sharedBrainRoot,
+      cfg.paths.clientLocalPath,
+      process.cwd(),
+      process.env.HOME || ""
+    ];
+    for (const candidate of candidates) {
+      if (!candidate || candidate === "/") continue;
+      try {
+        if (existsSync(candidate) && statSync(candidate).isDirectory()) {
+          return candidate;
+        }
+      } catch {
+        // Try the next stable directory.
+      }
+    }
+    return process.cwd();
+  }
+
+  function formatProposalMergeHarnessFailure(code: number, bin: string, stderr: string, stdout: string): string {
+    const combined = [stderr, stdout].filter(Boolean).join("\n").trim();
+    const detail = combined.match(/"detail"\s*:\s*"([^"]+)"/)?.[1] || combined.match(/ERROR:\s*(.+)$/m)?.[1] || "";
+    const model = combined.match(/^model:\s*(.+)$/m)?.[1]?.trim();
+    const version = combined.match(/^(?:OpenAI Codex|codex-cli)\s+(.+)$/m)?.[1]?.trim();
+    const actionable = detail.includes("requires a newer version of Codex")
+      ? [
+          `Codex rejected configured model${model ? ` ${model}` : ""}: ${detail}`,
+          `Brainstack used ${bin}${version ? ` (${version})` : ""}. Update that Codex CLI or configure harness.bin/CODEX_CLI_PATH to a newer Codex binary.`
+        ].join(" ")
+      : detail || combined.split(/\r?\n/).find((line) => /error|failed|unsupported/i.test(line)) || combined.slice(0, 500);
+    const diagnostic = combined
+      .split(/\r?\n/)
+      .filter((line) => /^(OpenAI Codex|codex-cli|workdir:|model:|provider:|ERROR:|stream error:)/.test(line))
+      .slice(0, 12)
+      .join("\n");
+    return [
+      `proposal merge harness failed (exit ${code}).`,
+      actionable,
+      diagnostic ? `Diagnostics:\n${diagnostic}` : ""
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  type HarnessMergeCandidate = {
+    title: string;
+    sourceIds: string[];
+    confidence: number;
+    topic: string;
+    project: string;
+    domain: string;
+    scope: string;
+    memoryKind: string;
+    summary: string;
+    applicability: string;
+    nonApplicability: string;
+    reason: string;
+  };
+
+  function normalizeHarnessMergeCandidate(
+    raw: Record<string, unknown>,
+    knownIds: Set<string>
+  ): { candidate?: HarnessMergeCandidate; error?: string } {
+    const sourceIds = uniqueNonEmptyStrings([
+      ...stringArrayFromRecord(raw, "source_ids"),
+      ...stringArrayFromRecord(raw, "sourceIds"),
+      ...stringArrayFromRecord(raw, "ids")
+    ]).filter((id) => knownIds.has(id));
+    if (sourceIds.length < 2) {
+      return { error: "candidate has fewer than two known source ids" };
+    }
+    if (sourceIds.length > 12) {
+      return { error: `candidate has ${sourceIds.length} source ids; max is 12` };
+    }
+    const confidence = typeof raw.confidence === "number" ? raw.confidence : Number(stringFromRecord(raw, "confidence") || "NaN");
+    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+      return { error: "candidate confidence is missing or invalid" };
+    }
+    const title = boundedCliString(stringFromRecord(raw, "title"), 140) || "Consolidated Brainstack proposal lesson";
+    const topic = boundedCliString(stringFromRecord(raw, "topic"), 80) || "related proposals";
+    const summary = boundedCliString(stringFromRecord(raw, "summary"), 1_500) || title;
+    const project = boundedCliString(stringFromRecord(raw, "project"), 120) || "shared-brain";
+    const domain = boundedCliString(stringFromRecord(raw, "domain"), 120) || project;
+    const scope = validateMemoryScope(stringFromRecord(raw, "scope") || "project");
+    const memoryKind = boundedCliString(stringFromRecord(raw, "memory_kind") || stringFromRecord(raw, "memoryKind"), 80) || "project_lesson";
+    return {
+      candidate: {
+        title,
+        sourceIds,
+        confidence,
+        topic,
+        project,
+        domain,
+        scope,
+        memoryKind,
+        summary,
+        applicability:
+          boundedCliString(stringFromRecord(raw, "applicability"), 1_000) ||
+          `Use when the supplied source proposals match ${project}/${domain} ${topic} work.`,
+        nonApplicability:
+          boundedCliString(stringFromRecord(raw, "non_applicability") || stringFromRecord(raw, "nonApplicability"), 1_000) ||
+          `Do not apply outside ${project}/${domain} without checking the source proposals.`,
+        reason: boundedCliString(stringFromRecord(raw, "reason"), 1_000) || "Harness judged these proposals related enough to consolidate."
+      }
+    };
+  }
+
+  function targetPageForHarnessMerge(candidate: HarnessMergeCandidate, details: Array<{ id: string; proposal: Record<string, unknown>; body: string }>): string {
+    const date = proposalCreatedDay(details[0]?.proposal || {});
+    const parts = [slugPart(candidate.project) || "shared-brain", slugPart(candidate.topic) || "proposal-merge", date === "unknown-date" ? "" : date.replaceAll("-", "")].filter(Boolean);
+    return `wiki/Syntheses/${parts.join("-")}-lessons.md`;
+  }
+
+  function harnessMergeSupersedeIdempotencyKey(mergeId: string, sourceId: string): string {
+    return `proposal-merge-close:${sha256Hex(JSON.stringify({ mergeId, sourceId })).slice(0, 48)}`;
+  }
+
+  async function closeHarnessMergeSources(
+    cfg: BrainstackConfig,
+    mergeId: string,
+    sourceIds: string[]
+  ): Promise<string[]> {
+    const closed: string[] = [];
+    for (const sourceId of sourceIds) {
+      await brainApiRequest(cfg, "POST", `/api/proposals/${encodeURIComponent(sourceId)}/supersede`, {
+        admin: true,
+        idempotencyKey: harnessMergeSupersedeIdempotencyKey(mergeId, sourceId),
+        body: {
+          decided_by: `${process.env.USER || "operator"}@${cfg.machine.name}`,
+          reason: `absorbed into ${mergeId}`
+        }
+      });
+      closed.push(sourceId);
+    }
+    return closed;
+  }
+
+  async function completeOutstandingHarnessMergeClosures(
+    cfg: BrainstackConfig,
+    proposals: Array<Record<string, unknown>>,
+    autoThreshold: number
+  ): Promise<Array<{ title: string; confidence: number; sourceIds: string[]; targetPage: string; autoMerged: boolean; writeStatus: string | null; closed: string[] }>> {
+    const byId = new Map<string, Record<string, unknown>>();
+    for (const proposal of proposals) {
+      const id = stringFromRecord(proposal, "id");
+      if (id) byId.set(id, proposal);
+    }
+    const recovered: Array<{ title: string; confidence: number; sourceIds: string[]; targetPage: string; autoMerged: boolean; writeStatus: string | null; closed: string[] }> = [];
+    for (const merge of proposals) {
+      if (!proposalIsMemoryMerge(merge) || !proposalIsOpen(merge)) {
+        continue;
+      }
+      const mergeId = stringFromRecord(merge, "id");
+      if (!mergeId) {
+        continue;
+      }
+      const confidence = numericRecordValue(merge, "confidence");
+      if (confidence < autoThreshold) {
+        continue;
+      }
+      const sourceIds = proposalIdsFromRefs(stringArrayFromRecord(merge, "source_ids"));
+      if (sourceIds.length < 2) {
+        continue;
+      }
+      const sourceRecords = sourceIds.map((id) => byId.get(id)).filter(Boolean) as Array<Record<string, unknown>>;
+      if (sourceRecords.length < 2 || !sourceRecords.some((record) => mergedIntoReason(record) === mergeId)) {
+        continue;
+      }
+      const outstanding = sourceRecords
+        .filter((record) => proposalIsOpen(record) && !proposalIsMemoryMerge(record))
+        .map((record) => stringFromRecord(record, "id"))
+        .filter(Boolean) as string[];
+      if (!outstanding.length) {
+        continue;
+      }
+      const closed = await closeHarnessMergeSources(cfg, mergeId, outstanding);
+      recovered.push({
+        title: stringFromRecord(merge, "title") || `Consolidate: ${mergeId}`,
+        confidence,
+        sourceIds,
+        targetPage: stringFromRecord(merge, "target_page") || "",
+        autoMerged: true,
+        writeStatus: "already-created",
+        closed
+      });
+    }
+    return recovered;
+  }
+
+  function buildHarnessMergeContent(
+    candidate: HarnessMergeCandidate,
+    details: Array<{ id: string; proposal: Record<string, unknown>; body: string }>,
+    autoMerged: boolean
+  ): string {
+    const evidenceRefs = uniqueNonEmptyStrings([
+      ...details.map((detail) => `proposal:${detail.id}`),
+      ...details.flatMap((detail) => stringArrayFromRecord(detail.proposal, "evidence_refs"))
+    ]).slice(0, 100);
+    const lessonLines = details.map((detail) => `- ${proposalLessonLine(detail)} (source: \`proposal:${detail.id}\`)`);
+    return [
+      `# ${candidate.title}`,
+      "",
+      candidate.summary,
+      "",
+      "## Lessons",
+      "",
+      ...lessonLines,
+      "",
+      "## Applicability",
+      "",
+      candidate.applicability,
+      "",
+      "## Non-applicability",
+      "",
+      candidate.nonApplicability,
+      "",
+      "## Merge Review",
+      "",
+      `- Harness confidence: ${Math.round(candidate.confidence * 100)}%`,
+      `- Topic: ${candidate.topic}`,
+      `- Decision path: ${autoMerged ? "auto-merged source proposals because confidence met threshold" : "needs-human review because confidence was below threshold"}`,
+      `- Reason: ${candidate.reason}`,
+      "",
+      "## Evidence",
+      "",
+      ...evidenceRefs.map((ref) => `- \`${ref}\``)
+    ].join("\n");
+  }
+
+  async function createHarnessProposalMerges(
+    cfg: BrainstackConfig,
+    args: ParsedArgs
+  ): Promise<{
+    dryRun: boolean;
+    harness: string;
+    totalOpen: number;
+    inspected: number;
+    overflow: boolean;
+    autoThreshold: number;
+    candidates: number;
+    merged: Array<{ title: string; confidence: number; sourceIds: string[]; targetPage: string; autoMerged: boolean; writeStatus: string | null; closed: string[] }>;
+    skipped: Array<{ ids?: string[]; reason: string }>;
+    warnings: string[];
+  }> {
+    const requestedStatus = requireFlagValue(args, "status");
+    const status = requestedStatus || "open";
+    const statusQuery = !requestedStatus || requestedStatus === "open" ? "pending,approved,needs-human,superseded" : status;
+    const requestedLimit = parsePositiveIntegerFlag(args, "limit", 100);
+    const limit = hasFlag(args, "allow-large") ? requestedLimit : Math.min(requestedLimit, 100);
+    const autoThreshold = parseUnitNumberFlag(args, "auto-threshold", 0.8);
+    const dryRun = !hasFlag(args, "submit") && !hasFlag(args, "apply") && !hasFlag(args, "yes");
+    const result = await brainApiRequest(cfg, "GET", `/api/proposals?status=${encodeURIComponent(statusQuery)}`);
+    const proposals = Array.isArray(result.proposals) ? (result.proposals as Array<Record<string, unknown>>) : [];
+    const recovered =
+      dryRun || hasFlag(args, "keep-sources")
+        ? []
+        : await completeOutstandingHarnessMergeClosures(cfg, proposals, autoThreshold);
+    const recoveredIds = new Set(recovered.flatMap((item) => item.closed));
+    const sourceProposals = proposals
+      .filter((proposal) => (status === "open" ? proposalIsOpen(proposal) : true))
+      .filter((proposal) => !proposalIsMemoryMerge(proposal))
+      .filter((proposal) => !recoveredIds.has(stringFromRecord(proposal, "id") || ""));
+    const selected = sourceProposals.slice(0, limit);
+    const details: Array<{ id: string; proposal: Record<string, unknown>; body: string }> = [];
+    for (const item of selected) {
+      const id = stringFromRecord(item, "id");
+      if (!id) continue;
+      const detail = await fetchProposalDetail(cfg, id);
+      details.push({ id, proposal: { ...item, ...detail.proposal }, body: detail.body });
+    }
+    const warnings = sourceProposals.length > limit ? [`Only inspected the top ${limit} of ${sourceProposals.length} open source proposals. Rerun after this batch to cover the rest.`] : [];
+    if (details.length < 2) {
+      return { dryRun, harness: cfg.harness.name, totalOpen: sourceProposals.length, inspected: details.length, overflow: sourceProposals.length > limit, autoThreshold, candidates: recovered.length, merged: recovered, skipped: [{ reason: "fewer than two readable proposals" }], warnings };
+    }
+    const harnessResult = await runProposalMergeHarness(
+      cfg,
+      args,
+      buildHarnessMergePrompt({ totalOpen: sourceProposals.length, limit, overflow: sourceProposals.length > limit, autoThreshold, proposals: details })
+    );
+    const rawCandidates = Array.isArray(harnessResult.output.merge_candidates)
+      ? (harnessResult.output.merge_candidates as Array<Record<string, unknown>>)
+      : Array.isArray(harnessResult.output.candidates)
+        ? (harnessResult.output.candidates as Array<Record<string, unknown>>)
+        : [];
+    const harnessWarnings = stringArrayFromRecord(harnessResult.output, "warnings");
+    warnings.push(...harnessWarnings);
+    const knownIds = new Set(details.map((detail) => detail.id));
+    const detailById = new Map(details.map((detail) => [detail.id, detail]));
+    const usedIds = new Set<string>();
+    const skipped: Array<{ ids?: string[]; reason: string }> = [];
+    const merged: Array<{ title: string; confidence: number; sourceIds: string[]; targetPage: string; autoMerged: boolean; writeStatus: string | null; closed: string[] }> = [...recovered];
+    for (const raw of rawCandidates) {
+      const normalized = normalizeHarnessMergeCandidate(raw, knownIds);
+      if (!normalized.candidate) {
+        skipped.push({ reason: normalized.error || "invalid candidate" });
+        continue;
+      }
+      const candidate = normalized.candidate;
+      const duplicateIds = candidate.sourceIds.filter((id) => usedIds.has(id));
+      if (duplicateIds.length) {
+        skipped.push({ ids: candidate.sourceIds, reason: `source ids already used by a higher-ranked candidate: ${duplicateIds.join(", ")}` });
+        continue;
+      }
+      const candidateDetails = candidate.sourceIds.map((id) => detailById.get(id)).filter(Boolean) as Array<{ id: string; proposal: Record<string, unknown>; body: string }>;
+      const autoMerged = candidate.confidence >= autoThreshold;
+      const targetPage = targetPageForHarnessMerge(candidate, candidateDetails);
+      const content = buildHarnessMergeContent(candidate, candidateDetails, autoMerged);
+      const sourceRefs = uniqueNonEmptyStrings([
+        ...candidate.sourceIds.map((id) => `proposal:${id}`),
+        ...candidateDetails.flatMap((detail) => stringArrayFromRecord(detail.proposal, "source_ids"))
+      ]).slice(0, 100);
+      const payload: Record<string, unknown> = {
+        title: `Consolidate: ${candidate.title}`,
+        body: `Harness proposed consolidating ${candidate.sourceIds.length} related proposals at ${Math.round(candidate.confidence * 100)}% confidence.`,
+        source_harness: requireFlagValue(args, "source-harness") || cfg.harness.name,
+        source_machine: requireFlagValue(args, "source-machine") || cfg.machine.name,
+        source_type: "memory-merge",
+        target_page: targetPage,
+        proposed_content: content,
+        base_sha256: "absent",
+        risk: autoMerged ? "low" : "medium",
+        confidence: candidate.confidence,
+        source_ids: sourceRefs,
+        project: candidate.project,
+        domain: candidate.domain,
+        scope: candidate.scope,
+        memory_kind: candidate.memoryKind,
+        context: `Harness-scanned top ${details.length} open Brainstack proposals and proposed this ${candidate.topic} consolidation.`,
+        applicability: candidate.applicability,
+        non_applicability: candidate.nonApplicability,
+        evidence_refs: candidate.sourceIds.map((id) => `proposal:${id}`)
+      };
+      if (!autoMerged) {
+        payload.status = "needs-human";
+        payload.reason = `Merge candidate confidence ${Math.round(candidate.confidence * 100)}% is below automatic threshold ${Math.round(autoThreshold * 100)}%. ${candidate.reason}`;
+      }
+      if (dryRun) {
+        merged.push({ title: String(payload.title), confidence: candidate.confidence, sourceIds: candidate.sourceIds, targetPage, autoMerged, writeStatus: null, closed: [] });
+        candidate.sourceIds.forEach((id) => usedIds.add(id));
+        continue;
+      }
+      const mergeIdempotencyKey = harnessMergeIdempotencyKey(targetPage, candidate.sourceIds);
+      const response = await brainApiRequest(cfg, "POST", "/api/propose", { admin: true, body: payload, idempotencyKey: mergeIdempotencyKey });
+      const mergedId = stringFromRecord(response, "proposal_id") || stringFromRecord(response, "id") || String(payload.title);
+      const closed: string[] = [];
+      if (autoMerged && !hasFlag(args, "keep-sources")) {
+        closed.push(...(await closeHarnessMergeSources(cfg, mergedId, candidate.sourceIds)));
+      }
+      merged.push({ title: String(payload.title), confidence: candidate.confidence, sourceIds: candidate.sourceIds, targetPage, autoMerged, writeStatus: stringFromRecord(response, "status") || "submitted", closed });
+      candidate.sourceIds.forEach((id) => usedIds.add(id));
+    }
+    return { dryRun, harness: harnessResult.harness, totalOpen: sourceProposals.length, inspected: details.length, overflow: sourceProposals.length > limit, autoThreshold, candidates: rawCandidates.length + recovered.length, merged, skipped, warnings };
   }
 
   function crossBrainAllowKey(sourceId: string, targetId: string): string {
@@ -2618,6 +3265,7 @@ function readEnvFile(path: string): Record<string, string> {
     proposalReviewGroupsFromResult,
     createReviewGroupMergeProposal,
     createAutomaticReviewGroupMerges,
+    createHarnessProposalMerges,
     commandSearch,
     commandRemember,
     commandAllow,

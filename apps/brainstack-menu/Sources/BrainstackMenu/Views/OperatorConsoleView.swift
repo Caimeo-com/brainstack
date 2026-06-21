@@ -8,6 +8,7 @@ struct OperatorConsoleView: View {
   @ObservedObject var model: AppModel
   @State private var selectedId: String?
   @State private var statusFilter: String = "all"
+  @State private var showMergeActionDetails = false
 
   var body: some View {
     HSplitView {
@@ -33,6 +34,11 @@ struct OperatorConsoleView: View {
       // the selected one leaves the open list after a decision.
       if selectedId == nil || !proposals.contains(where: { $0.id == selectedId }) {
         selectedId = filteredProposals.first?.id ?? proposals.first?.id
+      } else if let selectedId,
+                model.proposalDetails[selectedId] == nil,
+                model.detailErrors[selectedId] == nil,
+                model.loadingDetailId != selectedId {
+        model.loadProposalDetail(selectedId)
       }
     }
   }
@@ -80,12 +86,18 @@ struct OperatorConsoleView: View {
         Button("Look for Merges…") {
           lookForMerges()
         }
-        .help("Find related proposals, create consolidated proposals, and mark absorbed sources superseded. Wiki edits are not applied.")
+        .help("Ask the control host to scan the top 100 open proposals for merge candidates. Wiki edits are not applied.")
         .disabled(model.busyAction != nil || model.isLoadingProposals || model.proposals.count < 2)
       }
       .controlSize(.small)
       .padding(.horizontal, 12)
       .padding(.bottom, 6)
+
+      if let action = model.lastProposalMergeAction {
+        mergeActionBanner(action)
+          .padding(.horizontal, 12)
+          .padding(.bottom, 8)
+      }
 
       Divider()
 
@@ -157,13 +169,113 @@ struct OperatorConsoleView: View {
 
   private func lookForMerges() {
     let message = [
-      "Brainstack will scan open proposals for safe related batches.",
+      "Brainstack will ask the configured harness to scan the top 100 open proposals in one batch.",
       "",
-      "When it finds a batch, it creates a new consolidated proposal and marks the absorbed source proposals superseded.",
+      "Merge candidates at 80% confidence or higher create a consolidated proposal and mark absorbed source proposals superseded.",
+      "Lower-confidence candidates create review proposals so you can decide.",
+      "If more than 100 proposals are open, Brainstack will warn you to rerun after this batch.",
       "It does not accept proposals or apply wiki edits."
     ].joined(separator: "\n")
     if Confirm.ask(title: "Look for Proposal Merges", message: message) {
+      showMergeActionDetails = false
       model.lookForProposalMerges()
+    }
+  }
+
+  @ViewBuilder
+  private func mergeActionBanner(_ action: ActionOutcome) -> some View {
+    let isRecovery = action.recovery?.kind == .updateControlHost
+    VStack(alignment: .leading, spacing: 8) {
+      HStack(alignment: .top, spacing: 8) {
+        Image(systemName: isRecovery ? "exclamationmark.triangle.fill" : action.succeeded ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+          .foregroundColor(action.succeeded ? .green : .yellow)
+          .font(.caption)
+          .padding(.top, 2)
+        VStack(alignment: .leading, spacing: 3) {
+          Text(mergeActionTitle(action))
+            .font(.caption.weight(.semibold))
+          Text(mergeActionMessage(action))
+            .font(.caption2)
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      HStack(spacing: 8) {
+        if isRecovery {
+          Button("Update Control Host") {
+            confirmUpdateControlHost()
+          }
+          .disabled(model.busyAction != nil)
+        } else if action.title == "Update Control Host", !action.succeeded {
+          Button("Retry Update") {
+            confirmUpdateControlHost()
+          }
+          .disabled(model.busyAction != nil)
+        }
+        Button(action.succeeded && action.title == "Update Control Host" ? "Retry Merge Scan" : "Refresh") {
+          if action.succeeded && action.title == "Update Control Host" {
+            lookForMerges()
+          } else {
+            model.loadProposals()
+          }
+        }
+        .disabled(model.busyAction != nil || model.isLoadingProposals)
+      }
+      .controlSize(.small)
+      if !action.output.isEmpty || action.recovery?.technicalHint != nil {
+        DisclosureGroup("Technical Details", isExpanded: $showMergeActionDetails) {
+          VStack(alignment: .leading, spacing: 4) {
+            if let hint = action.recovery?.technicalHint {
+              Text(hint)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            }
+            if !action.output.isEmpty {
+              ScrollView {
+                Text(action.output)
+                  .font(.system(size: 10, design: .monospaced))
+                  .textSelection(.enabled)
+                  .frame(maxWidth: .infinity, alignment: .leading)
+              }
+              .frame(maxHeight: 88)
+            }
+          }
+          .padding(.top, 3)
+        }
+        .font(.caption2)
+        .foregroundColor(.secondary)
+      }
+    }
+    .padding(10)
+    .background((action.succeeded ? Color.green : Color.yellow).opacity(0.12))
+    .clipShape(RoundedRectangle(cornerRadius: 8))
+  }
+
+  private func mergeActionTitle(_ action: ActionOutcome) -> String {
+    if action.recovery?.kind == .updateControlHost {
+      return "Merge scan blocked"
+    }
+    if action.title == "Update Control Host" {
+      return action.succeeded ? "Control host updated" : "Control host update failed"
+    }
+    return action.succeeded ? "Merge scan finished" : "Merge scan failed"
+  }
+
+  private func mergeActionMessage(_ action: ActionOutcome) -> String {
+    if let recovery = action.recovery, recovery.kind == .updateControlHost {
+      return "\(model.controlHostDisplayName) needs a Brainstack update before it can scan for proposal merges. Proposal review still works; nothing was changed."
+    }
+    if action.title == "Update Control Host", action.succeeded {
+      return "The control host update finished. Retry Look for Merges when you are ready."
+    }
+    return action.summary
+  }
+
+  private func confirmUpdateControlHost() {
+    let machine = model.controlHostDisplayName
+    if Confirm.ask(title: "Update Control Host", message: "Pull, rebuild, upgrade, and restart Brainstack on \(machine)?") {
+      showMergeActionDetails = false
+      model.updateControlHost()
     }
   }
 
@@ -375,16 +487,27 @@ private struct ProposalDetailPane: View {
           if let error = model.detailErrors[proposal.id] {
             Text(error).font(.caption).foregroundColor(.orange)
           }
-          if detail == nil && model.detailErrors[proposal.id] == nil {
+          if detail == nil && model.detailErrors[proposal.id] == nil && model.loadingDetailId == proposal.id {
             HStack(spacing: 6) {
               ProgressView().controlSize(.small)
               Text("Loading proposal…").font(.caption).foregroundColor(.secondary)
+            }
+          } else if detail == nil && model.detailErrors[proposal.id] == nil {
+            VStack(alignment: .leading, spacing: 6) {
+              Text("Proposal detail is not loaded.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+              Button("Load Detail") {
+                model.loadProposalDetail(proposal.id, force: true)
+              }
+              .controlSize(.small)
             }
           }
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
       }
+      .id(proposal.id)
       Divider()
       decisionBar
     }
@@ -633,7 +756,6 @@ private struct DiffView: View {
       }
       .textSelection(.enabled)
     }
-    .frame(maxHeight: 360)
   }
 
   private func lineColor(_ line: String) -> Color {

@@ -2085,12 +2085,12 @@ export class CommandHandler {
         ? ["proposals", "groups", "--status", "open", "--min-size", "2", "--json", "--config", this.config.brainstackConfigPath]
         : [
             "proposals",
-            "auto-merge",
+            "batch-merge",
             ...(intent.dryRun ? [] : ["--submit"]),
-            "--max-group-size",
-            "6",
-            "--limit-groups",
-            "5",
+            "--limit",
+            "100",
+            "--auto-threshold",
+            "0.8",
             "--json",
             "--config",
             this.config.brainstackConfigPath
@@ -2101,11 +2101,22 @@ export class CommandHandler {
       intent.action === "groups"
         ? "Looking for proposal review groups with multiple open items."
         : intent.dryRun
-          ? "Previewing safe proposal merges. No proposals will be changed."
-          : "Looking for safe proposal merges. This may create consolidated proposals and mark absorbed sources superseded, but it will not apply wiki edits."
+          ? "Previewing proposal merges with the harness over the top 100 open proposals. No proposals will be changed."
+          : "Looking for proposal merges with the harness over the top 100 open proposals. High-confidence merges may create consolidated proposals and supersede absorbed sources; no wiki edits will be applied."
     );
 
-    const result = await this.runBrainctlCommand(args, intent.action === "groups" ? 45_000 : 180_000);
+    const progress =
+      intent.action === "groups"
+        ? null
+        : this.startProposalMergeProgress(target, intent.dryRun ? "previewing" : "looking for", 60_000);
+    let result: { ok: boolean; exitCode: number | null; timedOut: boolean; stdout: string; stderr: string };
+    try {
+      result = await this.runBrainctlCommand(args, intent.action === "groups" ? 45_000 : 600_000);
+    } finally {
+      if (progress) {
+        clearInterval(progress);
+      }
+    }
     const output = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n");
     if (!result.ok) {
       const trimmed = output.length > 3200 ? `${output.slice(0, 3200)}\n... truncated` : output;
@@ -2166,15 +2177,28 @@ export class CommandHandler {
       const parsed = JSON.parse(output) as Record<string, unknown>;
       const merged = Array.isArray(parsed.merged) ? (parsed.merged as Array<Record<string, unknown>>) : [];
       const skipped = Array.isArray(parsed.skipped) ? (parsed.skipped as Array<Record<string, unknown>>) : [];
+      const warnings = Array.isArray(parsed.warnings) ? (parsed.warnings as unknown[]).map(String).filter(Boolean) : [];
+      const inspected = parsed.inspected !== undefined ? `${String(parsed.inspected)}/${String(parsed.totalOpen ?? "?")}` : null;
+      const autoMergedCount = merged.filter((item) => item.autoMerged === true).length;
+      const reviewCount = merged.filter((item) => item.autoMerged === false).length;
       const lines = [
         dryRun ? "Proposal merge preview complete." : "Proposal merge scan complete.",
-        `Considered ${String(parsed.considered ?? 0)} review group(s); selected ${String(parsed.selected ?? 0)} batch(es); ${dryRun ? "would create" : "created"} ${merged.length} consolidated proposal(s).`
+        inspected
+          ? `Harness inspected ${inspected} open proposal(s); ${dryRun ? "would create" : "created"} ${merged.length} consolidated proposal(s): ${autoMergedCount} auto-merge, ${reviewCount} needs review.`
+          : `Considered ${String(parsed.considered ?? 0)} review group(s); selected ${String(parsed.selected ?? 0)} batch(es); ${dryRun ? "would create" : "created"} ${merged.length} consolidated proposal(s).`
       ];
+      for (const warning of warnings.slice(0, 3)) {
+        lines.push(`Warning: ${warning}`);
+      }
       for (const item of merged.slice(0, 5)) {
+        const sourceIds = Array.isArray(item.sourceIds) ? item.sourceIds.map(String) : [];
+        const confidence = typeof item.confidence === "number" ? `${Math.round(item.confidence * 100)}%` : null;
         lines.push(
           [
-            `- ${String(item.groupKey || "group")}`,
-            `sources=${String(item.selected ?? "?")}`,
+            `- ${String(item.title || item.groupKey || "merge")}`,
+            confidence ? `confidence=${confidence}` : null,
+            sourceIds.length ? `sources=${sourceIds.length}` : `sources=${String(item.selected ?? "?")}`,
+            item.autoMerged === true ? "auto-merged" : item.autoMerged === false ? "needs-review" : null,
             item.targetPage ? `target=${String(item.targetPage)}` : null,
             item.writeStatus ? `status=${String(item.writeStatus)}` : dryRun ? "preview" : null
           ]
@@ -2196,6 +2220,30 @@ export class CommandHandler {
     } catch {
       return output || "Proposal merge scan completed, but produced no output.";
     }
+  }
+
+  private startProposalMergeProgress(target: TelegramTarget, verb: string, intervalMs: number): ReturnType<typeof setInterval> {
+    const started = Date.now();
+    let count = 0;
+    const timer = setInterval(() => {
+      count += 1;
+      const elapsedSeconds = Math.max(1, Math.round((Date.now() - started) / 1000));
+      void this.telegram
+        .sendText(
+          target,
+          [
+            `Still ${verb} proposal merges (${elapsedSeconds}s elapsed).`,
+            count === 1
+              ? "The harness is reviewing the top 100 open proposals as one batch and will return consolidated candidates."
+              : "Still working; I will post the merge summary here when it finishes."
+          ].join("\n")
+        )
+        .catch((error) => {
+          console.warn("failed to send proposal merge progress message", error);
+        });
+    }, intervalMs);
+    timer.unref?.();
+    return timer;
   }
 
   private async runBrainctlCommand(

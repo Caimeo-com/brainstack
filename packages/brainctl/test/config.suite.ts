@@ -482,8 +482,8 @@ printf 'brew_installed=ffmpeg\\n'
         `const receivedPath = ${JSON.stringify(receivedPath)};`,
         `const proposals = [`,
         `  { id: "20260611t000000z-cli-proposal", title: "Remember: CLI proposal needs context", status: "needs-human", legacy_format: true, quality_decision: "needs-context", cluster_key: "cli:needs-context:legacy_memory", cluster_label: "CLI / needs-context / legacy_memory", target_page: "wiki/Status/CLI.md", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:00:00Z", source_ids: ["art-1"] },`,
-        `  { id: "p1", title: "Remember (cli): Front-end proposal output cards should be bounded", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", quality_decision: "ready", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:01:00Z", source_ids: ["art-1"] },`,
-        `  { id: "p2", title: "Remember (cli): UI proposal merge should preserve evidence", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", quality_decision: "ready", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:02:00Z", source_ids: ["art-2"] },`,
+        `  { id: "p1", title: "Remember (cli): Front-end proposal output cards should be bounded", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", quality_decision: "ready", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", target_page: "wiki/Status/CLI.md", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:01:00Z", source_ids: ["art-1"] },`,
+        `  { id: "p2", title: "Remember (cli): UI proposal merge should preserve evidence", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", quality_decision: "ready", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", target_page: "wiki/Status/CLI.md", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:02:00Z", source_ids: ["art-2"] },`,
         `  { id: "p3", title: "Remember (cli): Docs proposal copy should use end-user language", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", quality_decision: "ready", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", risk: "low", confidence: 0.8, created_at: "2026-06-11T00:03:00Z", source_ids: ["art-3"] },`,
         `  { id: "p4", title: "Remember (cli): UI proposal detail panes need clearer actions", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", quality_decision: "ready", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", risk: "low", confidence: 0.8, created_at: "2026-06-12T00:02:00Z", source_ids: ["art-4"] }`,
         `];`,
@@ -499,7 +499,7 @@ printf 'brew_installed=ffmpeg\\n'
         `    const url = new URL(req.url);`,
         `    const body = req.method === "POST" ? await req.json().catch(() => null) : null;`,
         `    const existing = (await Bun.file(receivedPath).exists()) ? await Bun.file(receivedPath).text() : "";`,
-        `    await Bun.write(receivedPath, existing + JSON.stringify({ method: req.method, path: url.pathname + url.search, auth: req.headers.get("authorization"), body }) + "\\n");`,
+        `    await Bun.write(receivedPath, existing + JSON.stringify({ method: req.method, path: url.pathname + url.search, auth: req.headers.get("authorization"), idempotency: req.headers.get("idempotency-key"), body }) + "\\n");`,
         `    if (req.method === "GET" && url.pathname === "/healthz") {`,
         `      return Response.json({ ok: true, service: "braind" });`,
         `    }`,
@@ -541,7 +541,7 @@ printf 'brew_installed=ffmpeg\\n'
       ].join("\n")
     );
     const server = Bun.spawn(["bun", "run", serverScript], { stdout: "ignore", stderr: "ignore" });
-    const readRequests = async (): Promise<Array<{ method: string; path: string; auth: string | null; body: Record<string, unknown> | null }>> =>
+    const readRequests = async (): Promise<Array<{ method: string; path: string; auth: string | null; idempotency: string | null; body: Record<string, unknown> | null }>> =>
       (await Bun.file(receivedPath).exists())
         ? (await readFile(receivedPath, "utf8"))
             .trim()
@@ -644,6 +644,109 @@ printf 'brew_installed=ffmpeg\\n'
         .filter((entry) => entry.path.endsWith("/supersede") && String(entry.body?.reason || "").includes("absorbed into x"))
         .slice(-2);
       expect(autoSupersedes.map((entry) => entry.path).sort()).toEqual(["/api/proposals/p1/supersede", "/api/proposals/p2/supersede"]);
+
+      const fakeHome = join(dir, "fake-home");
+      const fakeCodex = join(fakeHome, ".local", "bin", "fake-codex");
+      const fakeCodexPrompt = join(dir, "fake-codex-prompt.txt");
+      const fakeCodexEnv = join(dir, "fake-codex-env.txt");
+      await mkdir(dirname(fakeCodex), { recursive: true });
+      await writeExecutable(
+        fakeCodex,
+        [
+          "#!/bin/sh",
+          "out=''",
+          "while [ $# -gt 0 ]; do",
+          "  if [ \"$1\" = '--output-last-message' ]; then",
+          "    shift",
+          "    out=\"$1\"",
+          "  fi",
+          "  shift",
+          "done",
+          `env | sort > ${shellQuote(fakeCodexEnv)}`,
+          `cat > ${shellQuote(fakeCodexPrompt)}`,
+          "cat > \"$out\" <<'JSON'",
+          JSON.stringify({
+            merge_candidates: [
+              {
+                title: "CLI UI proposal review polish",
+                source_ids: ["p1", "p2"],
+                confidence: 0.86,
+                topic: "operator proposal UI",
+                project: "cli",
+                domain: "cli",
+                scope: "repo",
+                memory_kind: "project_lesson",
+                summary: "Proposal review UI should keep merge output bounded while preserving evidence.",
+                applicability: "Use when changing the CLI proposal operator UI.",
+                non_applicability: "Do not apply to unrelated docs work.",
+                reason: "Both candidates are about proposal UI merge/review behavior."
+              },
+              {
+                title: "CLI docs and detail copy",
+                source_ids: ["p3", "p4"],
+                confidence: 0.73,
+                topic: "docs/detail copy",
+                project: "cli",
+                domain: "cli",
+                scope: "repo",
+                memory_kind: "project_lesson",
+                summary: "Docs and detail pane copy need clearer end-user language.",
+                applicability: "Use when revising proposal documentation or detail copy.",
+                non_applicability: "Do not apply to backend merge semantics.",
+                reason: "Related but less certain because one candidate is docs and one is detail-pane action copy."
+              }
+            ],
+            warnings: ["fixture warning"]
+          }),
+          "JSON"
+        ].join("\n")
+      );
+      const batchSubmit = runBrainctl(["proposals", "batch-merge", "--submit", "--config", configPath, "--json"], {
+        ...env,
+        BRAIN_ADMIN_TOKEN: "cli-admin-token",
+        FACTORY_BRAIN_ADMIN_TOKEN: "factory-admin-token",
+        BRAIN_IMPORT_TOKEN: "cli-import-token",
+        FACTORY_TELEGRAM_BOT_TOKEN: "telegram-token",
+        RANDOM_SECRET: "secret",
+        CODEX_CLI_PATH: fakeCodex,
+        HOME: fakeHome,
+        PATH: process.env.PATH || "/usr/bin:/bin"
+      });
+      expectSuccess(batchSubmit);
+      const batchBody = JSON.parse(batchSubmit.stdout) as Record<string, any>;
+      expect(batchBody.harness).toBe("codex");
+      expect(batchBody.inspected).toBeGreaterThanOrEqual(4);
+      expect(batchBody.merged).toHaveLength(2);
+      expect(batchBody.merged[0].autoMerged).toBe(true);
+      expect(batchBody.merged[0].closed).toEqual(["p1", "p2"]);
+      expect(batchBody.merged[1].autoMerged).toBe(false);
+      expect(batchBody.merged[1].closed).toEqual([]);
+      expect(batchBody.warnings).toContain("fixture warning");
+      expect(await readFile(fakeCodexPrompt, "utf8")).toContain("Open proposals available");
+      const harnessEnv = await readFile(fakeCodexEnv, "utf8");
+      expect(harnessEnv).toContain(`CODEX_CLI_PATH=${fakeCodex}`);
+      expect(harnessEnv).not.toContain("BRAIN_ADMIN_TOKEN=");
+      expect(harnessEnv).not.toContain("FACTORY_BRAIN_ADMIN_TOKEN=");
+      expect(harnessEnv).not.toContain("BRAIN_IMPORT_TOKEN=");
+      expect(harnessEnv).not.toContain("FACTORY_TELEGRAM_BOT_TOKEN=");
+      expect(harnessEnv).not.toContain("RANDOM_SECRET=");
+      const batchRequests = await readRequests();
+      const batchProposals = batchRequests
+        .filter((entry) => entry.path === "/api/propose" && String(entry.body?.source_type || "") === "memory-merge")
+        .slice(-2);
+      expect(batchProposals).toHaveLength(2);
+      expect(batchProposals[0]?.auth).toBe("Bearer cli-admin-token");
+      expect(batchProposals[0]?.idempotency).toMatch(/^proposal-merge:[a-f0-9]{48}$/);
+      expect(batchProposals[1]?.idempotency).toMatch(/^proposal-merge:[a-f0-9]{48}$/);
+      expect(batchProposals[0]?.idempotency).not.toBe(batchProposals[1]?.idempotency);
+      expect(batchProposals[0]?.body?.target_page).not.toBe("wiki/Status/CLI.md");
+      expect(String(batchProposals[0]?.body?.target_page || "").startsWith("wiki/Syntheses/")).toBe(true);
+      expect(batchProposals[0]?.body?.status).toBeUndefined();
+      expect(batchProposals[1]?.body?.status).toBe("needs-human");
+      const batchSupersedes = batchRequests
+        .filter((entry) => entry.path.endsWith("/supersede") && String(entry.body?.reason || "").includes("absorbed into x"))
+        .slice(-2);
+      expect(batchSupersedes.map((entry) => entry.path).sort()).toEqual(["/api/proposals/p1/supersede", "/api/proposals/p2/supersede"]);
 
       const show = runBrainctl(["proposals", "show", "20260611t000000z-cli-proposal", "--config", configPath], env);
       expectSuccess(show);
@@ -871,7 +974,7 @@ printf 'brew_installed=ffmpeg\\n'
         return Boolean(response?.ok);
       });
       const env = { ...process.env, BRAIN_BASE_URL: `http://127.0.0.1:${port}`, BRAIN_ADMIN_TOKEN: "cli-admin-token" };
-      const result = runBrainctl(["proposals", "merge-group", "cli:repo:project_lesson", "--submit", "--close-sources", "--config", configPath], env);
+      const result = runBrainctl(["proposals", "merge-group", "cli:repo:project_lesson", "--submit", "--close-sources", "--config", configPath, "--local"], env);
       expectSuccess(result);
       const requests = await readRequests();
       expect(requests.some((entry) => entry.path === "/api/propose")).toBe(false);
@@ -879,6 +982,104 @@ printf 'brew_installed=ffmpeg\\n'
       const p2Supersede = requests.find((entry) => entry.path === "/api/proposals/p2/supersede");
       expect(p2Supersede?.auth).toBe("Bearer cli-admin-token");
       expect(p2Supersede?.body?.reason).toBe("absorbed into old-merge");
+    } finally {
+      server.kill();
+      await server.exited;
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("batch-merge resumes after a partially closed harness merge", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-batch-merge-retry-"));
+    const receivedPath = join(dir, "requests.jsonl");
+    const port = 47_000 + Math.floor(Math.random() * 1_000);
+    const configPath = join(dir, "brainstack.yaml");
+    await writeFile(
+      configPath,
+      [
+        "schema_version: 1",
+        "profile: single-node",
+        "machine:",
+        "  name: brain-control",
+        "brain:",
+        `  publicBaseUrl: http://127.0.0.1:${port}`,
+        "security:",
+        "  posture: trusted-tailnet",
+        "  bindHost: 127.0.0.1",
+        "  trustedExposure: none",
+        "paths:",
+        `  configRoot: ${dir}`,
+        `  stateRoot: ${join(dir, "state")}`,
+        `  sharedBrainBareRepo: ${join(dir, "bare.git")}`,
+        `  sharedBrainStagingRepo: ${join(dir, "staging")}`,
+        `  sharedBrainServeRepo: ${join(dir, "serve")}`,
+        "client:",
+        `  localPath: ${join(dir, "shared-brain")}`,
+        ""
+      ].join("\n")
+    );
+    const serverScript = join(dir, "brain.ts");
+    await writeFile(
+      serverScript,
+      [
+        `const receivedPath = ${JSON.stringify(receivedPath)};`,
+        `const proposals = [`,
+        `  { id: "x", title: "Consolidate: CLI UI proposal review polish", status: "pending", source_type: "memory-merge", target_page: "wiki/Syntheses/cli-ui-lessons.md", confidence: 0.91, source_ids: ["proposal:p1", "proposal:p2"], created_at: "2026-06-11T00:03:00Z" },`,
+        `  { id: "p1", title: "Remember (cli): old closed source", status: "superseded", reason: "absorbed into x", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", created_at: "2026-06-11T00:01:00Z" },`,
+        `  { id: "p2", title: "Remember (cli): still open source", status: "pending", source_type: "remember", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", created_at: "2026-06-11T00:02:00Z" }`,
+        `];`,
+        `Bun.serve({`,
+        `  hostname: "127.0.0.1",`,
+        `  port: ${port},`,
+        `  async fetch(req) {`,
+        `    const url = new URL(req.url);`,
+        `    const body = req.method === "POST" ? await req.json().catch(() => null) : null;`,
+        `    const existing = (await Bun.file(receivedPath).exists()) ? await Bun.file(receivedPath).text() : "";`,
+        `    await Bun.write(receivedPath, existing + JSON.stringify({ method: req.method, path: url.pathname + url.search, auth: req.headers.get("authorization"), idempotency: req.headers.get("idempotency-key"), body }) + "\\n");`,
+        `    if (req.method === "GET" && url.pathname === "/api/proposals") return Response.json({ ok: true, proposals });`,
+        `    if (req.method === "GET" && url.pathname.startsWith("/api/proposals/")) {`,
+        `      const id = decodeURIComponent(url.pathname.split("/").pop() || "");`,
+        `      const proposal = proposals.find((item) => item.id === id);`,
+        `      return proposal ? Response.json({ ok: true, proposal, body: "## Request\\n\\n" + proposal.title, diff: "" }) : Response.json({ error: "missing" }, { status: 404 });`,
+        `    }`,
+        `    if (req.method === "POST" && url.pathname === "/api/propose") return Response.json({ error: "must not create duplicate merge" }, { status: 500 });`,
+        `    if (req.method === "POST" && url.pathname === "/api/proposals/p2/supersede") return Response.json({ ok: true, status: "superseded" });`,
+        `    return Response.json({ error: "unexpected" }, { status: 500 });`,
+        `  }`,
+        `});`
+      ].join("\n")
+    );
+    const server = Bun.spawn(["bun", "run", serverScript], { stdout: "ignore", stderr: "ignore" });
+    const readRequests = async (): Promise<Array<{ method: string; path: string; auth: string | null; idempotency: string | null; body: Record<string, unknown> | null }>> =>
+      (await Bun.file(receivedPath).exists())
+        ? (await readFile(receivedPath, "utf8"))
+            .trim()
+            .split(/\r?\n/)
+            .filter(Boolean)
+            .map((line) => JSON.parse(line) as { method: string; path: string; auth: string | null; idempotency: string | null; body: Record<string, unknown> | null })
+        : [];
+    try {
+      await waitForCondition(async () => {
+        const response = await fetch(`http://127.0.0.1:${port}/api/proposals`).catch(() => null);
+        return Boolean(response?.ok);
+      });
+      const result = runBrainctl(["proposals", "batch-merge", "--submit", "--config", configPath, "--json"], {
+        HOME: dir,
+        BRAIN_BASE_URL: `http://127.0.0.1:${port}`,
+        BRAIN_ADMIN_TOKEN: "cli-admin-token",
+        PATH: process.env.PATH || "/usr/bin:/bin"
+      });
+      expectSuccess(result);
+      const body = JSON.parse(result.stdout) as Record<string, any>;
+      expect(body.merged).toHaveLength(1);
+      expect(body.merged[0].writeStatus).toBe("already-created");
+      expect(body.merged[0].closed).toEqual(["p2"]);
+      const requests = await readRequests();
+      expect(requests.some((entry) => entry.path === "/api/propose")).toBe(false);
+      const p2Supersede = requests.find((entry) => entry.path === "/api/proposals/p2/supersede");
+      expect(p2Supersede?.auth).toBe("Bearer cli-admin-token");
+      expect(p2Supersede?.idempotency).toMatch(/^proposal-merge-close:[a-f0-9]{48}$/);
+      expect(p2Supersede?.body?.reason).toBe("absorbed into x");
     } finally {
       server.kill();
       await server.exited;

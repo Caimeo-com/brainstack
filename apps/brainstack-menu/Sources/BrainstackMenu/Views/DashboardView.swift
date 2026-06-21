@@ -18,6 +18,7 @@ struct DashboardView: View {
   // moment later (which can make AppKit re-place it).
   @State private var scrollContentHeight: CGFloat = 360
   @State private var showDetails = false
+  @State private var showLastActionTechnicalDetails = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
@@ -156,6 +157,8 @@ struct DashboardView: View {
       model.runAction("Doctor") { await $0.doctor() }
     case .checkUpdates:
       model.runAction("Check Stack Updates", refreshAfter: false) { await $0.updates() }
+    case .updateControlHost:
+      model.updateControlHost()
     case .flushOutbox:
       model.runAction("Flush Outbox", verifying: ["outbox"]) { await $0.outboxFlush() }
     case .retryOutbox:
@@ -376,6 +379,14 @@ struct DashboardView: View {
         severity: .info
       ))
     }
+    if let recovery = model.lastAction?.recovery, recovery.kind == .updateControlHost {
+      items.append(AttentionItem(
+        title: "Proposal merge scan needs \(model.controlHostDisplayName) updated",
+        detail: "Proposal review still works and nothing was changed. Update the control host, then retry Look for Merges.",
+        severity: .warn,
+        repair: .updateControlHost
+      ))
+    }
     if controlHostLooksOld(report) {
       items.append(AttentionItem(
         title: "Control host needs update",
@@ -525,7 +536,16 @@ struct DashboardView: View {
     }
   }
 
+  @ViewBuilder
   private func lastActionView(_ action: ActionOutcome) -> some View {
+    if let recovery = action.recovery {
+      recoveryActionView(action, recovery: recovery)
+    } else {
+      defaultLastActionView(action)
+    }
+  }
+
+  private func defaultLastActionView(_ action: ActionOutcome) -> some View {
     VStack(alignment: .leading, spacing: 2) {
       Text("\(action.title): \(action.summary)")
         .font(.caption)
@@ -549,6 +569,63 @@ struct DashboardView: View {
           .font(.caption2)
           .foregroundColor(.orange)
       }
+    }
+  }
+
+  private func recoveryActionView(_ action: ActionOutcome, recovery: ActionRecovery) -> some View {
+    VStack(alignment: .leading, spacing: 6) {
+      HStack(alignment: .top, spacing: 8) {
+        Image(systemName: "exclamationmark.triangle.fill")
+          .foregroundColor(.yellow)
+          .font(.caption)
+          .padding(.top, 2)
+        VStack(alignment: .leading, spacing: 3) {
+          Text(recovery.title)
+            .font(.caption.weight(.semibold))
+          Text(recovery.message)
+            .font(.caption2)
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      HStack(spacing: 8) {
+        Button(recovery.primaryButtonTitle) {
+          performRecovery(recovery)
+        }
+        .controlSize(.small)
+        .disabled(model.busyAction != nil)
+      }
+      DisclosureGroup("Technical Details", isExpanded: $showLastActionTechnicalDetails) {
+        VStack(alignment: .leading, spacing: 4) {
+          if let hint = recovery.technicalHint {
+            Text(hint)
+              .font(.caption2)
+              .foregroundColor(.secondary)
+          }
+          if !action.output.isEmpty {
+            ScrollView {
+              Text(action.output)
+                .font(.system(size: 10, design: .monospaced))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+            }
+            .frame(maxHeight: 80)
+          }
+        }
+        .padding(.top, 2)
+      }
+      .font(.caption2)
+      .foregroundColor(.secondary)
+    }
+    .padding(8)
+    .background(Color.yellow.opacity(0.12))
+    .clipShape(RoundedRectangle(cornerRadius: 8))
+  }
+
+  private func performRecovery(_ recovery: ActionRecovery) {
+    switch recovery.kind {
+    case .updateControlHost:
+      performRepair(.updateControlHost)
     }
   }
 

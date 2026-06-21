@@ -20,6 +20,7 @@ enum RepairKind: Equatable, Sendable {
   case restartDaemon
   case repairHooks
   case checkUpdates
+  case updateControlHost
   case installCurator
   case openTailscale
 
@@ -34,6 +35,7 @@ enum RepairKind: Equatable, Sendable {
     case .restartDaemon: return "Restart"
     case .repairHooks: return "Repair"
     case .checkUpdates: return "Check Updates"
+    case .updateControlHost: return "Update"
     case .installCurator: return "Install"
     case .openTailscale: return "Open"
     }
@@ -58,6 +60,8 @@ enum RepairKind: Equatable, Sendable {
       return ("Install/Restart Daemon", "Install (or reinstall and restart) the brainstackd user service?")
     case .repairHooks:
       return ("Install/Repair Hooks", "Install or repair Brainstack hooks for Codex, Claude, and Cursor?")
+    case .updateControlHost:
+      return ("Update Control Host", "Pull, rebuild, upgrade, and restart Brainstack on the control host?")
     case .installCurator:
       return ("Install Curator", "Install the brain-curator routine on the control host? It schedules proposal generation; it does not accept or apply wiki edits.")
     }

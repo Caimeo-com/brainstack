@@ -158,16 +158,61 @@ final class CommandRunnerTests: XCTestCase {
     XCTAssertEqual(outcome.title, "Merge Proposal Group")
   }
 
-  func testProposalAutoMergeUsesBoundedSubmit() async throws {
+  func testProposalAutoMergeUsesHarnessBatchSubmit() async throws {
     let argsPath = scratch.appendingPathComponent("proposal-auto-merge-args.txt")
     let binary = try fakeBrainctl("printf '%s\\n' \"$@\" > '\(argsPath.path)'; echo 'merged=1'")
     let outcome = await client(binary).proposalAutoMerge()
     XCTAssertTrue(outcome.succeeded)
     XCTAssertEqual(
       try String(contentsOf: argsPath),
-      "proposals\nauto-merge\n--submit\n--max-group-size\n6\n--limit-groups\n5\n--config\n/tmp/test.yaml\n"
+      "proposals\nbatch-merge\n--submit\n--limit\n100\n--auto-threshold\n0.8\n--config\n/tmp/test.yaml\n"
     )
     XCTAssertEqual(outcome.title, "Look for Merges")
+  }
+
+  func testProposalAutoMergeModelMismatchIsActionable() async throws {
+    let binary = try fakeBrainctl("""
+    cat >&2 <<'EOF'
+    proposal merge harness failed (exit 1).
+    Codex rejected configured model gpt-5.5: The 'gpt-5.5' model requires a newer version of Codex.
+    Diagnostics:
+    OpenAI Codex v0.46.0
+    model: gpt-5.5
+    EOF
+    exit 1
+    """)
+    let outcome = await client(binary).proposalAutoMerge()
+    XCTAssertFalse(outcome.succeeded)
+    XCTAssertFalse(outcome.adminUnavailable)
+    XCTAssertTrue(outcome.summary.contains("Codex cannot run the configured merge model"))
+    XCTAssertTrue(outcome.output.contains("requires a newer version of Codex"))
+  }
+
+  func testProposalAutoMergeRemoteOldControlHostIsActionable() async throws {
+    let binary = try fakeBrainctl("""
+    cat >&2 <<'EOF'
+    proposal batch-merge failed over ssh with exit 1
+    Unknown proposals subcommand: batch-merge
+    EOF
+    exit 1
+    """)
+    let outcome = await client(binary).proposalAutoMerge()
+    XCTAssertFalse(outcome.succeeded)
+    XCTAssertFalse(outcome.unsupported)
+    XCTAssertEqual(outcome.recovery?.kind, .updateControlHost)
+    XCTAssertTrue(outcome.summary.contains("control host"))
+    XCTAssertTrue(outcome.summary.contains("update"))
+
+    let alternateBinary = try fakeBrainctl("""
+    cat >&2 <<'EOF'
+    proposal batch-merge failed over ssh with exit 1
+    Unknown command: proposals batch-merge
+    EOF
+    exit 1
+    """)
+    let alternate = await client(alternateBinary).proposalAutoMerge()
+    XCTAssertFalse(alternate.unsupported)
+    XCTAssertEqual(alternate.recovery?.kind, .updateControlHost)
   }
 
   func testCuratorInstallUsesNamedArguments() async throws {

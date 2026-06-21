@@ -726,6 +726,112 @@ describe("public release hygiene - fleet remote control invites and release", ()
     }
   }, 10_000);
 
+  test("proposal merge discovery forwards from client config to the control host over pinned SSH", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-proposal-merge-client-"));
+    try {
+      const binDir = join(dir, "bin");
+      const configRoot = join(dir, "config");
+      await mkdir(binDir, { recursive: true });
+      await mkdir(configRoot, { recursive: true });
+      const argsCapture = join(dir, "ssh-args.txt");
+      await writeFile(join(configRoot, "ssh_known_hosts"), "control.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeBrainstackControlKeyForTestsOnly\n");
+      const fakeSsh = join(binDir, "ssh");
+      await writeFile(
+        fakeSsh,
+        [
+          "#!/usr/bin/env bash",
+          "set -euo pipefail",
+          `printf '<%s>\\n' "$@" > '${argsCapture}'`,
+          "cat <<'JSON'",
+          '{"dryRun":false,"harness":"codex","totalOpen":116,"inspected":100,"overflow":true,"autoThreshold":0.8,"candidates":0,"merged":[],"skipped":[],"warnings":["fake remote run"]}',
+          "JSON",
+          ""
+        ].join("\n")
+      );
+      await chmod(fakeSsh, 0o755);
+
+      const configPath = join(dir, "client.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: mac-client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  configRoot: ${configRoot}`,
+          "client:",
+          "  remoteSsh: operator@control.example:/home/operator/shared-brain/bare/shared-brain.git",
+          "  telegramVia: operator@control.example",
+          "  telegramRemoteRepo: /home/operator/brainstack",
+          ""
+        ].join("\n")
+      );
+
+      const result = runBrainctl(["proposals", "batch-merge", "--submit", "--limit", "100", "--auto-threshold", "0.8", "--config", configPath, "--json"], {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        BRAIN_BASE_URL: "http://127.0.0.1:1"
+      });
+      expectSuccess(result);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.warnings).toEqual(["fake remote run"]);
+      const sshArgs = await readFile(argsCapture, "utf8");
+      expect(sshArgs).toContain("BatchMode=yes");
+      expect(sshArgs).toContain("ConnectTimeout=8");
+      expect(sshArgs).toContain("StrictHostKeyChecking=yes");
+      expect(sshArgs).toContain(`UserKnownHostsFile=${join(configRoot, "ssh_known_hosts")}`);
+      expect(sshArgs).toContain("operator@control.example");
+      expect(sshArgs).toContain("/home/operator/brainstack");
+      expect(sshArgs).toContain("$HOME/.local/bin/brainctl");
+      expect(sshArgs).toContain("'\\''proposals'\\'' '\\''batch-merge'\\''");
+      expect(sshArgs).toContain("'\\''--local'\\''");
+      expect(sshArgs).toContain("'\\''--submit'\\''");
+      expect(sshArgs).toContain("'\\''--limit'\\'' '\\''100'\\''");
+      expect(sshArgs).toContain("'\\''--auto-threshold'\\'' '\\''0.8'\\''");
+      expect(sshArgs).toContain("'\\''--json'\\''");
+      expect(sshArgs).not.toContain("127.0.0.1:1");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("proposal merge discovery on a client fails closed without an explicit control route", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-proposal-merge-no-control-"));
+    try {
+      const configRoot = join(dir, "config");
+      await mkdir(configRoot, { recursive: true });
+      const configPath = join(dir, "client.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: client-macos",
+          "machine:",
+          "  name: mac-client",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  configRoot: ${configRoot}`,
+          "client:",
+          "  remoteSsh: operator@control.example:/home/operator/shared-brain/bare/shared-brain.git",
+          ""
+        ].join("\n")
+      );
+
+      const result = runBrainctl(["proposals", "batch-merge", "--submit", "--config", configPath], {
+        BRAIN_BASE_URL: "http://127.0.0.1:1"
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain("must run on the control host for client profiles");
+      expect(result.stderr).toContain("client.telegramVia");
+      expect(result.stderr).not.toContain("Could not resolve hostname");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
   test("client remote control creates custom known-hosts parent for accept-new trust", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-control-accept-new-known-hosts-"));
     try {

@@ -42,7 +42,7 @@ export function usage(): string {
   brainctl telegram send-file --file PATH [--config brainstack.yaml] [--via SSH_TARGET] [--remote-repo PATH] [--caption TEXT] [--context SLUG|--chat-id ID] [--thread-id ID] [--kind document|photo] [--max-bytes N] [--allow-sensitive] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default] [--json]
   brainctl import-text --config brainstack.yaml --title TITLE --text TEXT --source-harness HARNESS --source-machine MACHINE [--source-type note]
   brainctl propose --config brainstack.yaml --title TITLE --body BODY [--target-page wiki/PATH.md] [--content-file FILE] [--base-sha256 HASH|absent] [--risk low|medium|high] [--confidence 0..1] [--curator-run-id ID] [--reason TEXT] [--needs-human] [--source-ids id1,id2] [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF]
-  brainctl proposals list|groups|clusters|show|enrich|reprocess|merge-group|auto-merge|approve|reject|supersede|apply [...]
+  brainctl proposals list|groups|clusters|show|enrich|reprocess|merge-group|auto-merge|batch-merge|approve|reject|supersede|apply [...]
   brainctl curator status|run|install [--config brainstack.yaml]
   brainctl context --repo PATH [--config brainstack.yaml] [--json] [--sync|--no-sync]
   brainctl search --repo PATH "query" [--config brainstack.yaml] [--json] [--wait-fresh]

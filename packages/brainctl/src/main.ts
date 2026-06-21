@@ -357,6 +357,7 @@ const proposalEnrichmentPayload = projectOutboxCommands.proposalEnrichmentPayloa
 const proposalReviewGroupsFromResult = projectOutboxCommands.proposalReviewGroupsFromResult;
 const createReviewGroupMergeProposal = projectOutboxCommands.createReviewGroupMergeProposal;
 const createAutomaticReviewGroupMerges = projectOutboxCommands.createAutomaticReviewGroupMerges;
+const createHarnessProposalMerges = projectOutboxCommands.createHarnessProposalMerges;
 const commandSearch = projectOutboxCommands.commandSearch;
 const commandRemember = projectOutboxCommands.commandRemember;
 const commandAllow = projectOutboxCommands.commandAllow;
@@ -1290,12 +1291,15 @@ async function brainApiRequest(
   cfg: BrainstackConfig,
   method: "GET" | "POST",
   path: string,
-  options: { admin?: boolean; body?: Record<string, unknown> } = {}
+  options: { admin?: boolean; body?: Record<string, unknown>; idempotencyKey?: string; timeoutMs?: number } = {}
 ): Promise<Record<string, unknown>> {
   const baseUrl = brainApiBaseUrl(cfg);
   const headers: Record<string, string> = {};
   if (options.admin) {
     headers.Authorization = `Bearer ${brainAdminToken(cfg)}`;
+  }
+  if (options.idempotencyKey) {
+    headers["Idempotency-Key"] = options.idempotencyKey;
   }
   if (options.body) {
     headers["Content-Type"] = "application/json";
@@ -1304,7 +1308,7 @@ async function brainApiRequest(
     method,
     headers,
     body: options.body ? JSON.stringify(options.body) : undefined,
-    signal: AbortSignal.timeout(brainWriteTimeoutMs())
+    signal: AbortSignal.timeout(options.timeoutMs ?? brainWriteTimeoutMs())
   });
   const text = await response.text();
   let parsed: Record<string, unknown>;
@@ -1377,6 +1381,74 @@ function formatProposalClusterLine(cluster: Record<string, unknown>): string {
 
 type ProposalDecisionAction = "approve" | "reject" | "apply" | "supersede";
 
+function proposalRemoteRepo(cfg: BrainstackConfig, args: ParsedArgs): string {
+  return requireFlagValue(args, "remote-repo") || process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() || cfg.client.telegramRemoteRepo || "~/brainstack";
+}
+
+function shouldRunProposalCurationOnControl(cfg: BrainstackConfig, args: ParsedArgs): boolean {
+  return cfg.profile.startsWith("client") && !hasFlag(args, "local");
+}
+
+function proposalCurationRemoteArgv(args: ParsedArgs, subcommand: string): string[] {
+  const forwarded = ["proposals", subcommand, ...args.positional.slice(1), "--local"];
+  const localOnlyFlags = new Set(["config", "profile", "root", "via", "remote-repo", "known-hosts", "ssh-trust", "local"]);
+  for (const [key, value] of Object.entries(args.flags)) {
+    if (localOnlyFlags.has(key)) {
+      continue;
+    }
+    if (value === true) {
+      forwarded.push(`--${key}`);
+    } else if (Array.isArray(value)) {
+      for (const item of value) {
+        forwarded.push(`--${key}`, item);
+      }
+    } else {
+      forwarded.push(`--${key}`, value);
+    }
+  }
+  return forwarded;
+}
+
+function proposalCurationTimeoutMs(subcommand: string): number {
+  if (["batch-merge", "harness-merge", "scan-merges"].includes(subcommand)) {
+    return 660_000;
+  }
+  if (["auto-merge", "auto-consolidate"].includes(subcommand)) {
+    return 180_000;
+  }
+  return 120_000;
+}
+
+async function maybeRunRemoteProposalCuration(cfg: BrainstackConfig, args: ParsedArgs, subcommand: string): Promise<boolean> {
+  if (!shouldRunProposalCurationOnControl(cfg, args)) {
+    return false;
+  }
+  const via = controlSshTarget(cfg, args, "proposal curation SSH target");
+  if (!via) {
+    throw new Error(
+      `proposal ${subcommand} must run on the control host for client profiles; configure client.telegramVia, set BRAINSTACK_TELEGRAM_VIA, pass --via, or use --local for deliberate development/testing`
+    );
+  }
+  const result = runControlRemoteScript(
+    cfg,
+    args,
+    "proposal curation SSH target",
+    remoteBrainctlScript(proposalRemoteRepo(cfg, args), proposalCurationRemoteArgv(args, subcommand), { preferInstalledBinary: true }),
+    proposalCurationTimeoutMs(subcommand)
+  );
+  if (!result) {
+    throw new Error(
+      `proposal ${subcommand} must run on the control host for client profiles; configure client.telegramVia, set BRAINSTACK_TELEGRAM_VIA, pass --via, or use --local for deliberate development/testing`
+    );
+  }
+  if (result.code !== 0) {
+    throw new Error(`proposal ${subcommand} failed over ssh with exit ${result.code}\n${result.stderr || result.stdout}`);
+  }
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  return true;
+}
+
 async function maybeRunRemoteProposalDecision(cfg: BrainstackConfig, args: ParsedArgs, action: ProposalDecisionAction, id: string, reason?: string): Promise<boolean> {
   if (cfg.telemux.enabled || process.env.BRAIN_ADMIN_TOKEN || readEnvFile(join(cfg.paths.configRoot, "braind.secrets.env")).BRAIN_ADMIN_TOKEN) {
     return false;
@@ -1385,9 +1457,8 @@ async function maybeRunRemoteProposalDecision(cfg: BrainstackConfig, args: Parse
   if (!via) {
     return false;
   }
-  const remoteRepo = requireFlagValue(args, "remote-repo") || process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() || cfg.client.telegramRemoteRepo || "~/brainstack";
   const argv = ["proposals", action, id, ...(reason ? ["--reason", reason] : [])];
-  const result = runControlRemoteScript(cfg, args, "proposal decision SSH target", remoteBrainctlScript(remoteRepo, argv), 120_000);
+  const result = runControlRemoteScript(cfg, args, "proposal decision SSH target", remoteBrainctlScript(proposalRemoteRepo(cfg, args), argv), 120_000);
   if (!result) {
     return false;
   }
@@ -1403,7 +1474,7 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
   const sub = args.positional[0] || "list";
   if (sub === "help" || sub === "--help" || sub === "-h") {
     console.log(
-      "Usage: brainctl proposals list [--status open|pending|approved|applied|rejected|superseded|needs-human] [--json]\n       brainctl proposals groups [--status open|pending|approved|applied|rejected|superseded|needs-human] [--min-size N] [--json]\n       brainctl proposals show <id> [--json]\n       brainctl proposals merge-group <group-key|group-label> [--id ID] [--submit] [--limit N|--all] [--target-page wiki/PATH.md] [--needs-human] [--close-sources] [--json]\n       brainctl proposals auto-merge [--submit] [--min-size N] [--max-group-size N|--allow-large-groups] [--max-source-group-size N|--all-source-groups] [--limit-groups N|--all-groups] [--relation-window day|all] [--keep-sources] [--json]\n       brainctl proposals approve <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals reject <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals supersede <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]"
+      "Usage: brainctl proposals list [--status open|pending|approved|applied|rejected|superseded|needs-human] [--json]\n       brainctl proposals groups [--status open|pending|approved|applied|rejected|superseded|needs-human] [--min-size N] [--json]\n       brainctl proposals show <id> [--json]\n       brainctl proposals merge-group <group-key|group-label> [--id ID] [--submit] [--limit N|--all] [--target-page wiki/PATH.md] [--needs-human] [--close-sources] [--json] [--via SSH_TARGET] [--remote-repo PATH] [--local]\n       brainctl proposals auto-merge [--submit] [--min-size N] [--max-group-size N|--allow-large-groups] [--max-source-group-size N|--all-source-groups] [--limit-groups N|--all-groups] [--relation-window day|all] [--keep-sources] [--json] [--via SSH_TARGET] [--remote-repo PATH] [--local]\n       brainctl proposals batch-merge [--submit] [--limit 100] [--auto-threshold 0.8] [--harness codex|claude] [--harness-bin PATH] [--keep-sources] [--json] [--via SSH_TARGET] [--remote-repo PATH] [--local]\n       brainctl proposals approve <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals reject <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals supersede <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]"
       + "\n       brainctl proposals enrich <id> [--summary TEXT] [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF] [--dry-run|--json]"
         + "\n       brainctl proposals reprocess [--status needs-human|open] [--group KEY] [--cluster KEY] [--id ID] [--limit N] [--apply] [--json] [enrichment flags...]"
     );
@@ -1538,6 +1609,9 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
     }
     case "merge-group":
     case "merge-cluster": {
+      if (await maybeRunRemoteProposalCuration(cfg, args, sub)) {
+        return;
+      }
       const groupKey = args.positional[1] || requireFlagValue(args, "group") || requireFlagValue(args, "cluster");
       if (!groupKey) {
         throw new Error("proposals merge-group requires a review group key or label");
@@ -1566,6 +1640,9 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
     }
     case "auto-merge":
     case "auto-consolidate": {
+      if (await maybeRunRemoteProposalCuration(cfg, args, sub)) {
+        return;
+      }
       const result = await createAutomaticReviewGroupMerges(cfg, args);
       if (hasFlag(args, "json")) {
         console.log(JSON.stringify(result, null, 2));
@@ -1599,6 +1676,52 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
       }
       if (result.dryRun) {
         console.log("No writes performed. Rerun with --submit to create consolidated proposals and supersede source candidates.");
+      }
+      return;
+    }
+    case "batch-merge":
+    case "harness-merge":
+    case "scan-merges": {
+      if (await maybeRunRemoteProposalCuration(cfg, args, sub)) {
+        return;
+      }
+      const result = await createHarnessProposalMerges(cfg, args);
+      if (hasFlag(args, "json")) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      console.log(
+        [
+          `batch_merge=${result.dryRun ? "dry-run" : "submitted"}`,
+          `harness=${result.harness}`,
+          `inspected=${result.inspected}/${result.totalOpen}`,
+          `candidates=${result.candidates}`,
+          `created=${result.merged.length}`,
+          `auto_threshold=${result.autoThreshold}`
+        ].join(" ")
+      );
+      for (const warning of result.warnings) {
+        console.log(`warning: ${warning}`);
+      }
+      for (const item of result.merged) {
+        console.log(
+          [
+            item.autoMerged ? "auto-merged" : "needs-review",
+            `confidence=${Math.round(item.confidence * 100)}%`,
+            `sources=${item.sourceIds.join(",")}`,
+            `target=${item.targetPage}`,
+            item.closed.length ? `closed_sources=${item.closed.join(",")}` : null,
+            `title=${item.title}`
+          ]
+            .filter(Boolean)
+            .join(" ")
+        );
+      }
+      for (const item of result.skipped.slice(0, 10)) {
+        console.log(`skipped${item.ids?.length ? ` ${item.ids.join(",")}` : ""}: ${item.reason}`);
+      }
+      if (result.dryRun) {
+        console.log("No writes performed. Rerun with --submit to create consolidated proposals.");
       }
       return;
     }

@@ -567,14 +567,14 @@ case "$*" in
 {"ok":true,"review_groups":[{"id":"brainstack:repo:project_lesson","label":"brainstack / repo / project_lesson","count":3,"needsContextCount":0,"legacyCount":0},{"id":"lindy:repo:project_lesson","label":"lindy / repo / project_lesson","count":2,"needsContextCount":1,"legacyCount":0}]}
 JSON
     ;;
-  *"proposals auto-merge"*)
+  *"proposals batch-merge"*)
     if [[ "$*" == *"--submit"* ]]; then
       cat <<'JSON'
-{"dryRun":false,"considered":2,"selected":1,"merged":[{"groupKey":"brainstack:repo:project_lesson","relationKey":"brainstack:repo:project_lesson:2026-06-20:curation","selected":3,"conflicts":[],"targetPage":"wiki/Syntheses/brainstack-curation-2026-06-20.md","closed":["p1","p2","p3"],"writeStatus":"pending"}],"skipped":[{"groupKey":"lindy:repo:project_lesson","reason":"contains proposals that need context"}]}
+{"dryRun":false,"harness":"codex","totalOpen":116,"inspected":100,"overflow":true,"autoThreshold":0.8,"candidates":2,"merged":[{"title":"Consolidate: brainstack proposal UI","confidence":0.86,"sourceIds":["p1","p2","p3"],"targetPage":"wiki/Syntheses/brainstack-curation-2026-06-20.md","autoMerged":true,"closed":["p1","p2","p3"],"writeStatus":"pending"},{"title":"Consolidate: lindy proposal context","confidence":0.72,"sourceIds":["p4","p5"],"targetPage":"wiki/Syntheses/lindy-context-20260620-lessons.md","autoMerged":false,"closed":[],"writeStatus":"needs-human"}],"skipped":[{"reason":"candidate has fewer than two known source ids"}],"warnings":["Only inspected the top 100 of 116 open proposals. Rerun after this batch to cover the rest."]}
 JSON
     else
       cat <<'JSON'
-{"dryRun":true,"considered":2,"selected":1,"merged":[{"groupKey":"brainstack:repo:project_lesson","relationKey":"brainstack:repo:project_lesson:2026-06-20:curation","selected":3,"conflicts":[],"targetPage":"wiki/Syntheses/brainstack-curation-2026-06-20.md","closed":[],"writeStatus":null}],"skipped":[]}
+{"dryRun":true,"harness":"codex","totalOpen":116,"inspected":100,"overflow":true,"autoThreshold":0.8,"candidates":1,"merged":[{"title":"Consolidate: brainstack proposal UI","confidence":0.86,"sourceIds":["p1","p2","p3"],"targetPage":"wiki/Syntheses/brainstack-curation-2026-06-20.md","autoMerged":true,"closed":[],"writeStatus":null}],"skipped":[],"warnings":["Only inspected the top 100 of 116 open proposals. Rerun after this batch to cover the rest."]}
 JSON
     fi
     ;;
@@ -2236,17 +2236,20 @@ test("basic loops install the brain-curator routine and curator commands work en
     const previewText = fixture.telegram.sent.at(-1)?.text || "";
     expect(previewText).toContain("Proposal merge preview complete");
     expect(previewText).toContain("would create 1 consolidated proposal");
+    expect(previewText).toContain("Harness inspected 100/116");
     expect(previewText).toContain("No proposals were changed");
 
     await fixture.commands.handleMessage(telegramMessage("look for proposal merges", 90));
     const mergeText = fixture.telegram.sent.at(-1)?.text || "";
     expect(mergeText).toContain("Proposal merge scan complete");
-    expect(mergeText).toContain("created 1 consolidated proposal");
+    expect(mergeText).toContain("created 2 consolidated proposal");
+    expect(mergeText).toContain("1 auto-merge, 1 needs review");
+    expect(mergeText).toContain("Rerun after this batch");
     expect(mergeText).toContain("No wiki edits were applied");
     const brainctlCalls = await readFile(fixture.fakeBrainctlCalls, "utf8");
     expect(brainctlCalls).toContain("proposals groups --status open --min-size 2 --json --config");
-    expect(brainctlCalls).toContain("proposals auto-merge --max-group-size 6 --limit-groups 5 --json --config");
-    expect(brainctlCalls).toContain("proposals auto-merge --submit --max-group-size 6 --limit-groups 5 --json --config");
+    expect(brainctlCalls).toContain("proposals batch-merge --limit 100 --auto-threshold 0.8 --json --config");
+    expect(brainctlCalls).toContain("proposals batch-merge --submit --limit 100 --auto-threshold 0.8 --json --config");
 
     // Accepting a proposal that carries a wiki change applies it.
     await fixture.commands.handleMessage(telegramMessage(`/proposal_accept_${token}_1`, 90));

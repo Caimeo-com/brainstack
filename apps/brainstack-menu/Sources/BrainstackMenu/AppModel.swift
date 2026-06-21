@@ -367,9 +367,32 @@ final class AppModel: ObservableObject {
     actionLog.last
   }
 
+  var lastProposalMergeAction: ActionOutcome? {
+    actionLog.reversed().first { action in
+      action.title == "Look for Merges"
+        || action.title == "Update Control Host"
+        || action.recovery?.kind == .updateControlHost
+    }
+  }
+
+  var controlHostMachineName: String? {
+    lastReport?.fleetMachines.first { $0.role.lowercased() == "control" }?.name
+  }
+
+  var controlHostDisplayName: String {
+    controlHostMachineName ?? "control host"
+  }
+
   func updateFleetMachine(_ machine: String) {
     runAction("Update \(machine)", verifying: ["fleet"]) { client in
       await client.fleetUpdate(machine: machine)
+    }
+  }
+
+  func updateControlHost() {
+    let target = controlHostMachineName ?? "control"
+    runAction("Update Control Host", verifying: ["fleet", "control_source", "curator", "proposals"]) { client in
+      await client.fleetUpdate(machine: target, title: "Update Control Host")
     }
   }
 
@@ -479,8 +502,6 @@ final class AppModel: ObservableObject {
           self.adminAvailability = .unavailable
         } else if outcome.succeeded {
           self.adminAvailability = .available
-        } else {
-          self.adminAvailability = .unavailable
         }
         self.proposalDetails.removeAll()
         self.refresh()
@@ -503,8 +524,6 @@ final class AppModel: ObservableObject {
           self.adminAvailability = .unavailable
         } else if outcome.succeeded {
           self.adminAvailability = .available
-        } else {
-          self.adminAvailability = .unavailable
         }
         self.proposalDetails.removeAll()
         self.refresh()

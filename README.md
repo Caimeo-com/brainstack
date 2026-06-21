@@ -40,6 +40,7 @@ bun run packages/brainctl/src/main.ts capabilities uninstall voice --target erbi
 bun run packages/brainctl/src/main.ts proposals groups --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts proposals merge-group GROUP_KEY --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts proposals auto-merge --config ~/.config/brainstack/brainstack.yaml --json
+bun run packages/brainctl/src/main.ts proposals batch-merge --config ~/.config/brainstack/brainstack.yaml --json
 bun run packages/brainctl/src/main.ts proposals reprocess --config ~/.config/brainstack/brainstack.yaml --limit 5
 bun run packages/brainctl/src/main.ts import codex-session SESSION_ID --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts lifecycle status --config ~/.config/brainstack/brainstack.yaml
@@ -51,6 +52,8 @@ bun run packages/brainctl/src/main.ts destroy --config ~/.config/brainstack/brai
 ```
 
 `init` is fresh-install only. Use `upgrade` or `apply-runtime` for existing installs; those commands do not silently seed or rewrite canonical shared-brain content.
+
+Proposal merge commands are control-host work. On enrolled client profiles, `proposals merge-group`, `proposals auto-merge`, and `proposals batch-merge` forward over the configured control SSH route by default; use `--local` only for development or single-node testing.
 
 For normal installed-machine maintenance, prefer `brainctl lifecycle status|repair|upgrade|uninstall`. These are safer orchestration wrappers around the lower-level commands: `status` is bounded and read-only, `repair` re-renders runtime and local harness guidance files plus daemon/hooks/skills surfaces, `upgrade` performs the existing backup plus runtime refresh, and `uninstall` delegates to manifest-driven `destroy`. Uninstall defaults to full managed artifact removal for control/single-node installs and client/worker artifact removal for edge installs.
 
