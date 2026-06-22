@@ -255,7 +255,7 @@ struct DashboardView: View {
         sectionGroup(title: "Other", names: extra)
       }
       if let config = model.lastReport?.sections["config"], config.state != .ok {
-        SectionRowView(name: "config", section: config, isVerifying: model.isSectionVerificationPending("config"))
+        SectionRowView(name: "config", section: config, report: model.lastReport, isVerifying: model.isSectionVerificationPending("config"))
       }
     }
   }
@@ -294,7 +294,7 @@ struct DashboardView: View {
         .font(.caption2)
         .foregroundColor(.secondary)
         .padding(.top, 4)
-      SectionRowView(name: "fleet", section: section)
+      SectionRowView(name: "fleet", section: section, report: model.lastReport)
     }
   }
 
@@ -491,7 +491,7 @@ struct DashboardView: View {
         .padding(.top, 4)
       ForEach(present, id: \.self) { name in
         if let section = model.lastReport?.sections[name] {
-          SectionRowView(name: name, section: section, isVerifying: model.isSectionVerificationPending(name))
+          SectionRowView(name: name, section: section, report: model.lastReport, isVerifying: model.isSectionVerificationPending(name))
         }
       }
     }
@@ -665,6 +665,7 @@ func color(for state: OverallState) -> Color {
 struct SectionRowView: View {
   let name: String
   let section: StatusSection
+  var report: StatusReport? = nil
   var isVerifying = false
 
   var body: some View {
@@ -705,6 +706,9 @@ struct SectionRowView: View {
     if isVerifying {
       return .blue
     }
+    if report?.isBenignControlSourceProbeWarning(name: name) == true {
+      return .green
+    }
     switch section.state {
     case .ok: return .green
     case .warn, .unknown: return .yellow
@@ -717,7 +721,7 @@ struct SectionRowView: View {
     if isVerifying {
       return "checking updated status..."
     }
-    return sectionMessage(name: name, section: section)
+    return sectionMessage(name: name, section: section, report: report)
   }
 }
 

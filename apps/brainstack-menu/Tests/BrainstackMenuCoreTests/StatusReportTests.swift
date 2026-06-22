@@ -63,6 +63,46 @@ final class StatusReportTests: XCTestCase {
     XCTAssertEqual(OverallStateMapper.map(report: report), .green)
   }
 
+  func testControlSourceProbeWarningIsBenignWhenFleetControlHostIsCurrent() throws {
+    let json = """
+    {"ok": false, "degraded": true, "sections": {
+      "config": {"state": "ok", "ok": true, "available": true, "detail": "config loaded"},
+      "brain_api": {"state": "ok", "ok": true, "available": true, "detail": "health=ok ready=ok"},
+      "curator": {"state": "ok", "ok": true, "available": true, "detail": "mode=approval installed=true open_proposals=0", "data": {"open_proposals": 0, "curator": {"installed": true}}},
+      "proposals": {"state": "ok", "ok": true, "available": true, "detail": "open_proposals=0", "data": {"count": 0}},
+      "fleet": {"state": "ok", "ok": true, "available": true, "detail": "machines=1 reachable=1 needs_update=0 unhealthy=0", "data": {
+        "machines": [
+          {"name": "valkyrie", "role": "control", "transport": "ssh", "reachable": true, "status": "ok", "update_state": "current", "needs_update": false, "detail": "current head=abc", "short": "abc", "dirty_count": 0}
+        ]
+      }},
+      "control_source": {"state": "warn", "ok": false, "available": true, "detail": "control host source probe failed"}
+    }}
+    """
+    let report = try StatusReport.parse(data: Data(json.utf8))
+    XCTAssertTrue(report.isBenignControlSourceProbeWarning(name: "control_source"))
+    XCTAssertTrue(report.hasOnlyBenignControlSourceProbeWarning)
+    XCTAssertEqual(report.reachableCurrentControlHostFromFleet?.name, "valkyrie")
+    XCTAssertEqual(OverallStateMapper.map(report: report), .green)
+  }
+
+  func testControlSourceProbeWarningStillDegradesWhenFleetControlHostNeedsUpdate() throws {
+    let json = """
+    {"ok": false, "degraded": true, "sections": {
+      "config": {"state": "ok", "ok": true, "available": true, "detail": "config loaded"},
+      "fleet": {"state": "warn", "ok": false, "available": true, "detail": "machines=1 reachable=1 needs_update=1 unhealthy=1", "data": {
+        "machines": [
+          {"name": "valkyrie", "role": "control", "transport": "ssh", "reachable": true, "status": "warn", "update_state": "behind", "needs_update": true, "detail": "behind origin by 1 commit", "short": "abc", "behind": 1, "dirty_count": 0}
+        ]
+      }},
+      "control_source": {"state": "warn", "ok": false, "available": true, "detail": "control host source probe failed"}
+    }}
+    """
+    let report = try StatusReport.parse(data: Data(json.utf8))
+    XCTAssertFalse(report.isBenignControlSourceProbeWarning(name: "control_source"))
+    XCTAssertNil(report.reachableCurrentControlHostFromFleet)
+    XCTAssertEqual(OverallStateMapper.map(report: report), .yellow)
+  }
+
   func testUnknownSectionsAndStatesDoNotCrash() throws {
     let report = try StatusReport.parse(data: fixture("status-unknown-sections"))
     XCTAssertTrue(report.sectionNames.contains("quantum_sync"))

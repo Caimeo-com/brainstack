@@ -92,6 +92,19 @@ public struct FleetMachineSummary: Identifiable, Equatable, Sendable {
 
   public var id: String { name }
 
+  public var isReachableCurrentCleanControlHost: Bool {
+    let normalizedRole = role.lowercased()
+    let normalizedStatus = status.lowercased()
+    let normalizedUpdateState = updateState.lowercased()
+    let clean = (dirtyCount ?? 0) == 0
+    return normalizedRole == "control"
+      && reachable
+      && normalizedStatus == "ok"
+      && !needsUpdate
+      && clean
+      && ["current", "up-to-date", "up_to_date"].contains(normalizedUpdateState)
+  }
+
   public init?(json: JSONValue) {
     guard let name = json["name"]?.stringValue, !name.isEmpty else {
       return nil
@@ -225,6 +238,36 @@ public extension StatusReport {
   var fleetMachines: [FleetMachineSummary] {
     sections["fleet"]?.data?["machines"]?.arrayValue?.compactMap(FleetMachineSummary.init(json:)) ?? []
   }
+
+  var reachableCurrentControlHostFromFleet: FleetMachineSummary? {
+    fleetMachines.first(where: \.isReachableCurrentCleanControlHost)
+  }
+
+  func isBenignControlSourceProbeWarning(name: String) -> Bool {
+    guard name == "control_source",
+          let section = sections[name],
+          section.state == .warn,
+          reachableCurrentControlHostFromFleet != nil else {
+      return false
+    }
+    let combined = "\(section.detail) \(section.error ?? "")".lowercased()
+    return combined.contains("source probe failed") || combined.contains("probe failed")
+  }
+
+  var hasOnlyBenignControlSourceProbeWarning: Bool {
+    guard isBenignControlSourceProbeWarning(name: "control_source") else {
+      return false
+    }
+    return sectionNames.allSatisfy { name in
+      guard let section = sections[name] else {
+        return true
+      }
+      if name == "control_source" {
+        return true
+      }
+      return section.state == .ok || section.state == .disabled
+    }
+  }
 }
 
 public enum StatusParseError: Error, Equatable {
@@ -251,14 +294,19 @@ public enum OverallStateMapper {
     guard let report else {
       return .gray
     }
-    let states = report.sectionNames.compactMap { report.sections[$0]?.state }
+    let states = report.sectionNames.compactMap { name -> SectionState? in
+      guard let state = report.sections[name]?.state else {
+        return nil
+      }
+      return report.isBenignControlSourceProbeWarning(name: name) ? nil : state
+    }
     if states.isEmpty {
       return .gray
     }
     if states.contains(.fail) {
       return .red
     }
-    if states.contains(.warn) || states.contains(.unknown) || report.degraded {
+    if states.contains(.warn) || states.contains(.unknown) || (report.degraded && !report.hasOnlyBenignControlSourceProbeWarning) {
       return .yellow
     }
     return .green

@@ -253,6 +253,7 @@ func isBenignProposalLatencyWarning(name: String, section: StatusSection, report
 func isBenignWarning(name: String, section: StatusSection, report: StatusReport) -> Bool {
   isBenignProductWarning(name: name, section: section)
     || isBenignProposalLatencyWarning(name: name, section: section, report: report)
+    || report.isBenignControlSourceProbeWarning(name: name)
 }
 
 func sectionLabel(_ name: String) -> String {
@@ -276,7 +277,7 @@ func sectionLabel(_ name: String) -> String {
   }
 }
 
-func sectionMessage(name: String, section: StatusSection) -> String {
+func sectionMessage(name: String, section: StatusSection, report: StatusReport? = nil) -> String {
   if name == "outbox" {
     return OutboxStatusSummary(section: section).compactMessage
   }
@@ -293,6 +294,9 @@ func sectionMessage(name: String, section: StatusSection) -> String {
   }
   if isBenignProductWarning(name: name, section: section) {
     return "This Mac is using the installed client binary without a local product source checkout."
+  }
+  if report?.isBenignControlSourceProbeWarning(name: name) == true {
+    return "Fleet confirms the control host is current; direct source check will retry."
   }
   if name == "fleet" {
     let machines = section.data?["machines"]?.arrayValue?.compactMap(FleetMachineSummary.init(json:)) ?? []
