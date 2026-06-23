@@ -830,6 +830,54 @@ test("unbound context commands explain and guide deterministic newctx binding", 
   }
 });
 
+test("newctx accepts interactive repo targets and GitHub org/repo shorthand", async () => {
+  const fixture = await createFixture();
+
+  try {
+    await fixture.commands.handleMessage(telegramTopicMessage("/newctx", 45, "Erbine Lindy"));
+    await fixture.commands.handleMessage(telegramMessage("2", 45));
+    const targetPrompt = fixture.telegram.sent.at(-1)?.text || "";
+    expect(targetPrompt).toContain("3) Code repository/path");
+    expect(targetPrompt).toContain("org/repo");
+
+    await fixture.commands.handleMessage(telegramMessage("3", 45));
+    const repoPrompt = fixture.telegram.sent.at(-1)?.text || "";
+    expect(repoPrompt).toContain("Send the repository or path for this topic.");
+    expect(repoPrompt).toContain("lindy-ai/lindy main");
+
+    await fixture.commands.handleMessage(telegramMessage("lindy-ai/lindy main", 45));
+    const wizardRepo = fixture.db.getContextBySlug("erbine-lindy");
+    expect(wizardRepo?.kind).toBe("repo");
+    expect(wizardRepo?.machine).toBe("worker1");
+    expect(wizardRepo?.target).toBe("https://github.com/lindy-ai/lindy.git");
+    expect(wizardRepo?.baseBranch).toBe("main");
+    expect(wizardRepo?.state).toBe("pending");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Context erbine-lindy bound to this topic.");
+
+    await fixture.commands.handleMessage(telegramTopicMessage("/newctx", 46, "Repo Direct"));
+    await fixture.commands.handleMessage(telegramMessage("2", 46));
+    await fixture.commands.handleMessage(telegramMessage("repo lindy-ai/lindy main", 46));
+    const directWizardRepo = fixture.db.getContextBySlug("repo-direct");
+    expect(directWizardRepo?.target).toBe("https://github.com/lindy-ai/lindy.git");
+    expect(directWizardRepo?.baseBranch).toBe("main");
+
+    await fixture.commands.handleMessage(telegramMessage("/newctx one-line worker1 lindy-ai/lindy main", 47));
+    const oneLineRepo = fixture.db.getContextBySlug("one-line");
+    expect(oneLineRepo?.target).toBe("https://github.com/lindy-ai/lindy.git");
+    expect(oneLineRepo?.baseBranch).toBe("main");
+
+    await fixture.commands.handleMessage(telegramMessage("/newctx bind-shorthand control scratch", 48));
+    await fixture.commands.handleMessage(telegramMessage("/bind worker1 lindy-ai/lindy main", 48));
+    const reboundRepo = fixture.db.getContextBySlug("bind-shorthand");
+    expect(reboundRepo?.machine).toBe("worker1");
+    expect(reboundRepo?.target).toBe("https://github.com/lindy-ai/lindy.git");
+    expect(reboundRepo?.baseBranch).toBe("main");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("curation command binds the current topic and owns exactly one curator routine", async () => {
   const fixture = await createFixture();
 

@@ -73,7 +73,7 @@ const MAX_PROPOSAL_LIST_LIMIT = 30;
 const NEW_CONTEXT_WIZARD_MAX_AGE_MS = 10 * 60 * 1000;
 const PROPOSAL_CURATION_CONTEXT_SLUG = "proposal-curation";
 
-type NewContextWizardStep = "slug-or-machine" | "machine" | "target";
+type NewContextWizardStep = "slug-or-machine" | "machine" | "target" | "repo-target";
 
 interface PendingNewContextWizard {
   targetKey: string;
@@ -620,6 +620,66 @@ function formatMachineChoices(hosts: string[]): string[] {
   return hosts.map((host, index) => `${index + 1}) ${host}`);
 }
 
+function parseGithubOrgRepoShorthand(input: string): string | null {
+  const trimmed = input.trim();
+  if (
+    !trimmed ||
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("~") ||
+    trimmed.startsWith("./") ||
+    trimmed.startsWith("../") ||
+    trimmed.includes("\\") ||
+    trimmed.includes("@") ||
+    trimmed.includes(":") ||
+    /^(?:https?:\/\/|ssh:\/\/|git@|file:\/\/)/i.test(trimmed)
+  ) {
+    return null;
+  }
+
+  const parts = trimmed.split("/");
+  if (parts.length !== 2) {
+    return null;
+  }
+
+  const [owner, rawRepo] = parts;
+  const repo = rawRepo?.replace(/\.git$/i, "") || "";
+  const githubName = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+  if (!owner || !repo || owner === "." || owner === ".." || repo === "." || repo === "..") {
+    return null;
+  }
+  if (!githubName.test(owner) || !githubName.test(repo)) {
+    return null;
+  }
+
+  return `${owner}/${repo}`;
+}
+
+function normalizeRepositoryTarget(input: string): string {
+  const shorthand = parseGithubOrgRepoShorthand(input);
+  return shorthand ? `https://github.com/${shorthand}.git` : input.trim();
+}
+
+function parseNewContextRepoTargetReply(input: string): { target: string; baseBranch: string | null } | null {
+  const parts = input.trim().split(/\s+/).filter(Boolean);
+  const head = parts[0]?.toLowerCase() || "";
+  if (head === "repo" || head === "path") {
+    parts.shift();
+  }
+  if (!parts.length || parts.length > 2) {
+    return null;
+  }
+
+  return {
+    target: normalizeRepositoryTarget(parts[0] || ""),
+    baseBranch: parts[1] || null
+  };
+}
+
+function isNewContextRepoPromptReply(input: string): boolean {
+  const normalized = input.trim().toLowerCase();
+  return normalized === "3" || normalized === "repo" || normalized === "path" || normalized === "code";
+}
+
 function parseNewContextTargetReply(input: string): { target: string; baseBranch: string | null } | null {
   const trimmed = input.trim();
   const normalized = trimmed.toLowerCase();
@@ -659,13 +719,18 @@ function parseNewContextTargetReply(input: string): { target: string; baseBranch
 
   const head = parts[0] || "";
   const second = parts[1];
-  const third = parts[2];
-  if ((head === "3" || head.toLowerCase() === "repo" || head.toLowerCase() === "path") && second) {
-    return { target: second, baseBranch: third || null };
+  if (head === "3" && second) {
+    return parseNewContextRepoTargetReply(parts.slice(1).join(" "));
+  }
+  if (head.toLowerCase() === "repo" || head.toLowerCase() === "path") {
+    return parseNewContextRepoTargetReply(trimmed);
   }
 
   if (parts.length <= 2) {
-    return { target: parts[0] || "", baseBranch: parts[1] || null };
+    return {
+      target: normalizeRepositoryTarget(parts[0] || ""),
+      baseBranch: parts[1] || null
+    };
   }
 
   return null;
@@ -1198,8 +1263,8 @@ export class CommandHandler {
               "/mode [fast|normal|max|clear]",
               "/model [model-id|clear]",
               "/effort [low|medium|high|xhigh|clear]",
-              "/newctx [slug] [machine] [target] [base-branch]",
-              "/bind <machine> <target> [base-branch]",
+              "/newctx [slug] [machine] [scratch|host|repo-url|org/repo|path] [base-branch]",
+              "/bind <machine> <scratch|host|repo-url|org/repo|path> [base-branch]",
               "/topicinfo",
               "/run <instruction>",
               "/resume [instruction]",
@@ -1731,8 +1796,23 @@ export class CommandHandler {
             return;
           }
 
-          const [slugInput, machine, contextTarget, baseBranch] = parts;
-          const bound = await this.createOrRebindContext(slugInput, machine, contextTarget, baseBranch || null, target);
+          const [slugInput, machine] = parts;
+          const selectedTarget = parseNewContextTargetReply(parts.slice(2).join(" "));
+          if (!slugInput || !machine || !selectedTarget?.target) {
+            await this.telegram.sendText(
+              target,
+              "Usage: /newctx <slug> <machine> <scratch|host|repo-url|org/repo|path> [base-branch]"
+            );
+            return;
+          }
+
+          const bound = await this.createOrRebindContext(
+            slugInput,
+            machine,
+            selectedTarget.target,
+            selectedTarget.baseBranch,
+            target
+          );
           const warning = boundContext ? this.formatRebindWarning(boundContext) : null;
           await this.telegram.sendText(
             target,
@@ -1746,7 +1826,7 @@ export class CommandHandler {
         case "/bind": {
           const parts = parsed.rest.split(/\s+/).filter(Boolean);
           if (!parts.length) {
-            await this.telegram.sendText(target, "Usage: /bind <machine> <target> [base-branch]");
+            await this.telegram.sendText(target, "Usage: /bind <machine> <scratch|host|repo-url|org/repo|path> [base-branch]");
             return;
           }
 
@@ -1769,17 +1849,23 @@ export class CommandHandler {
           if (!boundContext) {
             await this.telegram.sendText(
               target,
-              "This topic is not bound yet. Use /newctx <slug> <machine> <target> [base-branch]."
+              "This topic is not bound yet. Use /newctx <slug> <machine> <scratch|host|repo-url|org/repo|path> [base-branch]."
             );
             return;
           }
 
-          const [machine, contextTarget, baseBranch] = parts;
+          const [machine] = parts;
+          const selectedTarget = parseNewContextTargetReply(parts.slice(1).join(" "));
+          if (!machine || !selectedTarget?.target) {
+            await this.telegram.sendText(target, "Usage: /bind <machine> <scratch|host|repo-url|org/repo|path> [base-branch]");
+            return;
+          }
+
           const rebound = await this.createOrRebindContext(
             boundContext.slug,
             machine,
-            contextTarget,
-            baseBranch || null,
+            selectedTarget.target,
+            selectedTarget.baseBranch,
             target
           );
           await this.telegram.sendText(target, this.formatContextCreated(rebound));
@@ -2741,10 +2827,26 @@ export class CommandHandler {
       "Pick what this topic is for:",
       "1) Topic workspace - ongoing conversation, routines, proposal review; stores a durable scratch workspace and defaults to low thinking",
       "2) Machine administration - inspect or operate the selected machine; stores a durable host workspace",
-      "3) Code repository/path - reply with `repo <git-url-or-path> [base-branch]`",
+      "3) Code repository/path - reply 3 and I will ask for it, or reply `repo <url|org/repo|path> [base-branch]`",
       ...curationHint,
       "",
       `Recommended next command: /newctx ${wizard.slug} ${wizard.machine || "<machine>"} scratch`,
+      "Reply cancel to stop."
+    ].join("\n");
+  }
+
+  private promptNewContextRepoTarget(wizard: PendingNewContextWizard): string {
+    return [
+      `Slug: ${wizard.slug}`,
+      `Machine: ${wizard.machine || "unselected"}`,
+      "Send the repository or path for this topic.",
+      "",
+      "Examples:",
+      "- lindy-ai/lindy main",
+      "- https://github.com/lindy-ai/lindy.git main",
+      "- /srv/factory/repos/lindy main",
+      "",
+      "Use org/repo for GitHub shorthand. Add the base branch after a space when needed.",
       "Reply cancel to stop."
     ].join("\n");
   }
@@ -2763,6 +2865,7 @@ export class CommandHandler {
         ...formatMachineChoices(this.workers.knownHosts()),
         "",
         `Full command option: /newctx ${slug} <machine> scratch`,
+        `Repo shortcut option: /newctx ${slug} <machine> org/repo main`,
         "Reply cancel to stop."
       ].join("\n")
     ]
@@ -2820,6 +2923,39 @@ export class CommandHandler {
       wizard.machine = selectedMachine;
       wizard.step = "target";
       await this.telegram.sendText(target, this.promptNewContextTarget(wizard));
+      return;
+    }
+
+    if (wizard.step === "repo-target") {
+      const selectedTarget = parseNewContextRepoTargetReply(trimmed);
+      if (!selectedTarget?.target || !wizard.machine) {
+        await this.telegram.sendText(
+          target,
+          [
+            "I need a repo URL, GitHub org/repo, or local path.",
+            "",
+            this.promptNewContextRepoTarget(wizard)
+          ].join("\n")
+        );
+        return;
+      }
+
+      this.pendingNewContexts.delete(wizard.targetKey);
+      const bound = await this.createOrRebindContext(
+        wizard.slug,
+        wizard.machine,
+        selectedTarget.target,
+        selectedTarget.baseBranch,
+        target
+      );
+      const warning = boundContext ? this.formatRebindWarning(boundContext) : null;
+      await this.telegram.sendText(target, [warning, this.formatContextCreated(bound)].filter(Boolean).join("\n\n"));
+      return;
+    }
+
+    if (isNewContextRepoPromptReply(trimmed)) {
+      wizard.step = "repo-target";
+      await this.telegram.sendText(target, this.promptNewContextRepoTarget(wizard));
       return;
     }
 
