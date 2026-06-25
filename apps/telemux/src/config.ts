@@ -6,6 +6,7 @@ export type HarnessName = "codex" | "claude";
 export type WorkerSshTrustMode = "pinned" | "accept-new";
 export type UsageAdapter = "manual";
 export type TranscriptionTarget = "local" | "worker";
+export type HarnessStreamingMode = "off" | "status";
 
 export interface PreDispatchClassifierConfig {
   enabled: boolean;
@@ -84,6 +85,10 @@ export interface FactoryConfig {
   brainctlBin: string;
   brainstackConfigPath: string;
   capabilityProgressIntervalMs: number;
+  harnessStreamingMode: HarnessStreamingMode;
+  harnessStreamingInitialDelayMs: number;
+  harnessStreamingUpdateIntervalMs: number;
+  harnessStreamingMaxChars: number;
   brainBaseUrl: string;
   brainImportToken: string;
   brainAdminToken: string;
@@ -213,6 +218,10 @@ function normalizeUsageAdapter(value: string | undefined): UsageAdapter {
 
 function normalizeTranscriptionTarget(value: string | undefined): TranscriptionTarget {
   return value?.trim() === "worker" ? "worker" : "local";
+}
+
+function normalizeHarnessStreamingMode(value: string | undefined): HarnessStreamingMode {
+  return value?.trim().toLowerCase() === "off" ? "off" : "status";
 }
 
 function readJsonStringArray(env: NodeJS.ProcessEnv, name: string, fallback: string[] = []): string[] {
@@ -420,6 +429,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FactoryConfig 
       ? resolvePath(env.BRAINSTACK_CONFIG.trim())
       : resolve(process.env.HOME || ".", ".config", "brainstack", "brainstack.yaml"),
     capabilityProgressIntervalMs: readNonNegativeNumber(env, "FACTORY_CAPABILITY_PROGRESS_INTERVAL_MS", 45_000),
+    harnessStreamingMode: normalizeHarnessStreamingMode(env.FACTORY_HARNESS_STREAMING),
+    harnessStreamingInitialDelayMs: readNonNegativeNumber(env, "FACTORY_HARNESS_STREAMING_INITIAL_DELAY_MS", 8_000),
+    harnessStreamingUpdateIntervalMs: readNonNegativeNumber(env, "FACTORY_HARNESS_STREAMING_UPDATE_INTERVAL_MS", 12_000),
+    harnessStreamingMaxChars: readNumber(env, "FACTORY_HARNESS_STREAMING_MAX_CHARS", 1_800),
     brainBaseUrl: env.BRAIN_BASE_URL?.trim() || "",
     brainImportToken: env.BRAIN_IMPORT_TOKEN?.trim() || "",
     brainAdminToken: env.FACTORY_BRAIN_ADMIN_TOKEN?.trim() || env.BRAIN_ADMIN_TOKEN?.trim() || "",

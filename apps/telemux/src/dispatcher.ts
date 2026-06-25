@@ -22,6 +22,7 @@ import { summarizeUsage } from "./usage";
 import { postBrainImportOrQueue } from "./brain-outbox";
 import { normalizeCodexModelOverride } from "./codex-runtime";
 import type { FactoryConfig } from "./config";
+import { HarnessProgressReporter } from "./harness-progress";
 import type { TelegramBot, TelegramTarget } from "./telegram";
 
 export type DispatchMode = "run" | "resume" | "loop";
@@ -539,6 +540,7 @@ export class Dispatcher {
     options: DispatchOptions
   ): Promise<Exclude<QueuedTurnStatus, "queued" | "running" | "abandoned">> {
     const stopHeartbeat = this.startTypingHeartbeat(replyTarget);
+    let progressReporter: HarnessProgressReporter | null = null;
 
     try {
       const ensured = await this.workers.ensureContext(context);
@@ -635,11 +637,16 @@ export class Dispatcher {
         : buildPrompt(currentBeforeWorker, mode, instruction, preparedTelegramInput?.promptSection || null, promptProfile);
       let compactionNotified = false;
       const rawModelOverride = options.modelOverride ?? currentBeforeWorker.modelOverride;
+      progressReporter = new HarnessProgressReporter(this.telegram, replyTarget, currentBeforeWorker, this.config, mode);
+      progressReporter.start();
       const result = await this.workers.runCodex(currentBeforeWorker, prompt, mode, logPath, {
         workspaceFiles: preparedTelegramInput?.workspaceFiles,
         imagePaths: preparedTelegramInput?.imagePaths,
         modelOverride: rawModelOverride ? normalizeCodexModelOverride(rawModelOverride) : null,
         reasoningEffortOverride: options.reasoningEffortOverride ?? currentBeforeWorker.reasoningEffortOverride,
+        onProgress: (event) => {
+          progressReporter?.record(event);
+        },
         onCompaction: async () => {
           if (options.notifyCompaction === false || compactionNotified) {
             return;
@@ -664,6 +671,7 @@ export class Dispatcher {
 
       if (result.ok) {
         if (afterRunContext.state === "archived") {
+          await progressReporter.finish("skipped");
           await this.telegram.sendText(
             replyTarget,
             `${afterRunContext.slug} completed after it was archived. Completion side effects were skipped.`
@@ -688,6 +696,7 @@ export class Dispatcher {
 
         const usage = await summarizeUsage(saved);
         const reply = (lastMessage || summary || "").trim() || `${saved.slug} completed.`;
+        await progressReporter.finish("completed");
         await this.telegram.sendText(
           replyTarget,
           [
@@ -720,6 +729,7 @@ export class Dispatcher {
         lastError: failureOutput || `exit ${result.exitCode}`
       });
 
+      await progressReporter.finish("failed");
       await this.telegram.sendText(
         replyTarget,
         [
@@ -730,6 +740,7 @@ export class Dispatcher {
       );
       return "failed";
     } finally {
+      progressReporter?.stop();
       stopHeartbeat();
     }
   }

@@ -290,6 +290,42 @@ export class TelegramBot {
     }
   }
 
+  async sendTextMessage(target: TelegramTarget, text: string): Promise<TelegramMessage | null> {
+    if (!this.isConfigured()) {
+      return null;
+    }
+
+    const [firstChunk] = chunkText(text);
+    if (!firstChunk) {
+      return null;
+    }
+
+    return this.api<TelegramMessage>("sendMessage", {
+      chat_id: target.chatId,
+      message_thread_id: target.threadId ?? undefined,
+      text: firstChunk,
+      disable_web_page_preview: true
+    });
+  }
+
+  async editText(target: TelegramTarget, messageId: number, text: string): Promise<void> {
+    if (!this.isConfigured()) {
+      return;
+    }
+
+    const [firstChunk] = chunkText(text);
+    if (!firstChunk) {
+      return;
+    }
+
+    await this.api("editMessageText", {
+      chat_id: target.chatId,
+      message_id: messageId,
+      text: firstChunk,
+      disable_web_page_preview: true
+    });
+  }
+
   async sendAttachment(target: TelegramTarget, attachment: TelegramOutgoingAttachment): Promise<void> {
     if (!this.isConfigured()) {
       return;

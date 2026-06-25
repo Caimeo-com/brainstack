@@ -5,6 +5,7 @@ import { canonicalJson, sha256Hex } from "../../../packages/outbox/src/outbox";
 import type { CodexReasoningEffort } from "./codex-runtime";
 import { loadWorkerConfigsFromPath, type FactoryConfig, type FactoryWorkerConfig, type HarnessName } from "./config";
 import { ContextKind, ContextRecord, ContextState, FactoryDb, WorkerRecord } from "./db";
+import { CodexProgressLineParser, type HarnessProgressEvent } from "./harness-progress";
 import { isProtectedArtifactPath, TELEGRAM_ATTACHMENTS_WORKSPACE_PATH } from "./telegram-attachments";
 
 export interface WorkerExecResult {
@@ -59,6 +60,7 @@ export interface WorkspaceSeedFile {
 export interface CodexRunOptions {
   onSessionId?: (sessionId: string) => Promise<void> | void;
   onCompaction?: () => Promise<void> | void;
+  onProgress?: (event: HarnessProgressEvent) => Promise<void> | void;
   workspaceFiles?: WorkspaceSeedFile[];
   imagePaths?: string[];
   modelOverride?: string | null;
@@ -939,6 +941,7 @@ wait "$harness_pid"
 
     let stdoutBuffer = "";
     let stdoutControlLineBuffer = "";
+    const progressParser = new CodexProgressLineParser();
     let seenSessionId: string | null = null;
     let seenCompaction = false;
     const consumeControlEvents = async (chunk: string) => {
@@ -973,6 +976,11 @@ wait "$harness_pid"
       async (chunk) => {
         stdoutBuffer = appendBoundedOutput(stdoutBuffer, chunk, this.config.workerCaptureMaxBytes);
         await consumeControlEvents(chunk);
+        if (harness.family === "codex") {
+          for (const event of progressParser.push(chunk)) {
+            await options.onProgress?.(event);
+          }
+        }
         const detected = parseSessionId(chunk);
         if (detected && detected !== seenSessionId) {
           seenSessionId = detected;
@@ -997,6 +1005,11 @@ wait "$harness_pid"
     if (!seenCompaction && lineLooksLikeCompactionEvent(stdoutControlLineBuffer)) {
       seenCompaction = true;
       await options.onCompaction?.();
+    }
+    if (harness.family === "codex") {
+      for (const event of progressParser.flush()) {
+        await options.onProgress?.(event);
+      }
     }
 
     return {

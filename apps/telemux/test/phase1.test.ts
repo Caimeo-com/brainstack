@@ -36,6 +36,7 @@ afterEach(() => {
 
 class FakeTelegram {
   readonly sent: Array<{ target: TelegramTarget; text: string }> = [];
+  readonly edited: Array<{ target: TelegramTarget; messageId: number; text: string }> = [];
   readonly attachments: Array<{
     target: TelegramTarget;
     kind: TelegramAttachmentKind;
@@ -48,6 +49,25 @@ class FakeTelegram {
 
   async sendText(target: TelegramTarget, text: string): Promise<void> {
     this.sent.push({ target, text });
+  }
+
+  async sendTextMessage(target: TelegramTarget, text: string): Promise<TelegramMessage> {
+    this.sent.push({ target, text });
+    return {
+      message_id: nextMessageId++,
+      date: Math.floor(Date.now() / 1000),
+      text,
+      is_topic_message: target.threadId !== null,
+      message_thread_id: target.threadId ?? undefined,
+      chat: {
+        id: target.chatId,
+        type: "supergroup"
+      }
+    };
+  }
+
+  async editText(target: TelegramTarget, messageId: number, text: string): Promise<void> {
+    this.edited.push({ target, messageId, text });
   }
 
   async sendAttachment(
@@ -912,6 +932,30 @@ test("curation command binds the current topic and owns exactly one curator rout
     await rm(fixture.root, { recursive: true, force: true });
   }
 });
+
+test("dispatcher emits a throttled editable progress card for slow Codex runs", async () => {
+  const fixture = await createFixture({
+    FACTORY_HARNESS_STREAMING: "status",
+    FACTORY_HARNESS_STREAMING_INITIAL_DELAY_MS: "1",
+    FACTORY_HARNESS_STREAMING_UPDATE_INTERVAL_MS: "10"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx live-progress control scratch", 49));
+    await fixture.commands.handleMessage(telegramMessage("/run slow live session progress test", 49));
+
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Working on live-progress (run)")));
+    await waitFor(() => fixture.telegram.edited.some((entry) => entry.text.includes("Completed. Final response below.")));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for live-progress.")));
+
+    const progressText = fixture.telegram.sent.find((entry) => entry.text.includes("Working on live-progress (run)"))?.text || "";
+    expect(progressText).toContain("Machine: control");
+    expect(progressText).not.toContain("Authorization");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 10_000);
 
 test("phase 1 workflow covers local host/scratch and pending remote behavior", async () => {
   const fixture = await createFixture();
