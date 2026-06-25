@@ -247,9 +247,7 @@ export function createStatusFleetCommands(deps: StatusFleetDeps) {
         ...workerSshTrustArgs(cfg, worker),
         ...workerSshPortArgs(worker),
         workerRemoteTarget(worker),
-        "bash",
-        "-lc",
-        script
+        `bash -lc ${quoteForBash(script)}`
       ],
       { check: false, timeoutMs }
     );

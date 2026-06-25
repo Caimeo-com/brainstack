@@ -1280,6 +1280,12 @@ printf 'brew_installed=ffmpeg\\n'
         join(binDir, "ssh"),
         [
           "#!/usr/bin/env bash",
+          "for arg in \"$@\"; do",
+          "  if [ \"$arg\" = \"-lc\" ]; then",
+          "    echo 'unquoted remote bash command' >&2",
+          "    exit 99",
+          "  fi",
+          "done",
           "case \"$*\" in",
           "  *fleet*status*)",
           "    cat <<'JSON'",
