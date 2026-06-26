@@ -37,6 +37,8 @@ bun run packages/brainctl/src/main.ts import skill ~/.codex/skills/brainstack/SK
 bun run packages/brainctl/src/main.ts status --json --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts capabilities install voice --target erbine --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts capabilities uninstall voice --target erbine --remove-files --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts uploads put --machine erbine --file ./large-runbook.zip --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts uploads list --machine erbine --recent --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts proposals groups --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts proposals merge-group GROUP_KEY --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts proposals auto-merge --config ~/.config/brainstack/brainstack.yaml --json
@@ -119,6 +121,8 @@ Client import/propose writes can queue into `~/.local/state/brainstack/outbox/<b
 Use `brainctl fleet status --json` on the control host, or from an enrolled Mac client with a configured control SSH route, to see every known machine, reachability, service status, and whether its Brainstack product checkout is behind `origin/main`. Use `brainctl fleet update <machine>` or `brainctl fleet update --all` to pull, rebuild `brainctl`, run `upgrade`, and restart managed Brainstack services on the target machine(s). A Mac client can bootstrap an old control host even when that host's installed `brainctl` predates the `fleet` command.
 
 Mac clients can send local files to mobile through the control host's telemux bot with `brainctl telegram send-file`. The file streams over SSH to the control host, telemux uses its local Telegram env, and the bot token never needs to exist on the client.
+
+Operators can also stage large or sensitive local files directly onto a Brainstack machine with `brainctl uploads put --machine <machine> --file <path>`. Uploads live in that machine's private Brainstack state under date-stamped folders, can be listed with `brainctl uploads list`, and can be removed with `brainctl uploads rm`. Telemux understands `/uploads` and phrases like "the file I just uploaded" in bound topics, so large files can bypass Telegram's Bot API download limit while still being easy for a harness to find.
 
 Security defaults are explicit in config:
 

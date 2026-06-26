@@ -40,6 +40,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         },
         openOperatorConsole: { [weak self] in
           self?.openOperatorConsole()
+        },
+        openUploads: { [weak self] in
+          self?.openUploads()
         }
       )
     )
@@ -283,6 +286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
   }
 
   private var operatorConsoleWindow: NSWindow?
+  private var uploadsWindow: NSWindow?
 
   /// The dedicated operator window: full proposal review surface, kept out of the
   /// popover so the menu stays a status glance.
@@ -302,6 +306,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
     model.loadProposals()
     operatorConsoleWindow?.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
+
+  func openUploads() {
+    if popover.isShown {
+      popover.performClose(nil)
+    }
+    if uploadsWindow == nil {
+      let hosting = NSHostingController(rootView: UploadsView(model: model))
+      let window = NSWindow(contentViewController: hosting)
+      window.title = "Brainstack Uploads"
+      window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
+      window.setContentSize(NSSize(width: 660, height: 520))
+      window.isReleasedWhenClosed = false
+      window.center()
+      uploadsWindow = window
+    }
+    uploadsWindow?.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
   }
 

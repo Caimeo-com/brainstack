@@ -143,6 +143,24 @@ If invite enrollment configured `client.telegramVia` and `client.telegramRemoteR
 
 SSH trust is pinned by default through `~/.config/brainstack/ssh_known_hosts` from the client config root. Invites can embed the control host pin; otherwise run `brainctl trust-worker` or install the control host key first, or use `--known-hosts FILE` for a custom pin file. `--ssh-trust accept-new` is a bootstrap escape hatch only; it uses OpenSSH TOFU semantics and should be replaced with a pinned host key before routine use. Use `--display-name NAME` to change the Telegram filename and `--max-bytes N` for a smaller explicit cap.
 
+## Upload A Mac File To A Brainstack Machine
+
+Use the uploads registry when the file should land on a Brainstack machine for a harness to read, not be sent back to Telegram:
+
+```bash
+brainctl uploads put \
+  --config ~/.config/brainstack/brainstack.yaml \
+  --machine erbine \
+  --file ~/Downloads/retrospective.zip
+
+brainctl uploads list \
+  --config ~/.config/brainstack/brainstack.yaml \
+  --machine erbine \
+  --recent
+```
+
+The macOS menu app exposes the same flow under **Uploads…**. After uploading, copy the remote path or tell a bound Telemux topic something like "use the file I just uploaded"; Telemux will add recent upload paths to the harness prompt. Remove short-lived files with `brainctl uploads rm --machine <machine> --id <upload-id>` or the menu app's Delete button.
+
 ## Harness Instructions
 
 The bootstrap installer installs real guidance, not prose pointers:

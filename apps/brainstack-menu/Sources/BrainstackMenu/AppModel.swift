@@ -17,6 +17,10 @@ final class AppModel: ObservableObject {
   @Published private(set) var proposals: [ProposalSummary] = []
   @Published private(set) var proposalsError: String?
   @Published private(set) var isLoadingProposals = false
+  @Published private(set) var uploads: [UploadSummary] = []
+  @Published private(set) var uploadsError: String?
+  @Published private(set) var isLoadingUploads = false
+  @Published private(set) var isUploading = false
   @Published private(set) var adminAvailability: AdminAvailability = .unknown
   @Published private(set) var proposalDetails: [String: ProposalDetail] = [:]
   @Published private(set) var loadingDetailId: String?
@@ -150,6 +154,24 @@ final class AppModel: ObservableObject {
       return nil
     }
     return BrainctlClient(binaryPath: binary, configPath: (configPath as NSString).expandingTildeInPath)
+  }
+
+  var uploadTargetMachines: [String] {
+    var names: [String] = []
+    if let machine = lastReport?.machine, !machine.isEmpty {
+      names.append(machine)
+    }
+    names.append(contentsOf: lastReport?.fleetMachines.map(\.name) ?? [])
+    var seen = Set<String>()
+    let unique = names.filter { name in
+      let key = name.lowercased()
+      guard !seen.contains(key) else {
+        return false
+      }
+      seen.insert(key)
+      return true
+    }
+    return unique.isEmpty ? ["local"] : unique
   }
 
   // MARK: - Refresh / polling
@@ -393,6 +415,106 @@ final class AppModel: ObservableObject {
     let target = controlHostMachineName ?? "control"
     runAction("Update Control Host", verifying: ["fleet", "control_source", "curator", "proposals"]) { client in
       await client.fleetUpdate(machine: target, title: "Update Control Host")
+    }
+  }
+
+  // MARK: - Uploads
+
+  func loadUploads(machine: String) {
+    guard let client = client() else {
+      uploadsError = "brainctl is missing; choose the binary in Preferences."
+      uploads = []
+      return
+    }
+    guard !isLoadingUploads else {
+      return
+    }
+    isLoadingUploads = true
+    Task {
+      let (parsed, outcome) = await client.fetchUploads(machine: machine)
+      await MainActor.run {
+        self.isLoadingUploads = false
+        self.lastDurations["uploads list"] = outcome.duration
+        if let parsed {
+          self.uploads = parsed
+          self.uploadsError = nil
+        } else {
+          self.uploads = []
+          self.uploadsError = outcome.succeeded ? "Could not parse uploads." : outcome.summary
+          self.record(outcome)
+        }
+      }
+    }
+  }
+
+  func uploadFiles(_ urls: [URL], machine: String) {
+    guard !urls.isEmpty else {
+      return
+    }
+    guard let client = client() else {
+      uploadsError = "brainctl is missing; choose the binary in Preferences."
+      return
+    }
+    guard !isUploading else {
+      uploadsError = "An upload is already running."
+      return
+    }
+    isUploading = true
+    uploadsError = nil
+    Task {
+      var failed: ActionOutcome?
+      var uploaded = 0
+      var totalDuration: TimeInterval = 0
+      for url in urls {
+        let outcome = await client.uploadFile(machine: machine, path: url.path)
+        totalDuration += outcome.duration
+        if outcome.succeeded {
+          uploaded += 1
+        } else {
+          failed = outcome
+          break
+        }
+      }
+      await MainActor.run {
+        self.isUploading = false
+        if let failed {
+          self.record(failed)
+          self.uploadsError = failed.summary
+        } else {
+          self.record(ActionOutcome(
+            title: "Upload Files",
+            succeeded: true,
+            unsupported: false,
+            adminUnavailable: false,
+            summary: "Uploaded \(uploaded) file\(uploaded == 1 ? "" : "s") to \(machine).",
+            output: "",
+            duration: totalDuration
+          ))
+          self.uploadsError = nil
+        }
+        self.loadUploads(machine: machine)
+      }
+    }
+  }
+
+  func deleteUpload(_ upload: UploadSummary) {
+    guard let client = client() else {
+      uploadsError = "brainctl is missing; choose the binary in Preferences."
+      return
+    }
+    guard !isUploading else {
+      uploadsError = "An upload operation is already running."
+      return
+    }
+    isUploading = true
+    Task {
+      let outcome = await client.deleteUpload(machine: upload.machine, id: upload.id)
+      await MainActor.run {
+        self.isUploading = false
+        self.record(outcome)
+        self.uploadsError = outcome.succeeded ? nil : outcome.summary
+        self.loadUploads(machine: upload.machine)
+      }
     }
   }
 

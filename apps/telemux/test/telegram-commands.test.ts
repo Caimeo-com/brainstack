@@ -43,7 +43,7 @@ function testContext(slug: string, chatId: number | null, threadId: number | nul
 test("registered Telegram commands include implemented operator commands", () => {
   const commands = new Set(TELEGRAM_BOT_COMMANDS.map((command) => command.command));
 
-  for (const command of ["whoami", "workers", "updates", "voice", "context", "compact", "crons", "cron_run", "run", "resume", "loop", "artifacts", "shred", "usage"]) {
+  for (const command of ["whoami", "workers", "updates", "voice", "uploads", "context", "compact", "crons", "cron_run", "run", "resume", "loop", "artifacts", "shred", "usage"]) {
     expect(commands.has(command)).toBe(true);
   }
 });

@@ -42,6 +42,7 @@ export interface DispatchOptions {
   rawPrompt?: boolean;
   promptProfile?: PromptProfile;
   telegramInput?: TelegramInboundMessageInput | null;
+  extraPromptSections?: string[];
   modelOverride?: string | null;
   reasoningEffortOverride?: ContextRecord["reasoningEffortOverride"];
   sourceLabel?: string | null;
@@ -726,10 +727,12 @@ export class Dispatcher {
         return "skipped";
       }
 
+      const extraPromptSection = (options.extraPromptSections || []).map((section) => section.trim()).filter(Boolean).join("\n\n");
+      const telegramPromptSection = [preparedTelegramInput?.promptSection || "", extraPromptSection].filter(Boolean).join("\n\n") || null;
       const promptProfile: PromptProfile = preparedTelegramInput ? "full" : options.promptProfile || "full";
       const prompt = options.rawPrompt
         ? instruction
-        : buildPrompt(currentBeforeWorker, mode, instruction, preparedTelegramInput?.promptSection || null, promptProfile);
+        : buildPrompt(currentBeforeWorker, mode, instruction, telegramPromptSection, promptProfile);
       let compactionNotified = false;
       const rawModelOverride = options.modelOverride ?? currentBeforeWorker.modelOverride;
       progressReporter = new HarnessProgressReporter(this.telegram, replyTarget, currentBeforeWorker, this.config, mode);

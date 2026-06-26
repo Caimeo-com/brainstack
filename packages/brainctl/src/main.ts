@@ -29,6 +29,7 @@ import { createInstallEnrollCommands } from "./commands/install-enroll";
 import { createCapabilitiesCommands } from "./commands/capabilities";
 import { createProjectOutboxCommands } from "./commands/project-outbox";
 import { createSkillHookCommands } from "./commands/skills-hooks";
+import { createUploadsCommands } from "./commands/uploads";
 import { formatOutboxErrorSummary, summarizeOutboxTerminalErrors } from "./outbox-summary";
 import {
   ensureDir,
@@ -322,6 +323,34 @@ const capabilitiesCommands = createCapabilitiesCommands({
   }
 });
 const commandCapabilities = capabilitiesCommands.commandCapabilities;
+
+const uploadsCommands = createUploadsCommands({
+  abs,
+  absWithHome,
+  brainstackDefaultConfigPath,
+  controlSshTarget,
+  defaultWorkers,
+  flag,
+  hasFlag,
+  loadConfig,
+  parsePositiveIntegerFlag,
+  quoteForBash,
+  remoteBrainctlScript,
+  requireFlagValue,
+  run,
+  runControlRemoteScript,
+  runWithStdinFile,
+  runWorkerShell,
+  telegramControlWorker,
+  telegramKnownHostsPath,
+  telegramSshTrustArgs,
+  telegramSshTrustMode,
+  workerRemoteTarget,
+  workerSshPortArgs,
+  workerSshTrustArgs,
+  whichCommand: commandPath
+});
+const commandUploads = uploadsCommands.commandUploads;
 
 const projectOutboxCommands = createProjectOutboxCommands({
   clientEnvPathAbs,
@@ -3261,6 +3290,9 @@ async function main(): Promise<void> {
     case "capabilities":
     case "capability":
       return await commandCapabilities(args);
+    case "uploads":
+    case "upload":
+      return await commandUploads(args);
     case "expose":
       return await commandExpose(args);
     case "import":

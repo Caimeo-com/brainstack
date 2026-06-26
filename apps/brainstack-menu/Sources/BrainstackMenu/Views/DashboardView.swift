@@ -14,6 +14,7 @@ struct DashboardView: View {
   var openPreferences: () -> Void
   var openInstaller: () -> Void
   var openOperatorConsole: () -> Void
+  var openUploads: () -> Void
   // Start with a plausible height so the popover doesn't open tiny and balloon a
   // moment later (which can make AppKit re-place it).
   @State private var scrollContentHeight: CGFloat = 360
@@ -113,6 +114,7 @@ struct DashboardView: View {
     Menu {
       Section("Open") {
         Button("Wiki") { model.openWiki() }
+        Button("Uploads…") { openUploads() }
         Button("Shared Brain Folder") { model.openSharedBrainFolder() }
         Button("Config Folder") { model.openConfigFolder() }
         if model.operatorModeEnabled {

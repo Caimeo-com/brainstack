@@ -51,7 +51,11 @@ export function safeGitProtocolEnv(remote: string): Record<string, string> {
   };
 }
 
-export async function runWithStdinFile(args: string[], filePath: string, options: { cwd?: string; env?: Record<string, string>; maxBytes?: number } = {}) {
+export async function runWithStdinFile(
+  args: string[],
+  filePath: string,
+  options: { cwd?: string; env?: Record<string, string>; maxBytes?: number; timeoutMs?: number } = {}
+) {
   const proc = Bun.spawn(args, {
     cwd: options.cwd || process.cwd(),
     env: { ...process.env, ...(options.env || {}) },
@@ -62,6 +66,15 @@ export async function runWithStdinFile(args: string[], filePath: string, options
   const stdoutPromise = new Response(proc.stdout).text();
   const stderrPromise = new Response(proc.stderr).text();
   let inputError: unknown = null;
+  let timedOut = false;
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  if (options.timeoutMs !== undefined && options.timeoutMs > 0) {
+    timeout = setTimeout(() => {
+      timedOut = true;
+      proc.kill();
+    }, options.timeoutMs);
+    timeout.unref?.();
+  }
 
   try {
     // Open once with O_NOFOLLOW and validate the same descriptor we stream from, so
@@ -104,11 +117,16 @@ export async function runWithStdinFile(args: string[], filePath: string, options
     }
   }
 
-  const [code, stdout, stderr] = await Promise.all([proc.exited, stdoutPromise, stderrPromise]);
+  const [rawCode, stdout, stderr] = await Promise.all([proc.exited, stdoutPromise, stderrPromise]);
+  if (timeout) {
+    clearTimeout(timeout);
+  }
+  const timeoutMessage = timedOut && options.timeoutMs ? `timed out after ${options.timeoutMs}ms` : "";
   return {
-    code,
+    code: timedOut ? 124 : rawCode,
     stdout,
-    stderr: inputError ? [stderr, inputError instanceof Error ? inputError.message : String(inputError)].filter(Boolean).join("\n") : stderr
+    stderr: [stderr, inputError ? (inputError instanceof Error ? inputError.message : String(inputError)) : "", timeoutMessage].filter(Boolean).join("\n"),
+    timedOut
   };
 }
 

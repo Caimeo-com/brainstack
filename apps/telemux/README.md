@@ -148,6 +148,8 @@ Use `/mode`, `/model`, and `/effort` to change the Codex runtime for just that t
 
 Captioned image and file messages work in the same bound-topic flow. The control plane stages the inbound files into the workspace first, then runs Codex against that updated workspace.
 
+For files too large for Telegram's Bot API download path, stage them with `brainctl uploads put --machine <machine> --file <path>` or the macOS menu app's **Uploads…** window. In a bound topic, `/uploads [machine]` lists recent staged files. If you say something like "use the env file I just uploaded", Telemux adds the recent upload names and remote paths to the harness prompt without trying to download the file from Telegram again.
+
 Use `/context` to inspect the bound context, effective harness, topic overrides or last-probed worker model/effort, session id, paths, and busy state. `/usage` includes the same context header plus latest token usage and manual compaction availability.
 
 Use `/compact` to request manual compaction for a Codex-backed context that already has a session. Claude contexts reply that manual compact is unsupported.

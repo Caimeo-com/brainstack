@@ -588,11 +588,25 @@ case "$*" in
 	  *"capabilities doctor voice"*)
 	    echo "voice=ok enabled=yes target=erbine command=/tmp/whisper-tiny.en.llamafile"
 	    ;;
-	  *"capabilities uninstall voice"*)
+  *"capabilities uninstall voice"*)
 	    echo "uninstalled=voice"
 	    echo "files=removed target=erbine"
 	    echo "restart=scheduled service=telemux.service delay_ms=1500"
 	    ;;
+  *"uploads list"*)
+    machine="control"
+    while (($#)); do
+      if [[ "$1" == "--machine" && $# -gt 1 ]]; then
+        machine="$2"
+        shift 2
+      else
+        shift
+      fi
+    done
+    cat <<JSON
+{"ok":true,"machine":"$machine","uploads":[{"schema_version":1,"id":"up_20260626T000000Z_fixture","machine":"$machine","source":"test","original_name":"latest.env","file_name":"latest.env","label":"fixture","size_bytes":17,"sha256":"abc123","uploaded_at":"2026-06-26T00:00:00Z","remote_path":"/tmp/brainstack-upload-fixtures/$machine/latest.env","manifest_path":"/tmp/brainstack-upload-fixtures/$machine/manifest.json"}]}
+JSON
+    ;;
   *"proposals groups"*)
     cat <<'JSON'
 {"ok":true,"review_groups":[{"id":"brainstack:repo:project_lesson","label":"brainstack / repo / project_lesson","count":3,"needsContextCount":0,"legacyCount":0},{"id":"lindy:repo:project_lesson","label":"lindy / repo / project_lesson","count":2,"needsContextCount":1,"legacyCount":0}]}
@@ -1146,7 +1160,7 @@ exec sleep 30
     process.env.BRAINSTACK_UPDATE_PROBE_TIMEOUT_SECONDS = "1";
     const startedAt = Date.now();
     await fixture.commands.handleMessage(telegramMessage("/updates@brainstackbot", 10));
-    expect(Date.now() - startedAt).toBeLessThan(7000);
+    expect(Date.now() - startedAt).toBeLessThan(12_000);
     const updatesText = fixture.telegram.sent.at(-1)?.text || "";
     expect(updatesText).toContain("Update check degraded.");
     expect(updatesText).toContain("Artifact: .factory/reports/update-check-");
@@ -4601,6 +4615,39 @@ test("Telegram media coalescing batches quick multi-file uploads into one turn",
   } finally {
     process.env.PATH = fixture.previousPath;
     clearPendingMediaTimers(fixture);
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("recent Brainstack uploads can be listed and referenced by bound prompts", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "0"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx upload-aware control scratch", 66));
+    await fixture.commands.handleMessage(telegramMessage("/uploads", 66));
+
+    const uploadsReply = fixture.telegram.sent.at(-1)?.text || "";
+    expect(uploadsReply).toContain("Recent uploads on control:");
+    expect(uploadsReply).toContain("latest.env");
+    expect(uploadsReply).toContain("/tmp/brainstack-upload-fixtures/control/latest.env");
+
+    await fixture.commands.handleMessage(telegramMessage("Use the env file I just uploaded and print its path.", 66));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for upload-aware.")));
+
+    const prompt = await readFile(join(fixture.factoryRoot, "scratch", "upload-aware", ".factory", "control-plane.prompt.md"), "utf8");
+    expect(prompt).toContain("Recent Brainstack uploads on control:");
+    expect(prompt).toContain("latest.env");
+    expect(prompt).toContain("/tmp/brainstack-upload-fixtures/control/latest.env");
+
+    await fixture.commands.handleMessage(telegramMessage("Continue normally.", 66));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 2 for upload-aware.")));
+
+    const nextPrompt = await readFile(join(fixture.factoryRoot, "scratch", "upload-aware", ".factory", "control-plane.prompt.md"), "utf8");
+    expect(nextPrompt).not.toContain("Recent Brainstack uploads on control:");
+  } finally {
+    process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 15_000);

@@ -180,3 +180,19 @@ brainctl telegram send-file \
 ```
 
 Invites can carry the control SSH target, remote Brainstack repo path, and pinned host keys so routine file relay does not need ad hoc `scp`, provider credentials, or `ssh-trust accept-new`.
+
+Use `brainctl uploads` for the reverse direction: place a local file onto a selected Brainstack machine so a harness can consume it there.
+
+```bash
+brainctl uploads put \
+  --config ~/.config/brainstack/brainstack.yaml \
+  --machine erbine \
+  --file ~/Downloads/runbook.zip
+
+brainctl uploads list \
+  --config ~/.config/brainstack/brainstack.yaml \
+  --machine erbine \
+  --recent
+```
+
+Uploads are private machine state under Brainstack's local state root. They are useful for large files that Telegram cannot download and for short-lived operator-provided inputs such as archives, keys, or env files. Delete them with `brainctl uploads rm --machine <machine> --id <upload-id>` when they are no longer needed.

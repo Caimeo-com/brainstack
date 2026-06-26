@@ -115,6 +115,17 @@ interface VoiceCapabilityIntent {
   error: string | null;
 }
 
+interface BrainstackUploadSummary {
+  id: string;
+  machine: string;
+  file_name: string;
+  original_name?: string;
+  label?: string | null;
+  size_bytes: number;
+  uploaded_at: string;
+  remote_path: string;
+}
+
 function voiceCapabilityUsage(): string {
   return [
     "Voice transcription commands:",
@@ -425,6 +436,84 @@ function formatElapsed(ms: number): string {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return "unknown size";
+  }
+  const mib = bytes / (1024 * 1024);
+  if (mib >= 1) {
+    return `${mib.toFixed(mib >= 10 ? 1 : 2)} MiB`;
+  }
+  const kib = bytes / 1024;
+  if (kib >= 1) {
+    return `${kib.toFixed(kib >= 10 ? 1 : 2)} KiB`;
+  }
+  return `${bytes} bytes`;
+}
+
+function parseUploadsJson(text: string): BrainstackUploadSummary[] {
+  const parsed = JSON.parse(text) as { uploads?: unknown[] };
+  return (Array.isArray(parsed.uploads) ? parsed.uploads : [])
+    .map((entry) => entry && typeof entry === "object" ? entry as Record<string, unknown> : null)
+    .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+    .map((entry) => ({
+      id: typeof entry.id === "string" ? entry.id : "",
+      machine: typeof entry.machine === "string" ? entry.machine : "",
+      file_name: typeof entry.file_name === "string" ? entry.file_name : "",
+      original_name: typeof entry.original_name === "string" ? entry.original_name : undefined,
+      label: typeof entry.label === "string" ? entry.label : null,
+      size_bytes: typeof entry.size_bytes === "number" ? entry.size_bytes : 0,
+      uploaded_at: typeof entry.uploaded_at === "string" ? entry.uploaded_at : "",
+      remote_path: typeof entry.remote_path === "string" ? entry.remote_path : ""
+    }))
+    .filter((upload) => upload.id && upload.remote_path);
+}
+
+function uploadMachineFromText(rest: string, context: ContextRecord | null): string | null {
+  const parts = rest.split(/\s+/).map((part) => part.trim()).filter(Boolean);
+  const machine = parts.find((part) => !["recent", "list", "show", "uploads", "upload", "files", "on", "for"].includes(part.toLowerCase()));
+  return machine || context?.machine || null;
+}
+
+function formatUploadsForTelegram(machine: string, uploads: BrainstackUploadSummary[]): string {
+  if (!uploads.length) {
+    return `No recent uploads found on ${machine}.`;
+  }
+  const lines = [`Recent uploads on ${machine}:`];
+  for (const [index, upload] of uploads.slice(0, 10).entries()) {
+    const name = upload.file_name || upload.original_name || upload.id;
+    lines.push(`${index + 1}) ${name} (${formatBytes(upload.size_bytes)})`);
+    lines.push(`   path: ${upload.remote_path}`);
+    lines.push(`   id: ${upload.id}${upload.uploaded_at ? ` uploaded: ${upload.uploaded_at}` : ""}`);
+  }
+  lines.push("");
+  lines.push("In a bound topic, you can now say things like: use the env file I just uploaded.");
+  return lines.join("\n");
+}
+
+function looksLikeRecentUploadReference(text: string): boolean {
+  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return /\b(?:just uploaded|recent uploads?|latest uploads?|uploaded file|uploaded files|file i uploaded|files i uploaded|file i just uploaded|files i just uploaded|from uploads|uploads folder)\b/.test(normalized);
+}
+
+function formatRecentUploadsPromptSection(machine: string, uploads: BrainstackUploadSummary[]): string | null {
+  if (!uploads.length) {
+    return null;
+  }
+  return [
+    `Recent Brainstack uploads on ${machine}:`,
+    ...uploads.slice(0, 10).flatMap((upload) => [
+      `- ${upload.file_name || upload.original_name || upload.id} (${upload.id}, ${formatBytes(upload.size_bytes)}${upload.uploaded_at ? `, uploaded ${upload.uploaded_at}` : ""})`,
+      `  path: ${upload.remote_path}`
+    ]),
+    "",
+    "Treat these as local files on the named machine. Use paths directly when the user refers to a recently uploaded file. Do not print file contents unless the user asks."
+  ].join("\n");
 }
 
 function snippet(text: string | null, limit = 240): string {
@@ -1061,6 +1150,11 @@ export class CommandHandler {
       return;
     }
 
+    if (!parsed && !hasAttachments && /^(?:please\s+)?(?:show|list|what(?:'s| is))\s+(?:my\s+)?(?:recent\s+)?uploads?(?:\s+.+)?$/i.test(text.trim())) {
+      await this.telegram.sendText(target, await this.formatUploadsCommand(text, boundContext));
+      return;
+    }
+
     if (parsed?.command === "/whoami") {
       await this.telegram.sendText(
         target,
@@ -1272,6 +1366,7 @@ export class CommandHandler {
               "/workers",
               "/updates",
               "/voice",
+              "/uploads [machine]",
               "/context",
               "/compact",
               "/crons",
@@ -1304,6 +1399,7 @@ export class CommandHandler {
               "In a bound topic, plain text starts or resumes the stored Codex session.",
               "Use /artifacts to list tokenized send/send+del shortcuts. Generic requests such as \"send it\" send the latest artifact.",
               "Use /shred to list tokenized cleanup shortcuts.",
+              "Use /uploads [machine] to list files uploaded through Brainstack; plain text can refer to \"the file I just uploaded\".",
               "Use /mode, /model, and /effort to change Codex runtime behavior for this topic without rebinding it.",
               "Use /context or /usage to inspect the current topic state. Use /compact to compact Codex topics when supported.",
               "Use /voice install <machine> to install local voice transcription for Telegram voice notes.",
@@ -1440,6 +1536,11 @@ export class CommandHandler {
             return;
           }
           await this.telegram.sendText(target, formatUpdateCheckCommandResult(result));
+          return;
+        }
+
+        case "/uploads": {
+          await this.telegram.sendText(target, await this.formatUploadsCommand(parsed.rest, boundContext));
           return;
         }
 
@@ -1941,8 +2042,10 @@ export class CommandHandler {
             commandTelegramInput = prepared.telegramInput;
           }
 
+          const uploadPromptSection = await this.recentUploadsPromptSection(boundContext, instruction);
           const response = await this.dispatcher.dispatch(mode, boundContext, instruction, target, {
             telegramInput: commandTelegramInput,
+            extraPromptSections: uploadPromptSection ? [uploadPromptSection] : [],
             userId: message.from?.id ?? null
           });
           if (response.message) {
@@ -2413,6 +2516,41 @@ export class CommandHandler {
     };
   }
 
+  private async listUploads(machine: string, limit = 10): Promise<BrainstackUploadSummary[]> {
+    const result = await this.runBrainctlCommand(
+      ["uploads", "list", "--machine", machine, "--recent", "--limit", String(limit), "--json", "--config", this.config.brainstackConfigPath],
+      45_000
+    );
+    if (!result.ok) {
+      throw new Error([result.stderr.trim(), result.stdout.trim()].filter(Boolean).join("\n") || `exit ${result.exitCode}`);
+    }
+    return parseUploadsJson(result.stdout);
+  }
+
+  private async formatUploadsCommand(rest: string, boundContext: ContextRecord | null): Promise<string> {
+    const machine = uploadMachineFromText(rest, boundContext);
+    if (!machine) {
+      return "Usage: /uploads [machine]\nBind this topic first or provide a machine name, for example /uploads erbine.";
+    }
+    try {
+      return formatUploadsForTelegram(machine, await this.listUploads(machine, 10));
+    } catch (error) {
+      return `Could not list uploads on ${machine}: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  private async recentUploadsPromptSection(context: ContextRecord, text: string): Promise<string | null> {
+    if (!looksLikeRecentUploadReference(text)) {
+      return null;
+    }
+    try {
+      return formatRecentUploadsPromptSection(context.machine, await this.listUploads(context.machine, 10));
+    } catch (error) {
+      console.warn(`failed to list recent uploads for ${context.slug} on ${context.machine}`, error);
+      return null;
+    }
+  }
+
   private pendingKey(target: TelegramTarget, userId: number | null): string {
     return `${target.chatId}:${target.threadId ?? "none"}:${userId ?? "unknown"}`;
   }
@@ -2806,8 +2944,10 @@ export class CommandHandler {
     }
 
     const promptProfile = preDispatch.route === "light_harness" ? "light" : "full";
+    const uploadPromptSection = await this.recentUploadsPromptSection(freshContext, text);
     const response = await this.dispatcher.dispatch("resume", freshContext, text, target, {
       telegramInput,
+      extraPromptSections: uploadPromptSection ? [uploadPromptSection] : [],
       userId,
       promptProfile,
       sourceLabel: promptProfile === "light" ? "pre-dispatch light" : null

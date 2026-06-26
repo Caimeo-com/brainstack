@@ -450,4 +450,33 @@ public struct BrainctlClient: Sendable {
       timeout: 600
     )
   }
+
+  public func fetchUploads(machine: String) async -> (uploads: [UploadSummary]?, outcome: ActionOutcome) {
+    let result = await CommandRunner.run(
+      executable: binaryPath,
+      arguments: ["uploads", "list", "--machine", machine, "--recent", "--limit", "50", "--json", "--config", configPath],
+      timeout: 45
+    )
+    let outcome = Self.outcome(title: "List Uploads", result: result, timeout: 45)
+    guard result.succeeded else {
+      return (nil, outcome)
+    }
+    return (UploadSummary.parseList(result.stdout), outcome)
+  }
+
+  public func uploadFile(machine: String, path: String) async -> ActionOutcome {
+    await runAction(
+      title: "Upload File",
+      arguments: ["uploads", "put", "--machine", machine, "--file", path, "--json", "--config", configPath],
+      timeout: 900
+    )
+  }
+
+  public func deleteUpload(machine: String, id: String) async -> ActionOutcome {
+    await runAction(
+      title: "Delete Upload",
+      arguments: ["uploads", "rm", "--machine", machine, "--id", id, "--json", "--config", configPath],
+      timeout: 60
+    )
+  }
 }

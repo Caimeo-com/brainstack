@@ -170,6 +170,24 @@ Expected shape:
 - Local and remote guards should reject symlinks, directories, oversize files, and source or display names that look like secrets unless the user explicitly passes `--allow-sensitive`.
 - Prefer context slugs for bound telemux topics when available; otherwise use the configured control chat defaults. Do not print chat ids unless the user asks for routing diagnostics.
 
+## Upload Registry
+
+Use `brainctl uploads` when the operator needs to place a local file onto a Brainstack machine for later harness use, especially when Telegram cannot download the file because of Bot API size limits:
+
+```bash
+brainctl uploads put --config "$BRAINSTACK_CONFIG" --machine erbine --file ./runbook.zip
+brainctl uploads list --config "$BRAINSTACK_CONFIG" --machine erbine --recent
+brainctl uploads rm --config "$BRAINSTACK_CONFIG" --machine erbine --id up_...
+```
+
+Expected shape:
+
+- Uploads are private machine state under `~/.local/state/brainstack/uploads/YYYY-MM-DD/<upload-id>/`, not shared-brain content.
+- The command copies only regular non-symlink files, records a manifest with size/hash/path metadata, and writes private permissions.
+- From Telegram, `/uploads [machine]` lists recent files. Bound-topic messages that refer to "the file I just uploaded" should receive recent upload names and paths in the harness prompt.
+- Prefer this path over ad hoc `scp` when the operator wants a harness to consume a local file on a worker/control host. Use `telegram send-file` for the opposite direction: sending machine files back to the operator.
+- Delete uploads once they are no longer needed, especially if they contain credentials or private customer material.
+
 ## Worker Canary
 
 Use a non-destructive canary before repurposing a reused worker:
