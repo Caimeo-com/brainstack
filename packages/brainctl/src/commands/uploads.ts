@@ -373,7 +373,7 @@ function listRemoteUploadsScript(): string {
     'root="$HOME/.local/state/brainstack/uploads"',
     '[ -d "$root" ] || exit 0',
     'find "$root" -mindepth 3 -maxdepth 3 -type f -name manifest.json -print0 | while IFS= read -r -d "" file; do',
-    '  cat "$file"',
+    "  tr -d '\\r\\n' < \"$file\"",
     "  printf '\\n'",
     "done"
   ].join("\n");
@@ -520,7 +520,7 @@ export function createUploadsCommands(deps: UploadsDeps) {
     const validated = await validateSourceFile(sourcePath, maxBytes);
     const uploadedAt = new Date().toISOString();
 
-  if (cfg.profile === "client-macos" && !isLocalMachine(cfg, machine)) {
+    if (cfg.profile === "client-macos" && !isLocalMachine(cfg, machine)) {
       const stagedPath = await stageFileOnControl(cfg, args, sourcePath, id, fileName, deps, timeoutMs, maxBytes);
       const remoteArgs = [
         "uploads",

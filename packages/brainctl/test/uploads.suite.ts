@@ -101,6 +101,86 @@ describe("brainctl uploads", () => {
     }
   });
 
+  test("lists pretty remote upload manifests from worker storage", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-upload-remote-list-"));
+    try {
+      const binDir = join(dir, "bin");
+      const remoteHome = join(dir, "remote-home");
+      const manifestDir = join(remoteHome, ".local", "state", "brainstack", "uploads", "2026-06-26", "up_20260626T120000Z_fixture");
+      await mkdir(binDir, { recursive: true });
+      await mkdir(manifestDir, { recursive: true });
+      await writeExecutable(
+        join(binDir, "ssh"),
+        [
+          "#!/usr/bin/env bash",
+          "set -euo pipefail",
+          'last="${@: -1}"',
+          'eval "$last"',
+          ""
+        ].join("\n")
+      );
+      await writeFile(
+        join(manifestDir, "manifest.json"),
+        JSON.stringify(
+          {
+            schema_version: 1,
+            id: "up_20260626T120000Z_fixture",
+            machine: "erbine",
+            source: "client-macos",
+            original_name: "runbook.zip",
+            file_name: "runbook.zip",
+            label: "runbook",
+            size_bytes: 1234,
+            sha256: "a".repeat(64),
+            uploaded_at: "2026-06-26T12:00:00.000Z",
+            remote_path: "~/.local/state/brainstack/uploads/2026-06-26/up_20260626T120000Z_fixture/runbook.zip",
+            manifest_path: "~/.local/state/brainstack/uploads/2026-06-26/up_20260626T120000Z_fixture/manifest.json"
+          },
+          null,
+          2
+        ) + "\n"
+      );
+      const configPath = join(dir, "config.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: valkyrie",
+          "  user: operator",
+          "paths:",
+          `  home: ${dir}`,
+          `  stateRoot: ${join(dir, "state")}`,
+          "brain:",
+          "  publicBaseUrl: https://valkyrie.example.ts.net",
+          "telemux:",
+          "  enabled: true",
+          "  workers:",
+          "    - name: erbine",
+          "      transport: ssh",
+          "      sshTarget: erbine",
+          ""
+        ].join("\n")
+      );
+
+      const list = runBrainctl(["uploads", "list", "--config", configPath, "--machine", "erbine", "--json"], {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        HOME: remoteHome
+      });
+      expect(list.code).toBe(0);
+      const listJson = JSON.parse(list.stdout) as { uploads: Array<{ id: string; file_name: string; label: string }> };
+      expect(listJson.uploads).toHaveLength(1);
+      expect(listJson.uploads[0]).toMatchObject({
+        id: "up_20260626T120000Z_fixture",
+        file_name: "runbook.zip",
+        label: "runbook"
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("client remote uploads explain when the control host is too old", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-upload-old-control-"));
     try {
