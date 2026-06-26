@@ -1814,7 +1814,7 @@ export class CommandHandler {
             selectedTarget.baseBranch,
             target
           );
-          const warning = boundContext ? this.formatRebindWarning(boundContext) : null;
+          const warning = boundContext ? this.formatRebindCompletionNotice(boundContext, bound) : null;
           await this.telegram.sendText(
             target,
             [warning, this.formatContextCreated(bound)]
@@ -2951,7 +2951,7 @@ export class CommandHandler {
         selectedTarget.baseBranch,
         target
       );
-      const warning = boundContext ? this.formatRebindWarning(boundContext) : null;
+      const warning = boundContext ? this.formatRebindCompletionNotice(boundContext, bound) : null;
       await this.telegram.sendText(target, [warning, this.formatContextCreated(bound)].filter(Boolean).join("\n\n"));
       return;
     }
@@ -2971,7 +2971,7 @@ export class CommandHandler {
     this.pendingNewContexts.delete(wizard.targetKey);
     await this.maybeSendContextPreparationNotice(wizard.slug, wizard.machine, selectedTarget.target, selectedTarget.baseBranch, target);
     const bound = await this.createOrRebindContext(wizard.slug, wizard.machine, selectedTarget.target, selectedTarget.baseBranch, target);
-    const warning = boundContext ? this.formatRebindWarning(boundContext) : null;
+    const warning = boundContext ? this.formatRebindCompletionNotice(boundContext, bound) : null;
     await this.telegram.sendText(target, [warning, this.formatContextCreated(bound)].filter(Boolean).join("\n\n"));
   }
 
@@ -3137,7 +3137,7 @@ export class CommandHandler {
 
     const bound = await this.createOrRebindContext(PROPOSAL_CURATION_CONTEXT_SLUG, resolved.machine, "scratch", null, target);
     const routineLine = await this.ensureBrainCuratorRoutineInContext(bound, target);
-    const warning = boundContext && boundContext.slug !== bound.slug ? this.formatRebindWarning(boundContext) : null;
+    const warning = boundContext && boundContext.slug !== bound.slug ? this.formatRebindCompletionNotice(boundContext, bound) : null;
     await this.telegram.sendText(
       target,
       [
@@ -3259,11 +3259,46 @@ export class CommandHandler {
   }
 
   private formatRebindWarning(currentContext: ContextRecord): string {
+    if (this.isUnfinishedContext(currentContext)) {
+      return [
+        "This topic already has an unfinished setup.",
+        `Current setup: ${formatBoundContext(currentContext)}`,
+        currentContext.lastError ? `Setup issue: ${compact(currentContext.lastError, 180)}` : null,
+        "Completing a new context here will replace that routing.",
+        "Old Telegram messages stay in Telegram and are not automatically imported into a newly bound context."
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
     return [
       "Warning: this topic is already bound.",
       `Currently bound: ${formatBoundContext(currentContext)}`,
       ...contextRoutingNote()
     ].join("\n");
+  }
+
+  private formatRebindCompletionNotice(currentContext: ContextRecord, nextContext: ContextRecord): string | null {
+    if (currentContext.slug === nextContext.slug) {
+      return null;
+    }
+
+    if (this.isUnfinishedContext(currentContext)) {
+      return [
+        `Replaced previous unfinished setup ${currentContext.slug} with ${nextContext.slug}.`,
+        `Previous setup: ${formatBoundContext(currentContext)}`,
+        currentContext.lastError ? `Previous issue: ${compact(currentContext.lastError, 180)}` : null,
+        "Future messages in this topic will use the new context. Old Telegram messages stay in Telegram."
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
+    return this.formatRebindWarning(currentContext);
+  }
+
+  private isUnfinishedContext(context: ContextRecord): boolean {
+    return context.state === "pending" || context.state === "error";
   }
 
   private formatCommandSyncResults(results: TelegramCommandSyncResult[]): string {

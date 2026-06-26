@@ -876,6 +876,13 @@ test("newctx accepts interactive repo targets and GitHub org/repo shorthand", as
     expect(fixture.telegram.sent.at(-1)?.text).toContain("Context erbine-lindy bound to this topic.");
     expect(fixture.telegram.sent.at(-1)?.text).toContain("Workspace: bound, but setup is not ready yet");
 
+    await fixture.commands.handleMessage(telegramMessage("/newctx erbine-lindy-retry worker1 lindy-ai/lindy main", 45));
+    const retryText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(retryText).toContain("Replaced previous unfinished setup erbine-lindy with erbine-lindy-retry.");
+    expect(retryText).toContain("Future messages in this topic will use the new context.");
+    expect(retryText).not.toContain("Warning: this topic is already bound.");
+    expect(fixture.db.getContextByTopic(4242, 45)?.slug).toBe("erbine-lindy-retry");
+
     await fixture.commands.handleMessage(telegramTopicMessage("/newctx", 46, "Repo Direct"));
     await fixture.commands.handleMessage(telegramMessage("2", 46));
     await fixture.commands.handleMessage(telegramMessage("repo lindy-ai/lindy main", 46));
