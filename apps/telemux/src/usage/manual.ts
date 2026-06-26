@@ -8,6 +8,36 @@ export interface ManualUsageSummary {
   footer: string | null;
 }
 
+function formatTokenQuantity(tokens: number): string {
+  if (!Number.isFinite(tokens) || tokens < 0) {
+    return "0";
+  }
+  if (tokens < 1_000) {
+    return String(Math.round(tokens));
+  }
+  if (tokens < 10_000) {
+    const value = tokens / 1_000;
+    return `${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)}k`;
+  }
+  if (tokens < 1_000_000) {
+    return `${Math.round(tokens / 1_000)}k`;
+  }
+  if (tokens < 100_000_000) {
+    return `${(tokens / 1_000_000).toFixed(2)}M`;
+  }
+  if (tokens < 1_000_000_000) {
+    return `${(tokens / 1_000_000).toFixed(1)}M`;
+  }
+  return `${(tokens / 1_000_000_000).toFixed(2)}B`;
+}
+
+function formatManualUsageFooter(inputTokens: number, cachedInputTokens: number, outputTokens: number): string {
+  const totalTokens = inputTokens + outputTokens;
+  const freshInputTokens = Math.max(0, inputTokens - cachedInputTokens);
+  const cachedPercent = inputTokens > 0 ? Math.round((Math.min(cachedInputTokens, inputTokens) / inputTokens) * 100) : 0;
+  return `${formatTokenQuantity(totalTokens)} tok (${cachedPercent}% cached, ${formatTokenQuantity(freshInputTokens)} fresh in, ${formatTokenQuantity(outputTokens)} out)`;
+}
+
 async function readLogTail(path: string, maxBytes = MANUAL_USAGE_LOG_TAIL_BYTES): Promise<{ text: string; truncated: boolean }> {
   const handle = await open(path, "r");
   try {
@@ -83,9 +113,8 @@ export async function summarizeManualUsage(context: ContextRecord): Promise<Manu
     `Output tokens: ${outputTokens}`,
     `Log: ${context.latestRunLogPath}`
   ].filter(Boolean).join("\n");
-  const totalTokens = inputTokens + outputTokens;
   return {
     text: textSummary,
-    footer: `tokens=${totalTokens} (in=${inputTokens} cached=${cachedInputTokens} out=${outputTokens})`
+    footer: formatManualUsageFooter(inputTokens, cachedInputTokens, outputTokens)
   };
 }

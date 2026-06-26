@@ -2724,9 +2724,10 @@ test("context usage and manual compaction stay concise and harness-aware", async
     await fixture.commands.handleMessage(telegramMessage("/newctx compact-lab control scratch", 90));
     await fixture.commands.handleMessage(telegramMessage("Start the compact lab.", 90));
     await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for compact-lab.")));
-    expect(fixture.telegram.sent.find((entry) => entry.text.includes("Reply turn 1 for compact-lab."))?.text).toContain(
-      "tokens=15 (in=10 cached=0 out=5)"
-    );
+    const firstCompactReply = fixture.telegram.sent.find((entry) => entry.text.includes("Reply turn 1 for compact-lab."))?.text || "";
+    expect(firstCompactReply).toContain("control · manual | 15 tok (0% cached, 10 fresh in, 5 out)");
+    expect(firstCompactReply).toContain("run=");
+    expect(firstCompactReply).not.toContain("tokens=15");
     expect(fixture.telegram.sent.some((entry) => entry.text.includes("Dispatched resume for compact-lab."))).toBe(false);
 
     await fixture.commands.handleMessage(telegramMessage("/context", 90));

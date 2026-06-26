@@ -76,6 +76,20 @@ function snippet(text: string | null, limit = 240): string {
   return `${normalized.slice(0, limit - 1)}…`;
 }
 
+function shortRunId(id: string | null | undefined): string {
+  const value = (id || "n/a").trim();
+  if (!value || value === "n/a") {
+    return "n/a";
+  }
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
+    return `${value.slice(0, 8)}…${value.slice(-4)}`;
+  }
+  if (value.length <= 24) {
+    return value;
+  }
+  return `${value.slice(0, 12)}…${value.slice(-6)}`;
+}
+
 function uniqueTelegramWorkspacePath(messageId: number, fileName: string, usedPaths: Set<string>): string {
   let workspacePath = telegramWorkspacePath(messageId, fileName);
   if (!usedPaths.has(workspacePath)) {
@@ -796,9 +810,8 @@ export class Dispatcher {
         const reply = (lastMessage || summary || "").trim() || `${saved.slug} completed.`;
         await progressReporter.finish("completed");
         const footer = [
-          `session=${saved.codexSessionId || "n/a"}`,
-          `machine=${saved.machine}`,
-          `usage=${usage.adapter}`,
+          `run=${shortRunId(saved.codexSessionId)}`,
+          `${saved.machine} · ${usage.adapter}`,
           usage.footer,
           options.sourceLabel ? `source=${options.sourceLabel}` : null
         ]
