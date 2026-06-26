@@ -865,14 +865,16 @@ test("newctx accepts interactive repo targets and GitHub org/repo shorthand", as
     expect(repoPrompt).toContain("Send the repository or path for this topic.");
     expect(repoPrompt).toContain("lindy-ai/lindy main");
 
-    await fixture.commands.handleMessage(telegramMessage("lindy-ai/lindy main", 45));
+    await fixture.commands.handleMessage(telegramMessage("Lindy-ai/lindy main", 45));
     const wizardRepo = fixture.db.getContextBySlug("erbine-lindy");
     expect(wizardRepo?.kind).toBe("repo");
     expect(wizardRepo?.machine).toBe("worker1");
-    expect(wizardRepo?.target).toBe("https://github.com/lindy-ai/lindy.git");
+    expect(wizardRepo?.target).toBe("https://github.com/Lindy-ai/lindy.git");
     expect(wizardRepo?.baseBranch).toBe("main");
     expect(wizardRepo?.state).toBe("pending");
+    expect(fixture.telegram.sent.at(-2)?.text).toContain("preparing the repo workspace");
     expect(fixture.telegram.sent.at(-1)?.text).toContain("Context erbine-lindy bound to this topic.");
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Workspace: bound, but setup is not ready yet");
 
     await fixture.commands.handleMessage(telegramTopicMessage("/newctx", 46, "Repo Direct"));
     await fixture.commands.handleMessage(telegramMessage("2", 46));

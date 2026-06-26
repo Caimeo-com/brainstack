@@ -641,7 +641,8 @@ export class WorkerService {
   async bootstrapContext(request: ContextBootstrapRequest): Promise<BootstrapResult> {
     const worker = this.requireWorker(request.machine);
     const plan = this.planContext(worker, request);
-    const result = await this.runWorkerScript(worker, this.buildBootstrapScript(worker, request, plan), undefined, 45);
+    const timeoutSeconds = plan.kind === "repo" && isGitUrl(plan.target) ? 180 : 45;
+    const result = await this.runWorkerScript(worker, this.buildBootstrapScript(worker, request, plan), undefined, timeoutSeconds);
 
     if (!result.ok) {
       return {
@@ -2104,11 +2105,12 @@ if ! git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     exit 22
   fi
 
+  clone_args=(clone --filter=blob:none)
   if [ -n "$base_ref" ]; then
-    git clone --branch "$base_ref" --single-branch "$repo_url" "$repo_root"
-  else
-    git clone "$repo_url" "$repo_root"
+    clone_args+=(--branch "$base_ref" --single-branch)
   fi
+  clone_args+=("$repo_url" "$repo_root")
+  git "\${clone_args[@]}"
 fi
 
 if [ -n "$base_ref" ] && git -C "$repo_root" rev-parse --verify --quiet "$base_ref^{commit}" >/dev/null 2>&1; then

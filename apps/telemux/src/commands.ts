@@ -1806,6 +1806,7 @@ export class CommandHandler {
             return;
           }
 
+          await this.maybeSendContextPreparationNotice(slugInput, machine, selectedTarget.target, selectedTarget.baseBranch, target);
           const bound = await this.createOrRebindContext(
             slugInput,
             machine,
@@ -1861,6 +1862,7 @@ export class CommandHandler {
             return;
           }
 
+          await this.maybeSendContextPreparationNotice(boundContext.slug, machine, selectedTarget.target, selectedTarget.baseBranch, target);
           const rebound = await this.createOrRebindContext(
             boundContext.slug,
             machine,
@@ -2941,6 +2943,7 @@ export class CommandHandler {
       }
 
       this.pendingNewContexts.delete(wizard.targetKey);
+      await this.maybeSendContextPreparationNotice(wizard.slug, wizard.machine, selectedTarget.target, selectedTarget.baseBranch, target);
       const bound = await this.createOrRebindContext(
         wizard.slug,
         wizard.machine,
@@ -2966,9 +2969,31 @@ export class CommandHandler {
     }
 
     this.pendingNewContexts.delete(wizard.targetKey);
+    await this.maybeSendContextPreparationNotice(wizard.slug, wizard.machine, selectedTarget.target, selectedTarget.baseBranch, target);
     const bound = await this.createOrRebindContext(wizard.slug, wizard.machine, selectedTarget.target, selectedTarget.baseBranch, target);
     const warning = boundContext ? this.formatRebindWarning(boundContext) : null;
     await this.telegram.sendText(target, [warning, this.formatContextCreated(bound)].filter(Boolean).join("\n\n"));
+  }
+
+  private async maybeSendContextPreparationNotice(
+    slug: string,
+    machine: string,
+    contextTarget: string,
+    baseBranch: string | null,
+    target: TelegramTarget
+  ): Promise<void> {
+    if (contextTarget === "scratch" || contextTarget === "host") {
+      return;
+    }
+
+    await this.telegram.sendText(
+      target,
+      [
+        `Got it. Binding ${normalizeSlug(slug)} to ${machine} and preparing the repo workspace.`,
+        `Repo: ${contextTarget}${baseBranch ? ` (${baseBranch})` : ""}`,
+        "Large repositories can take a minute the first time. I will reply here when it is ready or if setup needs attention."
+      ].join("\n")
+    );
   }
 
   private async createOrRebindContext(
@@ -3155,12 +3180,20 @@ export class CommandHandler {
       `Codex mode: ${codexModeSummary(context)}`
     ];
 
+    if (context.state === "active") {
+      lines.push("Workspace: ready");
+    } else if (context.state === "pending") {
+      lines.push("Workspace: bound, but setup is not ready yet");
+    } else if (context.state === "error") {
+      lines.push("Workspace: setup failed");
+    }
+
     if (context.branchName) {
       lines.push(`Branch: ${context.branchName}`);
     }
 
     if (context.lastError) {
-      lines.push(`Error: ${compact(context.lastError)}`);
+      lines.push(`Setup issue: ${compact(context.lastError)}`);
     }
 
     lines.push(`Next: ${nextRecommendedAction(context)}`);

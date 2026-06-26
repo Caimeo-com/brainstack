@@ -53,13 +53,17 @@ export function normalizeSlug(input: string): string {
 }
 
 export function nextRecommendedAction(context: ContextRecord): string {
+  const targetSpec = context.baseBranch ? `${context.target} ${context.baseBranch}` : context.target;
   switch (context.state) {
     case "pending":
-      return `Wait for ${context.machine} to come online, then send plain text or rerun /newctx ${context.slug} ${context.machine} ${context.target}.`;
+      if (/worker command timed out/i.test(context.lastError || "")) {
+        return `Workspace setup timed out. Retry /newctx ${context.slug} ${context.machine} ${targetSpec}; if it repeats, use /topicinfo for the setup error.`;
+      }
+      return `Wait for ${context.machine} to come online, then send plain text or rerun /newctx ${context.slug} ${context.machine} ${targetSpec}.`;
     case "archived":
       return "Use /bind to attach this topic to another context, or create a fresh one with /newctx.";
     case "error":
-      return "Inspect /topicinfo or /tail, fix the workspace problem, then retry /run or /resume.";
+      return `Fix the workspace problem, then retry /newctx ${context.slug} ${context.machine} ${targetSpec} or inspect /topicinfo.`;
     case "active":
       return context.codexSessionId
         ? "Send plain text or /resume to continue the current Codex session."
