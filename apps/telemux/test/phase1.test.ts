@@ -19,6 +19,7 @@ import {
   resolveManifestRequests,
   type TelegramAttachmentKind
 } from "../src/telegram-attachments";
+import { TELEGRAM_MAX_INBOUND_FILE_BYTES } from "../src/telegram-inputs";
 import type { TelegramMessage, TelegramTarget } from "../src/telegram";
 import { WorkerService } from "../src/workers";
 
@@ -46,6 +47,7 @@ class FakeTelegram {
   }> = [];
   readonly actions: Array<{ target: TelegramTarget; action: string }> = [];
   readonly remoteFiles = new Map<string, { filePath: string; bytes: Uint8Array }>();
+  readonly getFileFailures = new Map<string, string>();
 
   async sendText(target: TelegramTarget, text: string): Promise<void> {
     this.sent.push({ target, text });
@@ -99,11 +101,20 @@ class FakeTelegram {
     });
   }
 
+  registerGetFileFailure(fileId: string, message: string): void {
+    this.getFileFailures.set(fileId, message);
+  }
+
   async getFile(fileId: string): Promise<{
     file_id: string;
     file_size: number;
     file_path: string;
   }> {
+    const failure = this.getFileFailures.get(fileId);
+    if (failure) {
+      throw new Error(failure);
+    }
+
     const file = this.remoteFiles.get(fileId);
     if (!file) {
       throw new Error(`Missing fake Telegram file: ${fileId}`);
@@ -4590,6 +4601,63 @@ test("Telegram media coalescing batches quick multi-file uploads into one turn",
   } finally {
     process.env.PATH = fixture.previousPath;
     clearPendingMediaTimers(fixture);
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("oversized Telegram documents fail with clear remediation before getFile", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "80"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx oversized control scratch", 66));
+    const firstDocument = telegramDocumentMessage("Unzip these runbook archives.", 66, "large-doc-a", "runbook.zip", "application/zip");
+    firstDocument.document!.file_size = TELEGRAM_MAX_INBOUND_FILE_BYTES + 8 * 1024 * 1024;
+    const secondDocument = telegramDocumentMessage("", 66, "large-doc-b", "retrospective.zip", "application/zip");
+    secondDocument.document!.file_size = TELEGRAM_MAX_INBOUND_FILE_BYTES + 5 * 1024 * 1024;
+
+    await fixture.commands.handleMessage(firstDocument);
+    await fixture.commands.handleMessage(secondDocument);
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Telegram cannot download these attachment")));
+
+    const reply = fixture.telegram.sent.find((entry) => entry.text.includes("Telegram cannot download these attachment"));
+    expect(reply?.text).toContain("standard 20.0 MiB Bot API download limit");
+    expect(reply?.text).toContain("runbook.zip is 28.0 MiB");
+    expect(reply?.text).toContain("retrospective.zip is 25.0 MiB");
+    expect(reply?.text).toContain("put the files on the target machine and send their paths");
+    expect(reply?.text).toContain(".factory/inbox/telegram/<message_id>/");
+    const root = join(fixture.factoryRoot, "scratch", "oversized");
+    expect(await Bun.file(join(root, ".factory", "fake-turn-count")).exists()).toBe(false);
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    clearPendingMediaTimers(fixture);
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("Telegram getFile 400 for attachments is translated into large-file guidance", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "0"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx getfile-limit control scratch", 67));
+    const largeDocument = telegramDocumentMessage("Inspect this archive.", 67, "large-unknown", "retrospective.zip", "application/zip");
+    delete largeDocument.document!.file_size;
+    fixture.telegram.registerGetFileFailure("large-unknown", "telegram api getFile failed with 400: Bad Request: file is too big");
+
+    await fixture.commands.handleMessage(largeDocument);
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Telegram did not provide a downloadable file path")));
+
+    const reply = fixture.telegram.sent.find((entry) => entry.text.includes("Telegram did not provide a downloadable file path"));
+    expect(reply?.text).toContain("retrospective.zip");
+    expect(reply?.text).toContain("usually means the file is over the standard 20.0 MiB Bot API download limit");
+    expect(reply?.text).toContain("send a normal download URL");
+    const root = join(fixture.factoryRoot, "scratch", "getfile-limit");
+    expect(await Bun.file(join(root, ".factory", "fake-turn-count")).exists()).toBe(false);
+  } finally {
+    process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 15_000);

@@ -582,6 +582,19 @@ test("getFile requests Telegram file metadata and downloadFile fetches the file 
     expect(calls[1]?.hasSignal).toBe(true);
 
     globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          ok: false,
+          description: "Bad Request: file is too big"
+        }),
+        {
+          status: 400,
+          headers: { "content-type": "application/json" }
+        }
+      )) as typeof fetch;
+    await expect(telegram.getFile("too-large")).rejects.toThrow("telegram api getFile failed with 400: Bad Request: file is too big");
+
+    globalThis.fetch = (async () =>
       new Response(new TextEncoder().encode("large body"), {
         status: 200,
         headers: {

@@ -10,6 +10,7 @@ import {
   formatTelegramPromptSection,
   inferTelegramWorkspaceFileName,
   isCodexImageAttachment,
+  TELEGRAM_INBOUND_WORKSPACE_ROOT,
   TELEGRAM_MAX_INBOUND_FILE_BYTES,
   TELEGRAM_MAX_INBOUND_TOTAL_BYTES,
   telegramMetadataPath,
@@ -92,6 +93,80 @@ function uniqueTelegramWorkspacePath(messageId: number, fileName: string, usedPa
   }
 
   throw new Error("Too many Telegram attachments share the same filename");
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return "unknown size";
+  }
+
+  const mib = bytes / (1024 * 1024);
+  if (mib >= 1) {
+    return `${mib.toFixed(mib >= 10 ? 1 : 2)} MiB`;
+  }
+
+  const kib = bytes / 1024;
+  if (kib >= 1) {
+    return `${kib.toFixed(kib >= 10 ? 1 : 2)} KiB`;
+  }
+
+  return `${bytes} bytes`;
+}
+
+function telegramAttachmentLabel(attachment: TelegramInboundMessageInput["attachments"][number], index: number): string {
+  return attachment.fileName || attachment.title || `${attachment.kind} attachment ${index + 1}`;
+}
+
+function formatTelegramOversizeError(
+  oversized: Array<{
+    attachment: TelegramInboundMessageInput["attachments"][number];
+    index: number;
+    bytes: number;
+  }>
+): string {
+  const limit = formatBytes(TELEGRAM_MAX_INBOUND_FILE_BYTES);
+  const files = oversized
+    .map(({ attachment, index, bytes }) => `- ${telegramAttachmentLabel(attachment, index)} is ${formatBytes(bytes)}`)
+    .join("\n");
+
+  return [
+    `Telegram cannot download these attachment(s) through the bot because they are over the standard ${limit} Bot API download limit:`,
+    files,
+    "",
+    "Use one of these instead:",
+    "- put the files on the target machine and send their paths",
+    "- send a normal download URL",
+    `- split or resend each file under ${limit}`,
+    "",
+    `Files Telegram can download are already staged into ${TELEGRAM_INBOUND_WORKSPACE_ROOT}/<message_id>/ and passed to the worker as prompt references.`
+  ].join("\n");
+}
+
+function isLikelyTelegramDownloadLimitError(message: string): boolean {
+  return /\bgetFile\b/i.test(message) && (/\b400\b/.test(message) || /\btoo (?:big|large)\b/i.test(message));
+}
+
+function formatTelegramGetFileError(
+  attachment: TelegramInboundMessageInput["attachments"][number],
+  index: number,
+  error: unknown
+): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (isLikelyTelegramDownloadLimitError(message)) {
+    return [
+      `Telegram did not provide a downloadable file path for ${telegramAttachmentLabel(attachment, index)}.`,
+      `This usually means the file is over the standard ${formatBytes(TELEGRAM_MAX_INBOUND_FILE_BYTES)} Bot API download limit.`,
+      "",
+      "Use one of these instead:",
+      "- put the file on the target machine and send its path",
+      "- send a normal download URL",
+      `- split or resend the file under ${formatBytes(TELEGRAM_MAX_INBOUND_FILE_BYTES)}`,
+      "",
+      `Downloadable Telegram files are staged into ${TELEGRAM_INBOUND_WORKSPACE_ROOT}/<message_id>/ and passed to the worker as prompt references.`
+    ].join("\n");
+  }
+
+  return `Telegram did not provide a downloadable file path for ${telegramAttachmentLabel(attachment, index)}: ${message}`;
 }
 
 function defaultInstruction(context: ContextRecord, mode: DispatchMode): string {
@@ -640,7 +715,7 @@ export class Dispatcher {
             lastRunAt: new Date().toISOString(),
             lastError: message
           });
-          await this.telegram.sendText(replyTarget, `Failed to prepare Telegram input: ${message}`);
+          await this.telegram.sendText(replyTarget, `I could not prepare the Telegram attachment(s) for the worker.\n\n${message}`);
           return "failed";
         }
       }
@@ -883,13 +958,29 @@ export class Dispatcher {
     const preparedAttachments: TelegramPreparedAttachment[] = [];
     const usedWorkspacePaths = new Set<string>();
     let totalBytes = 0;
+    const oversizedFromMessage = input.attachments
+      .map((attachment, index) => ({
+        attachment,
+        index,
+        bytes: attachment.fileSize ?? -1
+      }))
+      .filter((entry) => entry.bytes > TELEGRAM_MAX_INBOUND_FILE_BYTES);
+
+    if (oversizedFromMessage.length) {
+      throw new Error(formatTelegramOversizeError(oversizedFromMessage));
+    }
 
     for (const [index, attachment] of input.attachments.entries()) {
-      const remoteFile = await this.telegram.getFile(attachment.fileId);
+      let remoteFile: Awaited<ReturnType<typeof this.telegram.getFile>>;
+      try {
+        remoteFile = await this.telegram.getFile(attachment.fileId);
+      } catch (error) {
+        throw new Error(formatTelegramGetFileError(attachment, index, error));
+      }
       const reportedSize = remoteFile.file_size ?? attachment.fileSize ?? null;
 
       if (reportedSize !== null && reportedSize > TELEGRAM_MAX_INBOUND_FILE_BYTES) {
-        throw new Error(`Telegram file exceeds ${TELEGRAM_MAX_INBOUND_FILE_BYTES} bytes: ${attachment.kind}`);
+        throw new Error(formatTelegramOversizeError([{ attachment, index, bytes: reportedSize }]));
       }
 
       if (!remoteFile.file_path) {

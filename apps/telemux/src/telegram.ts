@@ -187,6 +187,12 @@ export interface TelegramRemoteFile {
   file_path?: string;
 }
 
+interface TelegramApiResponse<T> {
+  ok: boolean;
+  description?: string;
+  result: T;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -631,15 +637,21 @@ export class TelegramBot {
   }
 
   private async parseApiResponse<T>(method: string, response: Response): Promise<T> {
-    if (!response.ok) {
-      throw new Error(`telegram api ${method} failed with ${response.status}`);
+    let body: TelegramApiResponse<T>;
+
+    try {
+      body = (await response.json()) as TelegramApiResponse<T>;
+    } catch {
+      if (!response.ok) {
+        throw new Error(`telegram api ${method} failed with ${response.status}`);
+      }
+      throw new Error(`telegram api ${method} returned invalid JSON`);
     }
 
-    const body = (await response.json()) as {
-      ok: boolean;
-      description?: string;
-      result: T;
-    };
+    if (!response.ok) {
+      const description = body.description ? `: ${redactTelegramSecrets(body.description)}` : "";
+      throw new Error(`telegram api ${method} failed with ${response.status}${description}`);
+    }
 
     if (!body.ok) {
       throw new Error(body.description || `telegram api ${method} failed`);
