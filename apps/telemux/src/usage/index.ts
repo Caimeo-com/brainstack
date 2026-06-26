@@ -4,6 +4,7 @@ import { summarizeManualUsage } from "./manual";
 export interface UsageSummary {
   adapter: string;
   text: string;
+  footer: string | null;
 }
 
 export async function summarizeUsage(context: ContextRecord): Promise<UsageSummary> {
@@ -11,6 +12,7 @@ export async function summarizeUsage(context: ContextRecord): Promise<UsageSumma
   if (adapter !== "manual") {
     return {
       adapter,
+      footer: null,
       text: [
         `Unsupported usage adapter: ${adapter}`,
         "Brainstack only supports the manual local run-log parser now.",
@@ -19,8 +21,10 @@ export async function summarizeUsage(context: ContextRecord): Promise<UsageSumma
     };
   }
 
+  const manual = await summarizeManualUsage(context);
   return {
     adapter: "manual",
-    text: await summarizeManualUsage(context)
+    text: manual.text,
+    footer: manual.footer
   };
 }

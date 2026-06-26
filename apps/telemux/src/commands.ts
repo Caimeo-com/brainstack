@@ -767,6 +767,16 @@ interface PendingTextPrompt {
   createdAt: number;
 }
 
+interface PendingMediaPrompt {
+  key: string;
+  target: TelegramTarget;
+  userId: number | null;
+  contextSlug: string;
+  inputs: TelegramInboundMessageInput[];
+  timer: Timer;
+  createdAt: number;
+}
+
 interface CronShortcutSnapshot {
   targetKey: string;
   jobIds: string[];
@@ -799,6 +809,9 @@ const PROPOSAL_SHORTCUT_MAX_SNAPSHOTS = 50;
 const TEXT_COALESCE_MAX_PARTS = 25;
 const TEXT_COALESCE_MAX_CHARS = 120_000;
 const TEXT_COALESCE_MAX_PENDING = 100;
+const MEDIA_COALESCE_MAX_MESSAGES = 10;
+const MEDIA_COALESCE_MAX_ATTACHMENTS = 20;
+const MEDIA_COALESCE_MAX_PENDING = 100;
 
 function codexModeSummary(context: ContextRecord): string {
   return formatCodexModeSummary(context);
@@ -959,8 +972,10 @@ function formatUpdateCheckCommandResult(result: {
 
 export class CommandHandler {
   private readonly pendingText = new Map<string, PendingTextPrompt>();
+  private readonly pendingMedia = new Map<string, PendingMediaPrompt>();
   private readonly pendingNewContexts = new Map<string, PendingNewContextWizard>();
   private readonly flushingPendingTextKeys = new Set<string>();
+  private readonly flushingPendingMediaKeys = new Set<string>();
   private readonly cronShortcutSnapshots = new Map<string, CronShortcutSnapshot>();
   private readonly artifactShortcutSnapshots = new Map<string, ArtifactShortcutSnapshot>();
   private readonly proposalShortcutSnapshots = new Map<string, ProposalShortcutSnapshot>();
@@ -1007,7 +1022,10 @@ export class CommandHandler {
     }
 
     const hasAttachments = Boolean(rawTelegramInput?.attachments.length);
-    if (parsed || hasAttachments) {
+    if (parsed) {
+      await this.flushPendingText(target, message.from?.id ?? null);
+      await this.flushPendingMedia(target, message.from?.id ?? null);
+    } else if (hasAttachments) {
       await this.flushPendingText(target, message.from?.id ?? null);
     }
     const boundContext = this.contexts.getContextByTopic(target.chatId, target.threadId);
@@ -1082,6 +1100,11 @@ export class CommandHandler {
         }
 
         const hasNonAudioAttachments = Boolean(telegramInput?.attachments.length);
+        if (hasNonAudioAttachments && telegramInput && this.config.textCoalesceMs > 0) {
+          this.enqueuePendingMedia(boundContext, effectiveText, telegramInput, target, message.from?.id ?? null);
+          return;
+        }
+
         if (!hasNonAudioAttachments && this.config.textCoalesceMs > 0) {
           this.enqueuePendingText(boundContext, effectiveText, target, message.from?.id ?? null);
           return;
@@ -2398,6 +2421,37 @@ export class CommandHandler {
     return setTimeout(() => void this.flushPendingText(target, userId).catch((error) => this.reportPendingTextFlushError(target, error)), delayMs);
   }
 
+  private pendingMediaTimer(target: TelegramTarget, userId: number | null): ReturnType<typeof setTimeout> {
+    return setTimeout(() => void this.flushPendingMedia(target, userId).catch((error) => this.reportPendingMediaFlushError(target, error)), this.config.textCoalesceMs);
+  }
+
+  private normalizeMediaInput(input: TelegramInboundMessageInput, text: string): TelegramInboundMessageInput {
+    return {
+      ...input,
+      text: text.trim() || input.text?.trim() || null
+    };
+  }
+
+  private mediaAttachmentCount(inputs: TelegramInboundMessageInput[]): number {
+    return inputs.reduce((total, input) => total + input.attachments.length, 0);
+  }
+
+  private mergeMediaInputs(inputs: TelegramInboundMessageInput[]): TelegramInboundMessageInput | null {
+    const first = inputs[0];
+    if (!first) {
+      return null;
+    }
+
+    const textParts = inputs.map((input) => input.text?.trim()).filter((part): part is string => Boolean(part));
+    return {
+      messageId: first.messageId,
+      chatId: first.chatId,
+      threadId: first.threadId,
+      text: textParts.length ? textParts.join("\n\n") : null,
+      attachments: inputs.flatMap((input) => input.attachments)
+    };
+  }
+
   private pendingTextGenerationFor(stored: PendingTextRecord): string {
     if (stored.generationId) {
       return stored.generationId;
@@ -2539,6 +2593,100 @@ export class CommandHandler {
     const oldest = [...this.pendingText.values()].sort((a, b) => a.createdAt - b.createdAt)[0];
     if (oldest) {
       void this.flushPendingText(oldest.target, oldest.userId);
+    }
+  }
+
+  private enqueuePendingMedia(
+    context: ContextRecord,
+    text: string,
+    input: TelegramInboundMessageInput,
+    target: TelegramTarget,
+    userId: number | null
+  ): void {
+    const key = this.pendingKey(target, userId);
+    const normalizedInput = this.normalizeMediaInput(input, text);
+    const existing = this.pendingMedia.get(key);
+    if (existing && existing.contextSlug === context.slug) {
+      const nextInputs = [...existing.inputs, normalizedInput];
+      if (
+        nextInputs.length > MEDIA_COALESCE_MAX_MESSAGES ||
+        this.mediaAttachmentCount(nextInputs) > MEDIA_COALESCE_MAX_ATTACHMENTS
+      ) {
+        void this.flushPendingMedia(target, userId);
+      } else {
+        clearTimeout(existing.timer);
+        existing.inputs = nextInputs;
+        existing.timer = this.pendingMediaTimer(target, userId);
+        return;
+      }
+    } else if (existing) {
+      void this.flushPendingMedia(target, userId);
+    }
+
+    this.flushOldestPendingMediaIfNeeded(key);
+    this.pendingMedia.set(key, {
+      key,
+      target,
+      userId,
+      contextSlug: context.slug,
+      inputs: [normalizedInput],
+      createdAt: Date.now(),
+      timer: this.pendingMediaTimer(target, userId)
+    });
+  }
+
+  private flushOldestPendingMediaIfNeeded(nextKey: string): void {
+    if (this.pendingMedia.size < MEDIA_COALESCE_MAX_PENDING || this.pendingMedia.has(nextKey)) {
+      return;
+    }
+
+    const oldest = [...this.pendingMedia.values()].sort((a, b) => a.createdAt - b.createdAt)[0];
+    if (oldest) {
+      void this.flushPendingMedia(oldest.target, oldest.userId);
+    }
+  }
+
+  private async flushPendingMedia(target: TelegramTarget, userId: number | null): Promise<void> {
+    const key = this.pendingKey(target, userId);
+    if (this.flushingPendingMediaKeys.has(key)) {
+      return;
+    }
+    this.flushingPendingMediaKeys.add(key);
+    try {
+      const pending = this.pendingMedia.get(key);
+      if (!pending) {
+        return;
+      }
+      clearTimeout(pending.timer);
+      this.pendingMedia.delete(key);
+
+      const context = this.contexts.getContextBySlug(pending.contextSlug);
+      if (!context || context.state === "archived") {
+        await this.telegram.sendText(
+          pending.target,
+          `${pending.contextSlug} is archived or unavailable; your pending Telegram files were not dispatched. Rebind or create a new context, then resend them.`
+        );
+        return;
+      }
+
+      const mergedInput = this.mergeMediaInputs(pending.inputs);
+      if (!mergedInput) {
+        return;
+      }
+      if (pending.inputs.length > 1) {
+        console.log(`coalesced ${pending.inputs.length} Telegram media messages for ${context.slug}`);
+      }
+      const result = await this.handleBoundPlainText(context, mergedInput.text || "", pending.target, mergedInput, pending.userId);
+      if (!result.accepted) {
+        await this.telegram.sendText(pending.target, "Telegram files were queued behind the current run. They will be processed after it finishes.");
+      }
+    } finally {
+      this.flushingPendingMediaKeys.delete(key);
+      const deferred = this.pendingMedia.get(key);
+      if (deferred) {
+        clearTimeout(deferred.timer);
+        deferred.timer = this.pendingMediaTimer(deferred.target, deferred.userId);
+      }
     }
   }
 
@@ -2733,6 +2881,12 @@ export class CommandHandler {
       ? "Pending Telegram text was not dispatched and remains queued for retry"
       : "Pending Telegram text was not dispatched; newer text for another context remains queued, so please resend the older text";
     await this.telegram.sendText(target, `${status}: ${message}`);
+  }
+
+  private async reportPendingMediaFlushError(target: TelegramTarget, error: unknown): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("pending Telegram media flush failed", error);
+    await this.telegram.sendText(target, `Pending Telegram files were not dispatched: ${message}`);
   }
 
   recoverPendingText(): void {

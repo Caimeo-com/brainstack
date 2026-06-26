@@ -1,5 +1,5 @@
 import { mkdir } from "node:fs/promises";
-import { resolve } from "node:path";
+import { basename, extname, resolve } from "node:path";
 import { deliverAttachmentRequests, formatAttachmentDeliveryIssues } from "./attachment-delivery";
 import { CronManager } from "./cron-manager";
 import { CONTEXT_CRONS_FILE_NAME, CONTEXT_CRONS_WORKSPACE_PATH, CRON_REQUESTS_FILE_NAME, CRON_REQUESTS_WORKSPACE_PATH } from "./cron-jobs";
@@ -72,6 +72,26 @@ function snippet(text: string | null, limit = 240): string {
   }
 
   return `${normalized.slice(0, limit - 1)}…`;
+}
+
+function uniqueTelegramWorkspacePath(messageId: number, fileName: string, usedPaths: Set<string>): string {
+  let workspacePath = telegramWorkspacePath(messageId, fileName);
+  if (!usedPaths.has(workspacePath)) {
+    usedPaths.add(workspacePath);
+    return workspacePath;
+  }
+
+  const ext = extname(fileName);
+  const stem = basename(fileName, ext) || "attachment";
+  for (let index = 2; index < 1000; index += 1) {
+    workspacePath = telegramWorkspacePath(messageId, `${stem}-${index}${ext}`);
+    if (!usedPaths.has(workspacePath)) {
+      usedPaths.add(workspacePath);
+      return workspacePath;
+    }
+  }
+
+  throw new Error("Too many Telegram attachments share the same filename");
 }
 
 function defaultInstruction(context: ContextRecord, mode: DispatchMode): string {
@@ -697,12 +717,21 @@ export class Dispatcher {
         const usage = await summarizeUsage(saved);
         const reply = (lastMessage || summary || "").trim() || `${saved.slug} completed.`;
         await progressReporter.finish("completed");
+        const footer = [
+          `session=${saved.codexSessionId || "n/a"}`,
+          `machine=${saved.machine}`,
+          `usage=${usage.adapter}`,
+          usage.footer,
+          options.sourceLabel ? `source=${options.sourceLabel}` : null
+        ]
+          .filter(Boolean)
+          .join(" | ");
         await this.telegram.sendText(
           replyTarget,
           [
             reply,
             "",
-            `session=${saved.codexSessionId || "n/a"} | machine=${saved.machine} | usage=${usage.adapter}${options.sourceLabel ? ` | source=${options.sourceLabel}` : ""}`
+            footer
           ].join("\n")
         );
 
@@ -852,6 +881,7 @@ export class Dispatcher {
   private async prepareTelegramInput(input: TelegramInboundMessageInput): Promise<PreparedTelegramInput> {
     const workspaceFiles: WorkspaceSeedFile[] = [];
     const preparedAttachments: TelegramPreparedAttachment[] = [];
+    const usedWorkspacePaths = new Set<string>();
     let totalBytes = 0;
 
     for (const [index, attachment] of input.attachments.entries()) {
@@ -877,7 +907,7 @@ export class Dispatcher {
       }
 
       const fileName = inferTelegramWorkspaceFileName(attachment, index, remoteFile.file_path);
-      const workspacePath = telegramWorkspacePath(input.messageId, fileName);
+      const workspacePath = uniqueTelegramWorkspacePath(input.messageId, fileName, usedWorkspacePaths);
       const attachedAsImage = isCodexImageAttachment(attachment);
 
       workspaceFiles.push({

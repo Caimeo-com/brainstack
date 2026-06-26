@@ -750,6 +750,14 @@ function clearPendingTextTimers(fixture: Awaited<ReturnType<typeof createFixture
   pendingText.clear();
 }
 
+function clearPendingMediaTimers(fixture: Awaited<ReturnType<typeof createFixture>>): void {
+  const pendingMedia = (fixture.commands as unknown as { pendingMedia: Map<string, { timer: ReturnType<typeof setTimeout> }> }).pendingMedia;
+  for (const pending of pendingMedia.values()) {
+    clearTimeout(pending.timer);
+  }
+  pendingMedia.clear();
+}
+
 function setPendingTextGenerationForTest(fixture: Awaited<ReturnType<typeof createFixture>>, key: string, generationId: string): void {
   const rawDb = (fixture.db as unknown as { db: { query: (sql: string) => { run: (...args: unknown[]) => unknown } } }).db;
   rawDb.query("UPDATE pending_text_prompts SET generation_id = ? WHERE key = ?").run(generationId, key);
@@ -2691,6 +2699,9 @@ test("context usage and manual compaction stay concise and harness-aware", async
     await fixture.commands.handleMessage(telegramMessage("/newctx compact-lab control scratch", 90));
     await fixture.commands.handleMessage(telegramMessage("Start the compact lab.", 90));
     await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for compact-lab.")));
+    expect(fixture.telegram.sent.find((entry) => entry.text.includes("Reply turn 1 for compact-lab."))?.text).toContain(
+      "tokens=15 (in=10 cached=0 out=5)"
+    );
     expect(fixture.telegram.sent.some((entry) => entry.text.includes("Dispatched resume for compact-lab."))).toBe(false);
 
     await fixture.commands.handleMessage(telegramMessage("/context", 90));
@@ -4539,6 +4550,46 @@ test("phase 1 inbound Telegram media stages files and only forwards images to Co
     expect(await readFile(join(mediaRoot, ".factory", "fake-turn-count"), "utf8")).toBe(turnCountBeforeVoice);
   } finally {
     process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("Telegram media coalescing batches quick multi-file uploads into one turn", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "80"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx media-burst control scratch", 65));
+    fixture.telegram.registerRemoteFile("doc-a", "docs/first.txt", "first body");
+    fixture.telegram.registerRemoteFile("doc-b", "docs/second.txt", "second body");
+
+    const firstMessage = telegramDocumentMessage("Here are the env files.", 65, "doc-a", "notes.txt");
+    const secondMessage = telegramDocumentMessage("", 65, "doc-b", "notes.txt");
+    await fixture.commands.handleMessage(firstMessage);
+    await fixture.commands.handleMessage(secondMessage);
+
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("busy; queued this turn"))).toBe(false);
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for media-burst.")));
+    await Bun.sleep(140);
+    expect(fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 2 for media-burst."))).toBe(false);
+
+    const mediaRoot = join(fixture.factoryRoot, "scratch", "media-burst");
+    expect(await readFile(join(mediaRoot, ".factory", "fake-turn-count"), "utf8")).toBe("1");
+    expect(await readFile(join(mediaRoot, ".factory", "inbox", "telegram", String(firstMessage.message_id), "notes.txt"), "utf8")).toBe(
+      "first body"
+    );
+    expect(await readFile(join(mediaRoot, ".factory", "inbox", "telegram", String(firstMessage.message_id), "notes-2.txt"), "utf8")).toBe(
+      "second body"
+    );
+    const prompt = await readFile(join(mediaRoot, ".factory", "control-plane.prompt.md"), "utf8");
+    expect(prompt).toContain("Here are the env files.");
+    expect(prompt).toContain("path=.factory/inbox/telegram");
+    expect(prompt).toContain("notes.txt");
+    expect(prompt).toContain("notes-2.txt");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    clearPendingMediaTimers(fixture);
     await rm(fixture.root, { recursive: true, force: true });
   }
 }, 15_000);

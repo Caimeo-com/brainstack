@@ -3,6 +3,11 @@ import type { ContextRecord } from "../db";
 
 const MANUAL_USAGE_LOG_TAIL_BYTES = 2 * 1024 * 1024;
 
+export interface ManualUsageSummary {
+  text: string;
+  footer: string | null;
+}
+
 async function readLogTail(path: string, maxBytes = MANUAL_USAGE_LOG_TAIL_BYTES): Promise<{ text: string; truncated: boolean }> {
   const handle = await open(path, "r");
   try {
@@ -19,14 +24,14 @@ async function readLogTail(path: string, maxBytes = MANUAL_USAGE_LOG_TAIL_BYTES)
   }
 }
 
-export async function summarizeManualUsage(context: ContextRecord): Promise<string> {
+export async function summarizeManualUsage(context: ContextRecord): Promise<ManualUsageSummary> {
   if (!context.latestRunLogPath) {
-    return "No local run log recorded yet.";
+    return { text: "No local run log recorded yet.", footer: null };
   }
 
   const file = Bun.file(context.latestRunLogPath);
   if (!(await file.exists())) {
-    return `Latest log path is recorded but missing: ${context.latestRunLogPath}`;
+    return { text: `Latest log path is recorded but missing: ${context.latestRunLogPath}`, footer: null };
   }
 
   const { text, truncated } = await readLogTail(context.latestRunLogPath);
@@ -66,10 +71,10 @@ export async function summarizeManualUsage(context: ContextRecord): Promise<stri
   }
 
   if (!turns) {
-    return `No structured token usage found in ${context.latestRunLogPath}.`;
+    return { text: `No structured token usage found in ${context.latestRunLogPath}.`, footer: null };
   }
 
-  return [
+  const textSummary = [
     `Adapter: manual`,
     truncated ? `Scope: last ${MANUAL_USAGE_LOG_TAIL_BYTES} bytes of log` : null,
     `Turns counted: ${turns}`,
@@ -78,4 +83,9 @@ export async function summarizeManualUsage(context: ContextRecord): Promise<stri
     `Output tokens: ${outputTokens}`,
     `Log: ${context.latestRunLogPath}`
   ].filter(Boolean).join("\n");
+  const totalTokens = inputTokens + outputTokens;
+  return {
+    text: textSummary,
+    footer: `tokens=${totalTokens} (in=${inputTokens} cached=${cachedInputTokens} out=${outputTokens})`
+  };
 }
