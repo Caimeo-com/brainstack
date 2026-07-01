@@ -98,12 +98,66 @@ describe("brainctl install safety", () => {
       const rendered = await readFile(configPath, "utf8");
       expect(rendered).toContain("harness:");
       expect(rendered).toContain("name: codex");
-      expect(rendered).toContain("bin: codex");
+      expect(rendered).toContain(`bin: ${fakeCodex}`);
       expect(rendered).toContain("enabled: true");
       expect(rendered).toContain('publicBaseUrl: "https://brain-control.example.ts.net"');
-      expect(result.stdout).toContain("selected harness: codex (config bin: codex)");
-      expect(result.stdout).not.toContain(fakeCodex);
+      expect(result.stdout).toContain(`selected harness: codex (config bin: ${fakeCodex})`);
       expect(result.stdout).toContain("brainctl init --profile control");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("telemux runtime pins stable harness binary instead of earlier package-manager wrapper", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-stable-harness-"));
+    try {
+      const badBin = join(dir, ".local", "bin");
+      const stableBin = join(dir, ".bun", "bin");
+      const outDir = join(dir, "out");
+      await mkdir(badBin, { recursive: true });
+      await mkdir(stableBin, { recursive: true });
+      await writeExecutable(join(badBin, "codex"), "#!/usr/bin/env bash\nexec npx --yes --package @openai/codex -- codex \"$@\"\n");
+      await writeExecutable(
+        join(stableBin, "codex"),
+        [
+          "#!/usr/bin/env sh",
+          "if [ \"${1:-}\" = \"--version\" ]; then echo 'codex stable'; exit 0; fi",
+          "if [ \"${1:-}\" = \"exec\" ] && [ \"${2:-}\" = \"--help\" ]; then",
+          "  echo '--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --output-last-message'",
+          "  exit 0",
+          "fi",
+          "exit 0",
+          ""
+        ].join("\n")
+      );
+      const configPath = join(dir, "config.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "harness:",
+          "  name: codex",
+          "  bin: codex",
+          "machine:",
+          "  name: brain-control",
+          "paths:",
+          `  home: ${dir}`,
+          "brain:",
+          "  publicBaseUrl: https://brain-control.example.ts.net",
+          "telemux:",
+          "  enabled: true",
+          "  localMachine: brain-control",
+          ""
+        ].join("\n")
+      );
+
+      const render = runBrainctl(["render", "--profile", "control", "--config", configPath, "--out", outDir]);
+      expectSuccess(render);
+      const runtimeEnv = await readFile(join(outDir, "env", "telemux.runtime.env"), "utf8");
+      expect(runtimeEnv).toContain(`FACTORY_HARNESS_BIN=${join(stableBin, "codex")}`);
+      expect(runtimeEnv).toContain(`FACTORY_CODEX_BIN=${join(stableBin, "codex")}`);
+      expect(runtimeEnv).not.toContain(`FACTORY_HARNESS_BIN=${join(badBin, "codex")}`);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

@@ -1095,7 +1095,7 @@ describe("public release hygiene - fleet remote control invites and release", ()
     }
   }, 10_000);
 
-  test("doctor runs local harness wrappers with the user's shell PATH", async () => {
+  test("doctor rejects package-manager harness wrappers", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-local-harness-path-"));
     try {
       const helperBin = join(dir, "helper-bin");
@@ -1161,9 +1161,9 @@ describe("public release hygiene - fleet remote control invites and release", ()
         SHELL: fakeShell,
         PATH: `${dirname(process.execPath)}:/usr/bin:/bin`
       });
-      expectSuccess(result);
-      expect(result.stdout).toContain("PASS [versions] codex-harness");
-      expect(result.stdout).toContain("codex-cli 9.9.9");
+      expect(result.code).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("unstable package-manager wrapper");
+      expect(`${result.stdout}\n${result.stderr}`).toContain("Configure harness.bin to a stable absolute codex binary");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

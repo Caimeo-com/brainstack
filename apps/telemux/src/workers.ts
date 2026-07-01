@@ -210,6 +210,48 @@ fi
 `.trim();
 }
 
+function harnessResolutionPrelude(): string {
+  return `
+brainstack_harness_unstable() {
+  candidate="$1"
+  [ -f "$candidate" ] || return 1
+  head -c 8192 "$candidate" 2>/dev/null | LC_ALL=C grep -Eaq '(^|[^A-Za-z0-9_])(npx|bunx)([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])(npm[[:space:]]+(exec|x|install|run|--yes)|mise[[:space:]]+|pnpm[[:space:]]+(dlx|exec)|yarn[[:space:]]+(dlx|exec))'
+}
+brainstack_resolve_harness_bin() {
+  requested="$1"
+  case "$requested" in
+    */*) printf '%s\\n' "$requested"; return 0 ;;
+  esac
+  first_unstable=""
+  old_ifs="$IFS"
+  IFS=:
+  for dir in $PATH; do
+    [ -n "$dir" ] || continue
+    candidate="$dir/$requested"
+    [ -x "$candidate" ] || continue
+    if brainstack_harness_unstable "$candidate"; then
+      [ -n "$first_unstable" ] || first_unstable="$candidate"
+      continue
+    fi
+    IFS="$old_ifs"
+    printf '%s\\n' "$candidate"
+    return 0
+  done
+  IFS="$old_ifs"
+  if [ -n "$first_unstable" ]; then
+    printf '%s\\n' "$first_unstable"
+    return 0
+  fi
+  return 1
+}
+resolved_harness_bin="$(brainstack_resolve_harness_bin "$harness_bin" || true)"
+if [ -n "$resolved_harness_bin" ]; then
+  harness_bin="$resolved_harness_bin"
+fi
+unset resolved_harness_bin
+`.trim();
+}
+
 function truthyEnv(value: string | undefined): boolean {
   return ["1", "true", "yes", "on"].includes((value || "").trim().toLowerCase());
 }
@@ -558,6 +600,7 @@ export class WorkerService {
         `harness=${quoteSh(harness.family)}`,
         `harness_bin=${quoteSh(harness.bin)}`,
         ...(worker.transport === "local" ? [workerUserPathPrelude()] : []),
+        harnessResolutionPrelude(),
         "printf 'path=%s\\n' \"$PATH\"",
         "brainstack_config_value() { key=\"$1\"; file=\"$2\"; [ -f \"$file\" ] || return 0; awk -v key=\"$key\" 'BEGIN { in_section=0 } /^[[:space:]]*\\[/ { in_section=1 } in_section == 0 { pattern=\"^[[:space:]]*\" key \"[[:space:]]*=\"; if ($0 ~ pattern) { sub(/^[^=]*=[[:space:]]*/, \"\"); sub(/[[:space:]]*#.*/, \"\"); gsub(/^[[:space:]\"]+|[[:space:]\"]+$/, \"\"); print; exit } }' \"$file\" || true; }",
         "printf 'harness=%s\\n' \"$harness\"",
@@ -738,6 +781,7 @@ harness=${quoteSh(harness.family)}
 harness_bin=${quoteSh(harness.bin)}
 max_runtime_seconds=${quoteSh(String(this.config.workerRunTimeoutSeconds))}
 ${worker.transport === "local" ? workerUserPathPrelude() : ""}
+${harnessResolutionPrelude()}
 worktree="$(expand_home_path "$worktree_raw")"
 launcher_dir="$(mktemp -d "\${TMPDIR:-/tmp}/brainstack-run.XXXXXX")"
 prompt_file="$launcher_dir/control-plane.prompt.md"
@@ -1245,6 +1289,7 @@ expand_home_path() {
 harness=${quoteSh(harness.family)}
 harness_bin=${quoteSh(harness.bin)}
 ${workerUserPathPrelude()}
+${harnessResolutionPrelude()}
 
 brainstack_config_value() {
   key="$1"
@@ -2195,7 +2240,11 @@ printf 'BRANCH=%s\\n' "$branch_name"
     const cachePrelude = cachedPath ? `BRAINSTACK_WORKER_PATH=${quoteSh(cachedPath)}\nexport BRAINSTACK_WORKER_PATH\n` : "";
     const uncachedPrelude = usePathCache ? "" : "unset BRAINSTACK_WORKER_PATH\n";
     const harnessPrelude = `harness=${quoteSh(harness.family)}\nharness_bin=${quoteSh(harness.bin)}\n`;
-    const scriptToRun = worker.transport === "local" ? `${harnessPrelude}${script}` : `${uncachedPrelude}${cachePrelude}${harnessPrelude}${workerUserPathPrelude()}\n${script}`;
+    const resolutionPrelude = harnessResolutionPrelude();
+    const scriptToRun =
+      worker.transport === "local"
+        ? `${harnessPrelude}${resolutionPrelude}\n${script}`
+        : `${uncachedPrelude}${cachePrelude}${harnessPrelude}${workerUserPathPrelude()}\n${resolutionPrelude}\n${script}`;
     switch (worker.transport) {
       case "local":
         return this.spawnAndCapture(

@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { lstat, readlink, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { flag, hasFlag, requireFlagValue, type ParsedArgs } from "../args";
+import { resolveHarnessBin } from "../harness-bin";
 import { abs, absWithHome, shellSingleQuote } from "../paths";
 import {
   MIN_BUN_VERSION,
@@ -178,6 +179,10 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
     return commandVersionProbe(name).text;
   }
 
+  function commandSearchPath(): string {
+    return userShellPathEnv()?.PATH || process.env.PATH || "";
+  }
+
   function commandHelpProbe(name: string, args: string[] = ["--help"]): CommandProbe {
     const proc = run([commandPath(name) || name, ...args], { check: false, env: userShellPathEnv(), timeoutMs: updateProbeTimeoutMs() });
     return {
@@ -190,17 +195,31 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
   function harnessCompatibility(name: HarnessName, bin: string, options: { required?: boolean } = {}): DoctorCheck {
     const requiredHarness = options.required ?? true;
     const failureStatus: CheckStatus = requiredHarness ? "FAIL" : "WARN";
-    if (!commandOk(bin)) {
-      return check(failureStatus, "versions", `${name}-harness`, `${bin} not found in PATH`, requiredHarness ? installHint(name) : undefined);
+    const resolution = resolveHarnessBin(bin, { searchPath: commandSearchPath(), home: process.env.HOME || "." });
+    if (!resolution.resolved) {
+      return check(failureStatus, "versions", `${name}-harness`, resolution.reason || `${bin} not found in PATH`, requiredHarness ? installHint(name) : undefined);
     }
-    const versionProbe = commandVersionProbe(bin);
-    const helpProbe = name === "codex" ? commandHelpProbe(bin, ["exec", "--help"]) : commandHelpProbe(bin, ["--help"]);
+    if (resolution.risk === "unstable-wrapper") {
+      return check(
+        failureStatus,
+        "versions",
+        `${name}-harness`,
+        `${resolution.resolved} is an unstable package-manager wrapper${resolution.reason ? ` (${resolution.reason})` : ""}`,
+        `Configure harness.bin to a stable absolute ${name} binary, then run brainctl apply-runtime/upgrade and restart services. ${installHint(name)}`
+      );
+    }
+    const versionProbe = commandVersionProbe(resolution.resolved);
+    const helpProbe = name === "codex" ? commandHelpProbe(resolution.resolved, ["exec", "--help"]) : commandHelpProbe(resolution.resolved, ["--help"]);
     const version = versionProbe.text;
+    const suffix = resolution.resolved !== bin ? `; bin=${resolution.resolved}` : "";
+    const skipped = resolution.skippedUnstable.length
+      ? `; skipped unstable wrapper ${resolution.skippedUnstable.map((candidate) => candidate.path).join(", ")}`
+      : "";
     if (versionProbe.timedOut || helpProbe.timedOut) {
-      return check(failureStatus, "versions", `${name}-harness`, `${version}; CLI compatibility probe timed out`, `Update ${name} manually, then rerun doctor. ${installHint(name)}`);
+      return check(failureStatus, "versions", `${name}-harness`, `${version}; CLI compatibility probe timed out${suffix}${skipped}`, `Update ${name} manually, then rerun doctor. ${installHint(name)}`);
     }
     if (helpProbe.code !== 0) {
-      return check(failureStatus, "versions", `${name}-harness`, `${version}; CLI help probe exited ${helpProbe.code}`, `Update ${name} manually, then rerun doctor. ${installHint(name)}`);
+      return check(failureStatus, "versions", `${name}-harness`, `${version}; CLI help probe exited ${helpProbe.code}${suffix}${skipped}`, `Update ${name} manually, then rerun doctor. ${installHint(name)}`);
     }
     const help = helpProbe.text;
     const required =
@@ -213,11 +232,11 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
         failureStatus,
         "versions",
         `${name}-harness`,
-        `${version}; missing required CLI surface: ${missing.join(", ")}`,
+        `${version}; missing required CLI surface: ${missing.join(", ")}${suffix}${skipped}`,
         `Update ${name} manually, then rerun doctor. ${installHint(name)}`
       );
     }
-    return check("PASS", "versions", `${name}-harness`, `${version}; required CLI surface present`);
+    return check("PASS", "versions", `${name}-harness`, `${version}${suffix}${skipped}; required CLI surface present`);
   }
 
   function envHasKey(path: string, key: string): boolean {
@@ -847,6 +866,48 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
   `.trim();
   }
 
+  function workerHarnessResolutionPrelude(): string {
+    return `
+  brainstack_harness_unstable() {
+    candidate="$1"
+    [ -f "$candidate" ] || return 1
+    head -c 8192 "$candidate" 2>/dev/null | LC_ALL=C grep -Eaq '(^|[^A-Za-z0-9_])(npx|bunx)([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])(npm[[:space:]]+(exec|x|install|run|--yes)|mise[[:space:]]+|pnpm[[:space:]]+(dlx|exec)|yarn[[:space:]]+(dlx|exec))'
+  }
+  brainstack_resolve_harness_bin() {
+    requested="$1"
+    case "$requested" in
+      */*) printf '%s\\n' "$requested"; return 0 ;;
+    esac
+    first_unstable=""
+    old_ifs="$IFS"
+    IFS=:
+    for dir in $PATH; do
+      [ -n "$dir" ] || continue
+      candidate="$dir/$requested"
+      [ -x "$candidate" ] || continue
+      if brainstack_harness_unstable "$candidate"; then
+        [ -n "$first_unstable" ] || first_unstable="$candidate"
+        continue
+      fi
+      IFS="$old_ifs"
+      printf '%s\\n' "$candidate"
+      return 0
+    done
+    IFS="$old_ifs"
+    if [ -n "$first_unstable" ]; then
+      printf '%s\\n' "$first_unstable"
+      return 0
+    fi
+    return 1
+  }
+  resolved_harness_bin="$(brainstack_resolve_harness_bin "$harness_bin" || true)"
+  if [ -n "$resolved_harness_bin" ]; then
+    harness_bin="$resolved_harness_bin"
+  fi
+  unset resolved_harness_bin
+  `.trim();
+  }
+
   function runWorkerShell(cfg: BrainstackConfig, worker: BrainstackWorkerConfig, script: string, timeoutSeconds = 10, usePathCache = true) {
     const family = workerHarnessFamily(cfg, worker);
     const bin = workerHarnessBin(cfg, worker, family);
@@ -854,7 +915,7 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
     const cachePrelude = cachedPath ? `BRAINSTACK_WORKER_PATH=${quoteForBash(cachedPath)}\nexport BRAINSTACK_WORKER_PATH\n` : "";
     const uncachedPrelude = usePathCache ? "" : "unset BRAINSTACK_WORKER_PATH\n";
     const harnessPrelude = `harness=${quoteForBash(family)}\nharness_family=${quoteForBash(family)}\nharness_bin=${quoteForBash(bin)}\n`;
-    const wrappedScript = `${uncachedPrelude}${cachePrelude}${harnessPrelude}${workerUserPathPrelude()}\n${script}`;
+    const wrappedScript = `${uncachedPrelude}${cachePrelude}${harnessPrelude}${workerUserPathPrelude()}\n${workerHarnessResolutionPrelude()}\n${script}`;
     if (worker.transport === "local") {
       return run(["bash", "-lc", wrappedScript], { check: false, timeoutMs: timeoutSeconds * 1000 });
     }
@@ -967,8 +1028,6 @@ function check(status: CheckStatus, section: string, name: string, detail: strin
           : ["--dangerously-skip-permissions", "--permission-mode", "--output-format"];
       const script = [
         "set -euo pipefail",
-        `harness_bin=${quoteForBash(bin)}`,
-        `harness_family=${quoteForBash(family)}`,
         "printf 'worker=%s\\n' \"$(hostname)\"",
         "printf 'path=%s\\n' \"$PATH\"",
         "if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then printf 'sudo=ok\\n'; else printf 'sudo=fail\\n'; fi",

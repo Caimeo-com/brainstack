@@ -8,6 +8,7 @@ import { hostname, tmpdir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { boolFlag, flag, hasFlag, requireFlagValue, type ParsedArgs } from "../args";
 import { abs, absWithHome, expandHome, renderTemplate, shellSingleQuote } from "../paths";
+import { resolveHarnessBin } from "../harness-bin";
 import {
   BRAINSTACK_PACKAGE_VERSION,
   CLIENT_BOOTSTRAP_TEMPLATE_NAMES,
@@ -678,6 +679,8 @@ export function createInstallEnrollCommands(deps: InstallEnrollDeps) {
 
   function telemuxRuntimeEnv(cfg: BrainstackConfig): string {
     const toolPath = brainstackToolPath(cfg);
+    const serviceHarnessBin = serviceResolvedHarnessBin(cfg, cfg.harness.bin);
+    const serviceCodexBin = cfg.harness.name === "codex" ? serviceHarnessBin : serviceResolvedHarnessBin(cfg, "codex");
     const voice = cfg.capabilities.voice;
     const voiceArgs = voice.args.length ? voice.args : ["-f", "{input}", "-pc"];
     return [
@@ -719,11 +722,15 @@ export function createInstallEnrollCommands(deps: InstallEnrollDeps) {
       `FACTORY_SSH_KNOWN_HOSTS=${join(cfg.paths.configRoot, "ssh_known_hosts")}`,
       "FACTORY_USAGE_ADAPTER=manual",
       `FACTORY_HARNESS=${cfg.harness.name}`,
-      `FACTORY_HARNESS_BIN=${cfg.harness.bin}`,
-      `FACTORY_CODEX_BIN=${cfg.harness.name === "codex" ? cfg.harness.bin : "codex"}`,
+      `FACTORY_HARNESS_BIN=${serviceHarnessBin}`,
+      `FACTORY_CODEX_BIN=${serviceCodexBin}`,
       `BRAIN_BASE_URL=${cfg.brain.publicBaseUrl}`,
       ""
     ].join("\n");
+  }
+
+  function serviceResolvedHarnessBin(cfg: BrainstackConfig, bin: string): string {
+    return resolveHarnessBin(bin, { searchPath: brainstackToolPath(cfg), home: cfg.paths.home }).resolved || bin;
   }
 
   function brainstackToolPath(cfg: BrainstackConfig): string {
@@ -1461,9 +1468,11 @@ export function createInstallEnrollCommands(deps: InstallEnrollDeps) {
       const absoluteBin = absWithHome(invitedBin, process.env.HOME || ".");
       return { configBin: absoluteBin, executable: absoluteBin };
     }
-    const resolved = commandPath(invitedBin) || commandPath(invite.harness.name);
+    const resolvedInvite = resolveHarnessBin(invitedBin, { searchPath: commandSearchPath(), home: process.env.HOME || "." });
+    const resolvedName = resolveHarnessBin(invite.harness.name, { searchPath: commandSearchPath(), home: process.env.HOME || "." });
+    const resolved = resolvedInvite.resolved || resolvedName.resolved;
     if (resolved) {
-      return { configBin: invitedBin, executable: resolved };
+      return { configBin: resolved, executable: resolved };
     }
     if (invite.harness.name === "codex") {
       const codexAppCli = commonCodexAppCliPath();
@@ -1517,6 +1526,10 @@ export function createInstallEnrollCommands(deps: InstallEnrollDeps) {
     return path ? { PATH: `${process.env.PATH ? `${process.env.PATH}:` : ""}${path}` } : undefined;
   }
 
+  function commandSearchPath(): string {
+    return userShellPathEnv()?.PATH || process.env.PATH || "";
+  }
+
   function whereisPath(name: string): string | null {
     const direct = commandPath(name);
     if (direct) {
@@ -1528,6 +1541,10 @@ export function createInstallEnrollCommands(deps: InstallEnrollDeps) {
     }
     const [, rest = ""] = proc.stdout.split(":");
     return rest.trim().split(/\s+/).find((entry) => entry.startsWith("/")) || null;
+  }
+
+  function harnessPath(name: HarnessName): string | null {
+    return resolveHarnessBin(name, { searchPath: commandSearchPath(), home: process.env.HOME || "." }).resolved;
   }
 
   function installHint(name: string): string {
@@ -1617,8 +1634,8 @@ export function createInstallEnrollCommands(deps: InstallEnrollDeps) {
   async function selectProvisionHarness(args: ParsedArgs): Promise<{ name: HarnessName; bin: string; discovered: Record<string, string | null> }> {
     const requested = flag(args, "harness");
     const harnessBinOverride = flag(args, "harness-bin");
-    const codexPath = whereisPath("codex");
-    const claudePath = whereisPath("claude");
+    const codexPath = harnessPath("codex");
+    const claudePath = harnessPath("claude");
     const discovered = { codex: codexPath, claude: claudePath };
     if (requested) {
       const name = normalizeHarness(requested);
@@ -1776,7 +1793,7 @@ export function createInstallEnrollCommands(deps: InstallEnrollDeps) {
       },
       harness: {
         name: harness.name,
-        bin: flag(args, "harness-bin") || harness.name
+        bin: flag(args, "harness-bin") || harness.bin
       },
       machine: {
         name: machineName,
@@ -1880,7 +1897,7 @@ export function createInstallEnrollCommands(deps: InstallEnrollDeps) {
     console.log(`provision config written: ${out}`);
     console.log(`ownership manifest written: ${managedManifestPath(cfg)}`);
     console.log(`detected tools: ${Object.entries(found).map(([name]) => `${name}=present`).join(" ")}`);
-    console.log(`selected harness: ${selectedHarness.name} (config bin: ${flag(args, "harness-bin") || selectedHarness.name})`);
+    console.log(`selected harness: ${selectedHarness.name} (config bin: ${flag(args, "harness-bin") || selectedHarness.bin})`);
     console.log("next:");
     console.log(`  brainctl init --profile ${profile} --config ${out}`);
     if (profile === "single-node" || profile === "control") {
