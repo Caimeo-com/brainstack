@@ -163,6 +163,42 @@ describe("brainctl install safety", () => {
     }
   });
 
+  test("control runtime lets braind own search reindexing", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brainctl-search-owner-"));
+    try {
+      const outDir = join(dir, "out");
+      const configPath = join(dir, "config.yaml");
+      await writeFile(
+        configPath,
+        [
+          "schema_version: 1",
+          "profile: control",
+          "machine:",
+          "  name: brain-control",
+          "paths:",
+          `  home: ${join(dir, "home")}`,
+          `  productRepo: ${join(dir, "brainstack")}`,
+          `  sharedBrainRoot: ${join(dir, "shared-brain")}`,
+          "telemux:",
+          "  enabled: false",
+          ""
+        ].join("\n")
+      );
+
+      const render = runBrainctl(["render", "--profile", "control", "--config", configPath, "--out", outDir]);
+      expectSuccess(render);
+      const service = await readFile(join(outDir, "systemd", "user", "braind.service"), "utf8");
+      const hook = await readFile(join(outDir, "git-hooks", "post-receive"), "utf8");
+      expect(service).not.toContain("ExecStartPre");
+      expect(service).not.toContain("reindex.ts");
+      expect(hook).not.toContain("reindex.ts");
+      expect(hook).toContain("search-reindex-needed.json");
+      expect(hook).toContain("queued by post-receive");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("provision requires explicit harness when codex and claude are both present non-interactively", async () => {
     const dir = await mkdtemp(join(tmpdir(), "brainctl-provision-choice-"));
     try {

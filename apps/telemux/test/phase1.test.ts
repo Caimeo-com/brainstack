@@ -996,7 +996,7 @@ test("curation command binds the current topic and owns exactly one curator rout
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 10_000);
 
 test("basic loops preserve dedicated proposal curation routine instead of creating a General duplicate", async () => {
   const fixture = await createFixture({

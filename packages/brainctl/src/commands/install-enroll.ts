@@ -836,7 +836,6 @@ export function createInstallEnrollCommands(deps: InstallEnrollDeps) {
       `WorkingDirectory=${cfg.paths.productRepo}`,
       `EnvironmentFile=${join(cfg.paths.configRoot, "braind.runtime.env")}`,
       `EnvironmentFile=${join(cfg.paths.configRoot, "braind.secrets.env")}`,
-      `ExecStartPre=${cfg.runtime.bunBin} --no-env-file run ${join(cfg.paths.productRepo, "apps", "braind", "src", "reindex.ts")} --quiet`,
       `ExecStart=${cfg.runtime.bunBin} --no-env-file run ${join(cfg.paths.productRepo, "apps", "braind", "src", "server.ts")}`,
       "UMask=0077",
       "Restart=on-failure",
@@ -963,7 +962,20 @@ export function createInstallEnrollCommands(deps: InstallEnrollDeps) {
     git --git-dir="$SERVE_REPO/.git" --work-tree="$SERVE_REPO" fetch origin main
     git --git-dir="$SERVE_REPO/.git" --work-tree="$SERVE_REPO" checkout -f main
     git --git-dir="$SERVE_REPO/.git" --work-tree="$SERVE_REPO" reset --hard origin/main
-    SHARED_BRAIN_REPO_ROOT="$SERVE_REPO" "$BUN_BIN" --no-env-file run "$PRODUCT_REPO/apps/braind/src/reindex.ts" --quiet || true
+    mkdir -p "$SERVE_REPO/derived"
+    marker="$SERVE_REPO/derived/search-reindex-needed.json"
+    tmp_marker="$marker.tmp-$$"
+    updated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    generation=$(date -u +%s)
+    cat >"$tmp_marker" <<JSON
+{
+  "commit": "$newrev",
+  "error": "queued by post-receive",
+  "generation": $generation,
+  "updated_at": "$updated_at"
+}
+JSON
+    mv "$tmp_marker" "$marker"
   done
   `;
   }
