@@ -80,6 +80,7 @@ If `BRAIN_BASE_URL` and `BRAIN_IMPORT_TOKEN` are set, successful runs import `.f
 - `/synccommands`
 - `/showcommands`
 - `/workers`
+- `/ip`
 - `/updates`
 - `/context`
 - `/compact`

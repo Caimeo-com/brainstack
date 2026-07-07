@@ -107,6 +107,7 @@ If the remote worker is unavailable, the context is still created and stored as 
 /context
 /crons
 /cron show <id>
+/ip
 /mode
 /model
 /effort
@@ -119,6 +120,8 @@ If the remote worker is unavailable, the context is still created and stored as 
 ```
 
 `/workers` probes configured machines and reports reachability, transport, local execution, harness family, model, thinking effort, and `sudo -n true` status. The model and effort shown for the currently bound topic reflect topic overrides when they apply.
+
+`/ip` returns only the public IP address observed from the machine bound to the current topic. Use it when a service allowlist needs the worker or control-host egress IP.
 
 ### Start or continue work
 
