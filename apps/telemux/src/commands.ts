@@ -11,7 +11,7 @@ import {
 } from "./codex-runtime";
 import { formatControlMetaResponse, resolveControlMetaKind } from "./control-meta";
 import { CronManager } from "./cron-manager";
-import { decideProposal, fetchCuratorStatus, fetchProposals, type BrainProposalSummary } from "./curator-report";
+import { decideProposal, fetchCuratorStatus, fetchProposalDetail, fetchProposals, type BrainProposalDetail, type BrainProposalSummary } from "./curator-report";
 import { ContextRecord, FactoryDb, type PendingTextRecord } from "./db";
 import { ContextService, nextRecommendedAction, normalizeSlug } from "./contexts";
 import { Dispatcher } from "./dispatcher";
@@ -431,6 +431,13 @@ function compact(text: string | null, limit = 280): string {
   return `${normalized.slice(0, limit - 1)}…`;
 }
 
+function compactMultiline(text: string, limit = 3600): string {
+  if (text.length <= limit) {
+    return text;
+  }
+  return `${text.slice(0, limit - 1)}…`;
+}
+
 function formatElapsed(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
   const minutes = Math.floor(totalSeconds / 60);
@@ -527,6 +534,63 @@ function snippet(text: string | null, limit = 240): string {
   }
 
   return `${normalized.slice(0, limit - 1)}…`;
+}
+
+function recordString(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function recordNumber(record: Record<string, unknown>, key: string): number | null {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function recordStringList(record: Record<string, unknown>, key: string): string[] {
+  const value = record[key];
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0);
+}
+
+function sectionSnippet(markdown: string, heading: string, limit: number): string | null {
+  if (!markdown.trim()) {
+    return null;
+  }
+  const pattern = new RegExp(`(?:^|\\n)#{2,3}\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\n([\\s\\S]*?)(?=\\n#{2,3}\\s+|$)`, "i");
+  const match = markdown.match(pattern);
+  return match?.[1] ? snippet(match[1], limit) : null;
+}
+
+function proposalBodyPreview(body: string): string {
+  return (
+    sectionSnippet(body, "Lesson", 620) ||
+    sectionSnippet(body, "Summary", 620) ||
+    sectionSnippet(body, "Request", 620) ||
+    snippet(body.replace(/^---[\s\S]*?---\s*/m, ""), 620)
+  );
+}
+
+function proposalDiffPreview(diff: string | null): string {
+  if (!diff?.trim()) {
+    return "No rendered diff is attached. This may be a context-only candidate or a proposal without target-page content.";
+  }
+  const lines = diff.split(/\r?\n/);
+  const added = lines.filter((line) => line.startsWith("+") && !line.startsWith("+++")).length;
+  const removed = lines.filter((line) => line.startsWith("-") && !line.startsWith("---")).length;
+  const interesting = lines
+    .filter((line) => /^[+-][^+-]/.test(line))
+    .map((line) => snippet(line, 160))
+    .slice(0, 8);
+  return [`Diff: +${added}/-${removed}`, ...interesting].join("\n");
+}
+
+function looksLikeIpLiteral(value: string): boolean {
+  return (
+    /^(?:\d{1,3}\.){3}\d{1,3}$/.test(value) ||
+    (/^[0-9A-Fa-f:.]+$/.test(value) && value.includes(":") && value.length >= 3)
+  );
 }
 
 interface ArtifactSendIntent {
@@ -1333,14 +1397,19 @@ export class CommandHandler {
         return;
       }
 
-      const proposalShortcut = parsed.command.match(/^\/proposal_(accept|reject)_([a-z0-9]{6,10})_(\d+)$/);
+      const proposalShortcut = parsed.command.match(/^\/proposal_(accept|reject|explain|clarify)_([a-z0-9]{6,10})_(\d+)$/);
       if (proposalShortcut) {
         const proposal = this.resolveProposalSnapshotShortcut(proposalShortcut[2] || "", proposalShortcut[3] || "", target);
         if (!proposal) {
           await this.telegram.sendText(target, "That proposal shortcut expired or the list changed. Use /proposals to refresh.");
           return;
         }
-        await this.handleProposalDecision(proposalShortcut[1] === "reject" ? "reject" : "accept", proposal, target, message.from?.id ?? null);
+        const action = proposalShortcut[1] || "";
+        if (action === "explain" || action === "clarify") {
+          await this.handleProposalExplanation(proposal, target, proposalShortcut[2] || "", proposalShortcut[3] || "");
+          return;
+        }
+        await this.handleProposalDecision(action === "reject" ? "reject" : "accept", proposal, target, message.from?.id ?? null);
         return;
       }
 
@@ -1363,6 +1432,7 @@ export class CommandHandler {
               "/synccommands",
               "/showcommands",
               "/whoami",
+              "/ip",
               "/workers",
               "/updates",
               "/voice",
@@ -1497,6 +1567,22 @@ export class CommandHandler {
                   })
                   .join("\n")
               : "No workers configured."
+          );
+          return;
+        }
+
+        case "/ip": {
+          if (!boundContext) {
+            await this.telegram.sendText(target, "This topic is not bound. Use /newctx or /bind first.");
+            return;
+          }
+          const result = await this.workers.probePublicIp(boundContext.machine);
+          const ip = result.stdout.trim().split(/\s+/)[0] || "";
+          await this.telegram.sendText(
+            target,
+            result.ok && looksLikeIpLiteral(ip)
+              ? ip
+              : `Could not determine public IP for ${boundContext.machine}: ${compact(result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`, 180)}`
           );
           return;
         }
@@ -3390,7 +3476,13 @@ export class CommandHandler {
         runner: draft.runner || null,
         enabled: true
       });
-      return `Brain-curator routine ready: ${updated.id} (${updated.enabled ? "enabled" : "paused"}) next=${updated.nextRunAt || "none"}`;
+      const paused = await this.pauseDuplicateCuratorJobs(updated);
+      return [
+        `Brain-curator routine ready: ${updated.id} (${updated.enabled ? "enabled" : "paused"}) next=${updated.nextRunAt || "none"}`,
+        paused.length ? `Paused duplicate curator routine(s): ${paused.map((job) => job.id).join(", ")}` : null
+      ]
+        .filter(Boolean)
+        .join("\n");
     }
 
     const created = await this.cronManager.createJob(
@@ -3401,7 +3493,13 @@ export class CommandHandler {
       },
       { context, target }
     );
-    return `Brain-curator routine installed: ${created.id} next=${created.nextRunAt || "none"}`;
+    const paused = await this.pauseDuplicateCuratorJobs(created);
+    return [
+      `Brain-curator routine installed: ${created.id} next=${created.nextRunAt || "none"}`,
+      paused.length ? `Paused duplicate curator routine(s): ${paused.map((job) => job.id).join(", ")}` : null
+    ]
+      .filter(Boolean)
+      .join("\n");
   }
 
   private async setupProposalCurationTopic(rawRest: string, target: TelegramTarget, boundContext: ContextRecord | null): Promise<void> {
@@ -4026,7 +4124,26 @@ export class CommandHandler {
     const jobs = this.cronManager
       .listJobs()
       .filter((job) => job.kind === "codex" && !job.runner && job.label.toLowerCase() === "brain-curator");
-    return jobs.find((job) => job.executionContextSlug === "brainstack-routines") || jobs[0] || null;
+    return (
+      jobs.find((job) => job.enabled && job.executionContextSlug === PROPOSAL_CURATION_CONTEXT_SLUG) ||
+      jobs.find((job) => job.executionContextSlug === PROPOSAL_CURATION_CONTEXT_SLUG) ||
+      jobs.find((job) => job.enabled && job.executionContextSlug === "brainstack-routines") ||
+      jobs.find((job) => job.executionContextSlug === "brainstack-routines") ||
+      jobs.find((job) => job.enabled) ||
+      jobs[0] ||
+      null
+    );
+  }
+
+  private async pauseDuplicateCuratorJobs(keeper: CronJobRecord): Promise<CronJobRecord[]> {
+    const duplicates = this.cronManager
+      .listJobs()
+      .filter((job) => job.kind === "codex" && !job.runner && job.label.toLowerCase() === "brain-curator" && job.id !== keeper.id && job.enabled);
+    const paused: CronJobRecord[] = [];
+    for (const job of duplicates) {
+      paused.push(await this.cronManager.pauseJob(job));
+    }
+    return paused;
   }
 
   private async formatCuratorStatus(target: TelegramTarget): Promise<string> {
@@ -4127,7 +4244,7 @@ export class CommandHandler {
         }`
       );
       const acceptPart = proposal.target_page ? `/proposal_accept_${token}_${index + 1}` : "merge/enrich first";
-      lines.push(`   ${acceptPart}  /proposal_reject_${token}_${index + 1}`);
+      lines.push(`   /proposal_explain_${token}_${index + 1}  ${acceptPart}  /proposal_reject_${token}_${index + 1}`);
     });
     if (filtered.length > limited.length) {
       lines.push(`Showing ${limited.length}; narrow the search or use limit=${Math.min(filtered.length, MAX_PROPOSAL_LIST_LIMIT)}.`);
@@ -4138,6 +4255,7 @@ export class CommandHandler {
     } else {
       lines.push("");
       lines.push("Accept applies the proposed wiki change. Context-only candidates need merge/enrichment first.");
+      lines.push("Use explain before deciding when the title is not enough.");
       lines.push("Filter with `/proposals pending`, `/proposals needs-human needs-context`, or `/proposals open project:lindy limit=10`.");
     }
     return lines.join("\n");
@@ -4200,6 +4318,69 @@ export class CommandHandler {
     const effectiveAction = action === "accept" ? "apply" : action;
     const result = await decideProposal(this.config, proposal.id, effectiveAction, decidedBy);
     await this.telegram.sendText(target, result.message);
+  }
+
+  private async handleProposalExplanation(
+    proposal: BrainProposalSummary,
+    target: TelegramTarget,
+    token: string,
+    selector: string
+  ): Promise<void> {
+    const detail = await fetchProposalDetail(this.config, proposal.id);
+    if (!detail) {
+      await this.telegram.sendText(target, "Could not load that proposal detail. Is braind reachable?");
+      return;
+    }
+    await this.telegram.sendText(target, this.formatProposalExplanation(proposal, detail, token, selector));
+  }
+
+  private formatProposalExplanation(
+    summary: BrainProposalSummary,
+    detail: BrainProposalDetail,
+    token: string,
+    selector: string
+  ): string {
+    const proposal = detail.proposal;
+    const targetPage = recordString(proposal, "target_page") || summary.target_page;
+    const sourceIds = recordStringList(proposal, "source_ids").slice(0, 6);
+    const confidence = recordNumber(proposal, "confidence");
+    const quality = recordString(proposal, "quality_decision") || summary.quality_decision;
+    const risk = recordString(proposal, "risk") || summary.risk;
+    const project = recordString(proposal, "project") || summary.project;
+    const scope = recordString(proposal, "scope") || summary.scope;
+    const kind = recordString(proposal, "memory_kind") || summary.memory_kind;
+    const reviewGroup = recordString(proposal, "cluster_label") || summary.cluster_label || recordString(proposal, "cluster_key") || summary.cluster_key;
+    const acceptPart = targetPage ? `/proposal_accept_${token}_${selector}` : "Accept unavailable until merged/enriched";
+    const meta = [
+      `Status: ${recordString(proposal, "status") || summary.status}`,
+      quality ? `quality=${quality}` : null,
+      risk ? `risk=${risk}` : null,
+      confidence !== null ? `confidence=${Math.round(confidence * 100)}%` : null
+    ]
+      .filter(Boolean)
+      .join(" | ");
+
+    const lines = [
+      `Proposal ${selector}: ${recordString(proposal, "title") || summary.title}`,
+      meta,
+      targetPage ? `Target: ${targetPage}` : "Target: none yet; this needs merge/enrichment before Accept can apply anything.",
+      [project ? `Project: ${project}` : null, scope ? `Scope: ${scope}` : null, kind ? `Kind: ${kind}` : null].filter(Boolean).join(" | "),
+      reviewGroup ? `Review group: ${reviewGroup}` : null,
+      sourceIds.length ? `Sources: ${sourceIds.join(", ")}${recordStringList(proposal, "source_ids").length > sourceIds.length ? ", …" : ""}` : null,
+      "",
+      "What it says:",
+      proposalBodyPreview(detail.body),
+      "",
+      "Proposed change:",
+      proposalDiffPreview(detail.diff),
+      "",
+      "Actions:",
+      `/proposal_explain_${token}_${selector}`,
+      acceptPart,
+      `/proposal_reject_${token}_${selector}`
+    ].filter((line): line is string => line !== null);
+
+    return compactMultiline(lines.join("\n"), 3600);
   }
 
   private artifactEntriesForSend(artifacts: string | null, filterText: string | null, latestOnly: boolean): ArtifactEntry[] {

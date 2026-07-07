@@ -29,6 +29,7 @@ export const TELEGRAM_BOT_COMMANDS: TelegramBotCommand[] = [
   { command: "synccommands", description: "Re-register Telegram command scopes" },
   { command: "showcommands", description: "Show registered Telegram commands" },
   { command: "whoami", description: "Show Telegram ids and current binding" },
+  { command: "ip", description: "Show the bound machine public IP" },
   { command: "workers", description: "List worker status and transport" },
   { command: "updates", description: "Show manual update and harness version status" },
   { command: "voice", description: "Install or check voice transcription" },

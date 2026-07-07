@@ -69,8 +69,32 @@ export interface BrainProposalSummary {
   legacy_format: boolean;
 }
 
+export interface BrainProposalDetail {
+  proposal: Record<string, unknown>;
+  body: string;
+  diff: string | null;
+}
+
 export interface ProposalListOptions {
   status?: string;
+}
+
+function proposalSummaryFromRecord(proposal: Record<string, unknown>): BrainProposalSummary {
+  return {
+    id: String(proposal.id || ""),
+    title: String(proposal.title || ""),
+    status: String(proposal.status || ""),
+    target_page: typeof proposal.target_page === "string" ? proposal.target_page : null,
+    risk: typeof proposal.risk === "string" ? proposal.risk : null,
+    created_at: String(proposal.created_at || ""),
+    quality_decision: typeof proposal.quality_decision === "string" ? proposal.quality_decision : null,
+    project: typeof proposal.project === "string" ? proposal.project : null,
+    scope: typeof proposal.scope === "string" ? proposal.scope : null,
+    memory_kind: typeof proposal.memory_kind === "string" ? proposal.memory_kind : null,
+    cluster_key: typeof proposal.cluster_key === "string" ? proposal.cluster_key : null,
+    cluster_label: typeof proposal.cluster_label === "string" ? proposal.cluster_label : null,
+    legacy_format: proposal.legacy_format === true
+  };
 }
 
 export async function fetchProposals(config: FactoryConfig, options: ProposalListOptions = {}): Promise<BrainProposalSummary[] | null> {
@@ -87,21 +111,33 @@ export async function fetchProposals(config: FactoryConfig, options: ProposalLis
       return null;
     }
     const parsed = (await response.json()) as { proposals?: Array<Record<string, unknown>> };
-    return (parsed.proposals || []).map((proposal) => ({
-      id: String(proposal.id || ""),
-      title: String(proposal.title || ""),
-      status: String(proposal.status || ""),
-      target_page: typeof proposal.target_page === "string" ? proposal.target_page : null,
-      risk: typeof proposal.risk === "string" ? proposal.risk : null,
-      created_at: String(proposal.created_at || ""),
-      quality_decision: typeof proposal.quality_decision === "string" ? proposal.quality_decision : null,
-      project: typeof proposal.project === "string" ? proposal.project : null,
-      scope: typeof proposal.scope === "string" ? proposal.scope : null,
-      memory_kind: typeof proposal.memory_kind === "string" ? proposal.memory_kind : null,
-      cluster_key: typeof proposal.cluster_key === "string" ? proposal.cluster_key : null,
-      cluster_label: typeof proposal.cluster_label === "string" ? proposal.cluster_label : null,
-      legacy_format: proposal.legacy_format === true
-    }));
+    return (parsed.proposals || []).map(proposalSummaryFromRecord);
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchProposalDetail(config: FactoryConfig, id: string): Promise<BrainProposalDetail | null> {
+  if (!config.brainBaseUrl) {
+    return null;
+  }
+  try {
+    const response = await fetch(new URL(`/api/proposals/${encodeURIComponent(id)}`, config.brainBaseUrl).toString(), {
+      signal: AbortSignal.timeout(10_000)
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const parsed = (await response.json()) as Record<string, unknown>;
+    const proposal =
+      parsed.proposal && typeof parsed.proposal === "object" && !Array.isArray(parsed.proposal)
+        ? (parsed.proposal as Record<string, unknown>)
+        : {};
+    return {
+      proposal,
+      body: typeof parsed.body === "string" ? parsed.body : "",
+      diff: typeof parsed.diff === "string" ? parsed.diff : null
+    };
   } catch {
     return null;
   }

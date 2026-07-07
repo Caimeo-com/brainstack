@@ -113,13 +113,14 @@ Telegram mirrors the basics:
 /proposals [open|pending|needs-human|approved|applied|rejected|superseded] [ready|needs-context|needs-evidence|too-vague] [search terms|project:NAME|scope:NAME|group:NAME] [limit=N]
 /proposal_groups
 /proposal_merges [preview]
+/proposal_explain_<token>_<n>
 /proposal_accept_<token>_<n>
 /proposal_reject_<token>_<n>
 ```
 
 Run `/curation` in the Telegram topic you want to use for proposal review. It binds that topic to a durable `proposal-curation` scratch context, makes the built-in `brain-curator` routine target that topic, and prints the useful proposal review commands. It accepts an optional machine override: `/curation <machine>`.
 
-Telegram Accept applies the proposed wiki change when the proposal carries one (drift still parks it as `needs-human`). Context-only candidates without a target page must be enriched or merged before they can be accepted. `/proposal_groups` shows review groups with multiple open proposals. `/proposal_merges` runs the harness batch scan on the control host (`brainctl proposals batch-merge --submit --limit 100 --auto-threshold 0.8`): it reviews the top 100 open proposals, creates consolidated proposals, marks high-confidence absorbed sources superseded, and submits lower-confidence candidates for review, but does not apply wiki edits. Say "look for proposal merges", "show proposal merge candidates", or "merge related proposals" instead of using the commands directly. Accept/reject and merge submission from Telegram require the optional `FACTORY_BRAIN_ADMIN_TOKEN` in the telemux env; without it, Telegram stays read-only for proposals.
+Telegram proposal lists include Explain, Accept, and Reject shortcuts. Explain shows the proposal's status, scope, source refs, body preview, and rendered diff preview without making changes. Telegram Accept applies the proposed wiki change when the proposal carries one (drift still parks it as `needs-human`). Context-only candidates without a target page must be enriched or merged before they can be accepted. `/proposal_groups` shows review groups with multiple open proposals. `/proposal_merges` runs the harness batch scan on the control host (`brainctl proposals batch-merge --submit --limit 100 --auto-threshold 0.8`): it reviews the top 100 open proposals, creates consolidated proposals, marks high-confidence absorbed sources superseded, and submits lower-confidence candidates for review, but does not apply wiki edits. Say "look for proposal merges", "show proposal merge candidates", or "merge related proposals" instead of using the commands directly. Accept/reject and merge submission from Telegram require the optional `FACTORY_BRAIN_ADMIN_TOKEN` in the telemux env; without it, Telegram stays read-only for proposals.
 
 Useful review flows:
 

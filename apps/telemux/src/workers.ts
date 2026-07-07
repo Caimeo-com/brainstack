@@ -681,6 +681,34 @@ export class WorkerService {
     };
   }
 
+  async probePublicIp(host: string): Promise<WorkerExecResult> {
+    const worker = this.requireWorker(host);
+    const script = `
+set -euo pipefail
+fetch_url() {
+  url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 8 "$url" 2>/dev/null || true
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- --timeout=8 "$url" 2>/dev/null || true
+  fi
+}
+
+for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+  out="$(fetch_url "$url" | tr -d '\\r' | awk 'NR == 1 { gsub(/[[:space:]]/, ""); print; exit }')"
+  case "$out" in
+    ""|*[!0-9A-Fa-f:.]*) continue ;;
+    *.*.*.*|*:*) printf '%s\\n' "$out"; exit 0 ;;
+    *) continue ;;
+  esac
+done
+
+echo "public IP lookup failed" >&2
+exit 1
+`;
+    return this.runWorkerScript(worker, script, undefined, 20, undefined, 2048, false);
+  }
+
   async bootstrapContext(request: ContextBootstrapRequest): Promise<BootstrapResult> {
     const worker = this.requireWorker(request.machine);
     const plan = this.planContext(worker, request);

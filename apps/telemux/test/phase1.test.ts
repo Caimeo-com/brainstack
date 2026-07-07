@@ -961,19 +961,64 @@ test("curation command binds the current topic and owns exactly one curator rout
     expect(setupText).toContain("/proposals pending");
     expect(setupText).toContain("/proposals needs-human needs-context");
 
+    await fixture.commands.handleMessage(telegramMessage("/newctx brainstack-routines control scratch", 47));
+    const routinesContext = fixture.db.getContextBySlug("brainstack-routines");
+    if (!routinesContext) {
+      throw new Error("brainstack-routines context was not created");
+    }
+    const duplicate = await fixture.cronManager.createJob(
+      {
+        label: "brain-curator",
+        kind: "codex",
+        schedule: { type: "daily", time: "04:30", timezone: "Europe/Zagreb" },
+        executionContextSlug: "brainstack-routines",
+        targetChatId: 4242,
+        targetThreadId: null,
+        instruction: "Duplicate curator routine."
+      },
+      { context: routinesContext, target: { chatId: 4242, threadId: null } }
+    );
+    expect(duplicate.enabled).toBe(true);
+
     await fixture.commands.handleMessage(telegramTopicMessage("/curation", 46, "Proposal curation v2"));
     const movedContext = fixture.db.getContextBySlug("proposal-curation");
     expect(movedContext?.telegramThreadId).toBe(46);
     const movedJobs = fixture.db.listCronJobs().filter((job) => job.label === "brain-curator");
-    expect(movedJobs.length).toBe(1);
-    expect(movedJobs[0]?.executionContextSlug).toBe("proposal-curation");
-    expect(movedJobs[0]?.targetThreadId).toBe(46);
+    expect(movedJobs.length).toBe(2);
+    const enabledJobs = movedJobs.filter((job) => job.enabled);
+    expect(enabledJobs.length).toBe(1);
+    expect(enabledJobs[0]?.executionContextSlug).toBe("proposal-curation");
+    expect(enabledJobs[0]?.targetThreadId).toBe(46);
+    expect(fixture.db.getCronJob(duplicate.id)?.enabled).toBe(false);
     expect(fixture.telegram.sent.at(-1)?.text || "").toContain("Brain-curator routine ready:");
+    expect(fixture.telegram.sent.at(-1)?.text || "").toContain("Paused duplicate curator routine");
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });
   }
 });
+
+test("basic loops preserve dedicated proposal curation routine instead of creating a General duplicate", async () => {
+  const fixture = await createFixture({
+    FACTORY_TELEGRAM_CONTROL_CHAT_ID: "4242"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramTopicMessage("/curation", 45, "Proposal curation"));
+    const result = await ensureBasicLoops(fixture.config, fixture.contexts, fixture.workers, fixture.cronManager);
+    expect(result).toContain("curator updated:");
+
+    const curatorJobs = fixture.db.listCronJobs().filter((job) => job.label === "brain-curator");
+    expect(curatorJobs.length).toBe(1);
+    expect(curatorJobs[0]?.enabled).toBe(true);
+    expect(curatorJobs[0]?.executionContextSlug).toBe("proposal-curation");
+    expect(curatorJobs[0]?.targetThreadId).toBe(45);
+    expect(fixture.db.listCronJobs().some((job) => job.label === "update-check" && job.executionContextSlug === "brainstack-routines")).toBe(true);
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 30_000);
 
 test("dispatcher emits a throttled editable progress card for slow Codex runs", async () => {
   const fixture = await createFixture({
@@ -1041,6 +1086,21 @@ test("phase 1 workflow covers local host/scratch and pending remote behavior", a
     expect(explainText).toContain("Codex session exists: no");
     expect(explainText).toContain("If this topic is rebound:");
     expect(explainText).toContain("Old Telegram messages stay in Telegram");
+
+    const originalProbePublicIp = fixture.workers.probePublicIp.bind(fixture.workers);
+    fixture.workers.probePublicIp = async (host: string) => ({
+      ok: true,
+      host,
+      transport: "local",
+      exitCode: 0,
+      stdout: "203.0.113.9\n",
+      stderr: "",
+      durationMs: 1,
+      commandLabel: "local"
+    });
+    await fixture.commands.handleMessage(telegramMessage("/ip", 10));
+    expect(fixture.telegram.sent.at(-1)?.text).toBe("203.0.113.9");
+    fixture.workers.probePublicIp = originalProbePublicIp;
 
     await fixture.commands.handleMessage(telegramMessage("Check free disk space and leave a note.", 10));
     await waitFor(() => Boolean(fixture.db.getContextBySlug("control-general")?.codexSessionId));
@@ -2295,6 +2355,28 @@ test("basic loops install the brain-curator routine and curator commands work en
           ]
         });
       }
+      const proposalShow = url.pathname.match(/^\/api\/proposals\/([^/]+)$/);
+      if (req.method === "GET" && proposalShow) {
+        return Response.json({
+          ok: true,
+          proposal: {
+            id: proposalShow[1],
+            title: "Status update",
+            status: "pending",
+            target_page: "wiki/Status/Machines.md",
+            risk: "low",
+            confidence: 0.87,
+            quality_decision: "ready",
+            project: "brainstack",
+            scope: "repo",
+            memory_kind: "project_lesson",
+            cluster_label: "Brainstack / repo / project_lesson",
+            source_ids: ["raw:one", "proposal:two"]
+          },
+          body: "## Summary\n\nUpdate the machine status page with the latest worker health evidence.\n\n## Evidence\n\n- worker probe\n",
+          diff: "--- a/wiki/Status/Machines.md\n+++ b/wiki/Status/Machines.md\n@@\n-old\n+new worker status\n"
+        });
+      }
       if (req.method === "POST" && url.pathname === "/api/import") {
         return Response.json({ ok: true, artifact_id: "curator-run-notes" });
       }
@@ -2348,6 +2430,7 @@ test("basic loops install the brain-curator routine and curator commands work en
     const shortcut = listText.match(/\/proposal_accept_([a-z0-9]{6,10})_1/);
     expect(shortcut).not.toBeNull();
     const token = shortcut![1];
+    expect(listText).toContain(`/proposal_explain_${token}_1`);
     expect(listText).not.toContain(`/proposal_accept_${token}_2`);
     expect(listText).toContain("merge/enrich first");
 
@@ -2384,6 +2467,15 @@ test("basic loops install the brain-curator routine and curator commands work en
     expect(brainctlCalls).toContain("proposals groups --status open --min-size 2 --json --config");
     expect(brainctlCalls).toContain("proposals batch-merge --limit 100 --auto-threshold 0.8 --json --config");
     expect(brainctlCalls).toContain("proposals batch-merge --submit --limit 100 --auto-threshold 0.8 --json --config");
+
+    await fixture.commands.handleMessage(telegramMessage(`/proposal_explain_${token}_1`, 90));
+    const explainText = fixture.telegram.sent.at(-1)?.text || "";
+    expect(explainText).toContain("Proposal 1: Status update");
+    expect(explainText).toContain("confidence=87%");
+    expect(explainText).toContain("What it says:");
+    expect(explainText).toContain("Update the machine status page");
+    expect(explainText).toContain("Diff: +1/-1");
+    expect(explainText).toContain(`/proposal_accept_${token}_1`);
 
     // Accepting a proposal that carries a wiki change applies it.
     await fixture.commands.handleMessage(telegramMessage(`/proposal_accept_${token}_1`, 90));
