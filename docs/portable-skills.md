@@ -34,27 +34,29 @@ The public bundle intentionally excludes private topology. Do not add real hostn
 
 ## Shared Skill Imports
 
-Use `brainctl import skill` when a skill should become shared-brain material instead of remaining a one-machine local file. Local inputs preserve the local folder as-is; URL inputs fetch from the URL or clone the Git remote when the URL is a repository/tree URL.
+Use `brainctl skills import` when a skill should become shared-brain material instead of remaining a one-machine local file. Local inputs preserve the local folder as-is; URL inputs fetch from the URL or clone the Git remote when the URL is a repository/tree URL.
 
 ```bash
-brainctl import skill ~/.codex/skills/brainstack/SKILL.md \
+brainctl skills import ~/.codex/skills/brainstack/SKILL.md \
   --config ~/.config/brainstack/brainstack.yaml
 
-brainctl import skill ~/.codex/skills/my-private-overlay \
+brainctl skills import ~/.codex/skills/my-private-overlay \
   --config ~/.config/brainstack/brainstack.yaml
 
-brainctl import skill https://github.com/example/brainstack-skill \
+brainctl skills import https://github.com/example/brainstack-skill \
   --config ~/.config/brainstack/brainstack.yaml
 ```
 
-To discover local skills first, use the deterministic bulk planner:
+To discover local skills first, use the deterministic planner:
 
 ```bash
-brainctl import skills --config ~/.config/brainstack/brainstack.yaml
-brainctl import skills --config ~/.config/brainstack/brainstack.yaml --apply
+brainctl skills import --config ~/.config/brainstack/brainstack.yaml
+brainctl skills import ~/.codex/skills --config ~/.config/brainstack/brainstack.yaml
+brainctl skills import ~/.codex/skills --config ~/.config/brainstack/brainstack.yaml --select 1,3
+brainctl skills import ~/.codex/skills --config ~/.config/brainstack/brainstack.yaml --apply
 ```
 
-`import skills` scans the current directory plus the default skill roots for Codex, Claude, and Cursor. It prints a no-side-effect plan by default, groups duplicate skill names deterministically, prefers the current directory over harness home directories, skips unchanged skills already present in the local shared-brain clone, and only writes global shared-brain imports when `--apply` is passed.
+`skills import` with no path scans the current directory plus the default skill roots for Codex, Claude, and Cursor. `skills import <folder>` scans that folder. It prints a numbered plan, groups duplicate skill names deterministically, prefers the current directory over harness home directories, skips unchanged skills already present in the local shared-brain clone, and writes global shared-brain imports when you select numbers interactively, pass `--select`, or pass `--apply`.
 
 Inputs:
 
@@ -69,16 +71,19 @@ Safety flags:
 - `--max-file-bytes N`: per-file cap. Default is 512 KiB.
 - `--allow-private-url`: allow localhost, RFC1918, Tailscale/CGNAT, link-local, and private IPv6 URL fetches for trusted private skill sources. Omit it for normal public URL imports.
 
-Bulk planner flags:
+Planner flags:
 
 - `--target codex|claude|cursor|all`: choose which harness home skill roots to scan. Default is `all`.
 - `--scan-dir DIR`: add another recursive scan root.
 - `--skill NAME`: plan or apply only a named skill.
+- `--select 1,3` or `--select 1-4`: import selected numbered entries.
+- `--apply`: import every proposed entry.
 - `--max-depth N`: cap recursive current-directory scans. Default is 5.
 - `--max-scan-dirs N`: cap scanned directories per root. Default is 1500.
 - `--json`: emit the deterministic plan as JSON.
 - `--force`: include skills whose file content already matches the shared-brain package.
-- `--apply`: enqueue the proposed imports. This makes them global shared-brain material that connected harnesses can refresh.
+
+Compatibility aliases remain available for scripts: `brainctl import skill ...` and `brainctl import skills ...`.
 
 The importer rejects symlinks, hardlinks, non-regular files, traversal paths, oversized packages, and private raw-file URLs unless `--allow-private-url` is explicitly passed. If the shared brain is offline or the import token is missing, the package queues through the normal outbox and can be replayed with `brainctl outbox flush`.
 

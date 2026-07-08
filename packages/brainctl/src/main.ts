@@ -500,6 +500,7 @@ const normalizeHookTarget = skillHookCommands.normalizeHookTarget;
 const skillInstallRootForTarget = skillHookCommands.skillInstallRootForTarget;
 const commandImportSkills = skillHookCommands.commandImportSkills;
 const commandImport = skillHookCommands.commandImport;
+const commandSkillsImport = skillHookCommands.commandSkillsImport;
 const refreshBrainstackSkillPackages = skillHookCommands.refreshBrainstackSkillPackages;
 const skillDirsForDoctor = skillHookCommands.skillDirsForDoctor;
 const commandSkillsDoctor = skillHookCommands.commandSkillsDoctor;
@@ -2728,6 +2729,8 @@ async function commandSkills(args: ParsedArgs): Promise<void> {
       console.log(written.map((path) => `  ${path}`).join("\n"));
       return;
     }
+    case "import":
+      return await commandSkillsImport(args);
     case "refresh": {
       const cfg = await loadConfig(flag(args, "config"), flag(args, "profile") || "client-macos", flag(args, "root"));
       await refreshBrainstackSkillPackages(cfg, args, { quiet: hasFlag(args, "quiet") });
@@ -2738,7 +2741,7 @@ async function commandSkills(args: ParsedArgs): Promise<void> {
     case "help":
     case "--help":
     case "-h":
-      console.log("Usage: brainctl skills install [--target codex] [--profile client|operator|control|worker] [--skill NAME|--all] [--dir DIR] [--dry-run]\n       brainctl skills refresh [--target codex|claude|cursor] [--config brainstack.yaml] [--repo PATH] [--skill NAME] [--dir DIR] [--no-sync] [--force] [--quiet]\n       brainctl skills doctor [--target codex|claude|cursor] [--dir DIR] [--check-remote] [--json]\n       brainctl skills list");
+      console.log("Usage: brainctl skills install [--target codex] [--profile client|operator|control|worker] [--skill NAME|--all] [--dir DIR] [--dry-run]\n       brainctl skills import [PATH_OR_URL] [--config brainstack.yaml] [--select 1,3|all] [--apply] [--json]\n       brainctl skills refresh [--target codex|claude|cursor] [--config brainstack.yaml] [--repo PATH] [--skill NAME] [--dir DIR] [--no-sync] [--force] [--quiet]\n       brainctl skills doctor [--target codex|claude|cursor] [--dir DIR] [--check-remote] [--json]\n       brainctl skills list");
       return;
     default:
       throw new Error(`Unknown skills subcommand: ${subcommand}`);

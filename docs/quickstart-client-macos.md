@@ -184,11 +184,12 @@ Prefer `lifecycle repair` for routine client repair: it refreshes generated runt
 To globalize existing local skills, start with the no-side-effect planner:
 
 ```bash
-brainctl import skills --config ~/.config/brainstack/brainstack.yaml
-brainctl import skills --config ~/.config/brainstack/brainstack.yaml --apply
+brainctl skills import --config ~/.config/brainstack/brainstack.yaml
+brainctl skills import ~/.codex/skills --config ~/.config/brainstack/brainstack.yaml --select 1,3
+brainctl skills import ~/.codex/skills --config ~/.config/brainstack/brainstack.yaml --apply
 ```
 
-The planner scans the current directory plus default Codex, Claude, and Cursor skill roots. `--apply` enqueues the proposed skills as global shared-brain imports so connected harnesses can refresh them on the next prompt or manual `brainctl skills refresh`.
+The planner scans the current directory plus default Codex, Claude, and Cursor skill roots when no folder is passed. Passing a folder scans just that folder. Selecting numbers interactively, using `--select`, or using `--apply` enqueues skills as global shared-brain imports so connected harnesses can refresh them on the next prompt or manual `brainctl skills refresh`.
 
 ## Local Daemon
 

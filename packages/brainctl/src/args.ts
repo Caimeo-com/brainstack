@@ -26,11 +26,10 @@ export function usage(): string {
   brainctl render --config brainstack.yaml --profile ... --out DIR
   brainctl bootstrap-client --profile client-macos --config brainstack.yaml --out DIR
   brainctl skills install [--target codex] [--profile client|operator|control|worker] [--skill NAME|--all] [--dir DIR] [--dry-run]
+  brainctl skills import [PATH_OR_URL] [--config brainstack.yaml] [--select 1,3|all] [--apply] [--json]
   brainctl skills refresh [--target codex|claude|cursor] [--config brainstack.yaml] [--repo PATH] [--skill NAME] [--dir DIR] [--no-sync] [--force] [--quiet]
   brainctl skills doctor [--target codex|claude|cursor] [--dir DIR] [--check-remote] [--json]
   brainctl skills list
-  brainctl import skill <SKILL.md|DIR|URL> --config brainstack.yaml [--title TITLE] [--source-harness HARNESS] [--source-machine MACHINE] [--max-bytes N] [--max-files N] [--allow-private-url] [--allow-ssh-git]
-  brainctl import skills [--config brainstack.yaml] [--target codex|claude|cursor|all] [--scan-dir DIR] [--skill NAME] [--apply] [--json]
   brainctl import codex-session <SESSION_ID|JSONL_PATH> [--config brainstack.yaml] [--include-transcript] [--max-bytes N] [--dry-run] [--json]
   brainctl hooks install|status|remove [--target codex|claude|cursor|all] [--config brainstack.yaml] [--brainctl PATH] [--brainctl-command COMMAND] [--dry-run]
   brainctl hook run --harness codex|claude|cursor --event EVENT [--config brainstack.yaml]

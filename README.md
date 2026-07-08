@@ -32,8 +32,8 @@ bun run packages/brainctl/src/main.ts outbox status --config examples/client-mac
 bun run packages/brainctl/src/main.ts outbox retry import-... --config examples/client-macos.yaml
 bun run packages/brainctl/src/main.ts skills install --target codex --profile client --dry-run
 bun run packages/brainctl/src/main.ts skills doctor --dir ~/.codex/skills
-bun run packages/brainctl/src/main.ts import skills --config ~/.config/brainstack/brainstack.yaml
-bun run packages/brainctl/src/main.ts import skill ~/.codex/skills/brainstack/SKILL.md --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts skills import --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts skills import ~/.codex/skills/brainstack/SKILL.md --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts status --json --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts capabilities install voice --target erbine --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts capabilities uninstall voice --target erbine --remove-files --config ~/.config/brainstack/brainstack.yaml

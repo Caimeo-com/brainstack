@@ -44,16 +44,17 @@ Use `client` for ordinary enrolled machines and `operator` for admins who operat
 Shared skills are imported separately from the embedded public bundle:
 
 ```bash
-brainctl import skill ~/.codex/skills/brainstack/SKILL.md --config ~/.config/brainstack/brainstack.yaml
-brainctl import skill ~/.codex/skills/private-overlay --config ~/.config/brainstack/brainstack.yaml
-brainctl import skill https://github.com/example/skill-repo --config ~/.config/brainstack/brainstack.yaml
-brainctl import skills --config ~/.config/brainstack/brainstack.yaml
-brainctl import skills --config ~/.config/brainstack/brainstack.yaml --apply
+brainctl skills import ~/.codex/skills/brainstack/SKILL.md --config ~/.config/brainstack/brainstack.yaml
+brainctl skills import ~/.codex/skills/private-overlay --config ~/.config/brainstack/brainstack.yaml
+brainctl skills import https://github.com/example/skill-repo --config ~/.config/brainstack/brainstack.yaml
+brainctl skills import --config ~/.config/brainstack/brainstack.yaml
+brainctl skills import ~/.codex/skills --config ~/.config/brainstack/brainstack.yaml --select 1,3
+brainctl skills import ~/.codex/skills --config ~/.config/brainstack/brainstack.yaml --apply
 ```
 
 Local `SKILL.md` inputs package the whole parent skill folder. Directory inputs must contain `SKILL.md`. URL inputs fetch a raw `SKILL.md` or clone a repository/tree URL. Raw-file URL imports block localhost/private network targets by default; pass `--allow-private-url` only for trusted private skill sources. The package is written through the normal import/outbox path with provenance and file hashes; if the brain is offline, flush later with `brainctl outbox flush`.
 
-Use `brainctl import skills` before a broad migration. It scans the current directory plus default Codex, Claude, and Cursor skill roots, prints a deterministic no-side-effect plan, notes duplicate/already-current skills, and only enqueues global shared-brain imports with `--apply`.
+Use `brainctl skills import` before a broad migration. With no path it scans the current directory plus default Codex, Claude, and Cursor skill roots. With a folder it scans that folder. It prints a deterministic numbered plan, notes duplicate/already-current skills, and enqueues global shared-brain imports when the operator selects numbers interactively, passes `--select`, or passes `--apply`.
 
 Connected machines install shared skill packages from their local clone:
 

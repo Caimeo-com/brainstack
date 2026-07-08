@@ -771,6 +771,26 @@ describe("brainctl install safety", () => {
       expect(skipped.some((item) => item.name === "already-skill" && String(item.reason).includes("already in shared brain"))).toBe(true);
       expect(skipped.some((item) => item.name === "shared-skill" && String(item.reason).includes("duplicate skill name"))).toBe(true);
 
+      const folderPlan = runCommand(["bun", "run", BRAINCTL, "skills", "import", join(cwd, "packages", "skills"), "--config", configPath, "--json"], { cwd, env });
+      expectSuccess(folderPlan);
+      const folderPlanBody = JSON.parse(folderPlan.stdout) as Record<string, unknown>;
+      expect((folderPlanBody.proposed as Array<Record<string, unknown>>).map((item) => item.name)).toEqual(["shared-skill"]);
+      expect((folderPlanBody.scan_roots as Array<Record<string, unknown>>).map((item) => item.source)).toEqual(["arg:1"]);
+
+      const selectedFolderImport = runCommand(["bun", "run", BRAINCTL, "skills", "import", join(cwd, "packages", "skills"), "--config", configPath, "--select", "1", "--json"], { cwd, env });
+      expectSuccess(selectedFolderImport);
+      const selectedFolderBody = JSON.parse(selectedFolderImport.stdout) as Record<string, unknown>;
+      expect(selectedFolderBody.applied).toEqual(["shared-skill"]);
+      const selectedFolderPayload = await readQueuedPayloadFromOutput(`${selectedFolderImport.stdout}\n${selectedFolderImport.stderr}`);
+      const selectedFolderPackage = JSON.parse(String(selectedFolderPayload.text)) as Record<string, unknown>;
+      expect((selectedFolderPackage.files as Array<Record<string, unknown>>).map((file) => file.path)).toEqual(["SKILL.md", "guide.md"]);
+
+      const selectedFileImport = runCommand(["bun", "run", BRAINCTL, "skills", "import", join(cwd, "packages", "skills", "shared-skill", "SKILL.md"), "--config", configPath, "--select", "1", "--json"], { cwd, env });
+      expectSuccess(selectedFileImport);
+      const selectedFilePayload = await readQueuedPayloadFromOutput(`${selectedFileImport.stdout}\n${selectedFileImport.stderr}`);
+      const selectedFilePackage = JSON.parse(String(selectedFilePayload.text)) as Record<string, unknown>;
+      expect((selectedFilePackage.files as Array<Record<string, unknown>>).map((file) => file.path)).toEqual(["SKILL.md", "guide.md"]);
+
       const apply = runCommand(["bun", "run", BRAINCTL, "import", "skills", "--config", configPath, "--skill", "shared-skill", "--apply", "--json"], { cwd, env });
       expectSuccess(apply);
       const applyBody = JSON.parse(apply.stdout) as Record<string, unknown>;

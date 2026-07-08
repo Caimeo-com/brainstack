@@ -32,10 +32,11 @@ Use `--skill NAME` for a smaller explicit install, `--all` for every public skil
 Shared-brain skill imports use a separate path:
 
 ```bash
-brainctl import skill ~/.codex/skills/brainstack/SKILL.md --config ~/.config/brainstack/brainstack.yaml
-brainctl import skill https://github.com/example/skill-repo --config ~/.config/brainstack/brainstack.yaml
-brainctl import skills --config ~/.config/brainstack/brainstack.yaml
-brainctl import skills --config ~/.config/brainstack/brainstack.yaml --apply
+brainctl skills import ~/.codex/skills/brainstack/SKILL.md --config ~/.config/brainstack/brainstack.yaml
+brainctl skills import https://github.com/example/skill-repo --config ~/.config/brainstack/brainstack.yaml
+brainctl skills import --config ~/.config/brainstack/brainstack.yaml
+brainctl skills import ~/.codex/skills --config ~/.config/brainstack/brainstack.yaml --select 1,3
+brainctl skills import ~/.codex/skills --config ~/.config/brainstack/brainstack.yaml --apply
 brainctl lifecycle repair --config ~/.config/brainstack/brainstack.yaml
 brainctl skills refresh --config ~/.config/brainstack/brainstack.yaml --target codex
 brainctl skills doctor --dir ~/.codex/skills --check-remote
@@ -43,7 +44,7 @@ brainctl skills doctor --dir ~/.codex/skills --check-remote
 
 Local `SKILL.md` inputs package the whole parent folder. Directory inputs must contain `SKILL.md`. URL inputs fetch a raw skill file or clone a repository/tree URL. Raw-file URL imports block private network targets by default; use `--allow-private-url` only for trusted private sources. `lifecycle repair` is the routine installed-machine repair path; narrow `skills refresh` installs validated shared skill packages from the local shared-brain clone and refuses to overwrite unmarked local skill directories unless `--force` is passed.
 
-`import skills` is the no-side-effect bulk planner. It scans the current directory plus default Codex, Claude, and Cursor skill roots, reports which skills would become global shared-brain imports, notes duplicate and already-current skills, and writes only when `--apply` is passed.
+`skills import` is the shared-skill planner. With no path it scans the current directory plus default Codex, Claude, and Cursor skill roots; with a folder it scans that folder. It reports which skills would become global shared-brain imports, notes duplicate and already-current skills, and writes when you select numbers interactively, pass `--select`, or pass `--apply`.
 
 Harness hooks can run refresh in the background:
 

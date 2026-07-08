@@ -414,8 +414,35 @@ interface SkillPackageFile {
     return [normalizeHookTarget(target)];
   }
 
-  function skillScanRoots(args: ParsedArgs, targets: HookTarget[]): Array<{ source: string; path: string; priority: number; recursive: boolean }> {
-    const roots: Array<{ source: string; path: string; priority: number; recursive: boolean }> = [];
+  function isCanonicalSkillsImport(args: ParsedArgs): boolean {
+    return args.command === "skills" && args.positional[0] === "import";
+  }
+
+  function explicitSkillImportSources(args: ParsedArgs): string[] {
+    if (!isCanonicalSkillsImport(args)) {
+      return [];
+    }
+    const sources = args.positional.slice(1).filter(Boolean);
+    const flagSource = requireFlagValue(args, "source");
+    if (flagSource) {
+      sources.push(flagSource);
+    }
+    return sources;
+  }
+
+  function skillScanRoots(args: ParsedArgs, targets: HookTarget[]): Array<{ source: string; path: string; priority: number; recursive: boolean; explicit?: boolean }> {
+    const explicitSources = explicitSkillImportSources(args).filter((source) => !isUrlLikeSkillSource(source));
+    if (explicitSources.length) {
+      return explicitSources.map((source, index) => ({
+        source: `arg:${index + 1}`,
+        path: abs(source),
+        priority: index,
+        recursive: true,
+        explicit: true
+      }));
+    }
+
+    const roots: Array<{ source: string; path: string; priority: number; recursive: boolean; explicit?: boolean }> = [];
     if (!hasFlag(args, "no-current")) {
       roots.push({ source: "cwd", path: process.cwd(), priority: 0, recursive: true });
     }
@@ -433,14 +460,40 @@ interface SkillPackageFile {
 
   async function discoverSkillRootsInTree(
     root: string,
-    options: { maxDepth: number; maxDirs: number; recursive: boolean }
+    options: { maxDepth: number; maxDirs: number; recursive: boolean; warnMissing?: boolean }
   ): Promise<{ roots: string[]; warnings: string[] }> {
     const warnings: string[] = [];
     const discovered: string[] = [];
     const absoluteRoot = abs(root);
     if (!existsSync(absoluteRoot)) {
+      if (options.warnMissing) {
+        warnings.push(`scan root does not exist: ${absoluteRoot}`);
+      }
       return { roots: [], warnings };
     }
+    const initialInfo = await lstat(absoluteRoot).catch((error) => {
+      warnings.push(`scan skipped unreadable path ${absoluteRoot}: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    });
+    if (!initialInfo) {
+      return { roots: [], warnings };
+    }
+    if (initialInfo.isSymbolicLink()) {
+      warnings.push(`scan skipped symlink path ${absoluteRoot}`);
+      return { roots: [], warnings };
+    }
+    if (initialInfo.isFile()) {
+      if (basename(absoluteRoot) !== "SKILL.md") {
+        warnings.push(`scan input is a file, not SKILL.md: ${absoluteRoot}`);
+        return { roots: [], warnings };
+      }
+      return { roots: [await realpath(dirname(absoluteRoot))], warnings };
+    }
+    if (!initialInfo.isDirectory()) {
+      warnings.push(`scan input is not a directory or SKILL.md file: ${absoluteRoot}`);
+      return { roots: [], warnings };
+    }
+
     let scannedDirs = 0;
     let truncated = false;
     async function walk(dir: string, depth: number): Promise<void> {
@@ -556,7 +609,12 @@ interface SkillPackageFile {
     const rootsByPath = new Map<string, { root: string; sources: Set<string>; priority: number }>();
     const rejected: SkillImportRejectedCandidate[] = [];
     for (const scanRoot of roots) {
-      const discovered = await discoverSkillRootsInTree(scanRoot.path, { maxDepth, maxDirs: maxScanDirs, recursive: scanRoot.recursive });
+      const discovered = await discoverSkillRootsInTree(scanRoot.path, {
+        maxDepth,
+        maxDirs: maxScanDirs,
+        recursive: scanRoot.recursive,
+        warnMissing: Boolean(scanRoot.explicit)
+      });
       warnings.push(...discovered.warnings);
       for (const root of discovered.roots) {
         const current = rootsByPath.get(root);
@@ -622,9 +680,10 @@ interface SkillPackageFile {
     };
   }
 
-  function formatSkillImportCandidate(candidate: SkillImportScanCandidate): string {
+  function formatSkillImportCandidate(candidate: SkillImportScanCandidate, index?: number): string {
     const description = candidate.description ? ` - ${candidate.description}` : "";
-    return `  ${candidate.name} [${candidate.action}] ${candidate.root}${description} files=${candidate.file_count} bytes=${candidate.total_bytes} sources=${candidate.sources.join(",")}`;
+    const prefix = index === undefined ? "  -" : `  ${index})`;
+    return `${prefix} ${candidate.name} [${candidate.action}] ${candidate.root}${description} files=${candidate.file_count} bytes=${candidate.total_bytes} sources=${candidate.sources.join(",")}`;
   }
 
   function formatSkillImportPlan(plan: SkillImportPlan): string {
@@ -637,7 +696,7 @@ interface SkillPackageFile {
       ...plan.scan_roots.map((root) => `  ${root.source}: ${root.path}${root.exists ? "" : " (missing)"}`),
       "",
       "Proposed global imports:",
-      ...(plan.proposed.length ? plan.proposed.map(formatSkillImportCandidate) : ["  (none)"])
+      ...(plan.proposed.length ? plan.proposed.map((candidate, index) => formatSkillImportCandidate(candidate, index + 1)) : ["  (none)"])
     ];
     if (plan.skipped.length) {
       lines.push("", "Skipped:", ...plan.skipped.map((candidate) => `${formatSkillImportCandidate(candidate)} reason=${candidate.reason}`));
@@ -651,36 +710,114 @@ interface SkillPackageFile {
     if (plan.applied.length) {
       lines.push("", `Applied imports: ${plan.applied.join(", ")}`);
     } else if (!plan.apply) {
-      lines.push("", "No imports were written. Rerun with --apply to enqueue the proposed global shared-brain skill imports.");
+      lines.push("", "No imports were written. Rerun with --select 1,3 or --apply to enqueue proposed global shared-brain skill imports.");
     }
     return lines.join("\n");
   }
 
-  async function commandImportSkills(args: ParsedArgs): Promise<void> {
+  function parseSkillImportSelection(raw: string, count: number): number[] {
+    const trimmed = raw.trim().toLowerCase();
+    if (!trimmed || trimmed === "none" || trimmed === "cancel" || trimmed === "q" || trimmed === "quit") {
+      return [];
+    }
+    if (trimmed === "all" || trimmed === "*") {
+      return Array.from({ length: count }, (_value, index) => index);
+    }
+    const selected = new Set<number>();
+    for (const token of trimmed.split(/[\s,]+/).filter(Boolean)) {
+      const range = token.match(/^(\d+)-(\d+)$/);
+      if (range) {
+        const start = Number(range[1]);
+        const end = Number(range[2]);
+        if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start || end > count) {
+          throw new Error(`invalid skill selection range: ${token}`);
+        }
+        for (let value = start; value <= end; value += 1) {
+          selected.add(value - 1);
+        }
+        continue;
+      }
+      const value = Number(token);
+      if (!Number.isSafeInteger(value) || value < 1 || value > count) {
+        throw new Error(`invalid skill selection: ${token}`);
+      }
+      selected.add(value - 1);
+    }
+    return [...selected].sort((a, b) => a - b);
+  }
+
+  async function promptSkillImportSelection(count: number): Promise<number[]> {
+    if (!count || !process.stdin.isTTY || !process.stdout.isTTY) {
+      return [];
+    }
+    const { createInterface } = await import("node:readline/promises");
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      const answer = await rl.question('Import which skills? Enter numbers/ranges, "all", or blank to cancel: ');
+      return parseSkillImportSelection(answer, count);
+    } finally {
+      rl.close();
+    }
+  }
+
+  function selectedSkillImportIndexes(args: ParsedArgs, count: number): number[] | null {
+    const rawValues = flagValues(args, "select");
+    if (!rawValues.length) {
+      return null;
+    }
+    return parseSkillImportSelection(rawValues.join(","), count);
+  }
+
+  async function applySkillImportPlan(cfg: BrainstackConfig, args: ParsedArgs, plan: SkillImportPlan, indexes: number[]): Promise<void> {
+    const maxBytes = parsePositiveIntegerFlag(args, "max-bytes", SKILL_IMPORT_DEFAULT_MAX_BYTES);
+    const maxFiles = parsePositiveIntegerFlag(args, "max-files", SKILL_IMPORT_DEFAULT_MAX_FILES);
+    const maxFileBytes = parsePositiveIntegerFlag(args, "max-file-bytes", Math.min(SKILL_IMPORT_DEFAULT_MAX_FILE_BYTES, maxBytes));
+    for (const index of indexes) {
+      const candidate = plan.proposed[index];
+      if (!candidate) {
+        throw new Error(`invalid skill selection index: ${index + 1}`);
+      }
+      const pkg = await buildLocalSkillPackage(candidate.root, { maxBytes, maxFiles, maxFileBytes });
+      await postBrainWriteOrQueue(cfg, "import", {
+        title: `Skill import: ${pkg.name}`,
+        text: `${JSON.stringify(pkg, null, 2)}\n`,
+        source_harness: requireFlagValue(args, "source-harness") || cfg.harness.name,
+        source_machine: requireFlagValue(args, "source-machine") || cfg.machine.name,
+        source_type: "skill",
+        tags: ["brainstack", "brainstack-skill", `skill:${pkg.name}`]
+      });
+      plan.applied.push(pkg.name);
+    }
+  }
+
+  async function runSkillImportPlan(args: ParsedArgs, options: { interactive: boolean }): Promise<void> {
     const cfg = await loadConfig(flag(args, "config"), flag(args, "profile") || "client-macos", flag(args, "root"));
     const plan = await buildSkillImportPlan(cfg, args);
-    if (plan.apply) {
-      const maxBytes = parsePositiveIntegerFlag(args, "max-bytes", SKILL_IMPORT_DEFAULT_MAX_BYTES);
-      const maxFiles = parsePositiveIntegerFlag(args, "max-files", SKILL_IMPORT_DEFAULT_MAX_FILES);
-      const maxFileBytes = parsePositiveIntegerFlag(args, "max-file-bytes", Math.min(SKILL_IMPORT_DEFAULT_MAX_FILE_BYTES, maxBytes));
-      for (const candidate of plan.proposed) {
-        const pkg = await buildLocalSkillPackage(candidate.root, { maxBytes, maxFiles, maxFileBytes });
-        await postBrainWriteOrQueue(cfg, "import", {
-          title: `Skill import: ${pkg.name}`,
-          text: `${JSON.stringify(pkg, null, 2)}\n`,
-          source_harness: requireFlagValue(args, "source-harness") || cfg.harness.name,
-          source_machine: requireFlagValue(args, "source-machine") || cfg.machine.name,
-          source_type: "skill",
-          tags: ["brainstack", "brainstack-skill", `skill:${pkg.name}`]
-        });
-        plan.applied.push(pkg.name);
-      }
+    let printedPlanBeforePrompt = false;
+    let indexes = selectedSkillImportIndexes(args, plan.proposed.length);
+    if (!indexes && plan.apply) {
+      indexes = Array.from({ length: plan.proposed.length }, (_value, index) => index);
+    }
+    if (!indexes && options.interactive && !hasFlag(args, "json")) {
+      console.log(formatSkillImportPlan(plan));
+      printedPlanBeforePrompt = true;
+      indexes = await promptSkillImportSelection(plan.proposed.length);
+    }
+    if (indexes) {
+      plan.apply = indexes.length > 0;
+      await applySkillImportPlan(cfg, args, plan, indexes);
     }
     if (hasFlag(args, "json")) {
       console.log(JSON.stringify(plan, null, 2));
-    } else {
+    } else if (printedPlanBeforePrompt && plan.applied.length) {
+      console.log(`Applied imports: ${plan.applied.join(", ")}`);
+    } else if (!printedPlanBeforePrompt) {
       console.log(formatSkillImportPlan(plan));
     }
+  }
+
+  async function commandImportSkills(args: ParsedArgs): Promise<void> {
+    await runSkillImportPlan(args, { interactive: false });
   }
 
   function githubSkillUrl(input: string): { kind: "raw"; url: string } | { kind: "git"; remote: string; ref?: string; subdir?: string } | null {
@@ -1041,7 +1178,7 @@ interface SkillPackageFile {
     }
     if (subcommand !== "skill") {
       if (subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
-        console.log("Usage: brainctl import skill <SKILL.md|DIR|URL> --config brainstack.yaml [--title TITLE] [--source-harness HARNESS] [--source-machine MACHINE] [--max-bytes N] [--max-files N] [--allow-private-url] [--allow-ssh-git]\n       brainctl import skills [--config brainstack.yaml] [--target codex|claude|cursor|all] [--scan-dir DIR] [--skill NAME] [--apply] [--json]\n       brainctl import codex-session <SESSION_ID|JSONL_PATH> [--config brainstack.yaml] [--include-transcript] [--max-bytes N] [--dry-run] [--json]");
+        console.log("Usage: brainctl import codex-session <SESSION_ID|JSONL_PATH> [--config brainstack.yaml] [--include-transcript] [--max-bytes N] [--dry-run] [--json]\n       brainctl skills import [PATH_OR_URL] [--config brainstack.yaml] [--select 1,3|all] [--apply] [--json]\n\nLegacy aliases still work for scripts: brainctl import skill ... and brainctl import skills ...");
         return;
       }
       throw new Error(`Unknown import subcommand: ${subcommand}`);
@@ -1070,6 +1207,19 @@ interface SkillPackageFile {
       tags: ["brainstack", "brainstack-skill", `skill:${pkg.name}`]
     });
     console.log(`skill_package=${pkg.name} files=${pkg.files.length} sha256=${pkg.package_sha256}`);
+  }
+
+  async function commandSkillsImport(args: ParsedArgs): Promise<void> {
+    const sources = explicitSkillImportSources(args);
+    const urlSources = sources.filter(isUrlLikeSkillSource);
+    if (urlSources.length) {
+      if (sources.length > 1) {
+        throw new Error("skills import accepts either one URL or local file/folder sources, not both");
+      }
+      await commandImport({ ...args, positional: ["skill", urlSources[0]] });
+      return;
+    }
+    await runSkillImportPlan(args, { interactive: true });
   }
 
   function safeRepoRelativeFile(repo: string, repoPath: string): string {
@@ -2066,6 +2216,7 @@ interface SkillPackageFile {
     skillInstallRootForTarget,
     commandImportSkills,
     commandImport,
+    commandSkillsImport,
     refreshBrainstackSkillPackages,
     skillDirsForDoctor,
     commandSkillsDoctor,
