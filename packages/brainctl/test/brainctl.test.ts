@@ -9,6 +9,7 @@ const suiteFiles = [
   "install-safety.suite.ts",
   "braind-write-safety.suite.ts",
   "uploads.suite.ts",
+  "context-packs.suite.ts",
   "public-release-bootstrap.suite.ts",
   "public-release-context-outbox.suite.ts",
   "public-release-fleet-invite.suite.ts"

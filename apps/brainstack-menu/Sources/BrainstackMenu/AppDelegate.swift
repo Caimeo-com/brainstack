@@ -43,6 +43,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         },
         openUploads: { [weak self] in
           self?.openUploads()
+        },
+        openFolderPacks: { [weak self] in
+          self?.openFolderPacks()
+        },
+        openSkillsImport: { [weak self] in
+          self?.openSkillsImport()
         }
       )
     )
@@ -287,6 +293,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
   private var operatorConsoleWindow: NSWindow?
   private var uploadsWindow: NSWindow?
+  private var folderPacksWindow: NSWindow?
+  private var skillsImportWindow: NSWindow?
 
   /// The dedicated operator window: full proposal review surface, kept out of the
   /// popover so the menu stays a status glance.
@@ -324,6 +332,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
       uploadsWindow = window
     }
     uploadsWindow?.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
+
+  func openFolderPacks() {
+    if popover.isShown {
+      popover.performClose(nil)
+    }
+    if folderPacksWindow == nil {
+      let hosting = NSHostingController(rootView: FolderPacksView(model: model))
+      let window = NSWindow(contentViewController: hosting)
+      window.title = "Brainstack Folder Packs"
+      window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
+      window.setContentSize(NSSize(width: 760, height: 560))
+      window.isReleasedWhenClosed = false
+      window.center()
+      folderPacksWindow = window
+    }
+    folderPacksWindow?.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
+
+  func openSkillsImport() {
+    if popover.isShown {
+      popover.performClose(nil)
+    }
+    if skillsImportWindow == nil {
+      let hosting = NSHostingController(rootView: SkillsImportView(model: model))
+      let window = NSWindow(contentViewController: hosting)
+      window.title = "Brainstack Skills Import"
+      window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
+      window.setContentSize(NSSize(width: 760, height: 560))
+      window.isReleasedWhenClosed = false
+      window.center()
+      skillsImportWindow = window
+    }
+    skillsImportWindow?.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
   }
 

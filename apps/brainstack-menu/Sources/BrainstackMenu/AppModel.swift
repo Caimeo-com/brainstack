@@ -21,6 +21,15 @@ final class AppModel: ObservableObject {
   @Published private(set) var uploadsError: String?
   @Published private(set) var isLoadingUploads = false
   @Published private(set) var isUploading = false
+  @Published private(set) var contextPacks: [ContextPackSummary] = []
+  @Published private(set) var contextPacksError: String?
+  @Published private(set) var isLoadingContextPacks = false
+  @Published private(set) var isSyncingContextPack = false
+  @Published private(set) var skillImportPlan: SkillImportPlan?
+  @Published private(set) var skillImportSourcePath = ""
+  @Published private(set) var skillImportError: String?
+  @Published private(set) var isLoadingSkillImportPlan = false
+  @Published private(set) var isImportingSkills = false
   @Published private(set) var adminAvailability: AdminAvailability = .unknown
   @Published private(set) var proposalDetails: [String: ProposalDetail] = [:]
   @Published private(set) var loadingDetailId: String?
@@ -514,6 +523,298 @@ final class AppModel: ObservableObject {
         self.record(outcome)
         self.uploadsError = outcome.succeeded ? nil : outcome.summary
         self.loadUploads(machine: upload.machine)
+      }
+    }
+  }
+
+  // MARK: - Folder packs
+
+  func loadContextPacks(machine: String) {
+    guard let client = client() else {
+      contextPacksError = "brainctl is missing; choose the binary in Preferences."
+      contextPacks = []
+      return
+    }
+    guard !isLoadingContextPacks else {
+      return
+    }
+    isLoadingContextPacks = true
+    Task {
+      let (parsed, outcome) = await client.fetchContextPacks(machine: machine)
+      await MainActor.run {
+        self.isLoadingContextPacks = false
+        self.lastDurations["context-packs list"] = outcome.duration
+        if let parsed {
+          self.contextPacks = parsed
+          self.contextPacksError = nil
+        } else {
+          self.contextPacks = []
+          self.contextPacksError = outcome.succeeded ? "Could not parse folder packs." : outcome.summary
+          self.record(outcome)
+        }
+      }
+    }
+  }
+
+  func addContextPack(folder: URL, machine: String, name: String) {
+    guard let client = client() else {
+      contextPacksError = "brainctl is missing; choose the binary in Preferences."
+      return
+    }
+    let packName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !packName.isEmpty else {
+      contextPacksError = "Folder pack needs a name."
+      return
+    }
+    guard !isSyncingContextPack else {
+      contextPacksError = "A folder pack operation is already running."
+      return
+    }
+    isSyncingContextPack = true
+    contextPacksError = nil
+    Task {
+      let (preflight, preflightOutcome) = await client.preflightContextPack(machine: machine, name: packName, path: folder.path)
+      let shouldContinue = await MainActor.run {
+        self.record(preflightOutcome)
+        if !preflightOutcome.succeeded {
+          self.isSyncingContextPack = false
+          self.contextPacksError = preflightOutcome.summary
+          return false
+        }
+        guard let preflight else {
+          self.isSyncingContextPack = false
+          self.contextPacksError = "Could not parse folder pack preflight."
+          return false
+        }
+        return Confirm.ask(
+          title: "Sync Folder Pack",
+          message: self.contextPackPreflightMessage(preflight)
+        )
+      }
+      guard shouldContinue else {
+        await MainActor.run {
+          self.isSyncingContextPack = false
+        }
+        return
+      }
+      let outcome = await client.putContextPack(machine: machine, name: packName, path: folder.path)
+      await MainActor.run {
+        self.isSyncingContextPack = false
+        self.record(outcome)
+        self.contextPacksError = outcome.succeeded ? nil : outcome.summary
+        self.loadContextPacks(machine: machine)
+      }
+    }
+  }
+
+  func syncContextPack(_ pack: ContextPackSummary) {
+    guard let client = client() else {
+      contextPacksError = "brainctl is missing; choose the binary in Preferences."
+      return
+    }
+    guard !isSyncingContextPack else {
+      contextPacksError = "A folder pack operation is already running."
+      return
+    }
+    isSyncingContextPack = true
+    contextPacksError = nil
+    Task {
+      let outcome = await client.syncContextPack(machine: pack.machine, name: pack.safeName)
+      await MainActor.run {
+        self.isSyncingContextPack = false
+        self.record(outcome)
+        self.contextPacksError = outcome.succeeded ? nil : self.contextPackFriendlyError(outcome, pack: pack)
+        self.loadContextPacks(machine: pack.machine)
+      }
+    }
+  }
+
+  func attachContextPack(_ pack: ContextPackSummary, context: String) {
+    let slug = context.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !slug.isEmpty else {
+      contextPacksError = "Enter a context slug to attach this pack."
+      return
+    }
+    guard let client = client() else {
+      contextPacksError = "brainctl is missing; choose the binary in Preferences."
+      return
+    }
+    guard !isSyncingContextPack else {
+      contextPacksError = "A folder pack operation is already running."
+      return
+    }
+    isSyncingContextPack = true
+    contextPacksError = nil
+    Task {
+      let outcome = await client.attachContextPack(context: slug, machine: pack.machine, name: pack.safeName)
+      await MainActor.run {
+        self.isSyncingContextPack = false
+        self.record(outcome)
+        self.contextPacksError = outcome.succeeded ? nil : outcome.summary
+      }
+    }
+  }
+
+  func detachContextPack(_ pack: ContextPackSummary, context: String) {
+    let slug = context.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !slug.isEmpty else {
+      contextPacksError = "Enter a context slug to detach this pack."
+      return
+    }
+    guard let client = client() else {
+      contextPacksError = "brainctl is missing; choose the binary in Preferences."
+      return
+    }
+    guard !isSyncingContextPack else {
+      contextPacksError = "A folder pack operation is already running."
+      return
+    }
+    isSyncingContextPack = true
+    contextPacksError = nil
+    Task {
+      let outcome = await client.detachContextPack(context: slug, machine: pack.machine, name: pack.safeName)
+      await MainActor.run {
+        self.isSyncingContextPack = false
+        self.record(outcome)
+        self.contextPacksError = outcome.succeeded ? nil : outcome.summary
+      }
+    }
+  }
+
+  func deleteContextPack(_ pack: ContextPackSummary) {
+    guard let client = client() else {
+      contextPacksError = "brainctl is missing; choose the binary in Preferences."
+      return
+    }
+    guard !isSyncingContextPack else {
+      contextPacksError = "A folder pack operation is already running."
+      return
+    }
+    isSyncingContextPack = true
+    Task {
+      let outcome = await client.deleteContextPack(machine: pack.machine, name: pack.safeName)
+      await MainActor.run {
+        self.isSyncingContextPack = false
+        self.record(outcome)
+        self.contextPacksError = outcome.succeeded ? nil : outcome.summary
+        self.loadContextPacks(machine: pack.machine)
+      }
+    }
+  }
+
+  func gcContextPacks(machine: String, delete: Bool) {
+    guard let client = client() else {
+      contextPacksError = "brainctl is missing; choose the binary in Preferences."
+      return
+    }
+    guard !isSyncingContextPack else {
+      contextPacksError = "A folder pack operation is already running."
+      return
+    }
+    isSyncingContextPack = true
+    contextPacksError = nil
+    Task {
+      let outcome = await client.gcContextPacks(machine: machine, delete: delete)
+      await MainActor.run {
+        self.isSyncingContextPack = false
+        self.record(outcome)
+        self.contextPacksError = outcome.succeeded ? nil : outcome.summary
+        self.loadContextPacks(machine: machine)
+      }
+    }
+  }
+
+  private func contextPackPreflightMessage(_ pack: ContextPackSummary) -> String {
+    var lines = [
+      "Sync \(pack.displayName) to \(pack.machine)?",
+      "",
+      "Files: \(pack.fileCount)",
+      "Size: \(pack.formattedSize)",
+      "Destination free: \(pack.formattedFreeSpace)",
+      "Source: \(pack.sourceMachine.isEmpty ? "this Mac" : pack.sourceMachine)",
+      "",
+      "Brainstack will copy the included files with rsync into a stable current/ folder. Prompts receive only the folder path and metadata."
+    ]
+    if !pack.warnings.isEmpty {
+      lines.append("")
+      lines.append("Warnings:")
+      lines.append(contentsOf: pack.warnings.map { "- \($0)" })
+    }
+    return lines.joined(separator: "\n")
+  }
+
+  private func contextPackFriendlyError(_ outcome: ActionOutcome, pack: ContextPackSummary? = nil) -> String {
+    let combined = "\(outcome.summary)\n\(outcome.output)"
+    if combined.contains("No local source definition exists") {
+      let packName = pack?.displayName ?? "this pack"
+      let source = pack?.sourceMachine.isEmpty == false ? pack!.sourceMachine : "the source machine"
+      let synced = pack?.refreshedAt.isEmpty == false ? " Last synced: \(pack!.refreshedAt)." : ""
+      return "\(packName) is owned by \(source), so this Mac cannot refresh it directly.\(synced) Use the last synced copy, or run Sync Now on the source machine."
+    }
+    return outcome.summary
+  }
+
+  // MARK: - Skills import
+
+  func loadSkillImportPlan(sourcePath: String?) {
+    guard let client = client() else {
+      skillImportError = "brainctl is missing; choose the binary in Preferences."
+      skillImportPlan = nil
+      return
+    }
+    guard !isLoadingSkillImportPlan else {
+      return
+    }
+    let trimmed = sourcePath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    skillImportSourcePath = trimmed
+    isLoadingSkillImportPlan = true
+    skillImportError = nil
+    Task {
+      let (plan, outcome) = await client.fetchSkillImportPlan(sourcePath: trimmed.isEmpty ? nil : trimmed)
+      await MainActor.run {
+        self.isLoadingSkillImportPlan = false
+        self.lastDurations["skills import plan"] = outcome.duration
+        if let plan {
+          self.skillImportPlan = plan
+          self.skillImportError = nil
+        } else {
+          self.skillImportPlan = nil
+          self.skillImportError = outcome.succeeded ? "Could not parse the skill import plan." : outcome.summary
+          self.record(outcome)
+        }
+      }
+    }
+  }
+
+  func importSkills(indexes: [Int]) {
+    guard !indexes.isEmpty else {
+      skillImportError = "Select at least one skill to import."
+      return
+    }
+    guard let client = client() else {
+      skillImportError = "brainctl is missing; choose the binary in Preferences."
+      return
+    }
+    guard !isImportingSkills else {
+      skillImportError = "A skill import is already running."
+      return
+    }
+    let source = skillImportSourcePath.trimmingCharacters(in: .whitespacesAndNewlines)
+    isImportingSkills = true
+    skillImportError = nil
+    Task {
+      let outcome = await client.importSelectedSkills(sourcePath: source.isEmpty ? nil : source, indexes: indexes)
+      await MainActor.run {
+        self.isImportingSkills = false
+        self.record(outcome)
+        if outcome.succeeded {
+          self.pendingVerificationSections.insert("skills")
+          self.skillImportError = nil
+          self.loadSkillImportPlan(sourcePath: source.isEmpty ? nil : source)
+          self.refresh()
+        } else {
+          self.skillImportError = outcome.summary
+        }
       }
     }
   }

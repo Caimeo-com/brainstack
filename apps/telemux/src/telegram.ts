@@ -34,6 +34,7 @@ export const TELEGRAM_BOT_COMMANDS: TelegramBotCommand[] = [
   { command: "updates", description: "Show manual update and harness version status" },
   { command: "voice", description: "Install or check voice transcription" },
   { command: "uploads", description: "List recent Brainstack uploads" },
+  { command: "packs", description: "List or use Brainstack folder packs" },
   { command: "context", description: "Show current context, runtime, and session state" },
   { command: "compact", description: "Compact the current Codex thread when supported" },
   { command: "crons", description: "List scheduled jobs for this topic/context" },

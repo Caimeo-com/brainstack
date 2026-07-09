@@ -20,6 +20,13 @@ export function usage(): string {
   brainctl uploads put --machine MACHINE --file PATH [--label TEXT] [--json]
   brainctl uploads list [--machine MACHINE] [--recent] [--limit N] [--json]
   brainctl uploads rm --machine MACHINE --id UPLOAD_ID [--json]
+  brainctl context-packs put --machine MACHINE --name NAME --dir DIR [--include GLOB] [--exclude GLOB] [--allow-sensitive] [--dry-run] [--json]
+  brainctl context-packs sync --machine MACHINE --name NAME [--dir DIR] [--dry-run] [--json]
+  brainctl context-packs list [--machine MACHINE] [--json]
+  brainctl context-packs attach --context SLUG --machine MACHINE --name NAME [--json]
+  brainctl context-packs detach --context SLUG --name NAME [--machine MACHINE] [--json]
+  brainctl context-packs rm --machine MACHINE --name NAME [--json]
+  brainctl context-packs gc [--machine MACHINE] [--yes] [--json]
   brainctl expose tailscale --config brainstack.yaml --dry-run|--apply
   brainctl backup --config brainstack.yaml [--out DIR] [--pause-telemux]
   brainctl restore --backup DIR_OR_TGZ --target DIR [--apply]

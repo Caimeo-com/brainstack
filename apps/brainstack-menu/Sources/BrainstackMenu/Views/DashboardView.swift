@@ -15,6 +15,8 @@ struct DashboardView: View {
   var openInstaller: () -> Void
   var openOperatorConsole: () -> Void
   var openUploads: () -> Void
+  var openFolderPacks: () -> Void
+  var openSkillsImport: () -> Void
   // Start with a plausible height so the popover doesn't open tiny and balloon a
   // moment later (which can make AppKit re-place it).
   @State private var scrollContentHeight: CGFloat = 360
@@ -115,6 +117,7 @@ struct DashboardView: View {
       Section("Open") {
         Button("Wiki") { model.openWiki() }
         Button("Uploads…") { openUploads() }
+        Button("Folder Packs…") { openFolderPacks() }
         Button("Shared Brain Folder") { model.openSharedBrainFolder() }
         Button("Config Folder") { model.openConfigFolder() }
         if model.operatorModeEnabled {
@@ -132,6 +135,7 @@ struct DashboardView: View {
         if model.operatorModeEnabled, let discardRepair = outboxDiscardRepair {
           Button("Discard Saved Writes…") { performRepair(discardRepair) }
         }
+        Button("Import Skills…") { openSkillsImport() }
         Button("Refresh Skills…") { performRepair(.refreshSkills) }
         Button("Install/Restart Daemon…") { performRepair(.restartDaemon) }
         Button("Install/Repair Hooks…") { performRepair(.repairHooks) }

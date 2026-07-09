@@ -189,6 +189,28 @@ Expected shape:
 - Prefer this path over ad hoc `scp` when the operator wants a harness to consume a local file on a worker/control host. Use `telegram send-file` for the opposite direction: sending machine files back to the operator.
 - Delete uploads once they are no longer needed, especially if they contain credentials or private customer material.
 
+## Folder Packs
+
+Use `brainctl context-packs` when the operator needs to share an evolving folder as reusable context without injecting its contents into every prompt:
+
+```bash
+brainctl context-packs put --config "$BRAINSTACK_CONFIG" --machine erbine --name lindy-notes --dir ~/context/lindy-notes --dry-run
+brainctl context-packs put --config "$BRAINSTACK_CONFIG" --machine erbine --name lindy-notes --dir ~/context/lindy-notes
+brainctl context-packs sync --config "$BRAINSTACK_CONFIG" --machine erbine --name lindy-notes
+brainctl context-packs attach --config "$BRAINSTACK_CONFIG" --context erbine-lindy --machine erbine --name lindy-notes
+brainctl context-packs detach --config "$BRAINSTACK_CONFIG" --context erbine-lindy --machine erbine --name lindy-notes
+brainctl context-packs gc --config "$BRAINSTACK_CONFIG" --machine erbine
+```
+
+Expected shape:
+
+- Folder Packs are source-machine-owned private state under `~/.local/state/brainstack/context-packs/`, not shared-brain memory.
+- They sync with `rsync --delete` into stable `current/` directories. Re-sync updates the same folder instead of creating duplicate snapshots.
+- Preflight warns about large folders, file counts, skipped sensitive-looking files, and destination free space when available.
+- The scanner rejects symlinks/special files and skips default caches/build output/dependency folders plus env/key/cert/token/session/cookie/password-looking files unless the operator explicitly passes `--allow-sensitive`.
+- From Telegram, `/packs [machine]` lists packs. In a bound topic, `attach pack docs`, `use pack docs`, `sync pack docs`, and `detach pack docs` should route through Brainstack.
+- `use pack` should attempt a bounded on-use refresh before dispatch, then add only path/manifest metadata to the harness prompt. If the current surface cannot refresh because the source definition lives on another machine, it should make staleness explicit and use the last synced copy. `sync pack` is an explicit refresh and should tell the operator to sync from the source machine when the current machine lacks the source definition.
+
 ## Worker Canary
 
 Use a non-destructive canary before repurposing a reused worker:

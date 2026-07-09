@@ -27,6 +27,7 @@ export { loadConfig, parseSimpleYaml } from "./config";
 import { createDoctorStatusCommands } from "./commands/doctor-status";
 import { createInstallEnrollCommands } from "./commands/install-enroll";
 import { createCapabilitiesCommands } from "./commands/capabilities";
+import { createContextPacksCommands } from "./commands/context-packs";
 import { createProjectOutboxCommands } from "./commands/project-outbox";
 import { createSkillHookCommands } from "./commands/skills-hooks";
 import { createUploadsCommands } from "./commands/uploads";
@@ -351,6 +352,34 @@ const uploadsCommands = createUploadsCommands({
   whichCommand: commandPath
 });
 const commandUploads = uploadsCommands.commandUploads;
+
+const contextPacksCommands = createContextPacksCommands({
+  abs,
+  absWithHome,
+  brainstackDefaultConfigPath,
+  controlSshTarget,
+  defaultWorkers,
+  flag,
+  flagValues,
+  hasFlag,
+  loadConfig,
+  parsePositiveIntegerFlag,
+  quoteForBash: shellSingleQuote,
+  remoteBrainctlScript,
+  requireFlagValue,
+  run,
+  runControlRemoteScript,
+  runWorkerShell,
+  telegramControlWorker,
+  telegramKnownHostsPath,
+  telegramSshTrustArgs,
+  telegramSshTrustMode,
+  workerRemoteTarget,
+  workerSshPortArgs,
+  workerSshTrustArgs,
+  whichCommand: commandPath
+});
+const commandContextPacks = contextPacksCommands.commandContextPacks;
 
 const projectOutboxCommands = createProjectOutboxCommands({
   clientEnvPathAbs,
@@ -3296,6 +3325,9 @@ async function main(): Promise<void> {
     case "uploads":
     case "upload":
       return await commandUploads(args);
+    case "context-packs":
+    case "packs":
+      return await commandContextPacks(args);
     case "expose":
       return await commandExpose(args);
     case "import":

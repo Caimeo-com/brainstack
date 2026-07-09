@@ -341,6 +341,34 @@ public struct BrainctlClient: Sendable {
     await runAction(title: "Refresh Skills", arguments: ["skills", "refresh", "--config", configPath])
   }
 
+  public func fetchSkillImportPlan(sourcePath: String?) async -> (plan: SkillImportPlan?, outcome: ActionOutcome) {
+    var arguments = ["skills", "import"]
+    if let sourcePath, !sourcePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      arguments.append(sourcePath)
+    }
+    arguments.append(contentsOf: ["--json", "--config", configPath])
+    let result = await CommandRunner.run(
+      executable: binaryPath,
+      arguments: arguments,
+      timeout: 60
+    )
+    let outcome = Self.outcome(title: "Plan Skills Import", result: result, timeout: 60)
+    guard result.succeeded else {
+      return (nil, outcome)
+    }
+    return (SkillImportPlan.parse(result.stdout), outcome)
+  }
+
+  public func importSelectedSkills(sourcePath: String?, indexes: [Int]) async -> ActionOutcome {
+    let selected = indexes.sorted().map(String.init).joined(separator: ",")
+    var arguments = ["skills", "import"]
+    if let sourcePath, !sourcePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      arguments.append(sourcePath)
+    }
+    arguments.append(contentsOf: ["--select", selected, "--json", "--config", configPath])
+    return await runAction(title: "Import Skills", arguments: arguments, timeout: 300)
+  }
+
   public func daemonInstall() async -> ActionOutcome {
     await runAction(title: "Install/Restart Daemon", arguments: ["daemon", "install", "--start", "--config", configPath])
   }
@@ -477,6 +505,92 @@ public struct BrainctlClient: Sendable {
       title: "Delete Upload",
       arguments: ["uploads", "rm", "--machine", machine, "--id", id, "--json", "--config", configPath],
       timeout: 60
+    )
+  }
+
+  public func fetchContextPacks(machine: String) async -> (packs: [ContextPackSummary]?, outcome: ActionOutcome) {
+    let result = await CommandRunner.run(
+      executable: binaryPath,
+      arguments: ["context-packs", "list", "--machine", machine, "--json", "--config", configPath],
+      timeout: 60
+    )
+    let outcome = Self.outcome(title: "List Folder Packs", result: result, timeout: 60)
+    guard result.succeeded else {
+      return (nil, outcome)
+    }
+    return (ContextPackSummary.parseList(result.stdout), outcome)
+  }
+
+  public func putContextPack(machine: String, name: String, path: String) async -> ActionOutcome {
+    await runAction(
+      title: "Add Folder Pack",
+      arguments: ["context-packs", "put", "--machine", machine, "--name", name, "--dir", path, "--json", "--config", configPath],
+      timeout: 3600
+    )
+  }
+
+  public func preflightContextPack(machine: String, name: String, path: String) async -> (pack: ContextPackSummary?, outcome: ActionOutcome) {
+    let result = await CommandRunner.run(
+      executable: binaryPath,
+      arguments: ["context-packs", "put", "--machine", machine, "--name", name, "--dir", path, "--dry-run", "--json", "--config", configPath],
+      timeout: 3600
+    )
+    let outcome = Self.outcome(title: "Preflight Folder Pack", result: result, timeout: 3600)
+    guard result.succeeded else {
+      return (nil, outcome)
+    }
+    return (ContextPackSummary.parseSingle(result.stdout), outcome)
+  }
+
+  public func syncContextPack(machine: String, name: String) async -> ActionOutcome {
+    await runAction(
+      title: "Sync Folder Pack",
+      arguments: ["context-packs", "sync", "--machine", machine, "--name", name, "--json", "--config", configPath],
+      timeout: 3600
+    )
+  }
+
+  public func attachContextPack(context: String, machine: String, name: String) async -> ActionOutcome {
+    await runAction(
+      title: "Attach Folder Pack",
+      arguments: ["context-packs", "attach", "--context", context, "--machine", machine, "--name", name, "--json", "--config", configPath],
+      timeout: 60
+    )
+  }
+
+  public func detachContextPack(context: String, name: String) async -> ActionOutcome {
+    await runAction(
+      title: "Detach Folder Pack",
+      arguments: ["context-packs", "detach", "--context", context, "--name", name, "--json", "--config", configPath],
+      timeout: 60
+    )
+  }
+
+  public func detachContextPack(context: String, machine: String, name: String) async -> ActionOutcome {
+    await runAction(
+      title: "Detach Folder Pack",
+      arguments: ["context-packs", "detach", "--context", context, "--machine", machine, "--name", name, "--json", "--config", configPath],
+      timeout: 60
+    )
+  }
+
+  public func deleteContextPack(machine: String, name: String) async -> ActionOutcome {
+    await runAction(
+      title: "Delete Folder Pack",
+      arguments: ["context-packs", "rm", "--machine", machine, "--name", name, "--json", "--config", configPath],
+      timeout: 120
+    )
+  }
+
+  public func gcContextPacks(machine: String, delete: Bool) async -> ActionOutcome {
+    var arguments = ["context-packs", "gc", "--machine", machine, "--json", "--config", configPath]
+    if delete {
+      arguments.insert("--yes", at: 2)
+    }
+    return await runAction(
+      title: delete ? "Delete Unused Folder Packs" : "Check Unused Folder Packs",
+      arguments: arguments,
+      timeout: 120
     )
   }
 }

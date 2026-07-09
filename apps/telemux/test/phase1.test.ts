@@ -607,8 +607,36 @@ case "$*" in
 {"ok":true,"machine":"$machine","uploads":[{"schema_version":1,"id":"up_20260626T000000Z_fixture","machine":"$machine","source":"test","original_name":"latest.env","file_name":"latest.env","label":"fixture","size_bytes":17,"sha256":"abc123","uploaded_at":"2026-06-26T00:00:00Z","remote_path":"/tmp/brainstack-upload-fixtures/$machine/latest.env","manifest_path":"/tmp/brainstack-upload-fixtures/$machine/manifest.json"}]}
 JSON
     ;;
-  *"proposals groups"*)
+  *"context-packs attachments"*)
     cat <<'JSON'
+{"ok":true,"context":"pack-aware","packs":[{"name":"docs","safe_name":"docs","machine":"control","attached_at":"2026-07-08T00:00:00Z"}]}
+JSON
+    ;;
+  *"context-packs attach"*)
+    cat <<'JSON'
+{"ok":true,"context":"pack-aware","packs":[{"name":"docs","safe_name":"docs","machine":"control","attached_at":"2026-07-08T00:00:00Z"}]}
+JSON
+    ;;
+  *"context-packs sync"*)
+    echo "No local source definition exists for context pack docs. Run context-packs put on the source machine first." >&2
+    exit 1
+    ;;
+  *"context-packs list"*)
+    machine="control"
+    while (($#)); do
+      if [[ "$1" == "--machine" && $# -gt 1 ]]; then
+        machine="$2"
+        shift 2
+      else
+        shift
+      fi
+    done
+    cat <<JSON
+{"ok":true,"machine":"$machine","packs":[{"schema_version":1,"kind":"brainstack.context_pack","id":"cp_docs_fixture","name":"docs","safe_name":"docs","machine":"$machine","source_machine":"Brunos-MAKINA","source_root":"/Users/operator/context/docs","pack_root":"/tmp/brainstack-context-packs/$machine/docs","content_path":"/tmp/brainstack-context-packs/$machine/docs/current","manifest_path":"/tmp/brainstack-context-packs/$machine/docs/manifest.json","tree_path":"/tmp/brainstack-context-packs/$machine/docs/tree.jsonl","file_count":3,"total_bytes":4096,"tree_sha256":"abc123","refreshed_at":"2026-07-08T00:00:00Z","warnings":["last synced copy; source machine owns freshness"]}]}
+JSON
+    ;;
+	  *"proposals groups"*)
+	    cat <<'JSON'
 {"ok":true,"review_groups":[{"id":"brainstack:repo:project_lesson","label":"brainstack / repo / project_lesson","count":3,"needsContextCount":0,"legacyCount":0},{"id":"lindy:repo:project_lesson","label":"lindy / repo / project_lesson","count":2,"needsContextCount":1,"legacyCount":0}]}
 JSON
     ;;
@@ -4739,6 +4767,46 @@ test("recent Brainstack uploads can be listed and referenced by bound prompts", 
 
     const nextPrompt = await readFile(join(fixture.factoryRoot, "scratch", "upload-aware", ".factory", "control-plane.prompt.md"), "utf8");
     expect(nextPrompt).not.toContain("Recent Brainstack uploads on control:");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("Brainstack folder packs can be listed, attached, and referenced by bound prompts without contents", async () => {
+  const fixture = await createFixture({
+    FACTORY_TEXT_COALESCE_MS: "0"
+  });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx pack-aware control scratch", 67));
+    await fixture.commands.handleMessage(telegramMessage("/packs", 67));
+
+    const packsReply = fixture.telegram.sent.at(-1)?.text || "";
+    expect(packsReply).toContain("Folder packs on control:");
+    expect(packsReply).toContain("docs");
+    expect(packsReply).toContain("/tmp/brainstack-context-packs/control/docs/current");
+
+    await fixture.commands.handleMessage(telegramMessage("attach pack docs", 67));
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("Attached folder pack docs.");
+
+    await fixture.commands.handleMessage(telegramMessage("sync pack docs", 67));
+    expect(fixture.telegram.sent.at(-1)?.text).toContain("cannot refresh it from here");
+
+    await fixture.commands.handleMessage(telegramMessage("Use pack docs and inspect the README.", 67));
+    await waitFor(() => fixture.telegram.sent.some((entry) => entry.text.includes("Reply turn 1 for pack-aware.")));
+
+    const prompt = await readFile(join(fixture.factoryRoot, "scratch", "pack-aware", ".factory", "control-plane.prompt.md"), "utf8");
+    const brainctlCalls = await readFile(fixture.fakeBrainctlCalls, "utf8");
+    expect(brainctlCalls).toContain("context-packs sync --machine control --name docs");
+    expect(prompt).toContain('Brainstack folder packs available on "control":');
+    expect(prompt).toContain('safe_name: "docs"');
+    expect(prompt).toContain('path: "/tmp/brainstack-context-packs/control/docs/current"');
+    expect(prompt).toContain('manifest: "/tmp/brainstack-context-packs/control/docs/manifest.json"');
+    expect(prompt).toContain("last synced copy");
+    expect(prompt).toContain("refresh_warning");
+    expect(prompt).toContain("refresh is owned by the source machine");
+    expect(prompt).not.toContain("README contents");
   } finally {
     process.env.PATH = fixture.previousPath;
     await rm(fixture.root, { recursive: true, force: true });

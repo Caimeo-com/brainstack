@@ -72,6 +72,7 @@ const DEFAULT_PROPOSAL_LIST_LIMIT = 15;
 const MAX_PROPOSAL_LIST_LIMIT = 30;
 const NEW_CONTEXT_WIZARD_MAX_AGE_MS = 10 * 60 * 1000;
 const PROPOSAL_CURATION_CONTEXT_SLUG = "proposal-curation";
+const CONTEXT_PACK_ON_USE_SYNC_TIMEOUT_MS = 120_000;
 
 type NewContextWizardStep = "slug-or-machine" | "machine" | "target" | "repo-target";
 
@@ -124,6 +125,39 @@ interface BrainstackUploadSummary {
   size_bytes: number;
   uploaded_at: string;
   remote_path: string;
+}
+
+interface BrainstackContextPackSummary {
+  id: string;
+  name: string;
+  safe_name: string;
+  machine: string;
+  source_machine: string;
+  source_root: string;
+  content_path: string;
+  manifest_path: string;
+  tree_path: string;
+  file_count: number;
+  total_bytes: number;
+  tree_sha256: string;
+  refreshed_at: string;
+  freshness?: string;
+  warnings?: string[];
+}
+
+interface BrainstackContextPackAttachment {
+  name: string;
+  safe_name: string;
+  machine: string;
+  attached_at: string;
+}
+
+type ContextPackManagementAction = "list" | "attach" | "detach" | "sync";
+
+interface ContextPackManagementIntent {
+  action: ContextPackManagementAction;
+  name: string | null;
+  machine: string | null;
 }
 
 function voiceCapabilityUsage(): string {
@@ -520,6 +554,137 @@ function formatRecentUploadsPromptSection(machine: string, uploads: BrainstackUp
     ]),
     "",
     "Treat these as local files on the named machine. Use paths directly when the user refers to a recently uploaded file. Do not print file contents unless the user asks."
+  ].join("\n");
+}
+
+function parseContextPacksJson(text: string): BrainstackContextPackSummary[] {
+  try {
+    const parsed = JSON.parse(text) as { packs?: BrainstackContextPackSummary[] };
+    return Array.isArray(parsed.packs) ? parsed.packs : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseContextPackSyncJson(text: string): BrainstackContextPackSummary | null {
+  const packs = parseContextPacksJson(text);
+  if (packs[0]) {
+    return packs[0];
+  }
+  try {
+    const parsed = JSON.parse(text) as { pack?: BrainstackContextPackSummary };
+    return parsed.pack || null;
+  } catch {
+    return null;
+  }
+}
+
+function parseContextPackAttachmentsJson(text: string): BrainstackContextPackAttachment[] {
+  try {
+    const parsed = JSON.parse(text) as { packs?: BrainstackContextPackAttachment[] };
+    return Array.isArray(parsed.packs) ? parsed.packs : [];
+  } catch {
+    return [];
+  }
+}
+
+function packMachineFromText(rest: string, context: ContextRecord | null): string | null {
+  const parts = rest.split(/\s+/).map((part) => part.trim()).filter(Boolean);
+  const machine = parts.find((part) => !["list", "show", "packs", "pack", "folder", "folders", "on", "for"].includes(part.toLowerCase()));
+  return machine || context?.machine || null;
+}
+
+function packNameFromText(text: string): string | null {
+  const normalized = text.trim();
+  const match =
+    normalized.match(/\b(?:pack|folder pack|context pack)\s+([A-Za-z0-9._-]{1,80})\b/i) ||
+    normalized.match(/\b([A-Za-z0-9._-]{1,80})\s+(?:pack|folder pack|context pack)\b/i);
+  return match?.[1] || null;
+}
+
+function parseNaturalContextPackManagementIntent(text: string, context: ContextRecord | null): ContextPackManagementIntent | null {
+  const trimmed = text.trim();
+  if (/^(?:please\s+)?(?:show|list|what(?:'s| is))\s+(?:my\s+)?(?:context\s+)?(?:folder\s+)?packs?(?:\s+.+)?$/i.test(trimmed)) {
+    return { action: "list", name: null, machine: packMachineFromText(trimmed, context) };
+  }
+  const attach = trimmed.match(/^(?:please\s+)?(?:attach|add)\s+(?:the\s+)?(?:context\s+)?(?:folder\s+)?pack\s+([A-Za-z0-9._-]{1,80})$/i);
+  if (attach) {
+    return { action: "attach", name: attach[1] || null, machine: context?.machine || null };
+  }
+  const detach = trimmed.match(/^(?:please\s+)?(?:detach|remove)\s+(?:the\s+)?(?:context\s+)?(?:folder\s+)?pack\s+([A-Za-z0-9._-]{1,80})$/i);
+  if (detach) {
+    return { action: "detach", name: detach[1] || null, machine: context?.machine || null };
+  }
+  const sync = trimmed.match(/^(?:please\s+)?(?:sync|refresh)\s+(?:the\s+)?(?:context\s+)?(?:folder\s+)?pack\s+([A-Za-z0-9._-]{1,80})$/i);
+  if (sync) {
+    return { action: "sync", name: sync[1] || null, machine: context?.machine || null };
+  }
+  return null;
+}
+
+function formatContextPacksForTelegram(machine: string, packs: BrainstackContextPackSummary[], attachments: BrainstackContextPackAttachment[] = []): string {
+  if (!packs.length) {
+    return `No folder packs found on ${machine}. Add one from the Mac app or with brainctl context-packs put.`;
+  }
+  const attached = new Set(attachments.map((attachment) => `${attachment.machine}:${attachment.safe_name}`));
+  const lines = [`Folder packs on ${machine}:`];
+  for (const [index, pack] of packs.slice(0, 20).entries()) {
+    const marker = attached.has(`${pack.machine}:${pack.safe_name}`) ? " attached" : "";
+    lines.push(`${index + 1}) ${pack.name || pack.safe_name}${marker} (${pack.file_count} files, ${formatBytes(pack.total_bytes)})`);
+    lines.push(`   path: ${pack.content_path}`);
+    lines.push(`   synced: ${pack.refreshed_at} source: ${pack.source_machine}`);
+    if (pack.warnings?.length) {
+      lines.push(`   note: ${pack.warnings[0]}`);
+    }
+  }
+  lines.push("");
+  lines.push("In a bound topic, say `attach pack <name>` to keep it available, or `use pack <name>` in a normal request.");
+  return lines.join("\n");
+}
+
+function promptMetadata(value: string | number | null | undefined): string {
+  const text = value === null || value === undefined ? "" : String(value);
+  return JSON.stringify(text.replace(/[\u0000-\u001f\u007f]+/g, " ").slice(0, 600));
+}
+
+function looksLikeContextPackReference(text: string, attachments: BrainstackContextPackAttachment[]): boolean {
+  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  if (/\b(?:context pack|folder pack|shared folder|folder i shared|folders i shared|more context|use pack|use the pack)\b/.test(normalized)) {
+    return true;
+  }
+  return attachments.some((attachment) => normalized.includes(attachment.safe_name.toLowerCase()));
+}
+
+function formatContextPacksPromptSection(
+  context: ContextRecord,
+  packs: BrainstackContextPackSummary[],
+  syncWarnings: string[]
+): string | null {
+  if (!packs.length && !syncWarnings.length) {
+    return null;
+  }
+  return [
+    `Brainstack folder packs available on ${promptMetadata(context.machine)}:`,
+    ...packs.slice(0, 12).flatMap((pack) => [
+      "- pack:",
+      `  safe_name: ${promptMetadata(pack.safe_name)}`,
+      `  files: ${pack.file_count}`,
+      `  size: ${promptMetadata(formatBytes(pack.total_bytes))}`,
+      `  synced_at: ${promptMetadata(pack.refreshed_at)}`,
+      `  freshness: ${promptMetadata(pack.freshness || "last-synced")}`,
+      `  path: ${promptMetadata(pack.content_path)}`,
+      `  manifest: ${promptMetadata(pack.manifest_path)}`,
+      `  source_machine: ${promptMetadata(pack.source_machine)}`,
+      `  source_root: ${promptMetadata(pack.source_root)}`,
+      ...(pack.warnings?.length ? [`  warnings: ${promptMetadata(pack.warnings.slice(0, 2).join("; "))}`] : []),
+      `  note: ${promptMetadata("Brainstack attempted a bounded on-use refresh when this pack was referenced. Use the last synced copy if refresh_warning is present.")}`
+    ]),
+    ...syncWarnings.map((warning) => `- refresh_warning: ${promptMetadata(warning)}`),
+    "",
+    "Treat folder packs as local files on the bound machine. Open only the files needed for the user's request. Do not paste file contents unless asked."
   ].join("\n");
 }
 
@@ -1219,6 +1384,23 @@ export class CommandHandler {
       return;
     }
 
+    const contextPackIntent =
+      parsed?.command === "/packs"
+        ? { action: "list", name: null, machine: packMachineFromText(parsed.rest, boundContext) } satisfies ContextPackManagementIntent
+        : parsed?.command === "/pack_attach" || parsed?.command === "/context_pack_attach"
+          ? { action: "attach", name: parsed.rest.trim() || null, machine: boundContext?.machine || null } satisfies ContextPackManagementIntent
+          : parsed?.command === "/pack_detach" || parsed?.command === "/context_pack_detach"
+            ? { action: "detach", name: parsed.rest.trim() || null, machine: boundContext?.machine || null } satisfies ContextPackManagementIntent
+            : parsed?.command === "/pack_sync" || parsed?.command === "/context_pack_sync"
+              ? { action: "sync", name: parsed.rest.trim() || null, machine: boundContext?.machine || null } satisfies ContextPackManagementIntent
+              : !parsed && !hasAttachments
+                ? parseNaturalContextPackManagementIntent(text, boundContext)
+                : null;
+    if (contextPackIntent) {
+      await this.handleContextPackManagementIntent(contextPackIntent, target, boundContext);
+      return;
+    }
+
     if (parsed?.command === "/whoami") {
       await this.telegram.sendText(
         target,
@@ -1437,6 +1619,7 @@ export class CommandHandler {
               "/updates",
               "/voice",
               "/uploads [machine]",
+              "/packs [machine]",
               "/context",
               "/compact",
               "/crons",
@@ -1470,6 +1653,7 @@ export class CommandHandler {
               "Use /artifacts to list tokenized send/send+del shortcuts. Generic requests such as \"send it\" send the latest artifact.",
               "Use /shred to list tokenized cleanup shortcuts.",
               "Use /uploads [machine] to list files uploaded through Brainstack; plain text can refer to \"the file I just uploaded\".",
+              "Use /packs [machine] to list folder packs; say `attach pack <name>` or `use pack <name>` in a bound topic.",
               "Use /mode, /model, and /effort to change Codex runtime behavior for this topic without rebinding it.",
               "Use /context or /usage to inspect the current topic state. Use /compact to compact Codex topics when supported.",
               "Use /voice install <machine> to install local voice transcription for Telegram voice notes.",
@@ -1627,6 +1811,11 @@ export class CommandHandler {
 
         case "/uploads": {
           await this.telegram.sendText(target, await this.formatUploadsCommand(parsed.rest, boundContext));
+          return;
+        }
+
+        case "/packs": {
+          await this.telegram.sendText(target, await this.formatContextPacksCommand(parsed.rest, boundContext));
           return;
         }
 
@@ -2625,6 +2814,94 @@ export class CommandHandler {
     }
   }
 
+  private async listContextPacks(machine: string): Promise<BrainstackContextPackSummary[]> {
+    const result = await this.runBrainctlCommand(
+      ["context-packs", "list", "--machine", machine, "--json", "--config", this.config.brainstackConfigPath],
+      45_000
+    );
+    if (!result.ok) {
+      throw new Error([result.stderr.trim(), result.stdout.trim()].filter(Boolean).join("\n") || `exit ${result.exitCode}`);
+    }
+    return parseContextPacksJson(result.stdout);
+  }
+
+  private async attachedContextPacks(context: ContextRecord): Promise<BrainstackContextPackAttachment[]> {
+    const result = await this.runBrainctlCommand(
+      ["context-packs", "attachments", "--context", context.slug, "--json", "--config", this.config.brainstackConfigPath],
+      20_000
+    );
+    if (!result.ok) {
+      console.warn(`failed to read context pack attachments for ${context.slug}`, result.stderr || result.stdout);
+      return [];
+    }
+    return parseContextPackAttachmentsJson(result.stdout);
+  }
+
+  private async formatContextPacksCommand(rest: string, boundContext: ContextRecord | null): Promise<string> {
+    const machine = packMachineFromText(rest, boundContext);
+    if (!machine) {
+      return "Usage: /packs [machine]\nBind this topic first or provide a machine name, for example /packs erbine.";
+    }
+    try {
+      return formatContextPacksForTelegram(machine, await this.listContextPacks(machine), boundContext ? await this.attachedContextPacks(boundContext) : []);
+    } catch (error) {
+      return `Could not list folder packs on ${machine}: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  private async handleContextPackManagementIntent(
+    intent: ContextPackManagementIntent,
+    target: TelegramTarget,
+    boundContext: ContextRecord | null
+  ): Promise<void> {
+    if (intent.action === "list") {
+      await this.telegram.sendText(target, await this.formatContextPacksCommand(intent.machine || "", boundContext));
+      return;
+    }
+    if (!boundContext) {
+      await this.telegram.sendText(target, "This topic is not bound. Use /newctx or /bind first.");
+      return;
+    }
+    if (!intent.name) {
+      await this.telegram.sendText(target, `Which folder pack? For example: ${intent.action} pack docs`);
+      return;
+    }
+    const baseArgs = ["context-packs", intent.action, "--context", boundContext.slug, "--machine", boundContext.machine, "--name", intent.name, "--json", "--config", this.config.brainstackConfigPath];
+    if (intent.action === "sync") {
+      baseArgs.splice(2, 2); // sync has no --context
+    }
+    const timeout = intent.action === "sync" ? 60 * 60_000 : 30_000;
+    const result = await this.runBrainctlCommand(baseArgs, timeout);
+    if (!result.ok) {
+      const detail = [result.stderr.trim(), result.stdout.trim()].filter(Boolean).join("\n") || `exit ${result.exitCode}`;
+      if (intent.action === "sync" && /No local source definition exists/.test(detail)) {
+        await this.telegram.sendText(
+          target,
+          [
+            `I can see the last synced copy of ${intent.name}, but I cannot refresh it from here.`,
+            "Folder packs are refreshed by the source machine that owns the original folder.",
+            "Run Sync Now from that machine's Brainstack menu app or `brainctl context-packs sync --name <name>` there."
+          ].join("\n")
+        );
+        return;
+      }
+      await this.telegram.sendText(target, `Folder pack ${intent.action} failed: ${detail}`);
+      return;
+    }
+    if (intent.action === "sync") {
+      const packs = parseContextPacksJson(result.stdout);
+      const pack = packs[0] || (JSON.parse(result.stdout) as { pack?: BrainstackContextPackSummary }).pack;
+      await this.telegram.sendText(
+        target,
+        pack
+          ? `Synced folder pack ${pack.name || pack.safe_name} to ${pack.machine}: ${pack.file_count} files, ${formatBytes(pack.total_bytes)}.`
+          : `Synced folder pack ${intent.name}.`
+      );
+      return;
+    }
+    await this.telegram.sendText(target, `${intent.action === "attach" ? "Attached" : "Detached"} folder pack ${intent.name}.`);
+  }
+
   private async recentUploadsPromptSection(context: ContextRecord, text: string): Promise<string | null> {
     if (!looksLikeRecentUploadReference(text)) {
       return null;
@@ -2635,6 +2912,97 @@ export class CommandHandler {
       console.warn(`failed to list recent uploads for ${context.slug} on ${context.machine}`, error);
       return null;
     }
+  }
+
+  private async refreshContextPackForPrompt(
+    context: ContextRecord,
+    name: string
+  ): Promise<{ pack: BrainstackContextPackSummary | null; warning: string | null }> {
+    const result = await this.runBrainctlCommand(
+      [
+        "context-packs",
+        "sync",
+        "--machine",
+        context.machine,
+        "--name",
+        name,
+        "--json",
+        "--timeout-ms",
+        String(CONTEXT_PACK_ON_USE_SYNC_TIMEOUT_MS),
+        "--config",
+        this.config.brainstackConfigPath
+      ],
+      CONTEXT_PACK_ON_USE_SYNC_TIMEOUT_MS + 5_000
+    );
+    if (result.ok) {
+      return { pack: parseContextPackSyncJson(result.stdout), warning: null };
+    }
+    const detail = [result.stderr.trim(), result.stdout.trim()].filter(Boolean).join("\n") || `exit ${result.exitCode}`;
+    if (/No local source definition exists/.test(detail)) {
+      return {
+        pack: null,
+        warning: `${name}: refresh is owned by the source machine, so Telemux is using the last synced copy. Sync from the source machine if freshness matters.`
+      };
+    }
+    if (result.timedOut) {
+      return {
+        pack: null,
+        warning: `${name}: refresh timed out after ${formatElapsed(CONTEXT_PACK_ON_USE_SYNC_TIMEOUT_MS)}; using the last synced copy.`
+      };
+    }
+    return {
+      pack: null,
+      warning: `${name}: refresh failed (${compact(detail, 180)}); using the last synced copy.`
+    };
+  }
+
+  private async contextPacksPromptSection(context: ContextRecord, text: string): Promise<string | null> {
+    const attachments = await this.attachedContextPacks(context);
+    const shouldMention = looksLikeContextPackReference(text, attachments);
+    if (!attachments.length && !shouldMention) {
+      return null;
+    }
+    let packs: BrainstackContextPackSummary[] = [];
+    const syncWarnings: string[] = [];
+    try {
+      const named = packNameFromText(text);
+      const refreshedByName = new Map<string, BrainstackContextPackSummary>();
+      const refreshNames = shouldMention
+        ? [...new Set((named ? [named] : attachments.map((attachment) => attachment.safe_name)).map((name) => name.toLowerCase()))]
+        : [];
+      for (const refreshName of refreshNames) {
+        const refreshed = await this.refreshContextPackForPrompt(context, refreshName);
+        if (refreshed.warning) {
+          syncWarnings.push(refreshed.warning);
+        }
+        if (refreshed.pack) {
+          refreshedByName.set(refreshed.pack.safe_name.toLowerCase(), refreshed.pack);
+          if (refreshed.pack.name) {
+            refreshedByName.set(refreshed.pack.name.toLowerCase(), refreshed.pack);
+          }
+        }
+      }
+      const available = await this.listContextPacks(context.machine);
+      const wanted = new Set<string>([
+        ...attachments.map((attachment) => attachment.safe_name),
+        ...(named ? [named.toLowerCase()] : [])
+      ]);
+      packs = wanted.size
+        ? available.filter((pack) => wanted.has(pack.safe_name.toLowerCase()) || wanted.has((pack.name || "").toLowerCase()))
+        : available;
+      packs = packs.map((pack) => refreshedByName.get(pack.safe_name.toLowerCase()) || refreshedByName.get((pack.name || "").toLowerCase()) || pack);
+      for (const refreshed of new Set(refreshedByName.values())) {
+        if (!packs.some((pack) => pack.safe_name === refreshed.safe_name && pack.machine === refreshed.machine)) {
+          packs.push(refreshed);
+        }
+      }
+      if (shouldMention && named && !packs.length) {
+        syncWarnings.push(`${named}: no synced folder pack with that name is currently available on ${context.machine}`);
+      }
+    } catch (error) {
+      syncWarnings.push(error instanceof Error ? error.message : String(error));
+    }
+    return formatContextPacksPromptSection(context, packs, syncWarnings);
   }
 
   private pendingKey(target: TelegramTarget, userId: number | null): string {
@@ -3031,9 +3399,10 @@ export class CommandHandler {
 
     const promptProfile = preDispatch.route === "light_harness" ? "light" : "full";
     const uploadPromptSection = await this.recentUploadsPromptSection(freshContext, text);
+    const contextPackPromptSection = await this.contextPacksPromptSection(freshContext, text);
     const response = await this.dispatcher.dispatch("resume", freshContext, text, target, {
       telegramInput,
-      extraPromptSections: uploadPromptSection ? [uploadPromptSection] : [],
+      extraPromptSections: [uploadPromptSection, contextPackPromptSection].filter((section): section is string => Boolean(section)),
       userId,
       promptProfile,
       sourceLabel: promptProfile === "light" ? "pre-dispatch light" : null

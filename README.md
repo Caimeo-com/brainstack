@@ -39,6 +39,9 @@ bun run packages/brainctl/src/main.ts capabilities install voice --target erbine
 bun run packages/brainctl/src/main.ts capabilities uninstall voice --target erbine --remove-files --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts uploads put --machine erbine --file ./large-runbook.zip --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts uploads list --machine erbine --recent --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts context-packs put --machine erbine --name docs --dir ~/context/docs --dry-run --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts context-packs sync --machine erbine --name docs --config ~/.config/brainstack/brainstack.yaml
+bun run packages/brainctl/src/main.ts context-packs attach --context erbine-docs --machine erbine --name docs --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts proposals groups --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts proposals merge-group GROUP_KEY --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts proposals auto-merge --config ~/.config/brainstack/brainstack.yaml --json
@@ -123,6 +126,8 @@ Use `brainctl fleet status --json` on the control host, or from an enrolled Mac 
 Mac clients can send local files to mobile through the control host's telemux bot with `brainctl telegram send-file`. The file streams over SSH to the control host, telemux uses its local Telegram env, and the bot token never needs to exist on the client.
 
 Operators can also stage large or sensitive local files directly onto a Brainstack machine with `brainctl uploads put --machine <machine> --file <path>`. Uploads live in that machine's private Brainstack state under date-stamped folders, can be listed with `brainctl uploads list`, and can be removed with `brainctl uploads rm`. Telemux understands `/uploads` and phrases like "the file I just uploaded" in bound topics, so large files can bypass Telegram's Bot API download limit while still being easy for a harness to find.
+
+For evolving folders that should remain available as reusable context, use `brainctl context-packs`. Folder Packs are source-machine-owned private state, synced with `rsync --delete` into a stable `current/` directory on the target machine. Telemux understands `/packs`, `attach pack NAME`, `use pack NAME`, and `sync pack NAME`; prompts receive only folder paths and metadata. See [`docs/context-packs.md`](./docs/context-packs.md).
 
 Security defaults are explicit in config:
 
