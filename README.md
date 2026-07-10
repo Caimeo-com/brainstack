@@ -47,6 +47,8 @@ bun run packages/brainctl/src/main.ts proposals merge-group GROUP_KEY --config ~
 bun run packages/brainctl/src/main.ts proposals auto-merge --config ~/.config/brainstack/brainstack.yaml --json
 bun run packages/brainctl/src/main.ts proposals batch-merge --config ~/.config/brainstack/brainstack.yaml --json
 bun run packages/brainctl/src/main.ts proposals reprocess --config ~/.config/brainstack/brainstack.yaml --limit 5
+bun run packages/brainctl/src/main.ts curator inbox --config ~/.config/brainstack/brainstack.yaml --json
+bun run packages/brainctl/src/main.ts curator backfill-operational --config ~/.config/brainstack/brainstack.yaml --json
 bun run packages/brainctl/src/main.ts import codex-session SESSION_ID --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts lifecycle status --config ~/.config/brainstack/brainstack.yaml
 bun run packages/brainctl/src/main.ts lifecycle repair --config ~/.config/brainstack/brainstack.yaml --dry-run

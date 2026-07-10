@@ -173,7 +173,7 @@ Operator-managed secrets env files are created only if missing and are never ove
 
 Generated user services load both runtime and secrets env files and invoke Bun with `--no-env-file` so local repo `.env` files cannot silently alter service behavior.
 
-When telemux is enabled, `telemux.runtime.env` includes `BRAIN_BASE_URL` and `telemux.secrets.env` includes a blank `BRAIN_IMPORT_TOKEN`. Filling both opts successful runs into shared-brain raw imports of `SUMMARY.md` and `ARTIFACTS.md`; leaving either blank disables the bridge.
+When telemux is enabled, `telemux.runtime.env` includes `BRAIN_BASE_URL` and `telemux.secrets.env` includes a blank `BRAIN_IMPORT_TOKEN`. Filling both opts successful runs into shared-brain raw imports of `SUMMARY.md` and `ARTIFACTS.md`; leaving either blank disables the bridge. Built-in curator/update routines are different: they send only a small audit-only execution receipt, not the cumulative scratch summary.
 
 `telemux.runtime.env` also includes `FACTORY_HARNESS`, `FACTORY_HARNESS_BIN`, `FACTORY_TEXT_COALESCE_MS`, `FACTORY_TEXT_COALESCE_RECOVERY_MAX_AGE_MS`, `FACTORY_HARNESS_STREAMING`, and the disabled-by-default `FACTORY_PRE_DISPATCH_CLASSIFIER` knobs. Use `harness.name: claude` and `harness.bin: claude` in `brainstack.yaml` to route jobs through Claude Code instead of Codex by default. Text coalescing merges only short-window plain-text Telegram messages from the same user/chat/topic; commands and attachments flush pending text first. After a restart, stale pending coalesced text is dropped instead of being auto-run long after the user sent it.
 

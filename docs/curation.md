@@ -2,6 +2,19 @@
 
 The shared brain learns continuously without turning every raw import into canon: proposal generation is automatic, wiki mutation is policy-controlled.
 
+## Evidence admission
+
+The curator starts from source manifests, not raw artifact text. `brainctl curator inbox --json` classifies evidence deterministically before an LLM reads any body:
+
+- `candidate` is the default, including unknown or malformed metadata.
+- `audit-only` is reserved for exact operational provenance such as built-in `brain-curator` and `update-check` run receipts.
+
+Audit-only evidence stays in `raw/` with its source manifest and remains searchable. It is omitted from the curator candidate list, and braind rejects proposals whose entire resolved `source_ids` set is audit-only. Mixed and unknown source sets remain allowed so policy does not silently discard unrelated evidence. An admin can deliberately override the guard with `brainctl propose --allow-audit-only-sources`.
+
+The legacy fallback does not scan content keywords. It requires the complete old Telemux receipt signature: `source_harness=telemux`, `source_type=telemux-run`, one of Brainstack's dedicated routine/curation contexts, its matching generated title, and both `telemux` and `factory-run` tags.
+
+Use `brainctl curator backfill-operational --json` for a read-only plan of existing open proposals sourced entirely from these receipts. `--apply` supersedes the matched proposals with an exclusion reason; raw evidence is never deleted.
+
 ## Proposal state model
 
 Every proposal is a markdown file with machine frontmatter, plus an optional `<id>.content.md` sidecar carrying the full proposed page content.
@@ -70,14 +83,14 @@ curation:
 
 The `brain-curator` routine installs automatically (daily) into the `brainstack-routines` context when telemux has `FACTORY_TELEGRAM_CONTROL_CHAT_ID` set. Each run:
 
-1. Reads the cursor from `GET /api/curator/status`.
-2. Reviews imports/logs/proposals newer than the cursor, grouped by context, repo, source type, and deterministic review group hints.
+1. Reads `brainctl curator inbox --json`, which applies the cursor and evidence policy using manifest metadata only.
+2. Reviews only eligible imports plus open proposals, grouped by context, repo, source type, and deterministic review group hints. Audit-only bodies are not loaded into the harness prompt.
 3. Submits sourced machine proposals via `brainctl propose --target-page ... --content-file ... --base-sha256 ... --risk ... --confidence ... --source-ids ... --curator-run-id ...`.
 4. For memory candidates, includes the envelope fields (`--project`, `--domain`, `--scope`, `--memory-kind`, `--applicability`, `--non-applicability`, and `--evidence`) or lets `brainctl remember` provide conservative repo-scoped defaults.
 5. Runs `brainctl proposals auto-merge --submit --json` to collapse safe related date/topic batches inside review groups into one consolidated proposal and mark absorbed sources `superseded`. Oversized, legacy, context-poor, or one-off batches stay in the operator queue.
 6. telemux reports run outcome, failures, next run, and the new cursor to `POST /api/curator/status` (requires `FACTORY_BRAIN_ADMIN_TOKEN` in the telemux env).
 
-The wiki home page shows the curation panel: mode, curator installed, last/next run, last-run failures, open proposals, recently applied changes, and imports awaiting curation.
+The wiki home page shows the curation panel: mode, curator installed, last/next run, last-run failures, open proposals, recently applied changes, and eligible imports awaiting curation. `brainctl curator status` also reports eligible and audit-only evidence counts since the cursor.
 
 ## Commands
 
@@ -96,11 +109,13 @@ brainctl proposals supersede <id> [--reason TEXT] [--via SSH_TARGET] [--remote-r
 brainctl proposals needs-work <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
 brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
 brainctl curator status [--json]
+brainctl curator inbox [--limit 100] [--json]
+brainctl curator backfill-operational [--limit 500] [--apply] [--json]
 brainctl curator run
 brainctl curator install
 brainctl import codex-session <SESSION_ID|JSONL_PATH> [--include-transcript] [--max-bytes N] [--dry-run|--json]
 brainctl remember --repo PATH --summary TEXT [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF]
-brainctl propose --title TITLE --body BODY [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF]
+brainctl propose --title TITLE --body BODY [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF] [--allow-audit-only-sources]
 ```
 
 Reads are unauthenticated within the tailnet; proposal decisions require `BRAIN_ADMIN_TOKEN` on the control host. `needs-work` keeps a proposal open as `needs-human` and records the operator's reason for a later enrichment or curator pass. The CLI `approve` command is retained for approval-mode workflows, but normal review should use `apply`. On an enrolled client, proposal decision and consolidation commands forward over the explicit control SSH route from `--via`, `BRAINSTACK_TELEGRAM_VIA`, or `client.telegramVia`, using the configured pinned known-hosts file by default. Consolidation commands require that explicit control route and fail closed without it. `curator run`/`curator install` use the local telemux dashboard control endpoints when telemux is enabled; enrolled clients without local telemux forward them over the configured control SSH route, including the `client.remoteSsh` fallback for curator commands.
@@ -138,6 +153,9 @@ Useful review flows:
 - `GET /api/proposals/<id>` — proposal body, rendered diff, source-proposal excerpts, and current target-drift result (public read).
 - `POST /api/proposals/<id>/approve|reject|apply` — admin token.
 - `GET /api/curator/status` — policy, curator run state, proposal counts (public read).
+- `GET /api/curator/inbox[?limit=100]` — metadata-only eligible and audit-only evidence lists plus complete counts since the cursor (public read).
+- `GET /api/curator/operational-backfill[?limit=500]` — deterministic dry-run plan for legacy operational proposals (public read).
+- `POST /api/curator/operational-backfill` — supersede the planned operational proposals (admin token).
 - `POST /api/curator/status` — admin token; telemux reports run outcomes here.
 - `POST /api/propose` — accepts the machine fields (`target_page`, `proposed_content`, `base_sha256`, `risk`, `confidence`, `curator_run_id`, `reason`, `status: pending|needs-human`, `source_ids`) plus the memory envelope fields above. It auto-applies under policy in `auto` mode only after the final proposal status remains applyable.
 

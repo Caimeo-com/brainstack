@@ -46,6 +46,10 @@ export interface DispatchOptions {
   modelOverride?: string | null;
   reasoningEffortOverride?: ContextRecord["reasoningEffortOverride"];
   sourceLabel?: string | null;
+  runOrigin?: "manual" | "scheduled";
+  routineName?: string | null;
+  routineJobId?: string | null;
+  scheduledFor?: string | null;
   queuedTurnId?: string | null;
   userId?: number | null;
   /**
@@ -828,7 +832,7 @@ export class Dispatcher {
 
         await this.sendTelegramAttachments(saved, replyTarget, artifacts, attachmentManifest);
         await this.applyCronManifest(saved, replyTarget, cronManifest);
-        await this.importRunNotesToBrain(saved, summary, artifacts);
+        await this.importRunNotesToBrain(saved, summary, artifacts, options);
         return "finished";
       }
 
@@ -896,37 +900,64 @@ export class Dispatcher {
     }
   }
 
-  private async importRunNotesToBrain(context: ContextRecord, summary: string | null, artifacts: string | null): Promise<void> {
+  private async importRunNotesToBrain(
+    context: ContextRecord,
+    summary: string | null,
+    artifacts: string | null,
+    options: DispatchOptions
+  ): Promise<void> {
     if (!this.config.brainBaseUrl || !this.config.brainImportToken) {
       return;
     }
 
-    const body = [
-      `# Telemux run notes: ${context.slug}`,
-      "",
-      `- context: ${context.slug}`,
-      `- machine: ${context.machine}`,
-      `- session: ${context.codexSessionId || "n/a"}`,
-      `- run_at: ${context.lastRunAt || new Date().toISOString()}`,
-      "",
-      "## SUMMARY.md",
-      "",
-      summary?.trim() || "(empty)",
-      "",
-      "## ARTIFACTS.md",
-      "",
-      artifacts?.trim() || "(empty)",
-      ""
-    ].join("\n");
+    const routineName = options.routineName?.trim().toLowerCase() || null;
+    const operationalReceipt = Boolean(routineName && ["brain-curator", "update-check"].includes(routineName));
+    const body = operationalReceipt
+      ? [
+          `# Brainstack routine receipt: ${routineName}`,
+          "",
+          `- context: ${context.slug}`,
+          `- machine: ${context.machine}`,
+          `- session: ${context.codexSessionId || "n/a"}`,
+          `- run_at: ${context.lastRunAt || new Date().toISOString()}`,
+          `- run_origin: ${options.runOrigin || "scheduled"}`,
+          `- routine_job_id: ${options.routineJobId || "n/a"}`,
+          `- scheduled_for: ${options.scheduledFor || "n/a"}`,
+          "- status: completed",
+          "",
+          "This receipt records execution only. Durable lessons and wiki changes are represented by their own evidence and proposals.",
+          ""
+        ].join("\n")
+      : [
+          `# Telemux run notes: ${context.slug}`,
+          "",
+          `- context: ${context.slug}`,
+          `- machine: ${context.machine}`,
+          `- session: ${context.codexSessionId || "n/a"}`,
+          `- run_at: ${context.lastRunAt || new Date().toISOString()}`,
+          "",
+          "## SUMMARY.md",
+          "",
+          summary?.trim() || "(empty)",
+          "",
+          "## ARTIFACTS.md",
+          "",
+          artifacts?.trim() || "(empty)",
+          ""
+        ].join("\n");
 
     const status = await postBrainImportOrQueue(this.config, {
-      title: `telemux run notes: ${context.slug}`,
+      title: operationalReceipt ? `brainstack routine receipt: ${routineName}` : `telemux run notes: ${context.slug}`,
       text: body,
       source_harness: "telemux",
       source_machine: context.machine,
       source_type: "telemux-run",
       conversation_id: context.slug,
-      tags: ["telemux", "factory-run"]
+      ...(options.runOrigin ? { run_origin: options.runOrigin } : {}),
+      ...(routineName ? { routine_name: routineName } : {}),
+      ...(options.routineJobId ? { routine_job_id: options.routineJobId } : {}),
+      ...(options.scheduledFor ? { scheduled_for: options.scheduledFor } : {}),
+      tags: ["telemux", "factory-run", ...(operationalReceipt ? ["builtin-routine", "operational-receipt"] : [])]
     });
     if (status === "sent") {
       console.log(`shared brain import succeeded for ${context.slug}`);

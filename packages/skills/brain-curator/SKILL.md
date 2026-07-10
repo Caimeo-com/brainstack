@@ -19,7 +19,7 @@ Use this skill when acting as the control/admin side of a shared brain.
 
 Proposal generation is automatic; wiki mutation is policy-controlled (`curation.mode`: `manual`, `approval`, or `auto`). Do not edit canonical wiki pages directly — submit machine proposals and let policy decide:
 
-1. Read the cursor: `brainctl curator status` (or `GET /api/curator/status`). Review imports/logs/proposals newer than it.
+1. Read `brainctl curator inbox --json` first. It applies deterministic manifest policy before any artifact body is loaded. Inspect only its `candidates`; report `audit_only_count`, but do not read excluded bodies or create proposals for them.
 2. Group new material by topic/source type. Batch related memory candidates into one scoped card instead of producing many tiny global-looking fragments.
 3. Submit each change with:
    `brainctl propose --title T --body WHY --target-page wiki/PATH.md --content-file FILE --base-sha256 $(sha256sum current-page) --risk low|medium|high --confidence 0..1 --source-ids id1,id2 --curator-run-id RUN`
@@ -30,6 +30,10 @@ Proposal generation is automatic; wiki mutation is policy-controlled (`curation.
 5. Run the intelligibility test before submitting memory: "Would a future harness, with no original thread context, know where this applies and where it does not?" If no, enrich it or park it as `needs-human`.
 6. Risk guidance: `low` = additive, sourced, small (Status/Sources pages); `medium` = restructuring or prose edits; `high` = deletions, decision changes, runbooks.
 7. In `auto` mode only low-risk proposals inside `curation.autoApply.allowedPaths` apply automatically; everything else stays `pending` or `needs-human` for explicit Accept/reject review. Accept is the user-facing apply path; the low-level `approve` command exists only for compatibility.
+
+Operational routine receipts use `curation_disposition: audit-only`. They remain raw, searchable provenance but are not memory candidates. Unknown or malformed evidence defaults to `candidate`, and braind rejects proposals whose entire resolved source set is audit-only. An admin can deliberately override that guard with `brainctl propose --allow-audit-only-sources` after reviewing the evidence.
+
+Use `brainctl curator backfill-operational --json` to preview legacy open proposals sourced entirely from operational receipts. Add `--apply` only after reviewing the deterministic plan; it supersedes those proposal files without deleting their raw evidence.
 
 Use `brainctl proposals groups` to find related old or candidate memories that should be reviewed together. Review groups are deterministic hints from project/repo/scope/kind/topic metadata; Brainstack does not use embeddings or cosine thresholds for this path. Legacy title/body-only `Remember:` proposals are expected to show as `needs-human`/`needs-context` until enriched.
 

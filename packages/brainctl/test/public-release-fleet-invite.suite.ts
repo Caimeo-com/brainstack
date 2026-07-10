@@ -620,7 +620,11 @@ describe("public release hygiene - fleet remote control invites and release", ()
           "#!/usr/bin/env bash",
           "set -euo pipefail",
           `printf '<%s>\\n' "$@" > '${argsCapture}'`,
-          "echo 'curator install requested remotely'",
+          "if printf '%s\\n' \"$@\" | grep -q backfill-operational; then",
+          "  echo '{\"ok\":true,\"matched\":2,\"superseded\":[\"p1\",\"p2\"],\"overflow\":false}'",
+          "else",
+          "  echo 'curator install requested remotely'",
+          "fi",
           ""
         ].join("\n")
       );
@@ -659,6 +663,17 @@ describe("public release hygiene - fleet remote control invites and release", ()
       expect(sshArgs).toContain("operator@control.example");
       expect(sshArgs).toContain("/home/operator/brainstack");
       expect(sshArgs).toContain("'\\''curator'\\'' '\\''install'\\'' --config");
+
+      const backfill = runBrainctl(["curator", "backfill-operational", "--apply", "--limit", "25", "--json", "--config", configPath], {
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      });
+      expectSuccess(backfill);
+      expect(JSON.parse(backfill.stdout).superseded).toEqual(["p1", "p2"]);
+      const backfillArgs = await readFile(argsCapture, "utf8");
+      expect(backfillArgs).toContain("'\\''curator'\\'' '\\''backfill-operational'\\''");
+      expect(backfillArgs).toContain("'\\''--apply'\\''");
+      expect(backfillArgs).toContain("'\\''--limit'\\'' '\\''25'\\''");
+      expect(backfillArgs).toContain("'\\''--json'\\''");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

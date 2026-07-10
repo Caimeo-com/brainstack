@@ -2318,6 +2318,7 @@ test("basic loops do not retarget user-owned update-check jobs", async () => {
 test("basic loops install the brain-curator routine and curator commands work end to end", async () => {
   const statusPosts: Array<{ auth: string | null; body: Record<string, unknown> }> = [];
   const decisions: Array<{ path: string; auth: string | null; body: Record<string, unknown> }> = [];
+  const routineImports: Array<Record<string, unknown>> = [];
   const proposalStatusQueries: string[] = [];
   const port = 35_000 + Math.floor(Math.random() * 5_000);
   const server = Bun.serve({
@@ -2406,6 +2407,7 @@ test("basic loops install the brain-curator routine and curator commands work en
         });
       }
       if (req.method === "POST" && url.pathname === "/api/import") {
+        routineImports.push((await req.json()) as Record<string, unknown>);
         return Response.json({ ok: true, artifact_id: "curator-run-notes" });
       }
       const decision = url.pathname.match(/^\/api\/proposals\/([^/]+)\/(approve|reject|apply)$/);
@@ -2530,6 +2532,19 @@ test("basic loops install the brain-curator routine and curator commands work en
     expect(reported.body.installed).toBe(true);
     expect(reported.body.last_run_ok).toBe(true);
     expect(typeof reported.body.cursor).toBe("string");
+    expect(routineImports.length).toBeGreaterThanOrEqual(1);
+    const receipt = routineImports.at(-1)!;
+    expect(receipt).toMatchObject({
+      source_harness: "telemux",
+      source_type: "telemux-run",
+      run_origin: "manual",
+      routine_name: "brain-curator"
+    });
+    expect(String(receipt.routine_job_id || "").length).toBeGreaterThan(0);
+    expect(receipt.tags).toEqual(expect.arrayContaining(["builtin-routine", "operational-receipt"]));
+    expect(String(receipt.text)).toContain("This receipt records execution only");
+    expect(String(receipt.text)).not.toContain("## SUMMARY.md");
+    expect(String(receipt.text)).not.toContain("## ARTIFACTS.md");
   } finally {
     server.stop(true);
     process.env.PATH = fixture.previousPath;

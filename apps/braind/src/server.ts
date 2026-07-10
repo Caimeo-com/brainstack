@@ -21,6 +21,7 @@ import {
   ingestArtifacts,
   isSafeManifestId,
   isoNow,
+  listSourceManifests,
   lintWiki,
   parseFrontmatter,
   readPage,
@@ -50,9 +51,11 @@ import {
   renderUnifiedDiff,
   supersedeProposal,
   proposalBaseHash,
+  readCuratorStatus,
   validateProposalTargetPage,
   writeCuratorStatus
 } from "./curation";
+import { buildCuratorInbox, classifyEvidenceForCuration } from "./evidence-policy";
 
 class HttpError extends Error {
   constructor(
@@ -1826,10 +1829,13 @@ async function writeImport(
         touchedFiles,
         input.ingest_now ? `brain: import+ingest ${imported.artifactId}` : `brain: import ${imported.artifactId}`
       );
+      const curation = classifyEvidenceForCuration(imported.manifest);
       return {
         ok: true,
         artifact_id: imported.artifactId,
         deduplicated: imported.deduplicated,
+        curation_disposition: curation.disposition,
+        curation_reason: curation.reason,
         commit,
         touched_files: touchedFiles,
         search_index: await refreshSearchAfterWrite(commit)
@@ -1848,6 +1854,10 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
       reject(400, "multipart request requires a file field");
     }
     assertImportSize(file.size, "Uploaded file");
+    const runOrigin = String(form.get("run_origin") || "");
+    const routineName = String(form.get("routine_name") || "");
+    const routineJobId = String(form.get("routine_job_id") || "");
+    const scheduledFor = String(form.get("scheduled_for") || "");
     const input = {
       title: String(form.get("title") || file.name),
       source_harness: String(form.get("source_harness") || ""),
@@ -1856,6 +1866,10 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
       related_project: String(form.get("related_project") || "") || undefined,
       related_repo: String(form.get("related_repo") || "") || undefined,
       conversation_id: String(form.get("conversation_id") || "") || undefined,
+      ...(runOrigin === "scheduled" || runOrigin === "manual" ? { run_origin: runOrigin as "scheduled" | "manual" } : {}),
+      ...(routineName ? { routine_name: routineName } : {}),
+      ...(routineJobId ? { routine_job_id: routineJobId } : {}),
+      ...(scheduledFor ? { scheduled_for: scheduledFor } : {}),
       tags: [
         ...parseTags(form.get("tags")),
         ...form.getAll("tags[]").map((entry) => String(entry))
@@ -1897,6 +1911,10 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
       related_project: typeof body.related_project === "string" ? body.related_project : undefined,
       related_repo: typeof body.related_repo === "string" ? body.related_repo : undefined,
       conversation_id: typeof body.conversation_id === "string" ? body.conversation_id : undefined,
+      ...(body.run_origin === "scheduled" || body.run_origin === "manual" ? { run_origin: body.run_origin as "scheduled" | "manual" } : {}),
+      ...(typeof body.routine_name === "string" && body.routine_name ? { routine_name: body.routine_name } : {}),
+      ...(typeof body.routine_job_id === "string" && body.routine_job_id ? { routine_job_id: body.routine_job_id } : {}),
+      ...(typeof body.scheduled_for === "string" && body.scheduled_for ? { scheduled_for: body.scheduled_for } : {}),
       tags: Array.isArray(body.tags) ? body.tags.map(String) : [],
       ingest_now: Boolean(body.ingest_now)
     };
@@ -1926,6 +1944,10 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
       related_project: typeof body.related_project === "string" ? body.related_project : undefined,
       related_repo: typeof body.related_repo === "string" ? body.related_repo : undefined,
       conversation_id: typeof body.conversation_id === "string" ? body.conversation_id : undefined,
+      ...(body.run_origin === "scheduled" || body.run_origin === "manual" ? { run_origin: body.run_origin as "scheduled" | "manual" } : {}),
+      ...(typeof body.routine_name === "string" && body.routine_name ? { routine_name: body.routine_name } : {}),
+      ...(typeof body.routine_job_id === "string" && body.routine_job_id ? { routine_job_id: body.routine_job_id } : {}),
+      ...(typeof body.scheduled_for === "string" && body.scheduled_for ? { scheduled_for: body.scheduled_for } : {}),
       tags: Array.isArray(body.tags) ? body.tags.map(String) : [],
       ingest_now: Boolean(body.ingest_now)
     };
@@ -1955,6 +1977,35 @@ async function importFromRequest(request: Request, authScope: AuthScope): Promis
   }
 
   reject(400, "Import request must include text, url, or multipart file");
+}
+
+interface ProposalEvidencePolicyCheck {
+  allAuditOnly: boolean;
+  resolved: Array<{ id: string; disposition: string; reason: string | null }>;
+  unresolved: string[];
+}
+
+async function checkProposalEvidencePolicy(sourceIds: string[] | undefined): Promise<ProposalEvidencePolicyCheck> {
+  const requestedIds = Array.from(new Set(sourceIds || []));
+  const ids = requestedIds.filter(isSafeManifestId);
+  const resolved: ProposalEvidencePolicyCheck["resolved"] = [];
+  const unresolved: string[] = requestedIds.filter((id) => !isSafeManifestId(id));
+  for (const id of ids) {
+    const manifest = await findSourceManifestById(writeRepoRoot, id);
+    if (!manifest) {
+      unresolved.push(id);
+      continue;
+    }
+    const decision = classifyEvidenceForCuration(manifest);
+    resolved.push({ id, disposition: decision.disposition, reason: decision.reason });
+  }
+  return {
+    // Unknown evidence defaults to eligible. Only a fully resolved, entirely
+    // operational source set is blocked.
+    allAuditOnly: ids.length > 0 && unresolved.length === 0 && resolved.length === ids.length && resolved.every((item) => item.disposition === "audit-only"),
+    resolved,
+    unresolved
+  };
 }
 
 async function proposeFromRequest(request: Request, authScope: AuthScope): Promise<Record<string, unknown>> {
@@ -2020,7 +2071,14 @@ async function proposeFromRequest(request: Request, authScope: AuthScope): Promi
     review_after: typeof body.review_after === "string" ? body.review_after : undefined,
     expires_at: typeof body.expires_at === "string" ? body.expires_at : undefined
   };
-  const requestHash = requestHashFor({ endpoint: "propose", input });
+  const allowAuditOnlySources = body.allow_audit_only_sources === true;
+  if (allowAuditOnlySources && authScope !== "admin") {
+    reject(403, "allow_audit_only_sources requires the admin token");
+  }
+  if (allowAuditOnlySources) {
+    input.tags = Array.from(new Set([...(input.tags || []), "audit-only-source-override"]));
+  }
+  const requestHash = requestHashFor({ endpoint: "propose", input, allow_audit_only_sources: allowAuditOnlySources });
   const replay = await completedIdempotencyReplay(request, "propose", requestHash);
   if (replay) {
     return replay;
@@ -2030,6 +2088,14 @@ async function proposeFromRequest(request: Request, authScope: AuthScope): Promi
     return await withMutationGate(async () =>
       await withRepoLock(writeRepoRoot, async () => {
         await syncWritableRepoAsync(writeRepoRoot);
+        const evidencePolicy = await checkProposalEvidencePolicy(input.source_ids);
+        if (evidencePolicy.allAuditOnly && !allowAuditOnlySources) {
+          const reasons = Array.from(new Set(evidencePolicy.resolved.map((item) => item.reason).filter(Boolean))).join("; ");
+          reject(
+            422,
+            `proposal sources are operational audit receipts, not curator candidates${reasons ? `: ${reasons}` : ""}; use eligible evidence or an explicit admin override`
+          );
+        }
         const proposal = await createProposal(writeRepoRoot, input, { beforeMutation: markSideEffectStarted });
         const touchedFiles = [...proposal.touchedFiles];
 
@@ -2287,6 +2353,86 @@ async function showProposalResponse(id: string): Promise<Response> {
   });
 }
 
+function curatorInboxLimit(url: URL, fallback = 100, max = 1_000): number {
+  const parsed = Number(url.searchParams.get("limit") || String(fallback));
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.min(max, Math.trunc(parsed)) : fallback;
+}
+
+async function curatorInboxData(limit = 100): Promise<ReturnType<typeof buildCuratorInbox>> {
+  const status = await readCuratorStatus(repoRoot);
+  const cursor = status.cursor || status.last_run_finished_at;
+  return buildCuratorInbox(await listSourceManifests(writeRepoRoot), cursor, limit);
+}
+
+interface OperationalProposalBackfillItem {
+  id: string;
+  title: string;
+  status: string;
+  source_ids: string[];
+  reasons: string[];
+}
+
+async function operationalProposalBackfillPlan(limit = 500): Promise<{
+  matched: number;
+  overflow: boolean;
+  proposals: OperationalProposalBackfillItem[];
+}> {
+  const matches: OperationalProposalBackfillItem[] = [];
+  for (const proposal of await listProposals(writeRepoRoot, OPEN_PROPOSAL_STATUSES)) {
+    if (!proposal.sourceIds.length || proposal.tags.includes("audit-only-source-override")) {
+      continue;
+    }
+    const policy = await checkProposalEvidencePolicy(proposal.sourceIds);
+    if (!policy.allAuditOnly) {
+      continue;
+    }
+    matches.push({
+      id: proposal.id,
+      title: proposal.title,
+      status: proposal.status,
+      source_ids: proposal.sourceIds,
+      reasons: Array.from(new Set(policy.resolved.map((item) => item.reason).filter((reason): reason is string => Boolean(reason))))
+    });
+  }
+  const boundedLimit = Math.max(0, Math.min(2_000, Math.trunc(limit)));
+  return { matched: matches.length, overflow: matches.length > boundedLimit, proposals: matches.slice(0, boundedLimit) };
+}
+
+async function backfillOperationalProposalsFromRequest(request: Request): Promise<Record<string, unknown>> {
+  const body = await readJsonBody(request);
+  const limitRaw = Number(body.limit ?? 500);
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(2_000, Math.trunc(limitRaw)) : 500;
+  const decidedBy = typeof body.decided_by === "string" && body.decided_by.trim() ? body.decided_by.trim().slice(0, 200) : "curation-policy-backfill";
+  return await withMutationGate(async () =>
+    await withRepoLock(writeRepoRoot, async () => {
+      await syncWritableRepoAsync(writeRepoRoot);
+      const plan = await operationalProposalBackfillPlan(limit);
+      const touchedFiles: string[] = [];
+      const superseded: string[] = [];
+      for (const proposal of plan.proposals) {
+        const reason = `excluded by curation policy: all source evidence is operational-only${proposal.reasons.length ? ` (${proposal.reasons.join("; ")})` : ""}`;
+        const result = await supersedeProposal(writeRepoRoot, proposal.id, decidedBy, reason);
+        touchedFiles.push(...result.touchedFiles);
+        superseded.push(proposal.id);
+      }
+      if (!touchedFiles.length) {
+        return { ok: true, matched: plan.matched, superseded, overflow: plan.overflow, commit: null, touched_files: [] };
+      }
+      const uniqueTouchedFiles = Array.from(new Set(touchedFiles));
+      const commit = await gitCommitAndPush(writeRepoRoot, uniqueTouchedFiles, `brain: exclude ${superseded.length} operational proposal(s)`);
+      return {
+        ok: true,
+        matched: plan.matched,
+        superseded,
+        overflow: plan.overflow,
+        commit,
+        touched_files: uniqueTouchedFiles,
+        search_index: await refreshSearchAfterWrite(commit)
+      };
+    })
+  );
+}
+
 async function curatorStatusResponse(): Promise<Response> {
   const overview = await curationOverview(writeRepoRoot, repoRoot);
   return json({
@@ -2312,7 +2458,9 @@ async function updateCuratorStatusFromRequest(request: Request): Promise<Record<
 function renderCurationPanel(overview: Awaited<ReturnType<typeof curationOverview>>, imports: Awaited<ReturnType<typeof getRecentImports>>): string {
   const status = overview.status;
   const cursor = status.cursor || status.last_run_finished_at;
-  const awaitingCuration = cursor ? imports.filter((manifest) => manifest.created_at > cursor) : imports;
+  const awaitingCuration = (cursor ? imports.filter((manifest) => manifest.created_at > cursor) : imports).filter(
+    (manifest) => classifyEvidenceForCuration(manifest).disposition === "candidate"
+  );
   const proposalLine = (record: (typeof overview.openProposals)[number]): string =>
     `<li><strong>${htmlEscape(record.status)}</strong> ${htmlEscape(record.title)}${
       record.targetPage ? ` → <code>${htmlEscape(record.targetPage)}</code>` : ""
@@ -2700,6 +2848,17 @@ const server = Bun.serve({
       }
       if (request.method === "GET" && url.pathname === "/api/curator/status") {
         return await curatorStatusResponse();
+      }
+      if (request.method === "GET" && url.pathname === "/api/curator/inbox") {
+        return json({ ok: true, ...(await curatorInboxData(curatorInboxLimit(url))) });
+      }
+      if (request.method === "GET" && url.pathname === "/api/curator/operational-backfill") {
+        return json({ ok: true, dry_run: true, ...(await operationalProposalBackfillPlan(curatorInboxLimit(url, 500, 2_000))) });
+      }
+      if (request.method === "POST" && url.pathname === "/api/curator/operational-backfill") {
+        assertAdminAuth(request);
+        assertWriteRateLimit(request, "admin", "curator-operational-backfill", null);
+        return json(await backfillOperationalProposalsFromRequest(request));
       }
       if (request.method === "POST" && url.pathname === "/api/curator/status") {
         assertAdminAuth(request);

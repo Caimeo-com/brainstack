@@ -4,6 +4,7 @@ import { mkdir, open, readFile, readdir, rename, rm, rmdir, stat, writeFile } fr
 import { createHash, randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
+import { classifyEvidenceForCuration, type CurationDisposition } from "./evidence-policy";
 
 type FrontmatterValue = string | boolean | number | null | string[];
 
@@ -33,6 +34,12 @@ export interface SourceManifest {
   related_repo?: string;
   tags?: string[];
   conversation_id?: string;
+  run_origin?: "manual" | "scheduled";
+  routine_name?: string;
+  routine_job_id?: string;
+  scheduled_for?: string;
+  curation_disposition?: CurationDisposition;
+  curation_reason?: string;
   source_url?: string;
   original_filename?: string;
   deduplicated_from?: string;
@@ -59,6 +66,10 @@ export interface ImportMetadata {
   related_repo?: string;
   tags?: string[];
   conversation_id?: string;
+  run_origin?: "manual" | "scheduled";
+  routine_name?: string;
+  routine_job_id?: string;
+  scheduled_for?: string;
   ingest_now?: boolean;
 }
 
@@ -1214,9 +1225,18 @@ export async function createImportedArtifact(
     related_repo: input.related_repo,
     tags: collectInputTags(input),
     conversation_id: input.conversation_id,
+    run_origin: input.run_origin,
+    routine_name: input.routine_name?.trim().slice(0, 120) || undefined,
+    routine_job_id: input.routine_job_id?.trim().slice(0, 200) || undefined,
+    scheduled_for: input.scheduled_for?.trim().slice(0, 80) || undefined,
     source_url: input.url,
     original_filename: input.fileName
   };
+  const curation = classifyEvidenceForCuration(manifest);
+  if (curation.disposition === "audit-only") {
+    manifest.curation_disposition = curation.disposition;
+    manifest.curation_reason = curation.reason || undefined;
+  }
 
   const originalText = !useExternalBlob && isTextLike(rawFileName, mimeType) ? new TextDecoder().decode(bytes) : undefined;
   const normalized = await normalizeArtifactFile(paths, manifest, normalizationInputPath, originalText);
@@ -1732,13 +1752,14 @@ export async function getRecentLogEntries(repoRoot: string, limit = 10): Promise
 }
 
 export async function getRecentImports(repoRoot: string, limit = 10): Promise<SourceManifest[]> {
-  const paths = getRepoPaths(repoRoot);
-  const manifests = await Promise.all(
-    (await findSourceManifestFiles(paths)).map((file) => readJson<SourceManifest>(file))
-  );
-  return manifests
+  return (await listSourceManifests(repoRoot))
     .sort((a, b) => b.created_at.localeCompare(a.created_at))
     .slice(0, limit);
+}
+
+export async function listSourceManifests(repoRoot: string): Promise<SourceManifest[]> {
+  const paths = getRepoPaths(repoRoot);
+  return await Promise.all((await findSourceManifestFiles(paths)).map((file) => readJson<SourceManifest>(file)));
 }
 
 function indexSection(title: string, pageLinks: string[]): string[] {

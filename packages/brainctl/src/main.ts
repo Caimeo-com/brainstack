@@ -1322,6 +1322,20 @@ async function commandPropose(args: ParsedArgs): Promise<void> {
   if (expiresAt) {
     payload.expires_at = expiresAt;
   }
+  if (hasFlag(args, "allow-audit-only-sources")) {
+    payload.allow_audit_only_sources = true;
+    const result = await brainApiRequest(cfg, "POST", "/api/propose", {
+      admin: true,
+      body: payload,
+      idempotencyKey: `brainctl-admin-propose-${sha256Hex(JSON.stringify(payload)).slice(0, 48)}`
+    });
+    if (hasFlag(args, "json")) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      console.log(`proposal=${String(result.proposal_id || "submitted")} status=${String(result.status || "submitted")} override=audit-only-sources`);
+    }
+    return;
+  }
   await postBrainWriteOrQueue(cfg, "propose", payload);
 }
 
@@ -1852,8 +1866,8 @@ async function telemuxControlRequest(cfg: BrainstackConfig, path: string): Promi
   return parsed;
 }
 
-async function maybeRunRemoteCuratorControl(cfg: BrainstackConfig, args: ParsedArgs, subcommand: "run" | "install"): Promise<boolean> {
-  if (cfg.telemux.enabled) {
+async function maybeRunRemoteCuratorControl(cfg: BrainstackConfig, args: ParsedArgs, subcommand: "run" | "install" | "backfill-operational"): Promise<boolean> {
+  if (cfg.telemux.enabled || (subcommand === "backfill-operational" && !cfg.profile.startsWith("client"))) {
     return false;
   }
   const via = controlSshTarget(cfg, args, "curator control SSH target", { allowRemoteSshFallback: true });
@@ -1861,11 +1875,17 @@ async function maybeRunRemoteCuratorControl(cfg: BrainstackConfig, args: ParsedA
     return false;
   }
   const remoteRepo = requireFlagValue(args, "remote-repo") || process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() || cfg.client.telegramRemoteRepo || "~/brainstack";
+  const remoteArgs = ["curator", subcommand];
+  for (const key of ["apply", "json"] as const) {
+    if (hasFlag(args, key)) remoteArgs.push(`--${key}`);
+  }
+  const limit = requireFlagValue(args, "limit");
+  if (limit) remoteArgs.push("--limit", limit);
   const result = runControlRemoteScript(
     cfg,
     args,
     "curator control SSH target",
-    remoteBrainctlScript(remoteRepo, ["curator", subcommand]),
+    remoteBrainctlScript(remoteRepo, remoteArgs),
     120_000,
     { allowRemoteSshFallback: true }
   );
@@ -1883,15 +1903,21 @@ async function maybeRunRemoteCuratorControl(cfg: BrainstackConfig, args: ParsedA
 async function commandCurator(args: ParsedArgs): Promise<void> {
   const sub = args.positional[0] || "status";
   if (sub === "help" || sub === "--help" || sub === "-h") {
-    console.log("Usage: brainctl curator status [--json]\n       brainctl curator run [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl curator install [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]");
+    console.log("Usage: brainctl curator status [--json]\n       brainctl curator inbox [--limit 100] [--json]\n       brainctl curator backfill-operational [--limit 500] [--apply] [--json] [--via SSH_TARGET] [--remote-repo PATH]\n       brainctl curator run [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl curator install [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]");
     return;
   }
   const cfg = await loadConfig(flag(args, "config"), flag(args, "profile"), flag(args, "root"));
   switch (sub) {
     case "status": {
       const result = await brainApiRequest(cfg, "GET", "/api/curator/status");
+      let evidence: Record<string, unknown>;
+      try {
+        evidence = await brainApiRequest(cfg, "GET", "/api/curator/inbox?limit=0");
+      } catch (error) {
+        evidence = { available: false, error: error instanceof Error ? error.message : String(error) };
+      }
       if (hasFlag(args, "json")) {
-        console.log(JSON.stringify(result, null, 2));
+        console.log(JSON.stringify({ ...result, evidence_inbox: evidence }, null, 2));
         return;
       }
       const curator = (result.curator || {}) as Record<string, unknown>;
@@ -1904,6 +1930,11 @@ async function commandCurator(args: ParsedArgs): Promise<void> {
       console.log(
         `proposals: pending=${counts.pending || 0} approved=${counts.approved || 0} needs-human=${counts["needs-human"] || 0} applied=${counts.applied || 0} rejected=${counts.rejected || 0} superseded=${counts.superseded || 0}`
       );
+      console.log(
+        evidence.available === false
+          ? `evidence: unavailable (${String(evidence.error || "control host may need an update")})`
+          : `evidence: eligible=${Number(evidence.eligible_count || 0)} audit-only=${Number(evidence.audit_only_count || 0)} since_cursor=${Number(evidence.total_since_cursor || 0)}`
+      );
       const failures = Array.isArray(curator.last_run_failures) ? (curator.last_run_failures as string[]) : [];
       if (failures.length) {
         console.log("last run failures:");
@@ -1914,6 +1945,50 @@ async function commandCurator(args: ParsedArgs): Promise<void> {
       if (curator.last_run_summary) {
         console.log(`last run summary: ${String(curator.last_run_summary)}`);
       }
+      return;
+    }
+    case "inbox": {
+      const limit = parsePositiveIntegerFlag(args, "limit", 100);
+      const result = await brainApiRequest(cfg, "GET", `/api/curator/inbox?limit=${encodeURIComponent(String(limit))}`);
+      if (hasFlag(args, "json")) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      console.log(`curator inbox: eligible=${String(result.eligible_count || 0)} audit-only=${String(result.audit_only_count || 0)} since_cursor=${String(result.total_since_cursor || 0)}`);
+      for (const item of Array.isArray(result.candidates) ? result.candidates as Array<Record<string, unknown>> : []) {
+        console.log(`candidate ${String(item.id)} source_type=${String(item.source_type || "unknown")} title=${String(item.title || "")}`);
+      }
+      for (const item of Array.isArray(result.excluded) ? result.excluded as Array<Record<string, unknown>> : []) {
+        console.log(`audit-only ${String(item.id)} reason=${String(item.reason || "policy")} title=${String(item.title || "")}`);
+      }
+      if (result.overflow) console.log("warning: result lists are truncated; counts include all evidence since the cursor");
+      return;
+    }
+    case "backfill-operational": {
+      if (await maybeRunRemoteCuratorControl(cfg, args, "backfill-operational")) {
+        return;
+      }
+      const limit = parsePositiveIntegerFlag(args, "limit", 500);
+      const apply = hasFlag(args, "apply");
+      const result = apply
+        ? await brainApiRequest(cfg, "POST", "/api/curator/operational-backfill", {
+            admin: true,
+            body: { limit, decided_by: `${process.env.USER || "operator"}@${cfg.machine.name}` },
+            timeoutMs: 180_000
+          })
+        : await brainApiRequest(cfg, "GET", `/api/curator/operational-backfill?limit=${encodeURIComponent(String(limit))}`);
+      if (hasFlag(args, "json")) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      console.log(`${apply ? "operational backfill applied" : "operational backfill dry-run"}: matched=${String(result.matched || 0)} overflow=${Boolean(result.overflow)}`);
+      const proposals = Array.isArray(result.proposals) ? result.proposals as Array<Record<string, unknown>> : [];
+      for (const proposal of proposals.slice(0, 50)) {
+        console.log(`${String(proposal.id)} status=${String(proposal.status)} title=${String(proposal.title)}`);
+      }
+      const superseded = Array.isArray(result.superseded) ? result.superseded as string[] : [];
+      if (superseded.length) console.log(`superseded=${superseded.join(",")}`);
+      if (!apply && proposals.length) console.log("No writes performed. Rerun with --apply after reviewing this plan.");
       return;
     }
     case "run": {

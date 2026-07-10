@@ -59,6 +59,152 @@ import {
 import type { Server } from "./helpers";
 
 describe("braind write safety", () => {
+  test("operational routine evidence stays auditable without entering proposal generation", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "braind-operational-evidence-"));
+    const port = 40_000 + Math.floor(Math.random() * 3_000);
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const root = await createSingleNodeInstall(dir);
+      proc = await startBraind(root, port);
+      const request = async (path: string, method = "GET", body?: Record<string, unknown>, token = "import-test-token", key?: string) =>
+        await fetch(`http://127.0.0.1:${port}${path}`, {
+          method,
+          headers: {
+            ...(method === "POST" ? { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } : {}),
+            ...(key ? { "Idempotency-Key": key } : {})
+          },
+          body: body ? JSON.stringify(body) : undefined
+        });
+
+      const imported = await request(
+        "/api/import",
+        "POST",
+        {
+          title: "brainstack routine receipt: brain-curator",
+          text: "The built-in curator completed. This is execution metadata only.",
+          source_harness: "telemux",
+          source_machine: "control",
+          source_type: "telemux-run",
+          conversation_id: "brainstack-routines",
+          run_origin: "scheduled",
+          routine_name: "brain-curator",
+          routine_job_id: "cron-curator",
+          scheduled_for: "2026-07-11T06:30:00Z",
+          tags: ["telemux", "factory-run", "builtin-routine", "operational-receipt"]
+        },
+        "import-test-token",
+        "operational-import"
+      );
+      expect(imported.status).toBe(200);
+      const importedBody = (await imported.json()) as Record<string, unknown>;
+      expect(importedBody.curation_disposition).toBe("audit-only");
+      const operationalId = String(importedBody.artifact_id);
+
+      const normalImport = await request(
+        "/api/import",
+        "POST",
+        {
+          title: "Useful project lesson",
+          text: "A useful scoped project lesson that remains eligible for curation.",
+          source_harness: "codex",
+          source_machine: "worker",
+          source_type: "remember",
+          tags: ["remember"]
+        },
+        "import-test-token",
+        "candidate-import"
+      );
+      expect(normalImport.status).toBe(200);
+      const candidateId = String(((await normalImport.json()) as Record<string, unknown>).artifact_id);
+
+      const inbox = (await (await request("/api/curator/inbox?limit=10")).json()) as Record<string, unknown>;
+      expect(inbox.eligible_count).toBe(1);
+      expect(inbox.audit_only_count).toBe(1);
+      expect((inbox.excluded as Array<Record<string, unknown>>)[0]).toMatchObject({ id: operationalId, disposition: "audit-only" });
+      const cliEnv = { ...braindTestEnv(root, port), BRAIN_BASE_URL: `http://127.0.0.1:${port}` };
+      const cliInbox = runBrainctl(["curator", "inbox", "--config", join(dir, "config.yaml"), "--limit", "10", "--json"], cliEnv);
+      expectSuccess(cliInbox);
+      expect(JSON.parse(cliInbox.stdout).audit_only_count).toBe(1);
+
+      const proposal = (sourceIds: string[], allow = false) => ({
+        title: "Operational evidence proposal",
+        body: "This proposal exists only to test deterministic evidence admission policy.",
+        source_harness: "codex",
+        source_machine: "control",
+        source_ids: sourceIds,
+        ...(allow ? { allow_audit_only_sources: true } : {})
+      });
+      const blocked = await request("/api/propose", "POST", proposal([operationalId]), "import-test-token", "operational-blocked");
+      expect(blocked.status).toBe(422);
+      expect(String(((await blocked.json()) as Record<string, unknown>).error)).toContain("operational audit receipts");
+
+      const unauthorizedOverride = await request("/api/propose", "POST", proposal([operationalId], true), "import-test-token", "operational-override-denied");
+      expect(unauthorizedOverride.status).toBe(403);
+
+      const mixed = await request("/api/propose", "POST", proposal([operationalId, candidateId]), "import-test-token", "operational-mixed");
+      expect(mixed.status).toBe(200);
+
+      const overridden = await request("/api/propose", "POST", proposal([operationalId], true), "admin-test-token", "operational-override");
+      expect(overridden.status).toBe(200);
+      const overriddenId = String(((await overridden.json()) as Record<string, unknown>).proposal_id);
+      const overriddenShown = (await (await request(`/api/proposals/${encodeURIComponent(overriddenId)}`)).json()) as Record<string, unknown>;
+      expect((overriddenShown.proposal as Record<string, unknown>).tags).toContain("audit-only-source-override");
+
+      const legacyId = "legacy-operational-proposal";
+      const staging = join(root, "shared-brain", "staging", "shared-brain");
+      await writeFile(
+        join(staging, "proposals", "pending", `${legacyId}.md`),
+        [
+          "---",
+          "title: Legacy operational proposal",
+          "type: proposal",
+          `proposal_id: ${legacyId}`,
+          "created_at: 2026-07-10T00:00:00Z",
+          "updated_at: 2026-07-10T00:00:00Z",
+          "status: pending",
+          "tags:",
+          "  - proposal",
+          "source_ids:",
+          `  - ${operationalId}`,
+          "---",
+          "",
+          "# Legacy operational proposal",
+          "",
+          "This old proposal records only that a built-in routine ran.",
+          ""
+        ].join("\n"),
+        "utf8"
+      );
+      git(["add", `proposals/pending/${legacyId}.md`], staging);
+      git(["commit", "-m", "test: add legacy operational proposal"], staging);
+      git(["push", "origin", "HEAD"], staging);
+
+      const dryRun = (await (await request("/api/curator/operational-backfill?limit=20")).json()) as Record<string, unknown>;
+      expect(dryRun.dry_run).toBe(true);
+      expect(dryRun.matched).toBe(1);
+      expect((dryRun.proposals as Array<Record<string, unknown>>).map((item) => item.id)).toEqual([legacyId]);
+      const cliBackfill = runBrainctl(["curator", "backfill-operational", "--config", join(dir, "config.yaml"), "--limit", "20", "--json"], cliEnv);
+      expectSuccess(cliBackfill);
+      expect(JSON.parse(cliBackfill.stdout).matched).toBe(1);
+
+      const applied = await request(
+        "/api/curator/operational-backfill",
+        "POST",
+        { limit: 20, decided_by: "test-backfill" },
+        "admin-test-token"
+      );
+      expect(applied.status).toBe(200);
+      expect(((await applied.json()) as Record<string, unknown>).superseded).toEqual([legacyId]);
+      const shown = (await (await request(`/api/proposals/${encodeURIComponent(legacyId)}`)).json()) as Record<string, unknown>;
+      expect((shown.proposal as Record<string, unknown>).status).toBe("superseded");
+      const overrideStillOpen = (await (await request(`/api/proposals/${encodeURIComponent(overriddenId)}`)).json()) as Record<string, unknown>;
+      expect((overrideStillOpen.proposal as Record<string, unknown>).status).toBe("pending");
+    } finally {
+      if (proc) await stopBraind(proc);
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("staging clone fast-forwards after a direct push to the bare repo", async () => {
     const dir = await mkdtemp(join(tmpdir(), "braind-sync-"));
     try {

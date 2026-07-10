@@ -285,6 +285,10 @@ export class CronScheduler {
         modelOverride: claimed.modelOverride,
         reasoningEffortOverride: claimed.reasoningEffortOverride,
         sourceLabel: `manual cron run ${claimed.id}`,
+        runOrigin: "manual",
+        routineName: claimed.label,
+        routineJobId: claimed.id,
+        scheduledFor: manual.scheduledFor,
         onFinished: this.curatorFinishHook(claimed, manual.scheduledFor)
       }
     );
@@ -576,6 +580,10 @@ export class CronScheduler {
         modelOverride: claimed.modelOverride,
         reasoningEffortOverride: claimed.reasoningEffortOverride,
         sourceLabel: `scheduled cron ${claimed.id}`,
+        runOrigin: "scheduled",
+        routineName: claimed.label,
+        routineJobId: claimed.id,
+        scheduledFor,
         onFinished: this.curatorFinishHook(claimed, scheduledFor)
       }
     );
