@@ -728,6 +728,31 @@ export async function rejectProposal(repoRoot: string, id: string, decidedBy: st
   return { record: found.record, touchedFiles: touched };
 }
 
+export async function markProposalNeedsWork(repoRoot: string, id: string, decidedBy: string, reason: string | null): Promise<ProposalDecisionResult> {
+  const found = await findProposal(repoRoot, id);
+  if (!found) {
+    throw new Error(`proposal not found: ${id}`);
+  }
+  if (!OPEN_PROPOSAL_STATUSES.includes(found.record.status)) {
+    throw new Error(`proposal ${id} is ${found.record.status}; only open proposals can be sent back for more work`);
+  }
+  found.record.status = "needs-human";
+  found.record.decidedAt = isoNow();
+  found.record.decidedBy = decidedBy;
+  found.record.reason = reason || "operator requested more context before applying";
+  const touched = await saveRecord(repoRoot, found.record, found.absolutePath);
+  touched.push(
+    await appendLogEntry(repoRoot, "proposal-needs-work", found.record.path, found.record.title, [
+      `operation: proposal-needs-work`,
+      `inputs: requested_by=${decidedBy}; reason=${found.record.reason}`,
+      `files: [[${found.record.path}]]`,
+      `commit: pending`,
+      `summary: Returned proposal ${id} for more work.`
+    ])
+  );
+  return { record: found.record, touchedFiles: touched };
+}
+
 export async function supersedeProposal(repoRoot: string, id: string, decidedBy: string, reason: string | null): Promise<ProposalDecisionResult> {
   const found = await findProposal(repoRoot, id);
   if (!found) {

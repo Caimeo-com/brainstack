@@ -231,7 +231,7 @@ final class ProposalTests: XCTestCase {
   func testParseProposalList() {
     let json = """
     {"ok": true, "mode": "approval", "proposals": [
-      {"id": "p1", "title": "First", "status": "pending", "target_page": "wiki/Status/A.md", "risk": "low", "created_at": "2026-06-11T00:00:00Z"},
+      {"id": "p1", "title": "First", "status": "pending", "target_page": "wiki/Status/A.md", "base_sha256": "abc", "risk": "low", "created_at": "2026-06-11T00:00:00Z", "updated_at": "2026-06-11T00:05:00Z", "project": "brainstack", "domain": "product", "scope": "repo", "memory_kind": "project_lesson", "source_ids": ["source-a"], "source_harness": "codex", "source_machine": "mac", "source_type": "remember", "related_repo": "/repo", "context": "during review", "applicability": "when reviewing", "non_applicability": "outside Brainstack", "evidence_refs": ["proposal:a"], "review_after": "2026-07-01", "expires_at": "2027-01-01", "confidence": 0.9, "reason": "complete", "search_text": "A hidden lesson about queue ergonomics", "quality_reasons": ["scoped"], "has_proposed_content": true},
       {"id": "p2", "title": "Second", "status": "needs-human", "target_page": null, "risk": null, "created_at": "2026-06-11T01:00:00Z", "legacy_format": true, "cluster_key": "slack-ea:needs-context:legacy-memory", "cluster_label": "Slack EA / needs-context / legacy-memory"}
     ]}
     """
@@ -242,7 +242,76 @@ final class ProposalTests: XCTestCase {
     XCTAssertEqual(proposals?[1].legacyFormat, true)
     XCTAssertEqual(proposals?[1].clusterLabel, "Slack EA / needs-context / legacy-memory")
     XCTAssertNil(proposals?[0].qualityDecision)
+    XCTAssertEqual(proposals?[0].baseSHA256, "abc")
+    XCTAssertEqual(proposals?[0].sourceIds, ["source-a"])
+    XCTAssertEqual(proposals?[0].evidenceRefs, ["proposal:a"])
+    XCTAssertEqual(proposals?[0].includedSourceCount, 1)
+    XCTAssertEqual(proposals?[0].reviewLane, .reviewNow)
+    XCTAssertEqual(proposals?[1].reviewLane, .needsContext)
+    XCTAssertTrue(proposals?[0].matchesReviewSearch("reviewing") == true)
+    XCTAssertTrue(proposals?[0].matchesReviewSearch("SOURCE-A") == true)
+    XCTAssertTrue(proposals?[0].matchesReviewSearch("queue ergonomics") == true)
+    XCTAssertFalse(proposals?[0].matchesReviewSearch("unrelated") == true)
     XCTAssertNil(ProposalSummary.parseList("not json"))
+  }
+
+  func testReviewLaneSeparatesMergeConflictAndReviewedProposals() {
+    let json = """
+    {"proposals": [
+      {"id":"merge","title":"Consolidate lessons","status":"pending","source_type":"memory-merge","source_ids":["a","b"],"target_page":"wiki/A.md"},
+      {"id":"conflict","title":"Apply blocked","status":"needs-human","risk":"medium","target_page":"wiki/B.md","reason":"target page changed since this proposal was created"},
+      {"id":"reviewed","title":"Done","status":"applied","target_page":"wiki/C.md"},
+      {"id":"incomplete","title":"Missing boundaries","status":"pending","source_type":"remember","memory_kind":"lesson","scope":"repo","target_page":"wiki/D.md","source_ids":["a"]}
+    ]}
+    """
+    let proposals = ProposalSummary.parseList(json)
+    XCTAssertEqual(proposals?[0].reviewLane, .mergeSuggestions)
+    XCTAssertEqual(proposals?[0].reviewLeverage, 2)
+    XCTAssertEqual(proposals?[1].reviewLane, .conflicts)
+    XCTAssertEqual(proposals?[2].reviewLane, .reviewed)
+    XCTAssertEqual(proposals?[3].reviewLane, .needsContext)
+  }
+
+  func testDiffStatsIgnoreFileHeaders() {
+    let stats = ProposalDiffStats(diff: "--- a/wiki.md\n+++ b/wiki.md\n+one\n two\n-old\n+three")
+    XCTAssertEqual(stats.additions, 2)
+    XCTAssertEqual(stats.removals, 1)
+    XCTAssertEqual(ProposalDiffStats(diff: nil), ProposalDiffStats(diff: ""))
+  }
+
+  func testOptimisticDecisionsRestoreOnlyFailuresOnReload() {
+    let proposals = ProposalSummary.parseList("""
+    {"proposals":[
+      {"id":"success","title":"Applied","status":"pending"},
+      {"id":"failure","title":"Blocked","status":"pending"},
+      {"id":"untouched","title":"Open","status":"pending"}
+    ]}
+    """) ?? []
+    var state = OptimisticProposalDecisionState()
+    state.start(ids: ["success", "failure"])
+    XCTAssertEqual(state.pendingIds, ["success", "failure"])
+    XCTAssertEqual(state.filterVisible(proposals).map(\.id), ["untouched"])
+
+    state.complete(succeededIds: ["success"], failedIds: ["failure"])
+    XCTAssertTrue(state.pendingIds.isEmpty)
+    XCTAssertEqual(state.failedIds, ["failure"])
+    XCTAssertEqual(state.filterVisible(proposals).map(\.id), ["untouched"])
+
+    state.beginReload()
+    XCTAssertEqual(state.filterVisible(proposals).map(\.id), ["failure", "untouched"])
+    XCTAssertEqual(state.hiddenIds, ["success"])
+  }
+
+  func testBatchApplyRejectsDuplicateTargets() {
+    let proposals = ProposalSummary.parseList("""
+    {"proposals":[
+      {"id":"a","title":"A","status":"pending","target_page":"wiki/Same.md"},
+      {"id":"b","title":"B","status":"pending","target_page":"wiki/Same.md"},
+      {"id":"c","title":"C","status":"pending","target_page":"wiki/Other.md"}
+    ]}
+    """) ?? []
+    XCTAssertEqual(ProposalBatchValidation.duplicateTargets(in: proposals), ["wiki/Same.md"])
+    XCTAssertTrue(ProposalBatchValidation.duplicateTargets(in: [proposals[0], proposals[2]]).isEmpty)
   }
 }
 
@@ -252,7 +321,9 @@ final class ProposalDetailTests: XCTestCase {
     {"ok": true,
      "proposal": {"id": "p1", "title": "T", "status": "pending", "target_page": "wiki/Status/A.md", "risk": "low", "confidence": 0.85, "created_at": "2026-06-11T00:00:00Z", "source_ids": ["a", "b"], "reason": "why", "source_harness": "codex", "source_machine": "mac", "source_type": "remember", "related_repo": "/repo/app", "project": "app", "domain": "product", "scope": "repo", "memory_kind": "project_lesson", "context": "during test", "applicability": "use for this app", "non_applicability": "do not use globally", "evidence_refs": ["repo:/repo/app"], "review_after": "2026-07-01", "expires_at": "2027-01-01", "quality_decision": "ready", "quality_score": 0.92, "quality_reasons": ["has context"], "legacy_format": true, "cluster_key": "app:repo:project_lesson", "cluster_label": "app / repo / project_lesson"},
      "body": "## Request\\n\\ncontent",
-     "diff": "+ added line"}
+     "diff": "+ added line",
+     "target_unchanged": true,
+     "source_proposals": [{"id":"source-1","title":"Original lesson","status":"superseded","created_at":"2026-06-10T00:00:00Z","source_harness":"codex","source_machine":"valkyrie","excerpt":"Useful source excerpt"}]}
     """
     let detail = ProposalDetail.parse(json)
     XCTAssertEqual(detail?.summary.id, "p1")
@@ -280,6 +351,10 @@ final class ProposalDetailTests: XCTestCase {
     XCTAssertEqual(detail?.legacyFormat, true)
     XCTAssertEqual(detail?.clusterKey, "app:repo:project_lesson")
     XCTAssertEqual(detail?.clusterLabel, "app / repo / project_lesson")
+    XCTAssertEqual(detail?.sourceProposals.count, 1)
+    XCTAssertEqual(detail?.sourceProposals.first?.title, "Original lesson")
+    XCTAssertEqual(detail?.sourceProposals.first?.excerpt, "Useful source excerpt")
+    XCTAssertEqual(detail?.targetUnchanged, true)
     XCTAssertNil(ProposalDetail.parse("not json"))
     XCTAssertNil(ProposalDetail.parse(#"{"ok": true}"#))
   }

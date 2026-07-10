@@ -934,7 +934,7 @@ printf 'brew_installed=ffmpeg\\n'
       [
         `const receivedPath = ${JSON.stringify(receivedPath)};`,
         `const proposals = [`,
-        `  { id: "p1", title: "Remember (cli): old closed", status: "rejected", reason: "merged into old-merge", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", created_at: "2026-06-11T00:01:00Z" },`,
+        `  { id: "p1", title: "Remember (cli): old closed", status: "superseded", reason: "absorbed into old-merge", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", created_at: "2026-06-11T00:01:00Z" },`,
         `  { id: "p2", title: "Remember (cli): still open", status: "pending", project: "cli", domain: "cli", scope: "repo", memory_kind: "project_lesson", cluster_key: "cli:repo:project_lesson", cluster_label: "CLI / repo / project_lesson", created_at: "2026-06-11T00:02:00Z" }`,
         `];`,
         `Bun.serve({`,
@@ -952,7 +952,7 @@ printf 'brew_installed=ffmpeg\\n'
         `      return proposal ? Response.json({ ok: true, proposal, body: "## Request\\n\\n" + proposal.title, diff: "" }) : Response.json({ error: "missing" }, { status: 404 });`,
         `    }`,
         `    if (req.method === "POST" && url.pathname === "/api/propose") return Response.json({ error: "must not create duplicate merge" }, { status: 500 });`,
-        `    if (req.method === "POST" && url.pathname === "/api/proposals/p1/supersede") return Response.json({ error: "already rejected" }, { status: 409 });`,
+        `    if (req.method === "POST" && url.pathname === "/api/proposals/p1/supersede") return Response.json({ error: "already superseded" }, { status: 409 });`,
         `    if (req.method === "POST" && url.pathname === "/api/proposals/p2/supersede") return Response.json({ ok: true, status: "superseded" });`,
         `    return Response.json({ error: "unexpected" }, { status: 500 });`,
         `  }`,

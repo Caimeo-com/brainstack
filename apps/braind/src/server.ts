@@ -44,10 +44,12 @@ import {
   findProposal,
   isSafeProposalId,
   listProposals,
+  markProposalNeedsWork,
   readProposedContent,
   rejectProposal,
   renderUnifiedDiff,
   supersedeProposal,
+  proposalBaseHash,
   validateProposalTargetPage,
   writeCuratorStatus
 } from "./curation";
@@ -2080,7 +2082,7 @@ async function proposeFromRequest(request: Request, authScope: AuthScope): Promi
   });
 }
 
-const PROPOSAL_DECISION_ACTIONS = new Set(["approve", "reject", "apply", "supersede"]);
+const PROPOSAL_DECISION_ACTIONS = new Set(["approve", "reject", "apply", "supersede", "needs-work"]);
 
 async function proposalDecisionFromRequest(request: Request, id: string, action: string): Promise<Record<string, unknown>> {
   if (!PROPOSAL_DECISION_ACTIONS.has(action)) {
@@ -2105,6 +2107,8 @@ async function proposalDecisionFromRequest(request: Request, id: string, action:
           result = await rejectProposal(writeRepoRoot, id, decidedBy, reason);
         } else if (action === "supersede") {
           result = await supersedeProposal(writeRepoRoot, id, decidedBy, reason);
+        } else if (action === "needs-work") {
+          result = await markProposalNeedsWork(writeRepoRoot, id, decidedBy, reason);
         } else {
           const applyResult = await applyProposal(writeRepoRoot, id, decidedBy);
           result = applyResult;
@@ -2163,6 +2167,7 @@ function proposalToJson(record: import("./curation").ProposalRecord): Record<str
     confidence: record.confidence,
     curator_run_id: record.curatorRunId,
     reason: record.reason,
+    search_text: record.body.slice(0, 2_000),
     source_ids: record.sourceIds,
     decided_at: record.decidedAt,
     decided_by: record.decidedBy,
@@ -2178,12 +2183,15 @@ async function listProposalsResponse(url: URL): Promise<Response> {
   if (statusParam === "open") {
     statuses = [...OPEN_PROPOSAL_STATUSES];
   } else if (statusParam) {
-    const requested = statusParam.split(",").map((value) => value.trim()) as import("./curation").ProposalStatus[];
+    const requested = statusParam
+      .split(",")
+      .map((value) => value.trim())
+      .flatMap((value) => (value === "open" ? OPEN_PROPOSAL_STATUSES : [value])) as import("./curation").ProposalStatus[];
     const invalid = requested.filter((value) => !PROPOSAL_STATUSES.includes(value));
     if (invalid.length) {
       reject(400, `unknown proposal status filter: ${invalid.join(", ")}`);
     }
-    statuses = requested;
+    statuses = [...new Set(requested)];
   }
   const records = await listProposals(writeRepoRoot, statuses);
   const policy = curationPolicyFromEnv();
@@ -2233,21 +2241,49 @@ async function showProposalResponse(id: string): Promise<Response> {
   }
   const record = found!.record;
   let diff: string | null = null;
+  let targetUnchanged: boolean | null = null;
   const proposedContent = await readProposedContent(writeRepoRoot, record);
   if (record.targetPage && proposedContent !== null) {
     try {
       const targetAbsolute = safeRepoPath(writeRepoRoot, record.targetPage);
       const currentContent = existsSync(targetAbsolute) ? await readFile(targetAbsolute, "utf8") : null;
       diff = renderUnifiedDiff(currentContent, proposedContent);
+      if (record.baseSha256) {
+        targetUnchanged = proposalBaseHash(currentContent) === record.baseSha256;
+      }
     } catch {
       diff = "(target page path is invalid)";
     }
+  }
+  const sourceProposalIds = Array.from(
+    new Set(
+      [...record.evidenceRefs, ...record.sourceIds]
+        .filter((ref) => ref.startsWith("proposal:"))
+        .map((ref) => ref.slice("proposal:".length).trim())
+        .filter(Boolean)
+    )
+  ).slice(0, 20);
+  const sourceProposals: Array<Record<string, unknown>> = [];
+  for (const sourceId of sourceProposalIds) {
+    const source = await findProposal(writeRepoRoot, sourceId);
+    if (!source) continue;
+    sourceProposals.push({
+      id: source.record.id,
+      title: source.record.title,
+      status: source.record.status,
+      created_at: source.record.createdAt,
+      source_harness: source.record.sourceHarness,
+      source_machine: source.record.sourceMachine,
+      excerpt: source.record.body.trim().slice(0, 800)
+    });
   }
   return json({
     ok: true,
     proposal: proposalToJson(record),
     body: record.body,
-    diff
+    diff,
+    target_unchanged: targetUnchanged,
+    source_proposals: sourceProposals
   });
 }
 
@@ -2655,7 +2691,7 @@ const server = Bun.serve({
         if (proposalShow) {
           return await showProposalResponse(decodeURIComponent(proposalShow[1]));
         }
-        const proposalAction = request.method === "POST" ? url.pathname.match(/^\/api\/proposals\/([^/]+)\/(approve|reject|apply|supersede)$/) : null;
+        const proposalAction = request.method === "POST" ? url.pathname.match(/^\/api\/proposals\/([^/]+)\/(approve|reject|apply|supersede|needs-work)$/) : null;
         if (proposalAction) {
           assertAdminAuth(request);
           assertWriteRateLimit(request, "admin", "proposal-decision", null);

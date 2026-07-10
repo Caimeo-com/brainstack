@@ -307,7 +307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
       let window = NSWindow(contentViewController: hosting)
       window.title = "Brainstack Operator Console"
       window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
-      window.setContentSize(NSSize(width: 880, height: 560))
+      window.setContentSize(NSSize(width: 1_180, height: 760))
       window.isReleasedWhenClosed = false
       window.center()
       operatorConsoleWindow = window

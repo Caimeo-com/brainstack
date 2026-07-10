@@ -1438,7 +1438,7 @@ function formatProposalClusterLine(cluster: Record<string, unknown>): string {
     .join(" ");
 }
 
-type ProposalDecisionAction = "approve" | "reject" | "apply" | "supersede";
+type ProposalDecisionAction = "approve" | "reject" | "apply" | "supersede" | "needs-work";
 
 function proposalRemoteRepo(cfg: BrainstackConfig, args: ParsedArgs): string {
   return requireFlagValue(args, "remote-repo") || process.env.BRAINSTACK_TELEGRAM_REMOTE_REPO?.trim() || cfg.client.telegramRemoteRepo || "~/brainstack";
@@ -1516,7 +1516,7 @@ async function maybeRunRemoteProposalDecision(cfg: BrainstackConfig, args: Parse
   if (!via) {
     return false;
   }
-  const argv = ["proposals", action, id, ...(reason ? ["--reason", reason] : [])];
+  const argv = ["proposals", action, id, ...(reason ? ["--reason", reason] : []), ...(hasFlag(args, "json") ? ["--json"] : [])];
   const result = runControlRemoteScript(cfg, args, "proposal decision SSH target", remoteBrainctlScript(proposalRemoteRepo(cfg, args), argv), 120_000);
   if (!result) {
     return false;
@@ -1533,7 +1533,7 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
   const sub = args.positional[0] || "list";
   if (sub === "help" || sub === "--help" || sub === "-h") {
     console.log(
-      "Usage: brainctl proposals list [--status open|pending|approved|applied|rejected|superseded|needs-human] [--json]\n       brainctl proposals groups [--status open|pending|approved|applied|rejected|superseded|needs-human] [--min-size N] [--json]\n       brainctl proposals show <id> [--json]\n       brainctl proposals merge-group <group-key|group-label> [--id ID] [--submit] [--limit N|--all] [--target-page wiki/PATH.md] [--needs-human] [--close-sources] [--json] [--via SSH_TARGET] [--remote-repo PATH] [--local]\n       brainctl proposals auto-merge [--submit] [--min-size N] [--max-group-size N|--allow-large-groups] [--max-source-group-size N|--all-source-groups] [--limit-groups N|--all-groups] [--relation-window day|all] [--keep-sources] [--json] [--via SSH_TARGET] [--remote-repo PATH] [--local]\n       brainctl proposals batch-merge [--submit] [--limit 100] [--auto-threshold 0.8] [--harness codex|claude] [--harness-bin PATH] [--keep-sources] [--json] [--via SSH_TARGET] [--remote-repo PATH] [--local]\n       brainctl proposals approve <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals reject <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals supersede <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]"
+      "Usage: brainctl proposals list [--status open|pending|approved|applied|rejected|superseded|needs-human] [--json]\n       brainctl proposals groups [--status open|pending|approved|applied|rejected|superseded|needs-human] [--min-size N] [--json]\n       brainctl proposals show <id> [--json]\n       brainctl proposals merge-group <group-key|group-label> [--id ID] [--submit] [--limit N|--all] [--target-page wiki/PATH.md] [--needs-human] [--close-sources] [--json] [--via SSH_TARGET] [--remote-repo PATH] [--local]\n       brainctl proposals auto-merge [--submit] [--min-size N] [--max-group-size N|--allow-large-groups] [--max-source-group-size N|--all-source-groups] [--limit-groups N|--all-groups] [--relation-window day|all] [--keep-sources] [--json] [--via SSH_TARGET] [--remote-repo PATH] [--local]\n       brainctl proposals batch-merge [--submit] [--limit 100] [--auto-threshold 0.8] [--harness codex|claude] [--harness-bin PATH] [--keep-sources] [--json] [--via SSH_TARGET] [--remote-repo PATH] [--local]\n       brainctl proposals approve <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals reject <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals supersede <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals needs-work <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]\n       brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]"
       + "\n       brainctl proposals enrich <id> [--summary TEXT] [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF] [--dry-run|--json]"
         + "\n       brainctl proposals reprocess [--status needs-human|open] [--group KEY] [--cluster KEY] [--id ID] [--limit N] [--apply] [--json] [enrichment flags...]"
     );
@@ -1787,6 +1787,7 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
     case "approve":
     case "reject":
     case "supersede":
+    case "needs-work":
     case "apply": {
       const id = args.positional[1];
       if (!id) {
@@ -1801,6 +1802,10 @@ async function commandProposals(args: ParsedArgs): Promise<void> {
         return;
       }
       const result = await brainApiRequest(cfg, "POST", `/api/proposals/${encodeURIComponent(id)}/${sub}`, { admin: true, body });
+      if (hasFlag(args, "json")) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
       console.log(
         [
           `proposal=${id}`,

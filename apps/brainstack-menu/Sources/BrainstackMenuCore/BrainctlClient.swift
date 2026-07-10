@@ -55,6 +55,16 @@ public struct ActionOutcome: Sendable {
   }
 }
 
+public struct ProposalDecisionExecution: Sendable {
+  public let outcome: ActionOutcome
+  public let supersededIds: Set<String>
+
+  public init(outcome: ActionOutcome, supersededIds: Set<String> = []) {
+    self.outcome = outcome
+    self.supersededIds = supersededIds
+  }
+}
+
 public enum ActionRecoveryKind: String, Equatable, Sendable {
   case updateControlHost
 }
@@ -427,10 +437,10 @@ public struct BrainctlClient: Sendable {
 
   /// List + parse in one step. Parsing happens on the raw stdout *before* redaction,
   /// since redaction is for human-facing output and could mangle JSON fields.
-  public func fetchOpenProposals() async -> (proposals: [ProposalSummary]?, outcome: ActionOutcome) {
+  public func fetchProposals(status: String = "open") async -> (proposals: [ProposalSummary]?, outcome: ActionOutcome) {
     let result = await CommandRunner.run(
       executable: binaryPath,
-      arguments: ["proposals", "list", "--status", "open", "--json", "--config", configPath],
+      arguments: ["proposals", "list", "--status", status, "--json", "--config", configPath],
       timeout: 20
     )
     let outcome = Self.outcome(title: "List Proposals", result: result, timeout: 20)
@@ -438,6 +448,10 @@ public struct BrainctlClient: Sendable {
       return (nil, outcome)
     }
     return (ProposalSummary.parseList(result.stdout), outcome)
+  }
+
+  public func fetchOpenProposals() async -> (proposals: [ProposalSummary]?, outcome: ActionOutcome) {
+    await fetchProposals()
   }
 
   public func proposalShow(id: String) async -> ActionOutcome {
@@ -458,9 +472,59 @@ public struct BrainctlClient: Sendable {
     return (ProposalDetail.parse(result.stdout), outcome)
   }
 
-  public func proposalDecision(id: String, action: String) async -> ActionOutcome {
-    let title = action == "apply" ? "Accept Proposal" : "\(action.capitalized) Proposal"
-    return await runAction(title: title, arguments: ["proposals", action, id, "--config", configPath], timeout: 60)
+  public func proposalDecision(id: String, action: String) async -> ProposalDecisionExecution {
+    let title = action == "apply" ? "Apply Proposal" : "\(action.capitalized) Proposal"
+    // Remote decisions allow up to 120 seconds inside brainctl. Keep the app's
+    // outer deadline above that budget so it does not manufacture an ambiguous
+    // timeout while the control host is still committing and pushing.
+    let result = await CommandRunner.run(
+      executable: binaryPath,
+      arguments: ["proposals", action, id, "--json", "--config", configPath],
+      timeout: 150
+    )
+    let outcome = Self.outcome(title: title, result: result, timeout: 150)
+    let decoded = result.stdout.data(using: .utf8)
+      .flatMap { try? JSONDecoder().decode(JSONValue.self, from: $0) }
+    let supersededIds = Set(decoded?["superseded_ids"]?.arrayValue?.compactMap(\.stringValue) ?? [])
+    let normalizedOutput = "\(result.stdout)\n\(result.stderr)".lowercased()
+    if action == "apply", outcome.succeeded,
+       normalizedOutput.contains("status=needs-human") || normalizedOutput.contains("blocked=") {
+      return ProposalDecisionExecution(
+        outcome: ActionOutcome(
+          title: title,
+          succeeded: false,
+          unsupported: false,
+          adminUnavailable: false,
+          summary: "Brainstack could not apply this proposal because its destination changed. Refresh to review it again.",
+          output: outcome.output,
+          duration: outcome.duration
+        ),
+        supersededIds: supersededIds
+      )
+    }
+    if action == "apply", outcome.succeeded, decoded?["status"]?.stringValue == "needs-human" {
+      return ProposalDecisionExecution(
+        outcome: ActionOutcome(
+          title: title,
+          succeeded: false,
+          unsupported: false,
+          adminUnavailable: false,
+          summary: "Brainstack could not apply this proposal because its destination changed. Refresh to review it again.",
+          output: outcome.output,
+          duration: outcome.duration
+        ),
+        supersededIds: supersededIds
+      )
+    }
+    return ProposalDecisionExecution(outcome: outcome, supersededIds: supersededIds)
+  }
+
+  public func proposalNeedsWork(id: String, reason: String) async -> ActionOutcome {
+    await runAction(
+      title: "Send Proposal Back",
+      arguments: ["proposals", "needs-work", id, "--reason", reason, "--config", configPath],
+      timeout: 150
+    )
   }
 
   public func proposalMergeGroup(groupKey: String) async -> ActionOutcome {
@@ -469,6 +533,15 @@ public struct BrainctlClient: Sendable {
       arguments: ["proposals", "merge-group", groupKey, "--submit", "--close-sources", "--config", configPath],
       timeout: 120
     )
+  }
+
+  public func proposalMergeSelection(groupKey: String, ids: [String]) async -> ActionOutcome {
+    var arguments = ["proposals", "merge-group", groupKey]
+    for id in ids {
+      arguments.append(contentsOf: ["--id", id])
+    }
+    arguments.append(contentsOf: ["--submit", "--close-sources", "--config", configPath])
+    return await runAction(title: "Merge Selected Proposals", arguments: arguments, timeout: 150)
   }
 
   public func proposalAutoMerge() async -> ActionOutcome {

@@ -1277,6 +1277,47 @@ describe("braind write safety", () => {
       };
       expect(rejectedList.proposals.some((proposal) => proposal.id === rejectableId)).toBe(true);
 
+      // Needs-work keeps the proposal open while persisting operator feedback for
+      // a later enrichment/curator pass.
+      const revisable = await propose(
+        {
+          title: "Proposal That Needs Context",
+          body: "The idea is useful but too broad.",
+          source_harness: "test-harness",
+          source_machine: "test-machine"
+        },
+        "proposal-lifecycle-needs-work"
+      );
+      const revisableId = String(((await revisable.json()) as Record<string, unknown>).proposal_id);
+      const needsWork = await decide(revisableId, "needs-work", { decided_by: "tester", reason: "narrow this to the repo" });
+      const needsWorkBody = (await needsWork.json()) as Record<string, unknown>;
+      expect(needsWorkBody.status).toBe("needs-human");
+      const needsWorkList = (await (await fetch(`http://127.0.0.1:${port}/api/proposals?status=needs-human`)).json()) as {
+        proposals: Array<Record<string, unknown>>;
+      };
+      const needsWorkProposal = needsWorkList.proposals.find((proposal) => proposal.id === revisableId);
+      expect(needsWorkProposal?.reason).toBe("narrow this to the repo");
+
+      // Detail responses enrich proposal references with human-reviewable source
+      // titles, provenance, and excerpts.
+      const sourced = await propose(
+        {
+          title: "Sourced Consolidation",
+          body: "Review the captured source.",
+          source_harness: "test-harness",
+          source_machine: "test-machine",
+          evidence_refs: [`proposal:${revisableId}`]
+        },
+        "proposal-lifecycle-source-evidence"
+      );
+      const sourcedId = String(((await sourced.json()) as Record<string, unknown>).proposal_id);
+      const sourcedDetail = (await (await fetch(`http://127.0.0.1:${port}/api/proposals/${sourcedId}`)).json()) as {
+        source_proposals: Array<Record<string, unknown>>;
+      };
+      expect(sourcedDetail.source_proposals).toHaveLength(1);
+      expect(sourcedDetail.source_proposals[0]?.id).toBe(revisableId);
+      expect(String(sourcedDetail.source_proposals[0]?.excerpt || "")).toContain("useful but too broad");
+
       // Supersede marks source candidates as absorbed by a better proposal; this is
       // distinct from rejection because the source remains provenance for a merge.
       const absorbable = await propose(
@@ -1302,6 +1343,10 @@ describe("braind write safety", () => {
         proposals: Array<Record<string, unknown>>;
       };
       expect(supersededList.proposals.some((proposal) => proposal.id === absorbableId && proposal.reason === "absorbed into consolidated-card")).toBe(true);
+      const mixedOpenList = await fetch(`http://127.0.0.1:${port}/api/proposals?status=open,superseded`);
+      expect(mixedOpenList.status).toBe(200);
+      const mixedOpenBody = (await mixedOpenList.json()) as { proposals: Array<Record<string, unknown>> };
+      expect(mixedOpenBody.proposals.some((proposal) => proposal.id === absorbableId)).toBe(true);
 
       // needs-human can be set at proposal time.
       const parked = await propose(

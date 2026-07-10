@@ -867,3 +867,21 @@ enum Confirm {
     return alert.runModal() == .alertFirstButtonReturn
   }
 }
+
+enum TextPrompt {
+  static func ask(title: String, message: String, placeholder: String) -> String? {
+    let alert = NSAlert()
+    alert.messageText = title
+    alert.informativeText = message
+    alert.alertStyle = .informational
+    alert.addButton(withTitle: "Send Back")
+    alert.addButton(withTitle: "Cancel")
+    let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+    field.placeholderString = placeholder
+    alert.accessoryView = field
+    NSApp.activate(ignoringOtherApps: true)
+    guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+    let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    return value.isEmpty ? nil : value
+  }
+}

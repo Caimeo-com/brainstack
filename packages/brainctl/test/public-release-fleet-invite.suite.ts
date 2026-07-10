@@ -680,7 +680,7 @@ describe("public release hygiene - fleet remote control invites and release", ()
           "#!/usr/bin/env bash",
           "set -euo pipefail",
           `printf '<%s>\\n' "$@" > '${argsCapture}'`,
-          "echo 'proposal=proposal-1 action=reject status=rejected'",
+          "echo '{\"ok\":true,\"proposal_id\":\"proposal-1\",\"action\":\"reject\",\"status\":\"rejected\"}'",
           ""
         ].join("\n")
       );
@@ -706,12 +706,12 @@ describe("public release hygiene - fleet remote control invites and release", ()
         ].join("\n")
       );
 
-      const result = runBrainctl(["proposals", "reject", "proposal-1", "--reason", "not useful", "--config", configPath], {
+      const result = runBrainctl(["proposals", "reject", "proposal-1", "--reason", "not useful", "--json", "--config", configPath], {
         PATH: `${binDir}:${process.env.PATH || ""}`,
         BRAIN_ADMIN_TOKEN: ""
       });
       expectSuccess(result);
-      expect(result.stdout).toContain("status=rejected");
+      expect(JSON.parse(result.stdout).status).toBe("rejected");
       const sshArgs = await readFile(argsCapture, "utf8");
       expect(sshArgs).toContain("BatchMode=yes");
       expect(sshArgs).toContain("ConnectTimeout=8");
@@ -721,6 +721,7 @@ describe("public release hygiene - fleet remote control invites and release", ()
       expect(sshArgs).toContain("/home/operator/brainstack");
       expect(sshArgs).toContain("'\\''proposals'\\'' '\\''reject'\\'' '\\''proposal-1'\\''");
       expect(sshArgs).toContain("'\\''--reason'\\'' '\\''not useful'\\''");
+      expect(sshArgs).toContain("'\\''--json'\\''");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

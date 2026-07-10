@@ -3,6 +3,21 @@ import Combine
 import Foundation
 import BrainstackMenuCore
 
+struct ProposalDecisionNotice: Equatable {
+  let action: String
+  let attempted: Int
+  let succeeded: Int
+  let failed: Int
+
+  var message: String {
+    let verb = action == "apply" ? "Applied" : "Rejected"
+    if failed == 0 {
+      return "\(verb) \(succeeded) proposal\(succeeded == 1 ? "" : "s")."
+    }
+    return "\(verb) \(succeeded) of \(attempted). \(failed) unresolved proposal\(failed == 1 ? " will" : "s will") return when you refresh."
+  }
+}
+
 /// Central observable state for the menu bar app. All brainctl work happens off the
 /// main thread; this model only publishes results.
 @MainActor
@@ -15,8 +30,14 @@ final class AppModel: ObservableObject {
   @Published private(set) var busyAction: String?
   @Published private(set) var actionLog: [ActionOutcome] = []
   @Published private(set) var proposals: [ProposalSummary] = []
+  @Published private(set) var reviewedProposals: [ProposalSummary] = []
   @Published private(set) var proposalsError: String?
+  @Published private(set) var reviewedProposalsError: String?
   @Published private(set) var isLoadingProposals = false
+  @Published private(set) var isLoadingReviewedProposals = false
+  @Published private(set) var pendingProposalDecisionIds = Set<String>()
+  @Published private(set) var pendingProposalApplyTargets = Set<String>()
+  @Published private(set) var proposalDecisionNotice: ProposalDecisionNotice?
   @Published private(set) var uploads: [UploadSummary] = []
   @Published private(set) var uploadsError: String?
   @Published private(set) var isLoadingUploads = false
@@ -32,7 +53,7 @@ final class AppModel: ObservableObject {
   @Published private(set) var isImportingSkills = false
   @Published private(set) var adminAvailability: AdminAvailability = .unknown
   @Published private(set) var proposalDetails: [String: ProposalDetail] = [:]
-  @Published private(set) var loadingDetailId: String?
+  @Published private(set) var loadingDetailIds = Set<String>()
   @Published private(set) var detailErrors: [String: String] = [:]
   @Published private(set) var installerRunning = false
   @Published private(set) var pendingVerificationSections = Set<String>()
@@ -78,6 +99,10 @@ final class AppModel: ObservableObject {
   private var fleetRefreshQueued = false
   private var cachedFleetSection: StatusSection?
   private var cachedFleetRawSection: JSONValue?
+  private var proposalDecisionState = OptimisticProposalDecisionState()
+  private var proposalDecisionTask: Task<Void, Never>?
+  private var cancelledProposalDecisionIds = Set<String>()
+  private var proposalDetailGenerations: [String: Int] = [:]
 
   var onStateChange: (() -> Void)?
 
@@ -360,7 +385,7 @@ final class AppModel: ObservableObject {
     verifying sections: Set<String> = [],
     _ operation: @escaping (BrainctlClient) async -> ActionOutcome
   ) {
-    guard busyAction == nil else {
+    guard busyAction == nil, pendingProposalDecisionIds.isEmpty else {
       return
     }
     guard let client = client() else {
@@ -862,6 +887,9 @@ final class AppModel: ObservableObject {
     guard !isLoadingProposals else {
       return
     }
+    // A reload is the explicit reconciliation point for failed optimistic
+    // decisions. Successful decisions remain absent at the source of truth.
+    proposalDecisionState.beginReload()
     isLoadingProposals = true
     Task {
       let (parsed, outcome) = await client.fetchOpenProposals()
@@ -874,7 +902,7 @@ final class AppModel: ObservableObject {
           return
         }
         if let parsed {
-          self.proposals = parsed
+          self.proposals = self.proposalDecisionState.filterVisible(parsed)
           self.proposalsError = nil
         } else {
           self.proposals = []
@@ -884,14 +912,138 @@ final class AppModel: ObservableObject {
     }
   }
 
-  func decideProposal(_ proposal: ProposalSummary, action: String) {
-    guard busyAction == nil, let client = client() else {
+  func loadReviewedProposals() {
+    guard operatorModeEnabled, let client = client(), !isLoadingReviewedProposals else {
       return
     }
-    let actionLabel = action == "apply" ? "Accept" : action.capitalized
-    busyAction = "\(actionLabel) \(proposal.id)"
+    isLoadingReviewedProposals = true
     Task {
-      let outcome = await client.proposalDecision(id: proposal.id, action: action)
+      let (parsed, outcome) = await client.fetchProposals(status: "applied,rejected,superseded")
+      await MainActor.run {
+        self.isLoadingReviewedProposals = false
+        self.lastDurations["reviewed proposals list"] = outcome.duration
+        if let parsed {
+          self.reviewedProposals = parsed
+          self.reviewedProposalsError = nil
+        } else {
+          self.reviewedProposalsError = outcome.succeeded ? "Could not parse reviewed proposal list." : outcome.summary
+        }
+      }
+    }
+  }
+
+  func decideProposal(_ proposal: ProposalSummary, action: String) {
+    decideProposals([proposal], action: action)
+  }
+
+  func decideProposals(_ selected: [ProposalSummary], action: String) {
+    guard ["apply", "reject"].contains(action), busyAction == nil, let client = client() else {
+      return
+    }
+    let unique = Dictionary(selected.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+      .values
+      .filter { $0.isOpen && !pendingProposalDecisionIds.contains($0.id) }
+      .sorted { $0.id < $1.id }
+    guard !unique.isEmpty else {
+      return
+    }
+    if action == "apply" {
+      guard ProposalBatchValidation.duplicateTargets(in: Array(unique)).isEmpty else {
+        return
+      }
+    }
+    let selectedTargets = Set(unique.compactMap(\.targetPage))
+    guard pendingProposalApplyTargets.isDisjoint(with: selectedTargets) else {
+      return
+    }
+    let applyTargets = action == "apply" ? selectedTargets : []
+    let ids = Set(unique.map(\.id))
+    proposalDecisionNotice = nil
+    proposalDecisionState.start(ids: ids)
+    pendingProposalDecisionIds = proposalDecisionState.pendingIds
+    pendingProposalApplyTargets.formUnion(applyTargets)
+    proposals.removeAll { ids.contains($0.id) }
+    invalidateProposalDetails(ids)
+    let previousDecisionTask = proposalDecisionTask
+    proposalDecisionTask = Task {
+      await previousDecisionTask?.value
+      var executions: [ProposalDecisionExecution] = []
+      for proposal in unique {
+        if self.cancelledProposalDecisionIds.contains(proposal.id) {
+          executions.append(ProposalDecisionExecution(outcome: ActionOutcome(
+            title: action == "apply" ? "Apply Proposal" : "Reject Proposal",
+            succeeded: true,
+            unsupported: false,
+            adminUnavailable: false,
+            summary: "Proposal was already superseded by an earlier decision.",
+            output: "",
+            duration: 0
+          )))
+        } else {
+          executions.append(await client.proposalDecision(id: proposal.id, action: action))
+        }
+      }
+      await MainActor.run {
+        let outcomes = executions.map(\.outcome)
+        let succeededIds = Set(zip(unique, outcomes).compactMap { pair in pair.1.succeeded ? pair.0.id : nil })
+        let failedIds = ids.subtracting(succeededIds)
+        self.proposalDecisionState.complete(succeededIds: succeededIds, failedIds: failedIds)
+        self.pendingProposalDecisionIds = self.proposalDecisionState.pendingIds
+        self.pendingProposalApplyTargets.subtract(applyTargets)
+        let authoritativeSupersededIds = Set(executions.flatMap(\.supersededIds))
+        if !authoritativeSupersededIds.isEmpty {
+          self.cancelledProposalDecisionIds.formUnion(authoritativeSupersededIds)
+          self.proposalDecisionState.start(ids: authoritativeSupersededIds)
+          self.proposalDecisionState.complete(succeededIds: authoritativeSupersededIds, failedIds: [])
+          self.proposals.removeAll { authoritativeSupersededIds.contains($0.id) }
+          self.invalidateProposalDetails(authoritativeSupersededIds)
+        }
+        let succeeded = outcomes.filter(\.succeeded).count
+        let failed = outcomes.count - succeeded
+        let duration = outcomes.reduce(0) { $0 + $1.duration }
+        let output = outcomes.filter { !$0.succeeded }.map(\.output).filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let aggregate = ActionOutcome(
+          title: action == "apply" ? "Apply Proposals" : "Reject Proposals",
+          succeeded: failed == 0,
+          unsupported: outcomes.contains(where: \.unsupported),
+          adminUnavailable: outcomes.contains(where: \.adminUnavailable),
+          summary: failed == 0
+            ? "\(action == "apply" ? "Applied" : "Rejected") \(succeeded) proposal\(succeeded == 1 ? "" : "s")."
+            : "\(failed) of \(outcomes.count) proposal decisions failed. Refresh to restore unresolved proposals.",
+          output: output,
+          duration: duration
+        )
+        self.record(aggregate)
+        self.proposalDecisionNotice = ProposalDecisionNotice(
+          action: action,
+          attempted: outcomes.count,
+          succeeded: succeeded,
+          failed: failed
+        )
+        if aggregate.adminUnavailable {
+          self.adminAvailability = .unavailable
+        } else {
+          self.adminAvailability = .available
+        }
+        // The queue was updated optimistically. Do not reload it here: if a
+        // destination rejects a decision, the proposal returns on explicit reload.
+        self.refresh()
+      }
+    }
+  }
+
+  func clearProposalDecisionNotice() {
+    proposalDecisionNotice = nil
+  }
+
+  func requestProposalWork(_ proposal: ProposalSummary, reason: String) {
+    guard busyAction == nil, pendingProposalDecisionIds.isEmpty, let client = client() else { return }
+    let feedback = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !feedback.isEmpty else { return }
+    proposalDecisionNotice = nil
+    busyAction = "Sending proposal back"
+    Task {
+      let outcome = await client.proposalNeedsWork(id: proposal.id, reason: feedback)
       await MainActor.run {
         self.record(outcome)
         self.busyAction = nil
@@ -899,22 +1051,19 @@ final class AppModel: ObservableObject {
           self.adminAvailability = .unavailable
         } else if outcome.succeeded {
           self.adminAvailability = .available
-        } else {
-          self.adminAvailability = .unavailable
+          self.invalidateProposalDetails([proposal.id])
+          self.loadProposals()
         }
-        // The decision changed proposal state; the cached detail is stale.
-        self.proposalDetails[proposal.id] = nil
-        // Applying or rejecting changes proposal/wiki state; refresh both surfaces.
         self.refresh()
-        self.loadProposals()
       }
     }
   }
 
   func mergeProposalGroup(_ proposal: ProposalSummary) {
-    guard busyAction == nil, let client = client(), let groupKey = proposal.clusterKey, !groupKey.isEmpty else {
+    guard busyAction == nil, pendingProposalDecisionIds.isEmpty, let client = client(), let groupKey = proposal.clusterKey, !groupKey.isEmpty else {
       return
     }
+    proposalDecisionNotice = nil
     busyAction = "Merge \(groupKey)"
     Task {
       let outcome = await client.proposalMergeGroup(groupKey: groupKey)
@@ -926,7 +1075,31 @@ final class AppModel: ObservableObject {
         } else if outcome.succeeded {
           self.adminAvailability = .available
         }
-        self.proposalDetails.removeAll()
+        self.invalidateAllProposalDetails()
+        self.refresh()
+        self.loadProposals()
+      }
+    }
+  }
+
+  func mergeSelectedProposals(_ proposals: [ProposalSummary]) {
+    let selected = proposals.filter(\.isOpen)
+    let groups = Set(selected.compactMap(\.clusterKey))
+    guard selected.count > 1, groups.count == 1, let groupKey = groups.first, !groupKey.isEmpty,
+          busyAction == nil, pendingProposalDecisionIds.isEmpty, let client = client() else { return }
+    proposalDecisionNotice = nil
+    busyAction = "Merging selected proposals"
+    Task {
+      let outcome = await client.proposalMergeSelection(groupKey: groupKey, ids: selected.map(\.id))
+      await MainActor.run {
+        self.record(outcome)
+        self.busyAction = nil
+        if outcome.adminUnavailable {
+          self.adminAvailability = .unavailable
+        } else if outcome.succeeded {
+          self.adminAvailability = .available
+        }
+        self.invalidateAllProposalDetails()
         self.refresh()
         self.loadProposals()
       }
@@ -934,9 +1107,10 @@ final class AppModel: ObservableObject {
   }
 
   func lookForProposalMerges() {
-    guard busyAction == nil, let client = client() else {
+    guard busyAction == nil, pendingProposalDecisionIds.isEmpty, let client = client() else {
       return
     }
+    proposalDecisionNotice = nil
     busyAction = "Looking for merges"
     Task {
       let outcome = await client.proposalAutoMerge()
@@ -948,7 +1122,7 @@ final class AppModel: ObservableObject {
         } else if outcome.succeeded {
           self.adminAvailability = .available
         }
-        self.proposalDetails.removeAll()
+        self.invalidateAllProposalDetails()
         self.refresh()
         self.loadProposals()
       }
@@ -963,16 +1137,18 @@ final class AppModel: ObservableObject {
     if !force, proposalDetails[id] != nil {
       return
     }
-    guard loadingDetailId != id else {
+    guard !loadingDetailIds.contains(id) else {
       return
     }
-    loadingDetailId = id
+    let generation = proposalDetailGenerations[id, default: 0] + 1
+    proposalDetailGenerations[id] = generation
+    loadingDetailIds.insert(id)
+    detailErrors[id] = nil
     Task {
       let (detail, outcome) = await client.fetchProposalDetail(id: id)
       await MainActor.run {
-        if self.loadingDetailId == id {
-          self.loadingDetailId = nil
-        }
+        guard self.proposalDetailGenerations[id] == generation else { return }
+        self.loadingDetailIds.remove(id)
         self.lastDurations["proposal show"] = outcome.duration
         if let detail {
           self.proposalDetails[id] = detail
@@ -982,6 +1158,58 @@ final class AppModel: ObservableObject {
         }
       }
     }
+  }
+
+  func loadProposalDetails(_ proposals: [ProposalSummary]) {
+    guard operatorModeEnabled, let client = client() else { return }
+    let ids = Array(Dictionary(
+      proposals.prefix(ProposalBatchValidation.maximumBatchSize).map { ($0.id, $0.id) },
+      uniquingKeysWith: { first, _ in first }
+    ).keys).sorted()
+    var requests: [(id: String, generation: Int)] = []
+    for id in ids where proposalDetails[id] == nil && !loadingDetailIds.contains(id) {
+      let generation = proposalDetailGenerations[id, default: 0] + 1
+      proposalDetailGenerations[id] = generation
+      loadingDetailIds.insert(id)
+      detailErrors[id] = nil
+      requests.append((id, generation))
+    }
+    guard !requests.isEmpty else { return }
+    Task {
+      // Keep remote admin reads bounded. The queue remains responsive and shows
+      // aggregate loading progress while each decision packet arrives.
+      for request in requests {
+        let (detail, outcome) = await client.fetchProposalDetail(id: request.id)
+        await MainActor.run {
+          guard self.proposalDetailGenerations[request.id] == request.generation else { return }
+          self.loadingDetailIds.remove(request.id)
+          self.lastDurations["proposal show"] = outcome.duration
+          if let detail {
+            self.proposalDetails[request.id] = detail
+            self.detailErrors[request.id] = nil
+          } else {
+            self.detailErrors[request.id] = outcome.succeeded ? "Could not parse proposal detail." : outcome.summary
+          }
+        }
+      }
+    }
+  }
+
+  private func invalidateProposalDetails(_ ids: Set<String>) {
+    for id in ids {
+      proposalDetailGenerations[id, default: 0] += 1
+      loadingDetailIds.remove(id)
+      proposalDetails[id] = nil
+      detailErrors[id] = nil
+    }
+  }
+
+  private func invalidateAllProposalDetails() {
+    let ids = Set(proposalDetailGenerations.keys)
+      .union(loadingDetailIds)
+      .union(proposalDetails.keys)
+      .union(detailErrors.keys)
+    invalidateProposalDetails(ids)
   }
 
   // MARK: - Open / copy helpers

@@ -139,11 +139,31 @@ final class CommandRunnerTests: XCTestCase {
 
   func testProposalDecisionApplyUsesBrainctlApply() async throws {
     let argsPath = scratch.appendingPathComponent("proposal-args.txt")
-    let binary = try fakeBrainctl("printf '%s\\n' \"$@\" > '\(argsPath.path)'; echo 'accepted'")
-    let outcome = await client(binary).proposalDecision(id: "p1", action: "apply")
+    let binary = try fakeBrainctl("printf '%s\\n' \"$@\" > '\(argsPath.path)'; echo '{\"status\":\"applied\",\"superseded_ids\":[\"older\"]}'")
+    let execution = await client(binary).proposalDecision(id: "p1", action: "apply")
+    XCTAssertTrue(execution.outcome.succeeded)
+    XCTAssertEqual(execution.supersededIds, ["older"])
+    XCTAssertEqual(try String(contentsOf: argsPath), "proposals\napply\np1\n--json\n--config\n/tmp/test.yaml\n")
+    XCTAssertEqual(execution.outcome.title, "Apply Proposal")
+  }
+
+  func testProposalDecisionTreatsTargetDriftAsFailure() async throws {
+    let binary = try fakeBrainctl("echo 'proposal=p1 action=apply status=needs-human blocked=target-changed'")
+    let execution = await client(binary).proposalDecision(id: "p1", action: "apply")
+    XCTAssertFalse(execution.outcome.succeeded)
+    XCTAssertFalse(execution.outcome.adminUnavailable)
+    XCTAssertTrue(execution.outcome.summary.contains("destination changed"))
+  }
+
+  func testProposalNeedsWorkPersistsFeedbackThroughBrainctl() async throws {
+    let argsPath = scratch.appendingPathComponent("proposal-needs-work-args.txt")
+    let binary = try fakeBrainctl("printf '%s\\n' \"$@\" > '\(argsPath.path)'; echo 'status=needs-human'")
+    let outcome = await client(binary).proposalNeedsWork(id: "p1", reason: "add a source excerpt")
     XCTAssertTrue(outcome.succeeded)
-    XCTAssertEqual(try String(contentsOf: argsPath), "proposals\napply\np1\n--config\n/tmp/test.yaml\n")
-    XCTAssertEqual(outcome.title, "Accept Proposal")
+    XCTAssertEqual(
+      try String(contentsOf: argsPath),
+      "proposals\nneeds-work\np1\n--reason\nadd a source excerpt\n--config\n/tmp/test.yaml\n"
+    )
   }
 
   func testProposalMergeGroupUsesSubmitAndCloseSources() async throws {
@@ -156,6 +176,17 @@ final class CommandRunnerTests: XCTestCase {
       "proposals\nmerge-group\napp:repo:project_lesson\n--submit\n--close-sources\n--config\n/tmp/test.yaml\n"
     )
     XCTAssertEqual(outcome.title, "Merge Proposal Group")
+  }
+
+  func testProposalMergeSelectionForwardsOnlyChosenIds() async throws {
+    let argsPath = scratch.appendingPathComponent("proposal-merge-selection-args.txt")
+    let binary = try fakeBrainctl("printf '%s\\n' \"$@\" > '\(argsPath.path)'; echo 'merged'")
+    let outcome = await client(binary).proposalMergeSelection(groupKey: "app:repo:lesson", ids: ["p1", "p3"])
+    XCTAssertTrue(outcome.succeeded)
+    XCTAssertEqual(
+      try String(contentsOf: argsPath),
+      "proposals\nmerge-group\napp:repo:lesson\n--id\np1\n--id\np3\n--submit\n--close-sources\n--config\n/tmp/test.yaml\n"
+    )
   }
 
   func testProposalAutoMergeUsesHarnessBatchSubmit() async throws {
@@ -243,6 +274,18 @@ final class CommandRunnerTests: XCTestCase {
     let (proposals, outcome) = await client(binary).fetchOpenProposals()
     XCTAssertNil(proposals)
     XCTAssertFalse(outcome.succeeded)
+  }
+
+  func testFetchReviewedProposalsUsesCombinedStatusFilter() async throws {
+    let argsPath = scratch.appendingPathComponent("reviewed-proposal-args.txt")
+    let binary = try fakeBrainctl("printf '%s\\n' \"$@\" > '\(argsPath.path)'; echo '{\"ok\":true,\"proposals\":[]}'")
+    let (proposals, outcome) = await client(binary).fetchProposals(status: "applied,rejected,superseded")
+    XCTAssertTrue(outcome.succeeded)
+    XCTAssertEqual(proposals?.count, 0)
+    XCTAssertEqual(
+      try String(contentsOf: argsPath),
+      "proposals\nlist\n--status\napplied,rejected,superseded\n--json\n--config\n/tmp/test.yaml\n"
+    )
   }
 
   func testBinaryResolutionPrefersExplicitPath() throws {

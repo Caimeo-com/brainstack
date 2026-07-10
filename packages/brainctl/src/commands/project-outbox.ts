@@ -1577,7 +1577,9 @@ function readEnvFile(path: string): Record<string, string> {
     groupKey: string
   ): Promise<{ payload: Record<string, unknown>; selected: number; conflicts: string[]; dryRun: boolean; write?: BrainWriteOutcome; closed?: string[] }> {
     const closeSources = hasFlag(args, "close-sources");
-    const status = requireFlagValue(args, "status") || (closeSources ? "open,rejected" : "open");
+    // Include previously superseded sources so an interrupted close operation can
+    // resume against the same idempotently-created merge proposal.
+    const status = requireFlagValue(args, "status") || (closeSources ? "open,superseded" : "open");
     const result = await brainApiRequest(cfg, "GET", `/api/proposals?status=${encodeURIComponent(status)}`);
     const proposals = Array.isArray(result.proposals) ? (result.proposals as Array<Record<string, unknown>>) : [];
     const requestedIds = selectedProposalIdSet(args);

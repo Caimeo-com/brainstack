@@ -93,6 +93,7 @@ brainctl proposals batch-merge [--status open] [--submit] [--limit 100] [--auto-
 brainctl proposals approve <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
 brainctl proposals reject <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
 brainctl proposals supersede <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
+brainctl proposals needs-work <id> [--reason TEXT] [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
 brainctl proposals apply <id> [--via SSH_TARGET] [--remote-repo PATH] [--known-hosts FILE] [--ssh-trust pinned|accept-new|default]
 brainctl curator status [--json]
 brainctl curator run
@@ -102,7 +103,7 @@ brainctl remember --repo PATH --summary TEXT [--project NAME] [--domain NAME] [-
 brainctl propose --title TITLE --body BODY [--project NAME] [--domain NAME] [--scope repo|project|global|machine|harness] [--memory-kind KIND] [--applicability TEXT] [--non-applicability TEXT] [--evidence REF]
 ```
 
-Reads are unauthenticated within the tailnet; accept/reject/apply require `BRAIN_ADMIN_TOKEN` on the control host. The CLI `approve` command is retained for approval-mode workflows, but normal review should use `apply`/Accept. On an enrolled client, proposal decision and consolidation commands forward over the explicit control SSH route from `--via`, `BRAINSTACK_TELEGRAM_VIA`, or `client.telegramVia`, using the configured pinned known-hosts file by default. Consolidation commands require that explicit control route and fail closed without it. `curator run`/`curator install` use the local telemux dashboard control endpoints when telemux is enabled; enrolled clients without local telemux forward them over the configured control SSH route, including the `client.remoteSsh` fallback for curator commands.
+Reads are unauthenticated within the tailnet; proposal decisions require `BRAIN_ADMIN_TOKEN` on the control host. `needs-work` keeps a proposal open as `needs-human` and records the operator's reason for a later enrichment or curator pass. The CLI `approve` command is retained for approval-mode workflows, but normal review should use `apply`. On an enrolled client, proposal decision and consolidation commands forward over the explicit control SSH route from `--via`, `BRAINSTACK_TELEGRAM_VIA`, or `client.telegramVia`, using the configured pinned known-hosts file by default. Consolidation commands require that explicit control route and fail closed without it. `curator run`/`curator install` use the local telemux dashboard control endpoints when telemux is enabled; enrolled clients without local telemux forward them over the configured control SSH route, including the `client.remoteSsh` fallback for curator commands.
 
 Telegram mirrors the basics:
 
@@ -134,7 +135,7 @@ Useful review flows:
 
 - `GET /api/proposals[?status=...]` — list proposals plus deterministic review group hints (public read). The response includes both `review_groups` and legacy `clusters`.
 - `GET /api/proposals/groups[?status=open&min_size=2]` — list deterministic memory-review groups (public read). `/api/proposals/clusters` remains as a compatibility alias.
-- `GET /api/proposals/<id>` — proposal body plus a rendered diff (public read).
+- `GET /api/proposals/<id>` — proposal body, rendered diff, source-proposal excerpts, and current target-drift result (public read).
 - `POST /api/proposals/<id>/approve|reject|apply` — admin token.
 - `GET /api/curator/status` — policy, curator run state, proposal counts (public read).
 - `POST /api/curator/status` — admin token; telemux reports run outcomes here.
