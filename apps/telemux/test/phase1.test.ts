@@ -1739,6 +1739,90 @@ test("archived contexts stop pre-worker dispatch and pause linked cron slots", a
   }
 }, 15_000);
 
+test("Codex worker launches use the stdin sentinel and close stdin for new and resumed turns", async () => {
+  const fixture = await createFixture({ FACTORY_WORKER_RUN_TIMEOUT_SECONDS: "3" });
+
+  try {
+    await fixture.commands.handleMessage(telegramMessage("/newctx stdin-contract control scratch", 86));
+    const context = fixture.db.getContextBySlug("stdin-contract");
+    expect(context).toBeTruthy();
+
+    await makeExecutable(
+      fixture.fakeCodex,
+      `#!/usr/bin/env bash
+set -euo pipefail
+if (($# >= 2)) && [[ "$1" == "exec" && "$2" == "--help" ]]; then
+  echo '--dangerously-bypass-approvals-and-sandbox --output-last-message --skip-git-repo-check'
+  exit 0
+fi
+if (($# >= 1)) && [[ "$1" == "--version" ]]; then
+  echo 'codex fake'
+  exit 0
+fi
+
+last_arg="\${!#}"
+if [[ "$last_arg" != "-" ]]; then
+  echo "expected stdin sentinel as final argument, got: $last_arg" >&2
+  exit 41
+fi
+
+output_file=""
+resuming=0
+for arg in "$@"; do
+  if [[ "$arg" == "resume" ]]; then
+    resuming=1
+  fi
+done
+while (($#)); do
+  case "$1" in
+    --output-last-message|-o)
+      output_file="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+# Newer Codex waits for EOF here even when a positional prompt was supplied.
+prompt="$(cat)"
+case "$prompt" in
+  "new turn over stdin"|"resumed turn over stdin") ;;
+  *) echo "unexpected stdin prompt: $prompt" >&2; exit 42 ;;
+esac
+
+if [[ -n "$output_file" ]]; then
+  printf 'stdin contract reply' > "$output_file"
+fi
+if ((resuming)); then
+  printf '{"type":"session.resumed","session_id":"stdin-contract-session"}\n'
+else
+  printf '{"type":"session.started","session_id":"stdin-contract-session"}\n'
+fi
+printf '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}\n'
+`
+    );
+
+    const logPath = join(fixture.controlRoot, "logs", "stdin-contract.log");
+    const first = await fixture.workers.runCodex(context!, "new turn over stdin", "run", logPath);
+    expect(first.ok).toBe(true);
+    expect(first.sessionId).toBe("stdin-contract-session");
+
+    const resumed = await fixture.workers.runCodex(
+      { ...context!, codexSessionId: "stdin-contract-session" },
+      "resumed turn over stdin",
+      "resume",
+      logPath
+    );
+    expect(resumed.ok).toBe(true);
+    expect(resumed.sessionId).toBe("stdin-contract-session");
+  } finally {
+    process.env.PATH = fixture.previousPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}, 15_000);
+
 test("worker execution keeps full logs but bounds in-memory stdout and stderr", async () => {
   const fixture = await createFixture({ FACTORY_WORKER_CAPTURE_MAX_BYTES: "256" });
 
